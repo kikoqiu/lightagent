@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -206,6 +207,64 @@ func TestShouldCompact(t *testing.T) {
 	// A reported usage larger than the estimate also triggers.
 	if !c.shouldCompact(nil, "", 600) {
 		t.Fatal("usage above the limit should trigger compaction")
+	}
+}
+
+// TestEnsureUserMessage pins the marker the engine inserts after a pass that
+// leaves no user message behind: chat templates reject a request whose messages
+// hold no user query.
+func TestEnsureUserMessage(t *testing.T) {
+	if got := ensureUserMessage(nil); len(got) != 1 ||
+		got[0].Role != "user" || got[0].Content != contextContinueMessage {
+		t.Fatalf("empty tail = %+v, want the engine continue marker", got)
+	}
+
+	// A tail without a user message gets the marker appended, so an assistant
+	// tool_call / tool result pair in front of it stays intact.
+	orphan := []llm.Message{
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1", Type: "function"}}},
+		{Role: "tool", ToolCallID: "c1"},
+	}
+	got := ensureUserMessage(orphan)
+	if len(got) != 3 || got[0].Role != "assistant" || got[1].Role != "tool" {
+		t.Fatalf("orphan tail = %+v, want the original rows first", got)
+	}
+	if got[2].Role != "user" || got[2].Content != contextContinueMessage {
+		t.Fatalf("orphan tail last row = %+v, want the engine continue marker", got[2])
+	}
+	if len(orphan) != 2 {
+		t.Fatalf("input slice was grown in place: %+v", orphan)
+	}
+
+	// A tail that already holds a user message is left alone.
+	withUser := []llm.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "answer"}}
+	if same := ensureUserMessage(withUser); len(same) != 2 || same[0].Content != "hi" {
+		t.Fatalf("tail with a user message = %+v, want it unchanged", same)
+	}
+}
+
+// TestCompactKeepsAUserMessageWhenEverythingIsCut covers the pass that cuts the
+// whole tail: the tiny window leaves no room for even the newest turn, so
+// nothing but the engine marker may survive — also on the summarize-failure
+// fallback, which drops the batch and keeps that marker.
+func TestCompactKeepsAUserMessageWhenEverythingIsCut(t *testing.T) {
+	c := &compactor{contextWindow: 100, maxTokens: 40960}
+	hist := []llm.Message{
+		userRunes("q", 100),
+		{Role: "assistant", Content: "answer"},
+	}
+	newHist, summary, changed, err := c.compact(context.Background(), hist, "carried", summarizeModeAuto)
+	if !changed {
+		t.Fatal("expected the whole tail to be compressed")
+	}
+	if err == nil {
+		t.Fatal("expected the summarize failure of the client-less compactor")
+	}
+	if summary != "carried" {
+		t.Fatalf("summary = %q, want the untouched one", summary)
+	}
+	if len(newHist) != 1 || newHist[0].Role != "user" || newHist[0].Content != contextContinueMessage {
+		t.Fatalf("history = %+v, want only the engine continue marker", newHist)
 	}
 }
 

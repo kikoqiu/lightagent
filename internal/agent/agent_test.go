@@ -322,6 +322,77 @@ func TestCompactionPublishesProgressAndSummary(t *testing.T) {
 	}
 }
 
+// TestAutoCompactionKeepsAUserMessage covers a pass that compresses the whole
+// context, the user turn of the running loop included: the request that follows
+// must still carry a user message (chat templates reject one without a user
+// query), so the engine inserts its continue marker.
+func TestAutoCompactionKeepsAUserMessage(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		bodies [][]capturedMessage
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []capturedMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, req.Messages)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	// A tiny window with a 1% trigger compresses on every iteration, and a
+	// retention budget of a few tokens leaves no room for the newest turn, so
+	// the whole tail is cut — the user turn included.
+	cfg.Context.ContextWindow = 100
+	cfg.Context.SummarizeTokenPercent = 1
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Load([]llm.Message{
+		userRunes("old ", 100),
+		{Role: "assistant", Content: "old answer"},
+	}, "")
+	a.Submit(userRunes("question ", 100).Content)
+	drainEvents(t, events)
+
+	hist := a.History()
+	if len(hist) != 2 {
+		t.Fatalf("history = %+v, want the engine marker and the model reply", hist)
+	}
+	if hist[0].Role != "user" || hist[0].Content != contextContinueMessage {
+		t.Fatalf("history[0] = %+v, want the engine continue marker", hist[0])
+	}
+	if hist[1].Role != "assistant" || hist[1].Content != "done" {
+		t.Fatalf("history[1] = %+v, want the model reply", hist[1])
+	}
+
+	// The model call that follows the pass must have carried that marker, and
+	// only it: a request without a user message is what the provider rejected.
+	mu.Lock()
+	last := bodies[len(bodies)-1]
+	mu.Unlock()
+	var users []string
+	for _, m := range last {
+		if m.Role == "user" {
+			users = append(users, m.Content)
+		}
+	}
+	if len(users) != 1 || users[0] != contextContinueMessage {
+		t.Fatalf("final request user messages = %q, want only the engine continue marker", users)
+	}
+}
+
 // TestContextTokensAnchorsToProviderUsage verifies a reported prompt-token
 // count anchors the context size while messages appended afterwards are
 // estimated on top of it.

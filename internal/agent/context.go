@@ -37,6 +37,27 @@ func EstimateMessagesTokens(msgs []llm.Message) int {
 	return total
 }
 
+// contextContinueMessage is the user message the engine inserts when a pass
+// leaves no user message behind. Compaction may drop every message, including
+// the user turn that started the running loop, but chat templates reject a
+// request whose messages hold no user query — so the engine adds this marker
+// and the conversation carries on from the summary alone.
+const contextContinueMessage = "[engine] Context summarized, continue."
+
+// ensureUserMessage appends contextContinueMessage to msgs when they hold no
+// user message, and returns msgs unchanged otherwise. The appended result is a
+// fresh slice, so the caller never writes into the input's spare capacity.
+func ensureUserMessage(msgs []llm.Message) []llm.Message {
+	for _, m := range msgs {
+		if m.Role == "user" {
+			return msgs
+		}
+	}
+	out := make([]llm.Message, 0, len(msgs)+1)
+	out = append(out, msgs...)
+	return append(out, llm.Message{Role: "user", Content: contextContinueMessage})
+}
+
 // summarizeAppendInstruction is the single instruction appended as the final
 // user message when compressing.
 // Summarize mode so the compression call reuses the live conversation layout.
@@ -225,7 +246,11 @@ func (c *compactor) compact(ctx context.Context, history []llm.Message, summary 
 		return history, summary, false, nil
 	}
 	batch := history[:cut]
-	tail := history[cut:]
+	// Cutting everything — including the user turn that started the running
+	// loop — would leave the next request without a user message, which chat
+	// templates reject. The retained window always starts at a user message
+	// when it is non-empty, so this only fires on a fully compressed tail.
+	tail := ensureUserMessage(history[cut:])
 
 	digest, err := c.digest(ctx, batch, summary)
 	if err != nil || digest == "" {
