@@ -66,11 +66,15 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 `reasoning_delta` 携带模型「思考」增量文本，CLI 与
 web 各自流式渲染（CLI 为 `[thinking]` 块，web 为 thinking 行），并和可见回答一样按
 `ui.markdown` 设置渲染 Markdown；定稿后的思考写入 assistant 消息（`reasoning_content`）并随后续请求回传，供 preserve thinking 模板使用。
+`compacted` 携带 `summary`（压缩后的累积摘要）：CLI 与 web 都据此在**截断处**显示摘要——
+CLI 打印 `[summary]` 块，网页追加一条 `summary` 行，两端的「详细消息到此为止」位置一致。
 
 CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket 客户端。web 在启动时用当前
 会话（含恢复的历史）播种一份内存回放缓冲，并把之后每个事件追加进去（思考增量合并成一条
-`reasoning` 行），新连接的浏览器先收到含全部行的 `history` 快照，因此思考、工具行与
-info/error 标记在刷新或后开网页时都不丢失，且不受压缩影响。
+`reasoning` 行；`compacted` 在信息行之后追加一条 `summary` 行），新连接的浏览器先收到含
+全部行的 `history` 快照，因此思考、工具行、摘要行与 info/error 标记在刷新或后开网页时都
+不丢失，且不受压缩影响：压缩不删回滚里的旧消息，只在切点插入摘要行；而恢复的会话因为切点
+之前的消息本就不在，摘要行是回放缓冲的第一行。
 
 ## 网络与超时
 
@@ -145,6 +149,11 @@ info/error 标记在刷新或后开网页时都不丢失，且不受压缩影响
 被压缩的部分（切点之前）按 append_instruction 模式交给模型总结，摘要与旧摘要合并
 （`旧 + "\n\n" + 新`）后写入系统提示的 `# CONVERSATION SUMMARY` 段；摘要失败则退化为
 直接丢弃被压缩消息，回合继续。CLI `/compact` 会以**手动模式**触发（更保守的保留窗口）。
+压缩完成后发布带 `summary` 的 `compacted` 事件，CLI 与 web 便在截断处显示它；恢复会话时
+摘要出现在历史消息之前（网页日志区的第一行），即「此前的对话只以摘要形式保留」。
+由于总结本身是一次模型调用（可能较慢），**压缩开始前**先发布一条 `info`
+（`compacting context: summarizing N of M messages`），两端因此马上能看到「正在压缩」，
+不会在等待期间毫无反馈；没有可压缩内容时不发任何事件，由命令调用方回复「无需压缩」。
 
 ### token 估算（`EstimateMessageTokens`）
 

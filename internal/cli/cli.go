@@ -1330,7 +1330,14 @@ func (c *CLI) render(ev agent.Event) {
 		}
 		body := indentAfterFirst(clipForDisplay(ev.Text, resultDisplayLines, resultDisplayChars), "  ")
 		c.outLocked(color("[result] "+body) + "\n")
-	case agent.EventCompacted, agent.EventInfo:
+	case agent.EventCompacted:
+		c.flushMarkdownLocked()
+		c.endLineLocked()
+		c.outLocked(termcolor.Cyan("[info] ") + ev.Text + "\n")
+		// The summary replaced the messages that were just cut out of the
+		// context, so it is printed right at the truncation point.
+		c.writeSummaryLocked(ev.Summary)
+	case agent.EventInfo:
 		c.flushMarkdownLocked()
 		c.endLineLocked()
 		c.outLocked(termcolor.Cyan("[info] ") + ev.Text + "\n")
@@ -1421,7 +1428,12 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 			c.write(termcolor.Red("[error] ") + "a turn is running; try again when idle\n")
 			break
 		}
-		c.write(termcolor.Cyan("[info] ") + c.agent.CompactNow(ctx) + "\n")
+		// A pass with nothing to condense is the only case that needs a line
+		// here: one that did compress reports itself on the bus (the
+		// "compacting" info, then the compacted event with the summary).
+		if msg := c.agent.CompactNow(ctx); msg != "" {
+			c.write(termcolor.Cyan("[info] ") + msg + "\n")
+		}
 	case "/stop":
 		if !c.agent.Interrupt() {
 			c.write(termcolor.Gray("[info] nothing to interrupt") + "\n")
@@ -1483,9 +1495,31 @@ func (c *CLI) toggleToolResults(args []string) string {
 	return termcolor.Cyan("[info] ") + "hiding tool/exec results"
 }
 
+// summaryMarker introduces a compressed-context summary: it states what the
+// block below stands for, so the truncation point is obvious. The page draws
+// the same wording on its summary row.
+const summaryMarker = "older messages are condensed into the summary below"
+
+// writeSummaryLocked prints the summary block: the marker line and the summary
+// text indented under it. It is a no-op without a summary - nothing was
+// condensed, so there is nothing to mark. The caller must hold c.mu.
+func (c *CLI) writeSummaryLocked(summary string) {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return
+	}
+	c.outLocked(termcolor.Cyan("[summary] ") + summaryMarker + "\n")
+	c.outLocked("  " + indentAfterFirst(summary, "  ") + "\n")
+}
+
 // ShowHistory prints a resumed conversation so re-entering a session shows what
 // was said before.
 func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
+	// Everything before the last compaction is represented by the summary
+	// alone, so it is printed first: it marks where this transcript starts.
+	c.mu.Lock()
+	c.writeSummaryLocked(summary)
+	c.mu.Unlock()
 	if len(messages) == 0 {
 		return
 	}
@@ -1505,9 +1539,6 @@ func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
 			}
 			c.write("\n\n")
 		}
-	}
-	if strings.TrimSpace(summary) != "" {
-		c.write(termcolor.Gray("[summary] ") + summary + "\n")
 	}
 	c.write(termcolor.Gray("--- end of history ---") + "\n\n")
 }

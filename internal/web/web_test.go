@@ -374,6 +374,58 @@ func TestScrollbackSkipsEmptyToolResult(t *testing.T) {
 	}
 }
 
+// TestHistorySummaryMarksTheTruncationPoint pins the reload path: a resumed
+// conversation replays the compressed-context summary as its first row, because
+// everything before the cut is gone and the summary is all that is left of it.
+func TestHistorySummaryMarksTheTruncationPoint(t *testing.T) {
+	srv := newTestServer(t, "")
+	srv.agent.Load([]llm.Message{
+		{Role: "user", Content: "after the cut"},
+		{Role: "assistant", Content: "answer"},
+	}, "what happened before")
+	srv.seedHistory()
+
+	rows := decodeHistory(t, srv)
+	if got := rolesOf(rows); got != "summary,user,assistant" {
+		t.Fatalf("roles = %q, want the summary row first", got)
+	}
+	if rows[0].Content != "what happened before" {
+		t.Fatalf("summary row = %+v", rows[0])
+	}
+	for _, want := range []string{"m.role === 'summary'", "SUMMARY_ROLE", ".summary .role"} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("index page is missing %q", want)
+		}
+	}
+}
+
+// TestScrollbackRecordsTheCompactedSummary pins the live path: a compaction
+// records the summary it produced right after the info row that counts it, so a
+// page reconnecting later replays the marker at the cut. A compaction that
+// produced no summary (the fallback dropped messages without condensing them)
+// records the info row alone.
+func TestScrollbackRecordsTheCompactedSummary(t *testing.T) {
+	srv := newTestServer(t, "")
+	bus := srv.agent.Bus()
+
+	bus.Publish(agent.Event{Type: agent.EventAssistant, Text: "early"})
+	bus.Publish(agent.Event{
+		Type:    agent.EventCompacted,
+		Text:    "context compressed: 9 -> 3 messages",
+		Summary: "the digest",
+	})
+	bus.Publish(agent.Event{Type: agent.EventCompacted, Text: "context compressed: 3 -> 2 messages"})
+	bus.Publish(agent.Event{Type: agent.EventAssistant, Text: "later"})
+
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 5 })
+	if got, want := rolesOf(rows), "assistant,info,summary,info,assistant"; got != want {
+		t.Fatalf("roles = %q, want %q", got, want)
+	}
+	if rows[2].Content != "the digest" {
+		t.Fatalf("summary row = %+v", rows[2])
+	}
+}
+
 // TestInterruptAffordances guards the mirror's interrupt path: the page carries a
 // Stop button and an interrupted marker, and /stop is consumed by the server.
 func TestInterruptAffordances(t *testing.T) {

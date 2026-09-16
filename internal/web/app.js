@@ -401,10 +401,19 @@
   // signed in, and drops the socket when a session ends.
   var AUTH = window.AUTH || { ok: function () { return true; }, ensure: function () { return Promise.resolve(true); }, onChange: function () {}, unauthorized: function () {} };
 
+  // The compressed-context summary is drawn as its own bordered block: it marks
+  // the point where the older messages were cut out of the model context, so it
+  // must stand out from the ordinary info rows. The CLI prints the same wording.
+  var SUMMARY_ROLE = 'summary (older messages condensed)';
+
   function render(kind, ev) {
     // Any event other than a further reasoning chunk ends the thinking row.
     if (kind !== 'reasoning_delta') { finishReasoning(); }
     if (kind === 'usage') { setUsage(ev.tokens || 0, ev.context_window || 0); return; }
+    // A summary row is the truncation marker itself, so it is drawn as a whole
+    // block instead of an [info] line; it arrives either live with a compacted
+    // event or replayed from the history frame.
+    if (kind === 'summary') { addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN); return; }
     if (kind === 'user') { setRunning(true); }
     if (kind === 'turn_done' || kind === 'interrupted') { setRunning(false); }
     if (kind === 'reasoning_delta') {
@@ -439,7 +448,14 @@
       }
       addRow(ev.is_error ? 'error' : 'result', '', '[result] ' + ev.text, false);
     }
-    else if (kind === 'info' || kind === 'compacted') { addRow('result', '', '[info] ' + (ev.text || ''), false); syncResults(ev.text || ''); }
+    else if (kind === 'info') { addRow('result', '', '[info] ' + (ev.text || ''), false); syncResults(ev.text || ''); }
+    else if (kind === 'compacted') {
+      // The info row counts what was compressed away; the summary block shows
+      // what replaced it. The mirror records the same block at this point of its
+      // scrollback, so a reload replays it exactly here.
+      addRow('result', '', '[info] ' + (ev.text || ''), false);
+      if (ev.summary) { render('summary', { text: ev.summary }); }
+    }
     else if (kind === 'interrupted') { addRow('interrupted', '', '[interrupted] ' + (ev.text || ''), false); }
     else if (kind === 'error') { addRow('error', '', '[error] ' + (ev.text || ''), false); }
   }
@@ -462,11 +478,14 @@
       else if (m.role === 'tool_call') { render('tool_call', { name: m.name, args: m.args }); }
       else if (m.role === 'tool_result') { render('tool_result', { text: m.content, is_error: m.is_error }); }
       else if (m.role === 'info') { render('info', { text: m.content }); }
+      else if (m.role === 'summary') { render('summary', { text: m.content }); }
       else if (m.role === 'error') { render('error', { text: m.content }); }
       else if (m.role === 'interrupted') { render('interrupted', { text: m.content }); }
     });
     replaying = false;
-    if (ev.summary) { render('info', { text: 'summary: ' + ev.summary }); }
+    // The compressed-context summary is not appended here: it is one of the rows
+    // above, recorded exactly where the context was cut, so a reload rebuilds
+    // the truncation marker in the right place.
     setUsage(ev.tokens || 0, ev.window || 0);
     // The frames carry the current switches, so a reconnected tab agrees with
     // whatever the other tabs (or the CLI) changed meanwhile.

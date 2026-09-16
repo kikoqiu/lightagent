@@ -622,16 +622,17 @@ func (a *Agent) compactIfNeeded(ctx context.Context) {
 	}
 }
 
-// CompactNow forces a compaction pass (used by the /compact command).
+// CompactNow forces a compaction pass (used by the /compact command). It returns
+// the note the caller should print: a pass that did compress reports itself on the
+// bus (the "compacting" info and the compacted event), so it returns "" then.
 func (a *Agent) CompactNow(ctx context.Context) string {
 	if a.compactor == nil {
 		return "compaction is not configured"
 	}
-	before := len(a.History())
 	if !a.doCompact(ctx, summarizeModeManual) {
 		return "nothing to compress yet"
 	}
-	return fmt.Sprintf("context compressed: %d -> %d messages", before, len(a.History()))
+	return ""
 }
 
 // doCompact performs one compaction pass. It returns whether a change happened.
@@ -640,6 +641,19 @@ func (a *Agent) doCompact(ctx context.Context, mode summarizeMode) bool {
 	hist := append([]llm.Message(nil), a.history...)
 	sum := a.summary
 	a.mu.Unlock()
+
+	// Summarizing is a model call that can take a while, so the pass announces
+	// itself on the bus before it starts: both front-ends then show what the
+	// wait is for. A pass with nothing to condense stays silent (its caller
+	// reports that).
+	cut, ok := a.compactor.cut(hist, mode)
+	if !ok {
+		return false
+	}
+	a.bus.Publish(Event{
+		Type: EventInfo,
+		Text: fmt.Sprintf("compacting context: summarizing %d of %d messages", cut, len(hist)),
+	})
 
 	newHist, newSum, changed, err := a.compactor.compact(ctx, hist, sum, mode)
 	if err != nil {
@@ -656,9 +670,13 @@ func (a *Agent) doCompact(ctx context.Context, mode summarizeMode) bool {
 	a.usageAt = 0
 	a.mu.Unlock()
 
+	// The summary rides along with the event: it is what replaced the messages
+	// that were just cut out of the context, so the front-ends print it at the
+	// truncation point instead of reaching into the agent for it.
 	a.bus.Publish(Event{
-		Type: EventCompacted,
-		Text: fmt.Sprintf("context compressed: %d -> %d messages", len(hist), len(newHist)),
+		Type:    EventCompacted,
+		Text:    fmt.Sprintf("context compressed: %d -> %d messages", len(hist), len(newHist)),
+		Summary: newSum,
 	})
 	a.save()
 	return true

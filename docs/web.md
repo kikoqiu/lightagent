@@ -147,7 +147,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 **1. 首次连接时推送历史**（随后才是实时事件）：
 
 ```json
-{ "type": "history", "summary": "可选摘要", "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "messages": [ { "role": "user", "content": "..." } ] }
+{ "type": "history", "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "messages": [ { "role": "user", "content": "..." } ] }
 ```
 
 > 页面收到 `history` 时会**清空并重建**整个日志区（历史始终是全量快照），因此断线重连
@@ -156,12 +156,16 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 > 与其它标签页（或 CLI）的改动保持一致。
 >
 > `messages[].role` 取值与页面绘制的行一一对应：`user`、`assistant`、`reasoning`（模型
-> 思考，斜体灰字）、`tool_call`、`tool_result`、`info`、`error`、`interrupted`。
+> 思考，斜体灰字）、`tool_call`、`tool_result`、`info`、`summary`、`error`、`interrupted`。
+> `summary` 是**压缩摘要行**（页面上是一条带虚线边框的醒目块），它标示上下文被截断的位置：
+> 该位置之前的旧消息不再发给模型，取而代之的就是这一行摘要（见下方 `compacted` 事件）。
 >
 > 服务端在启动时就初始化自己的**内存回放缓冲**：先用当时的会话（如已恢复的历史）播种，
 > 之后把事件总线上的每个事件追加进去（思考增量会合并成一条 `reasoning` 行）。因此网页
 > 之后才打开、或刷新重连，都能看到完整的对话，包括思考、工具行与 info/error 标记，
-> 且不受上下文压缩影响（与终端回滚一致）。
+> 且不受上下文压缩影响（与终端回滚一致）：旧消息不会被删掉，压缩只在切点追加一条摘要行。
+> 而**恢复的会话**（进程重启后重新拉起）里，切点之前的消息本就不在，播种时摘要行会成为
+> 日志区的第一行，表示此前的对话只以摘要形式保留。
 
 **2. 实时事件**：字段与 Agent 事件一致。
 
@@ -172,7 +176,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "tool_call", "name": "exec_command", "args": "{\"command\":\"ls\"}" }
 { "type": "tool_result", "name": "exec_command", "text": "展示文本", "is_error": false }
 { "type": "info", "text": "..." }
-{ "type": "compacted", "text": "context compressed: 20 -> 9 messages" }
+{ "type": "compacted", "text": "context compressed: 20 -> 9 messages", "summary": "被压缩消息的累积摘要" }
 { "type": "interrupted", "text": "interrupted; the turn was stopped" }
 { "type": "error", "text": "..." }
 { "type": "usage", "tokens": 1234, "context_window": 131072 }
@@ -180,6 +184,14 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "turn_done" }
 { "type": "settings", "markdown": true, "result": true }
 ```
+
+* `compacted` 携带 `summary`：累计摘要（总结失败时退化为丢弃消息，此时它可能为空/未变）。
+  CLI 与网页都在**截断处**显示它——CLI 先打印 `[info] context compressed: …` 再打印一个
+  `[summary]` 块，网页在信息行之后追加一条 `summary` 行；网页的这条行同时写进回放缓冲，
+  所以刷新/重连后摘要仍出现在同一个位置。
+  总结要调用模型（可能较慢），因此压缩**开始前**会先广播一条 `info`：
+  `compacting context: summarizing N of M messages`，两端立刻显示「正在压缩」；没有可压缩
+  内容时不广播任何事件（`/compact` 由命令处理方回复 `nothing to compress yet`）。
 
 * `settings` 是**瞬时帧**（不进日志区）：服务端在网页侧开关（`/result`、`/markdown`）变化时广播，
   页面的命令栏据此刷新 on / off 状态；新页面从注入的配置、重连页面从 `history` 帧拿到同样的值。

@@ -361,6 +361,12 @@ token 预算 + 回合数上限：
   最多保留 3 个（自动）或 2 个（手动）Turn；从新到旧累加，谁先触顶谁停止。
 * 把更早的消息按原对话布局发给模型总结（末尾追加压缩指令），摘要合并进系统提示
   （`# CONVERSATION SUMMARY`）；失败则退化为直接丢弃最旧消息。
+* 压缩后发布带 `summary` 的 `compacted` 事件：CLI 与网页都在**截断处**显示这份摘要
+  （CLI 为一个 `[summary]` 块，网页为一条带边框的摘要行），一眼可见详细消息到此为止。
+  恢复会话时摘要出现在历史消息之前（网页日志区的第一行），因为切点之前的内容本就只以
+  摘要形式保留。
+* 总结是一次模型调用（可能较慢），因此压缩**开始前**先发一条 `compacting context:
+  summarizing N of M messages` 的 info，CLI 与网页立刻显示「正在压缩」，不会静默等待。
 * 可通过 `/compact` 手动触发（手动模式）。
 
 详见 [`docs/architecture.md`](docs/architecture.md)。

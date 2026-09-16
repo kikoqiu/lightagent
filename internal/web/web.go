@@ -328,7 +328,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 // historyMessage is one conversation row sent to a browser. It mirrors the rows
 // the live view draws: user/assistant/thinking text, info and error markers,
-// plus one entry per tool call and per user-visible tool result.
+// plus one entry per tool call and per user-visible tool result. The "summary"
+// role is the compressed-context summary: it marks the point where the older
+// messages were cut out of the model context.
 type historyMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content,omitempty"`
@@ -343,6 +345,12 @@ type historyMessage struct {
 // connects, thinking included.
 func (s *Server) seedHistory() {
 	rows := messageRows(s.agent.History(), s.agent.ToolResultsVisible())
+	// A resumed conversation carries the summary of everything that was
+	// compressed away before it, so it becomes the first row: the page then
+	// starts exactly where the agent's context does.
+	if sum := strings.TrimSpace(s.agent.Summary()); sum != "" {
+		rows = append([]historyMessage{{Role: "summary", Content: sum}}, rows...)
+	}
 	s.mu.Lock()
 	s.history = rows
 	s.reasoningOpen = false
@@ -422,8 +430,16 @@ func (s *Server) recordLocked(ev agent.Event) {
 			return
 		}
 		s.history = append(s.history, historyMessage{Role: "tool_result", Content: ev.Text, IsError: ev.IsError})
-	case agent.EventInfo, agent.EventCompacted:
+	case agent.EventInfo:
 		s.history = append(s.history, historyMessage{Role: "info", Content: ev.Text})
+	case agent.EventCompacted:
+		s.history = append(s.history, historyMessage{Role: "info", Content: ev.Text})
+		// The summary is what replaced the messages that were cut out of the
+		// context, so its row is recorded right at the cut: a page connecting
+		// later replays the marker in the same place.
+		if sum := strings.TrimSpace(ev.Summary); sum != "" {
+			s.history = append(s.history, historyMessage{Role: "summary", Content: sum})
+		}
 	case agent.EventInterrupted:
 		s.history = append(s.history, historyMessage{Role: "interrupted", Content: ev.Text})
 	case agent.EventError:
@@ -450,15 +466,17 @@ func (s *Server) historyFrame() []byte {
 	return s.historyFrameLocked()
 }
 
-// historyFrameLocked serializes the scrollback plus the summary, context-usage
-// and busy state the page needs. The busy flag lets a client connecting
-// mid-turn show the running indicator. The caller must hold s.mu.
+// historyFrameLocked serializes the scrollback plus the context-usage and busy
+// state the page needs. The rows carry everything the page draws - the summary
+// that marks where the context was cut included (see seedHistory and
+// recordLocked) - so a reload rebuilds exactly what the live view showed. The
+// busy flag lets a client connecting mid-turn show the running indicator. The
+// caller must hold s.mu.
 func (s *Server) historyFrameLocked() []byte {
 	stats := s.agent.Stats()
 	payload, err := json.Marshal(map[string]any{
 		"type":     "history",
 		"messages": s.history,
-		"summary":  s.agent.Summary(),
 		"tokens":   stats.EstimatedTok,
 		"window":   stats.ContextWindow,
 		"busy":     stats.Busy,
@@ -542,7 +560,12 @@ func (s *Server) handleCommand(text string) {
 			s.fail("a turn is running; try again when idle")
 			return
 		}
-		s.info(s.agent.CompactNow(context.Background()))
+		// A pass with nothing to condense is the only case that needs a row
+		// here: one that did compress reports itself on the bus (the
+		// "compacting" info, then the compacted event with the summary).
+		if msg := s.agent.CompactNow(context.Background()); msg != "" {
+			s.info(msg)
+		}
 	case "/stop":
 		if !s.agent.Interrupt() {
 			s.info("nothing to interrupt")

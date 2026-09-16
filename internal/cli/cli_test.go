@@ -112,6 +112,84 @@ func TestToggleToolResults(t *testing.T) {
 	}
 }
 
+// TestCompactedEventPrintsTheSummary pins the live compaction marker: the info
+// line counts what was compressed, and the summary block right below it shows
+// what replaced it, so the truncation point is obvious in the transcript.
+func TestCompactedEventPrintsTheSummary(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.lineStart = true
+
+	c.render(agent.Event{
+		Type:    agent.EventCompacted,
+		Text:    "context compressed: 9 -> 3 messages",
+		Summary: "goal: ship it",
+	})
+	got := buf.String()
+	info := strings.Index(got, "[info] context compressed: 9 -> 3 messages")
+	marker := strings.Index(got, "[summary] "+summaryMarker)
+	if info < 0 || marker < 0 {
+		t.Fatalf("compaction marker missing: %q", got)
+	}
+	if info > marker {
+		t.Fatalf("the info line should come first: %q", got)
+	}
+	if !strings.Contains(got, "\n  goal: ship it\n") {
+		t.Fatalf("the summary text is not indented under its marker: %q", got)
+	}
+
+	// A compaction without a summary (the fallback dropped the oldest messages
+	// without condensing them) prints the info line alone.
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventCompacted, Text: "context compressed: 3 -> 2 messages"})
+	if strings.Contains(buf.String(), "[summary]") {
+		t.Fatalf("an empty summary should not print a block: %q", buf.String())
+	}
+}
+
+// TestCompactCommandReportsWhenIdle pins the /compact answer when there is
+// nothing to condense. A pass that does compress needs no line here: it reports
+// itself on the bus (the "compacting" info and the compacted event).
+func TestCompactCommandReportsWhenIdle(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	if exit := c.handleCommand(context.Background(), "/compact"); exit {
+		t.Fatal("/compact must not exit the CLI")
+	}
+	if !strings.Contains(buf.String(), "[info] nothing to compress yet") {
+		t.Fatalf("/compact on an empty agent = %q", buf.String())
+	}
+}
+
+// TestShowHistoryPrintsTheSummaryFirst pins that a resumed conversation shows the
+// summary before the messages it replaced: it is the head of the restored
+// transcript, marking where it was truncated, not a trailing note.
+func TestShowHistoryPrintsTheSummaryFirst(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.ShowHistory([]llm.Message{{Role: "user", Content: "hi"}}, "goal: ship it")
+	got := buf.String()
+	marker := strings.Index(got, "[summary] "+summaryMarker)
+	history := strings.Index(got, "--- history: 1 messages ---")
+	if marker < 0 || history < 0 {
+		t.Fatalf("history output = %q", got)
+	}
+	if marker > history {
+		t.Fatalf("the summary should precede the history listing: %q", got)
+	}
+	if !strings.Contains(got, "\n  goal: ship it\n") {
+		t.Fatalf("the summary text is missing: %q", got)
+	}
+}
+
 // TestInterruptAffordances covers the console interrupt markers: the interrupted
 // event renders a marker and /stop reports when there is nothing to stop.
 func TestInterruptAffordances(t *testing.T) {

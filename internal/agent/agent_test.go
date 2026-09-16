@@ -262,6 +262,66 @@ func TestResetAndStats(t *testing.T) {
 	}
 }
 
+// TestCompactionPublishesProgressAndSummary verifies the compaction bus contract:
+// the pass announces itself before the (slow) summarizing call, reports the
+// summary it produced with the compacted event, and stays silent when there is
+// nothing to condense (its caller then reports that instead).
+func TestCompactionPublishesProgressAndSummary(t *testing.T) {
+	a := newTestAgent(t)
+	// Three turns; the manual retention window keeps two, so the oldest turn is
+	// compressed. The agent has no LLM client, so summarizing fails and the pass
+	// falls back to dropping those messages while keeping the current summary.
+	a.Load([]llm.Message{
+		{Role: "user", Content: "one"},
+		{Role: "assistant", Content: "two"},
+		{Role: "user", Content: "three"},
+		{Role: "assistant", Content: "four"},
+		{Role: "user", Content: "five"},
+	}, "carried over")
+	events, cancel := a.Bus().Subscribe()
+	defer cancel()
+
+	if msg := a.CompactNow(context.Background()); msg != "" {
+		t.Fatalf("CompactNow after compressing = %q, want no extra note", msg)
+	}
+
+	var kinds []EventType
+	var texts []string
+	deadline := time.After(2 * time.Second)
+	for len(kinds) < 3 {
+		select {
+		case ev := <-events:
+			kinds = append(kinds, ev.Type)
+			texts = append(texts, ev.Text)
+			if ev.Type == EventCompacted && ev.Summary != "carried over" {
+				t.Fatalf("compacted event summary = %q, want the carried-over one", ev.Summary)
+			}
+		case <-deadline:
+			t.Fatalf("events = %v %v, want the info, the error and the compacted one", kinds, texts)
+		}
+	}
+	if kinds[0] != EventInfo || texts[0] != "compacting context: summarizing 2 of 5 messages" {
+		t.Fatalf("first event = %v %q, want the compacting info", kinds[0], texts[0])
+	}
+	if kinds[1] != EventError || kinds[2] != EventCompacted {
+		t.Fatalf("event kinds = %v, want info, error, compacted", kinds)
+	}
+	if texts[2] != "context compressed: 5 -> 3 messages" {
+		t.Fatalf("compacted event text = %q", texts[2])
+	}
+
+	// The retained window now holds every turn, so a further pass has nothing to
+	// condense: it publishes nothing and says so to its caller.
+	if msg := a.CompactNow(context.Background()); msg != "nothing to compress yet" {
+		t.Fatalf("CompactNow on a compacted history = %q", msg)
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("a pass with nothing to do published %+v", ev)
+	default:
+	}
+}
+
 // TestContextTokensAnchorsToProviderUsage verifies a reported prompt-token
 // count anchors the context size while messages appended afterwards are
 // estimated on top of it.

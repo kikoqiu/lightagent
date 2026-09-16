@@ -36,6 +36,11 @@ type Event struct {
 	Name    string    `json:"name,omitempty"`
 	Args    string    `json:"args,omitempty"`
 	IsError bool      `json:"is_error,omitempty"`
+	// Summary carries the accumulated context summary that replaced the
+	// compressed messages. It is set on compacted events so every front-end
+	// can show the summary exactly where the transcript was truncated,
+	// without reading the agent's own state.
+	Summary string `json:"summary,omitempty"`
 	// Source identifies who submitted a user message ("cli", "web"). It is
 	// empty for events that do not originate from user input.
 	Source string `json:"source,omitempty"`

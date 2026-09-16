@@ -249,6 +249,20 @@
   .tool .arg-name { font-weight:700; color:var(--cyan); }
   .tool .arg-sep, .tool .arg-val, .tool .arg-raw { color:var(--gray); }
 
+  /* ---- compressed-context summary ---- */
+  /* The summary row is the point where the older messages were cut out of the
+     model context. A dashed, accented block makes that obvious in a long
+     transcript; the CLI prints the matching [summary] marker. */
+  .summary {
+    border:1px dashed rgba(227,179,65,.55); border-left:3px solid var(--yellow);
+    border-radius:var(--radius-sm);
+    background:rgba(227,179,65,.07);
+    padding:10px 13px;
+  }
+  .summary .role { color:var(--yellow); }
+  .summary .text { color:var(--fg); }
+  .summary .text:not(.md) { color:var(--fg-muted); font-style:italic; }
+
   /* ---- markdown ---- */
   .row p { margin:0 0 8px; }
   .row h1, .row h2, .row h3, .row h4, .row h5, .row h6 { margin:15px 0 7px; line-height:1.3; }

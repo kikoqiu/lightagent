@@ -202,15 +202,26 @@ func summarizeTailCut(history []llm.Message, keepTokenBudget, maxKeptTurns int) 
 	return start, true
 }
 
+// cut reports how much of history a pass would compress: the number of leading
+// messages that fall outside the retained window. ok is false when there is
+// nothing to condense (the whole history already fits the window).
+func (c *compactor) cut(history []llm.Message, mode summarizeMode) (int, bool) {
+	if len(history) < 2 {
+		return 0, false
+	}
+	cut, ok := summarizeTailCut(history, c.retentionBudget(mode), summarizeMaxKeptTurns(mode))
+	if !ok || cut <= 0 {
+		return 0, false
+	}
+	return cut, true
+}
+
 // compact compresses history. It returns the new history, the new summary,
 // whether a change happened, and any error. On summarization failure it falls
 // back to dropping the oldest messages so the turn can continue.
 func (c *compactor) compact(ctx context.Context, history []llm.Message, summary string, mode summarizeMode) ([]llm.Message, string, bool, error) {
-	if len(history) < 2 {
-		return history, summary, false, nil
-	}
-	cut, ok := summarizeTailCut(history, c.retentionBudget(mode), summarizeMaxKeptTurns(mode))
-	if !ok || cut <= 0 {
+	cut, ok := c.cut(history, mode)
+	if !ok {
 		return history, summary, false, nil
 	}
 	batch := history[:cut]
