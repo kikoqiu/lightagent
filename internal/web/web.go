@@ -4,6 +4,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"lightagent/internal/agent"
 	"lightagent/internal/llm"
+	"lightagent/internal/slash"
 	"lightagent/internal/tools"
 )
 
@@ -69,7 +71,13 @@ type Server struct {
 	port     int
 	listener net.Listener
 	srv      *http.Server
+	// markdown is the page's markdown switch. It starts at the configured
+	// ui.markdown value and the browser's /markdown flips it at runtime; mu
+	// guards the field (the terminal has its own switch, see internal/cli).
 	markdown bool
+	// save writes the conversation to the session file and returns the path. It
+	// is registered by the program (SetSessionSaver) and backs /save.
+	save func() (string, error)
 	// auth holds the login credential and the live sessions; the zero value (no
 	// password) means the mirror runs without a login.
 	auth *auth
@@ -138,6 +146,13 @@ func listen(host string, port int) (net.Listener, int, error) {
 // Port returns the actual bound port.
 func (s *Server) Port() int { return s.port }
 
+// SetSessionSaver registers the callback behind the browser's /save: it writes
+// the current conversation to the session file and returns the path it was
+// written to. The program wires it to the CLI (cli.CLI.SaveSession), so a save
+// driven from the page persists exactly what a terminal /save would; without it
+// /save reports that saving is unavailable.
+func (s *Server) SetSessionSaver(fn func() (string, error)) { s.save = fn }
+
 // Start seeds the in-memory scrollback, serves in the background and subscribes
 // to the agent event bus.
 func (s *Server) Start() {
@@ -193,6 +208,12 @@ func (s *Server) publish(ev agent.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.recordLocked(ev)
+	s.broadcastLocked(data)
+}
+
+// broadcastLocked writes one payload to every connected client and drops the
+// connections that fail. The caller must hold s.mu.
+func (s *Server) broadcastLocked(data []byte) {
 	for id, c := range s.clients {
 		if err := c.writeText(data); err != nil {
 			_ = c.Close()
@@ -441,6 +462,10 @@ func (s *Server) historyFrameLocked() []byte {
 		"tokens":   stats.EstimatedTok,
 		"window":   stats.ContextWindow,
 		"busy":     stats.Busy,
+		// The page-only switches ride along, so a tab that reconnects after
+		// another one flipped them picks the new state up.
+		"markdown": s.markdown,
+		"result":   s.agent.ToolResultsVisible(),
 	})
 	if err != nil {
 		return nil
@@ -448,10 +473,10 @@ func (s *Server) historyFrameLocked() []byte {
 	return payload
 }
 
-// handleClientMessage submits an inbound client message to the agent. Multiple
-// clients may call this concurrently; steering is handled by the agent. A few
-// control commands (handled by the agent itself) are recognized so the mirror
-// can drive them too.
+// handleClientMessage submits an inbound client message. Slash commands are
+// handled here, so the mirror offers the same command set as the terminal REPL;
+// every other line goes to the agent. Multiple clients may call this
+// concurrently; steering is handled by the agent.
 func (s *Server) handleClientMessage(data []byte) {
 	var msg struct {
 		Text string `json:"text"`
@@ -463,56 +488,222 @@ func (s *Server) handleClientMessage(data []byte) {
 	if text == "" {
 		return
 	}
-	if s.handleCommand(text) {
+	if slash.IsCommandLine(text) {
+		s.handleCommand(text)
 		return
 	}
 	s.agent.SubmitFrom("web", text)
 }
 
-// handleCommand applies the small set of shared control commands the web UI may
-// send. It reports whether text was consumed. Any other "/..." text is passed
-// through to the agent.
-func (s *Server) handleCommand(text string) bool {
-	fields := strings.Fields(text)
-	if len(fields) == 0 {
-		return false
+// handleCommand runs one slash command from a browser; the set is the terminal
+// REPL's (see internal/slash).
+//
+// Commands that touch state both front-ends share — the conversation, the
+// session file, tool-result visibility — answer on the agent bus, so the
+// terminal shows the same feedback as the browser. The commands that only
+// concern this page (its /help listing, its markdown switch, a mistyped
+// command) are recorded in the mirror's scrollback and sent to the browsers
+// alone: the terminal has its own /help and its own rendering. An unknown
+// command is consumed, exactly like the terminal does, instead of being sent to
+// the model.
+func (s *Server) handleCommand(text string) {
+	cmd, args, known := slash.Split(text)
+	if !known {
+		s.localError("unknown command " + cmd + "; try /help")
+		return
 	}
-	switch strings.ToLower(fields[0]) {
-	case "/result", "/results":
-		on := !s.agent.ToolResultsVisible()
-		if len(fields) > 1 {
-			switch strings.ToLower(fields[1]) {
-			case "on", "true", "1", "yes":
-				on = true
-			case "off", "false", "0", "no":
-				on = false
-			default:
-				s.agent.Bus().Publish(agent.Event{Type: agent.EventInfo, Text: "usage: /result [on|off]"})
-				return true
-			}
+	switch cmd {
+	case "/help":
+		s.localInfo(slash.Table(nil) + s.helpNotes())
+	case "/new":
+		if s.agent.Busy() {
+			// The side rail runs commands with one click, so never discard a
+			// running conversation under the user's feet.
+			s.localError("a turn is running; try again when idle")
+			return
+		}
+		s.agent.Reset()
+		// The page has to forget the rows of the conversation /new dropped.
+		s.clearScrollback()
+		s.info("started a new conversation (in memory; /save to persist)")
+	case "/save":
+		if s.save == nil {
+			s.fail("saving is not available in this run")
+			return
+		}
+		path, err := s.save()
+		if err != nil {
+			s.fail("failed to save session: " + err.Error())
+			return
+		}
+		s.info("session saved to " + path)
+	case "/compact":
+		if s.agent.Busy() {
+			s.fail("a turn is running; try again when idle")
+			return
+		}
+		s.info(s.agent.CompactNow(context.Background()))
+	case "/stop":
+		if !s.agent.Interrupt() {
+			s.info("nothing to interrupt")
+		}
+		// The interrupted marker and the end of the turn are broadcast to every
+		// client by the agent.
+	case "/history":
+		s.info(slash.UsageText(s.agent.Stats()))
+	case "/result":
+		on, ok := slash.ToggleArg(argAt(args, 0), s.agent.ToolResultsVisible())
+		if !ok {
+			s.fail("usage: /result [on|off]")
+			return
 		}
 		s.agent.SetToolResultsVisible(on)
 		state := "hiding"
 		if on {
 			state = "showing"
 		}
-		s.agent.Bus().Publish(agent.Event{Type: agent.EventInfo, Text: state + " tool/exec results"})
-		return true
-	case "/stop", "/interrupt":
-		if !s.agent.Interrupt() {
-			s.agent.Bus().Publish(agent.Event{Type: agent.EventInfo, Text: "nothing to interrupt"})
+		s.info(state + " tool/exec results")
+		s.broadcastSettings()
+	case "/markdown":
+		on, ok := slash.ToggleArg(argAt(args, 0), s.markdownEnabled())
+		if !ok {
+			s.fail("usage: /markdown [on|off]")
+			return
 		}
-		// The interrupted marker and the end of the turn are broadcast to every
-		// client by the agent.
-		return true
+		s.setMarkdown(on)
+		state := "markdown rendering off (raw output)"
+		if on {
+			state = "markdown rendering on"
+		}
+		s.localInfo(state)
+	case "/exit":
+		// /exit ends the whole session — terminal included — after asking whether
+		// to save, so the page points at the terminal instead.
+		s.localInfo("/exit quits the terminal; just close the tab to leave the mirror")
 	}
-	return false
+}
+
+// helpNotes appends the page-specific hints to the shared command table.
+func (s *Server) helpNotes() string {
+	lines := []string{
+		"",
+		"run a command by clicking it in the side rail, or type it here.",
+	}
+	var terminal []string
+	for _, c := range slash.TerminalOnly() {
+		terminal = append(terminal, fmt.Sprintf("%s — %s", c.Usage(), c.Summary))
+	}
+	if len(terminal) > 0 {
+		lines = append(lines, "terminal only: "+strings.Join(terminal, "; "))
+	}
+	return strings.Join(append(lines,
+		"input: Enter inserts a newline, Ctrl+Enter sends.",
+		"while a turn runs, type a message to insert it into the loop (steering).",
+	), "\n")
+}
+
+// argAt returns args[i], or "" when the command carried fewer arguments.
+func argAt(args []string, i int) string {
+	if i < len(args) {
+		return args[i]
+	}
+	return ""
+}
+
+// info publishes shared feedback on the agent bus, so the terminal and every
+// browser render the same line.
+func (s *Server) info(text string) {
+	s.agent.Bus().Publish(agent.Event{Type: agent.EventInfo, Text: text})
+}
+
+// fail publishes a shared failure the same way; the front-ends render it as an
+// error row.
+func (s *Server) fail(text string) {
+	s.agent.Bus().Publish(agent.Event{Type: agent.EventError, Text: text})
+}
+
+// localRow records a mirror-only row: it joins the mirror's scrollback and is
+// pushed to the connected browsers, but never reaches the agent bus, so it
+// cannot leak into the terminal's transcript.
+func (s *Server) localRow(row historyMessage, ev agent.Event) {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeReasoningLocked()
+	s.history = append(s.history, row)
+	s.broadcastLocked(data)
+}
+
+// localInfo and localError are localRow for the two page-only markers.
+func (s *Server) localInfo(text string) {
+	s.localRow(historyMessage{Role: "info", Content: text}, agent.Event{Type: agent.EventInfo, Text: text})
+}
+
+func (s *Server) localError(text string) {
+	s.localRow(historyMessage{Role: "error", Content: text}, agent.Event{Type: agent.EventError, Text: text})
+}
+
+// clearScrollback drops the mirror's rows and pushes the now empty listing, so
+// every open page forgets the conversation that was just discarded.
+func (s *Server) clearScrollback() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.history = nil
+	s.reasoningOpen = false
+	if payload := s.historyFrameLocked(); payload != nil {
+		s.broadcastLocked(payload)
+	}
+}
+
+// markdownEnabled reports the page's markdown switch.
+func (s *Server) markdownEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.markdown
+}
+
+// setMarkdown flips the page's markdown switch and tells the browsers; the
+// command that drove it records the human-readable row itself.
+func (s *Server) setMarkdown(on bool) {
+	s.mu.Lock()
+	s.markdown = on
+	s.mu.Unlock()
+	s.broadcastSettings()
+}
+
+// settingsFrame builds the transient payload carrying the switches the side
+// rail mirrors. A fresh page gets the same values injected into its document
+// and a reconnecting one gets them in its history frame.
+func (s *Server) settingsFrame() []byte {
+	data, err := json.Marshal(map[string]any{
+		"type":     "settings",
+		"markdown": s.markdownEnabled(),
+		"result":   s.agent.ToolResultsVisible(),
+	})
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// broadcastSettings pushes the current switches to the connected browsers.
+func (s *Server) broadcastSettings() {
+	data := s.settingsFrame()
+	if data == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.broadcastLocked(data)
 }
 
 // handleIndex serves the single-page UI. The page is public (it carries no data
-// and its sign-in dialog has to be reachable before there is a session); only the
-// markdown switch is injected, and every endpoint that touches the agent asks for
-// a session of its own.
+// and its sign-in dialog has to be reachable before there is a session); the
+// runtime switches and the command rail are injected, and every endpoint that
+// touches the agent asks for a session of its own.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -522,6 +713,21 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// The page embeds the script/style URLs, so it must never be reused from
 	// cache: a rebuilt binary has to be able to replace the whole UI at once.
 	w.Header().Set("Cache-Control", "no-cache")
-	body := strings.ReplaceAll(indexHTML, "__LIGHTAGENT_MARKDOWN__", strconv.FormatBool(s.markdown))
+	body := indexHTML
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_MARKDOWN__", strconv.FormatBool(s.markdownEnabled()))
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_RESULT__", strconv.FormatBool(s.agent.ToolResultsVisible()))
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_COMMANDS__", commandsJSON())
 	fmt.Fprint(w, body)
+}
+
+// commandsJSON is the command rail handed to the page. It is built from the
+// shared catalogue (internal/slash), so the rail can never drift from the /help
+// text of either front-end; the page folds everything the catalogue does not
+// mark primary.
+func commandsJSON() string {
+	data, err := json.Marshal(slash.WebCommands())
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
 }

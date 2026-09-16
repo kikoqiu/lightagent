@@ -12,6 +12,7 @@ import (
 	"lightagent/internal/agent"
 	"lightagent/internal/config"
 	"lightagent/internal/llm"
+	"lightagent/internal/slash"
 	"lightagent/internal/store"
 	"lightagent/internal/termcolor"
 	"lightagent/internal/tools"
@@ -108,36 +109,6 @@ func TestToggleToolResults(t *testing.T) {
 	}
 	if out := c.toggleToolResults([]string{"bogus"}); !strings.Contains(out, "usage") {
 		t.Fatalf("invalid argument = %q", out)
-	}
-}
-
-// TestNormalizeCommand covers full-width IME input for slash commands.
-func TestNormalizeCommand(t *testing.T) {
-	cases := map[string]string{
-		"/help":       "/help",
-		"/？":          "/?",
-		"／help":       "/help",
-		"／？":          "/?",
-		"/result off": "/result off",
-	}
-	for in, want := range cases {
-		if got := normalizeCommand(in); got != want {
-			t.Fatalf("normalizeCommand(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-// TestIsCommandLine checks both ASCII and full-width slash prefixes.
-func TestIsCommandLine(t *testing.T) {
-	for _, line := range []string{"/help", "/?", "／？", "／exit"} {
-		if !isCommandLine(line) {
-			t.Fatalf("isCommandLine(%q) = false, want true", line)
-		}
-	}
-	for _, line := range []string{"hello", " /help", "?/"} {
-		if isCommandLine(line) {
-			t.Fatalf("isCommandLine(%q) = true, want false", line)
-		}
 	}
 }
 
@@ -568,15 +539,38 @@ func TestWrapPreviewRows(t *testing.T) {
 	}
 }
 
-// TestFormatUsage renders messages, tokens and the context-window percentage.
-func TestFormatUsage(t *testing.T) {
-	got := formatUsage(agent.Stats{
-		Messages:      3,
-		EstimatedTok:  1000,
-		ContextWindow: 10000,
-	})
-	if !strings.Contains(got, "3 messages") || !strings.Contains(got, "10.0%") || !strings.Contains(got, "1000/10000") {
-		t.Fatalf("formatUsage = %q", got)
+// TestEveryCataloguedCommandIsHandled pins that the terminal REPL has a case for
+// every entry of the shared catalogue: a command added to internal/slash without
+// wiring it here would answer "unknown command".
+func TestEveryCataloguedCommandIsHandled(t *testing.T) {
+	for _, cmd := range slash.Commands {
+		c := newTestCLI(t)
+		var buf strings.Builder
+		c.out = &buf
+		exit := c.handleCommand(context.Background(), cmd.Name)
+		if strings.Contains(buf.String(), "unknown command") {
+			t.Errorf("%s is not handled by the CLI: %q", cmd.Name, buf.String())
+		}
+		if wantExit := cmd.Name == "/exit"; exit != wantExit {
+			t.Errorf("%s exit = %v, want %v", cmd.Name, exit, wantExit)
+		}
+	}
+}
+
+// TestCanonicalAliasesShareTheCase pins that an alias reaches the same handler
+// as its primary name.
+func TestCanonicalAliasesShareTheCase(t *testing.T) {
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.handleCommand(context.Background(), "/interrupt")
+	if !strings.Contains(buf.String(), "nothing to interrupt") {
+		t.Fatalf("/interrupt = %q, want the /stop handler", buf.String())
+	}
+	buf.Reset()
+	c.handleCommand(context.Background(), "／？")
+	if !strings.Contains(buf.String(), "commands") {
+		t.Fatalf("full-width ／？ = %q, want the /help listing", buf.String())
 	}
 }
 

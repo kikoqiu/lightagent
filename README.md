@@ -229,6 +229,11 @@ source <(lightagent completion bash)       # bash 补全
 | `/markdown` | 切换 Markdown 渲染（`/markdown on` / `/markdown off`，无参数则取反） |
 | `/exit` `/quit` | 退出（会先询问是否保存，默认是） |
 
+> 同一套命令也用于 **Web 镜像**：在网页输入框里输入，或点击左侧 **Commands** 卡片（点击即执行）。
+> CLI 与网页共用 `internal/slash` 的命令表（名称、别名、参数、说明、分组），两边的 `/help`
+> 都由它生成；仅网页侧的命令差异（`/help`、`/markdown` 只作用于当前页面，`/exit` 只在终端生效，
+> 未知命令不会发给模型）见 [docs/web.md](docs/web.md)。
+
 **输入方式**：Enter 换行、**Ctrl+J 发送**（Windows 本地也可 Ctrl+Enter；Linux/SSH 下终端支持
 kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可以）；Ctrl+U 清空当前输入；**Ctrl+C 优先中断正在运行的回合**，空闲时清空输入，输入为空时退出。
 
@@ -288,6 +293,14 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 * 工具调用行（`tool_call`）与 CLI 一致：**函数名单独一行高亮**，参数逐条以
   `参数名 - 值` 展示（值用原始内容：字符串不带引号，嵌套数组/对象为紧凑 JSON）。
 * 网页里发送 `/result off`（或 `on`）可开关工具（exec）结果输出，与 CLI 共享同一开关。
+* **网页与 CLI 共用同一套斜杠命令**：命令表（名称、别名、参数、说明、分组）由 `internal/slash` 统一提供，
+  CLI 的 `/help` 与网页的左侧栏、`/help` 都从它生成，因此不会各自漂移。共享状态的命令
+  （`/new`、`/save`、`/stop`、`/compact`、`/history`、`/result`）通过事件总线广播，终端与所有网页
+  看到同一条反馈；只属于当前页面的命令（`/help` 列表、`/markdown` 渲染开关、拼错的命令）只出现在网页里。
+  `/exit` 只在终端生效（网页会提示关闭标签页）；未知命令与 CLI 一样被本地拒绝，不会发给模型。
+* 桌面端左侧栏有 **Commands** 命令栏：默认只列 `/help`、`/new`、`/save`、`/stop`（命令表中标为
+  `primary` 的那些），其余命令折叠在标题之后 —— **点击标题展开/收起**，标题右侧 `+N` 是折叠数量；
+  **点击即执行**，`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态。
 * 右上角 **⚙**（桌面端侧栏 “Configuration” 卡片）打开配置编辑器，右上角可在 **Form / JSON** 两种模式间切换：
   Form 是分段控件表单（文本框 / 开关 / 滑杆 / 下拉 / 多行文本，按 `config.json` 的键逐项列出，留空即用内置默认），
   JSON 是整份文档原文；两者同步，改动实时写入将提交的文档。保存前两端都会校验（控件行内报错 + 服务端规则），

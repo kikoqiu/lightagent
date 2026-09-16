@@ -86,15 +86,48 @@
   .meter > span.warm { background:linear-gradient(90deg, var(--yellow), #f0883e); }
   .meter > span.hot { background:linear-gradient(90deg, #ff8a3d, var(--red)); }
   .actions { display:flex; flex-wrap:wrap; gap:8px; }
-  .card.tips ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
-  .card.tips li { display:flex; align-items:center; gap:8px; color:var(--fg-muted); font-size:12px; }
-  .card.tips li span { margin-left:auto; color:var(--fg-dim); font-size:11px; }
-  kbd {
-    font-family:inherit; font-size:11px; color:var(--fg);
-    background:var(--bg-elev); border:1px solid var(--border); border-bottom-width:2px;
-    border-radius:6px; padding:1px 6px;
+  /* ---- side-rail command list ---- */
+  /* One flat list of buttons: the rail is the click-to-run form of the slash
+     commands the server injected (see app.js buildCommands). The card title is
+     the fold, so only the primary commands are visible by default. */
+  .card-title.cmd-toggle {
+    width:100%; margin-bottom:10px; padding:0; min-height:0;
+    border:0; background:none; box-shadow:none; cursor:pointer;
+    color:var(--fg-dim); font-size:10px; font-weight:700; letter-spacing:1.1px;
+    text-transform:uppercase; display:flex; align-items:center; gap:6px;
   }
-  .card.tips code { color:var(--accent); font-size:11.5px; }
+  .card-title.cmd-toggle:hover { color:var(--fg); filter:none; }
+  .card-title.cmd-toggle:active { transform:none; }
+  /* The badge counts what the fold hides; it is cleared while expanded. */
+  .card-title.cmd-toggle .cmd-more { margin-left:auto; color:var(--accent); letter-spacing:0; }
+  .card-title.cmd-toggle .chev { color:var(--fg-dim); font-size:9px; }
+  .card-title.cmd-toggle .chev::before { content:"▸"; }
+  .card-title.cmd-toggle[aria-expanded="true"] .chev::before { content:"▾"; }
+  .cmds { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:1px; }
+  .cmds li.folded { display:none; }
+  .cmds.open li.folded { display:block; }
+  /* One row: the usage on the first line, its summary on the second, and the
+     switch badge pushed to the right of the first line. */
+  .cmd {
+    display:flex; flex-wrap:wrap; align-items:baseline; gap:0 4px;
+    width:100%; min-height:0; text-align:left;
+    padding:4px 7px; border:1px solid transparent; border-radius:var(--radius-sm);
+    background:none; color:var(--fg-muted); box-shadow:none;
+    font-family:inherit; font-size:12px; font-weight:600; line-height:1.35;
+  }
+  .cmd:hover { background:rgba(90,162,255,.12); border-color:var(--border-soft); color:var(--fg); filter:none; }
+  .cmd:active { transform:none; }
+  .cmd code { color:var(--accent); font-size:11.5px; }
+  .cmd .cmd-args { color:var(--fg-dim); font-size:11px; font-weight:400; }
+  .cmd .cmd-desc { flex-basis:100%; color:var(--fg-dim); font-size:10.5px; font-weight:400; }
+  /* The /result and /markdown switches show their state on the right. */
+  .cmd .cmd-state {
+    margin-left:auto; padding:0 5px; border-radius:999px;
+    border:1px solid var(--border-soft); background:rgba(8,11,17,.5);
+    font-size:9.5px; font-weight:700; letter-spacing:.6px; text-transform:uppercase;
+  }
+  .cmd .cmd-state[data-on="1"] { color:var(--green); border-color:rgba(63,185,80,.4); }
+  .cmd .cmd-state[data-on="0"] { color:var(--fg-dim); }
   .side-foot { margin-top:auto; padding:6px 4px 0; color:var(--fg-dim); font-size:10.5px; letter-spacing:.6px; text-transform:uppercase; }
 
   /* ---- top bar ---- */

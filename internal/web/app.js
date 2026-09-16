@@ -7,7 +7,6 @@
   var runEl = document.getElementById('run');
   var stopEl = document.getElementById('stop');
   var sendEl = document.getElementById('send');
-  var resultsEl = document.getElementById('results');
   var current = null;
   var currentText = '';
   var pendingRender = null;
@@ -19,8 +18,14 @@
   // replaying suppresses live-only side effects while a history frame rebuilds
   // the log (e.g. replayed user rows must not light up the running indicator).
   var replaying = false;
-  // resultsOn mirrors the shared /result switch for the side-rail quick action.
-  var resultsOn = true;
+  // The command rail's switches (/result, /markdown) are the only commands with
+  // state: the rail shows it and sends the explicit opposite, so one click
+  // always lands on the state the user asked for. The values arrive with the
+  // injected page config, with a settings frame (another tab flipped one) or in
+  // a history frame (after a reconnect).
+  var switchKeys = { '/result': 'result', '/markdown': 'markdown' };
+  var switchOn = { '/result': true, '/markdown': true };
+  var switchEls = {};
 
   // The transcript follows new output exactly while the reader is already at the
   // bottom: dragging (or wheeling) up to read or copy history unpins the view, so
@@ -112,14 +117,12 @@
     if (noteEl) { noteEl.textContent = tokens + ' / ' + win + ' tokens'; }
   }
 
-  // syncResults mirrors the shared /result switch into the side-rail button so
-  // it stays accurate whether the toggle came from this page, the CLI or the
-  // agent's own feedback markers.
+  // syncResults follows the shared /result switch: the server announces every
+  // change (made here, in the CLI or in another tab) as an info row, so the rail
+  // stays accurate.
   function syncResults(text) {
-    if (/hiding tool\/exec results/i.test(text)) { resultsOn = false; }
-    else if (/showing tool\/exec results/i.test(text)) { resultsOn = true; }
-    else { return; }
-    if (resultsEl) { resultsEl.textContent = resultsOn ? 'Hide results' : 'Show results'; }
+    if (/hiding tool\/exec results/i.test(text)) { setSwitch('/result', false); }
+    else if (/showing tool\/exec results/i.test(text)) { setSwitch('/result', true); }
   }
 
   // mdToHTML renders markdown with the vendored marked library and sanitizes the
@@ -278,6 +281,117 @@
     return row;
   }
 
+  // ---- command rail ----
+
+  // setSwitch records a switch state and repaints its rail badge.
+  function setSwitch(name, on) {
+    switchOn[name] = on;
+    var el = switchEls[name];
+    if (!el) { return; }
+    el.textContent = on ? 'on' : 'off';
+    el.setAttribute('data-on', on ? '1' : '0');
+    el.title = on ? 'currently on' : 'currently off';
+  }
+
+  // applySettings mirrors the switches the server reports: the injected page
+  // config, a settings frame (another tab flipped one) or a history frame.
+  function applySettings(s) {
+    if (typeof s.markdown === 'boolean') {
+      MARKDOWN = s.markdown;
+      setSwitch('/markdown', s.markdown);
+    }
+    if (typeof s.result === 'boolean') { setSwitch('/result', s.result); }
+  }
+
+  // sendCommand submits one rail click on the shared connection.
+  function sendCommand(name, args) {
+    if (!ws || ws.readyState !== 1) { return; }
+    ws.send(JSON.stringify({ text: args ? name + ' ' + args : name }));
+  }
+
+  // commandRow draws one command: its usage, the one-line summary and, for the
+  // stateful switches, the current on/off state. The row itself is the button;
+  // the state badge goes last so the summary can take a line of its own (see the
+  // .cmd rules in app.css).
+  function commandRow(cmd) {
+    var li = document.createElement('li');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cmd';
+    btn.dataset.cmd = cmd.name;
+    var name = document.createElement('code');
+    name.textContent = cmd.name;
+    btn.appendChild(name);
+    if (cmd.args) {
+      var args = document.createElement('span');
+      args.className = 'cmd-args';
+      args.textContent = ' ' + cmd.args;
+      btn.appendChild(args);
+    }
+    if (switchKeys[cmd.name]) {
+      var state = document.createElement('span');
+      state.className = 'cmd-state';
+      switchEls[cmd.name] = state;
+      btn.appendChild(state);
+    }
+    var desc = document.createElement('span');
+    desc.className = 'cmd-desc';
+    desc.textContent = cmd.summary;
+    btn.appendChild(desc);
+
+    var hint = cmd.name + (cmd.args ? ' ' + cmd.args : '') + ' — ' + cmd.summary;
+    if ((cmd.aliases || []).length > 0) { hint += ' (aliases: ' + cmd.aliases.join(', ') + ')'; }
+    btn.title = hint;
+
+    btn.onclick = function () {
+      // A stateful switch sends the opposite of what the rail shows, so the
+      // click always lands where the user aimed.
+      if (switchKeys[cmd.name]) {
+        sendCommand(cmd.name, switchOn[cmd.name] ? 'off' : 'on');
+        return;
+      }
+      sendCommand(cmd.name, '');
+    };
+    li.appendChild(btn);
+    return li;
+  }
+
+  // setCommandsOpen folds or unfolds the non-primary commands. The fold keeps the
+  // rail short by default; the title carries its state for screen readers and the
+  // count of what the fold hides.
+  function setCommandsOpen(open) {
+    var host = document.getElementById('cmds');
+    var toggle = document.getElementById('cmdToggle');
+    var more = document.getElementById('cmdMore');
+    if (!host || !toggle) { return; }
+    host.classList.toggle('open', open);
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.title = open ? 'fold the extra commands' : 'show all commands';
+    if (more) { more.hidden = open; }
+  }
+
+  // buildCommands fills the rail from the server's command list, which is built
+  // from the shared slash catalogue: the page and the CLI therefore describe the
+  // same commands, and a command added there shows up here on the next reload.
+  // Everything the catalogue does not mark primary starts folded.
+  function buildCommands() {
+    var host = document.getElementById('cmds');
+    if (!host) { return; }
+    var folded = 0;
+    (CFG.commands || []).forEach(function (cmd) {
+      var row = commandRow(cmd);
+      if (!cmd.primary) { row.className = 'folded'; folded++; }
+      host.appendChild(row);
+    });
+    var more = document.getElementById('cmdMore');
+    if (more && folded > 0) { more.textContent = '+' + folded; }
+    var toggle = document.getElementById('cmdToggle');
+    if (toggle) { toggle.onclick = function () { setCommandsOpen(!host.classList.contains('open')); }; }
+    setCommandsOpen(false);
+    setSwitch('/result', !!CFG.result);
+    setSwitch('/markdown', MARKDOWN);
+  }
+
   var ws = null;
   // Configuration injected by the server into the page head.
   var CFG = window.__LIGHTAGENT__ || {};
@@ -354,6 +468,9 @@
     replaying = false;
     if (ev.summary) { render('info', { text: 'summary: ' + ev.summary }); }
     setUsage(ev.tokens || 0, ev.window || 0);
+    // The frames carry the current switches, so a reconnected tab agrees with
+    // whatever the other tabs (or the CLI) changed meanwhile.
+    applySettings(ev);
     // A reconnect mid-turn must still show the indicator.
     setRunning(!!ev.busy);
   }
@@ -397,6 +514,8 @@
       var ev;
       try { ev = JSON.parse(e.data); } catch (err) { return; }
       if (ev.type === 'history') { renderHistory(ev); return; }
+      // The switches the rail mirrors: no row, just state.
+      if (ev.type === 'settings') { applySettings(ev); return; }
       render(ev.type, ev);
     };
   }
@@ -422,19 +541,15 @@
   stopEl.onclick = function () {
     if (ws && ws.readyState === 1) { ws.send(JSON.stringify({ text: '/stop' })); }
   };
-  if (resultsEl) {
-    resultsEl.onclick = function () {
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ text: resultsOn ? '/result off' : '/result on' }));
-      }
-    };
-  }
   input.addEventListener('input', autoGrow);
   input.addEventListener('keydown', function (e) {
     // Enter inserts a newline (default textarea behavior); Ctrl+Enter sends.
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
   });
 
+  // The rail only mirrors the shared catalogue, so it is built once, before the
+  // connection is dialed.
+  buildCommands();
   sendEl.disabled = true;
   // Wait for the session state before dialing: the handshake fails without a
   // session, and AUTH may sign this browser in on its own with a stored digest.

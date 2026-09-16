@@ -73,9 +73,9 @@ CLI 与网页（可同时多个）都能输入；Agent 的事件通过 **WebSock
 
 | 文件 | 说明 |
 |------|------|
-| `index.html` | 页面骨架（含 viewport、登录对话框与运行时 markdown 开关占位符），服务端每次请求替换后再返回 |
+| `index.html` | 页面骨架（含 viewport、登录对话框与占位符：markdown 开关、工具结果开关、左侧命令栏的命令表），服务端每次请求替换后再返回 |
 | `app.css` | 页面样式（响应式布局与主题） |
-| `app.js` | 页面行为（WebSocket、渲染、输入） |
+| `app.js` | 页面行为（WebSocket、渲染、输入、左侧命令栏） |
 | `auth.js` | 登录对话框：取盐、算加盐摘要（自带 SHA-256，明文 HTTP 下没有 WebCrypto）、保存摘要、连接门控 |
 | `config.js` | 配置编辑器（表单 / JSON 两种模式，访问 `/api/config`、`/api/password`） |
 | `assets/` | 第三方库（marked / DOMPurify），见该目录的 `README.md` |
@@ -147,11 +147,13 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 **1. 首次连接时推送历史**（随后才是实时事件）：
 
 ```json
-{ "type": "history", "summary": "可选摘要", "tokens": 1234, "window": 131072, "messages": [ { "role": "user", "content": "..." } ] }
+{ "type": "history", "summary": "可选摘要", "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "messages": [ { "role": "user", "content": "..." } ] }
 ```
 
 > 页面收到 `history` 时会**清空并重建**整个日志区（历史始终是全量快照），因此断线重连
-> 不会把同一条消息再显示一遍。`tokens`/`window` 用于顶部上下文用量徽标。
+> 不会把同一条消息再显示一遍。`tokens`/`window` 用于顶部上下文用量徽标，`busy` 让运行中连上的
+> 页面也显示转圈指示；`markdown` / `result` 是当前的渲染开关与工具结果开关，重连的标签页据此
+> 与其它标签页（或 CLI）的改动保持一致。
 >
 > `messages[].role` 取值与页面绘制的行一一对应：`user`、`assistant`、`reasoning`（模型
 > 思考，斜体灰字）、`tool_call`、`tool_result`、`info`、`error`、`interrupted`。
@@ -176,7 +178,11 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "usage", "tokens": 1234, "context_window": 131072 }
 { "type": "user", "text": "某客户端发送的消息", "source": "web" }
 { "type": "turn_done" }
+{ "type": "settings", "markdown": true, "result": true }
 ```
+
+* `settings` 是**瞬时帧**（不进日志区）：服务端在网页侧开关（`/result`、`/markdown`）变化时广播，
+  页面的命令栏据此刷新 on / off 状态；新页面从注入的配置、重连页面从 `history` 帧拿到同样的值。
 
 * `usage` 在上下文增长的每个时点广播（回合开始、每次模型回复、每轮工具执行后），
   页面据此**实时**更新顶部上下文用量徽标（`tokens` 以接口返回的 `prompt_tokens` 为基准）。
@@ -201,14 +207,34 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 
 ### 客户端 → 服务端
 
-发送一条用户消息：
+发送一条用户消息或一条斜杠命令：
 
 ```json
 { "text": "帮我看看当前目录" }
+{ "text": "/compact" }
 ```
 
-服务端会对 `/result [on|off]`（开关工具结果输出，与 CLI 共享）和 `/stop`（中断当前回合）
-做本地处理，其余文本调用 `Agent.SubmitFrom("web", ...)`：
+服务端先按**命令表**（`internal/slash`，与 CLI 同一份）解析以 `/` 开头的文本（全角 `／` 同样识别，
+别名统一归一到主名，例如 `/interrupt` → `/stop`）：
+
+| 命令 | 网页侧行为 |
+|------|------------|
+| `/help` `/?` | 列出命令表与网页说明；**只在网页里**（终端有自己的 `/help`） |
+| `/new` | 清空会话，并清空网页日志区；回合运行中会拒绝，避免误点丢弃正在进行的对话 |
+| `/save` | 通过 `SetSessionSaver` 回调落盘（程序把它接到 `cli.CLI.SaveSession`，与终端 `/save` 写同一份文件） |
+| `/stop` `/interrupt` | 中断当前回合（与 CLI 共享） |
+| `/compact` | 手动压缩上下文；回合运行中会拒绝 |
+| `/history` `/context` | 上下文用量文案（与 CLI 共用同一份实现） |
+| `/result` `/results` | 开关工具（exec）结果输出（与 CLI 共享同一开关），并广播 `settings` 帧 |
+| `/markdown` | 切换**本页**的 Markdown 渲染并广播 `settings` 帧；终端的渲染开关属于终端，因此不做共享 |
+| `/exit` `/quit` `/q` | 只提示「请在终端退出」：它会结束整个会话（含终端） |
+| 其它 `/xxx` | 与 CLI 一致地报 `unknown command`，**不发给模型** |
+
+共享状态的命令（`/new`、`/save`、`/stop`、`/compact`、`/history`、`/result`）的结果通过**事件总线**
+广播，因此终端与所有网页看到同一条反馈；只属于当前页面的命令（上面的 `/help`、`/markdown`、
+未知命令）只写进网页日志区，不会污染终端回滚。
+
+不以 `/` 开头的文本调用 `Agent.SubmitFrom("web", ...)`：
 * Agent 空闲 → 开启新回合；
 * Agent 忙碌 → 作为 steering 插入当前回合。
 
@@ -223,8 +249,10 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   断线时发送按钮禁用，并每 1.5s 自动重连（重连前先向 `/api/session` 确认会话还有效；
   会话已失效则改为弹出登录对话框）。未登录（且配置了密码）时不会建立连接。
 * **两种形态自适应**：手机（窄屏）为单列——紧凑顶栏 + 消息流 + 底部输入区；
-  桌面（宽屏 ≥1000px）在左侧展开固定信息栏，含上下文进度条（随占用变黄/变红）、
-  快捷操作（切换工具结果输出，与 `/result` 共享）与快捷键说明，右侧为聊天主区。
+  桌面（宽屏 ≥1000px）在左侧展开固定信息栏：上下文进度条（随占用变黄/变红）、
+  **Commands 命令栏**（默认只列 `primary` 的那些命令，其余折叠在标题后，点击标题展开/收起；
+  点击即执行；`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态）与配置编辑器入口，
+  右侧为聊天主区。
 * 布局用 `100dvh` 动态视口高度 + 安全区（含顶部刘海与横屏左右内边距）适配手机；
   不使用 `position:fixed`，输入区始终可见；内容列居中且最宽 920px；点触目标不小于 44px。
 * 回合运行中顶部显示转圈指示，输入框右侧出现 **Stop** 按钮：点击等同于发送 `/stop`，

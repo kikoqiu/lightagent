@@ -50,12 +50,13 @@ internal/tools/             工具与命令执行引擎
 internal/store/             单会话持久化（含旧会话归档）
 internal/markdown/          Markdown → ANSI 渲染（CLI）
 internal/passwd/            加盐摘要：sha256(盐+密码)，Go 与页面共用同一字节约定
+internal/slash/             斜杠命令表：CLI 的 /help、网页的 /help 与左侧命令栏共用（含命令解析）
 internal/cli/               彩色 REPL + 多行编辑（Enter 换行、Ctrl+J 发送）
   escape.go                 转义序列解码（CSI/SS3、kitty CSI-u、modifyOtherKeys）
   term_windows.go           Windows 控制台 raw 输入（ReadConsoleInputW + Win32 input mode）
   term_linux.go             Linux termios raw 输入 + kitty 键盘协议请求
 internal/web/               WebSocket 镜像 + config 编辑（/api/config）+ 登录（/api/login）
-  index.html                页面骨架（服务端注入 markdown 开关；含登录对话框）
+  index.html                页面骨架（服务端注入 markdown/结果开关与命令栏；含登录对话框）
   app.css                   页面样式（含配置表单控件与登录面板样式）
   app.js                    页面行为（对话镜像，连接受会话状态门控）
   auth.js                   登录对话框（加盐摘要、记住我、连接门控）
@@ -147,6 +148,19 @@ docs/                       本文档
    返回 `OK(...)`、`Fail(...)` 或 `Silent(...)`。
 4. 在 `main.go` 的装配处 `reg.Register(...)`（必要时在 `config.ToolsConfig` 增加开关）。
 5. 在 `internal/tools/*_test.go` 增加用例，并在 `docs/tools.md` 补充说明。
+
+## 扩展：新增一个斜杠命令
+
+1. 在 `internal/slash/slash.go` 的 `Commands` 里加一条（名称、别名、参数提示、一句话说明；
+   `Web: true` 表示网页也能执行、会出现在左侧命令栏，`Primary: true` 表示它在命令栏里默认展开
+   —— 其余网页命令折叠在命令栏标题之后）。
+2. 在 `internal/cli/cli.go` 的 `handleCommand` 加 `case`（`slash.Split` 已把别名和全角斜杠归一，
+   所以只写主名）；需要开关参数时用 `slash.ToggleArg`。
+3. 若网页也能执行，在 `internal/web/web.go` 的 `handleCommand` 加同一个 `case`：影响两边共享状态的
+   命令用 `s.info` / `s.fail`（走事件总线，终端与所有网页同屏），只影响当前页面的用 `s.localInfo` /
+   `s.localError`（只进网页日志区）。
+4. 两侧的 `/help`（`slash.Table`）与左侧命令栏（`slash.WebCommands` → 注入页面）会自动带上新命令；
+   在 `internal/slash/slash_test.go` 的命令表用例与 `docs/web.md` 的命令表补充说明即可。
 
 ## 扩展：新增一个配置项
 

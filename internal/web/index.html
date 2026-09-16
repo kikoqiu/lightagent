@@ -7,9 +7,14 @@
 <title>lightagent</title>
 <script>
   // Runtime configuration injected by the server: whether replies are rendered
-  // as markdown in the browser. Sessions are cookie based, so no token is needed
-  // here (see auth.js).
-  window.__LIGHTAGENT__ = { markdown: __LIGHTAGENT_MARKDOWN__ };
+  // as markdown in the browser, whether tool results are shown, and the command
+  // rail (the shared slash catalogue, so the page and the CLI agree). Sessions
+  // are cookie based, so no token is needed here (see auth.js).
+  window.__LIGHTAGENT__ = {
+    markdown: __LIGHTAGENT_MARKDOWN__,
+    result: __LIGHTAGENT_RESULT__,
+    commands: __LIGHTAGENT_COMMANDS__
+  };
 </script>
 <link rel="stylesheet" href="app.css">
 <script src="assets/marked.min.js"></script>
@@ -28,10 +33,17 @@
       <div class="card-note" id="meterNote">waiting for usage…</div>
     </section>
     <section class="card">
-      <div class="card-title"><span>Quick actions</span></div>
-      <div class="actions">
-        <button id="results" class="ghost" type="button">Hide results</button>
-      </div>
+      <!-- The rail lists the commands this page can run, built from
+           window.__LIGHTAGENT__.commands (the shared slash catalogue). The
+           title is the fold: only the primary commands show by default. -->
+      <button class="card-title cmd-toggle" id="cmdToggle" type="button"
+              aria-expanded="false" aria-controls="cmds" title="show all commands">
+        <span>Commands</span>
+        <span class="cmd-more" id="cmdMore"></span>
+        <span class="chev" aria-hidden="true"></span>
+      </button>
+      <ul class="cmds" id="cmds"></ul>
+      <div class="card-note">One click runs a command; the title folds the rest.</div>
     </section>
     <section class="card">
       <div class="card-title"><span>Configuration</span></div>
@@ -39,15 +51,6 @@
         <button class="ghost" type="button" data-config-open>Edit config.json</button>
       </div>
       <div class="card-note">Saved changes apply after a restart.</div>
-    </section>
-    <section class="card tips">
-      <div class="card-title"><span>Shortcuts</span></div>
-      <ul>
-        <li><kbd>Ctrl</kbd>+<kbd>Enter</kbd><span>send</span></li>
-        <li><kbd>Enter</kbd><span>newline</span></li>
-        <li><code>/stop</code><span>interrupt</span></li>
-        <li><code>/result</code><span>tool output</span></li>
-      </ul>
     </section>
     <div class="side-foot">lightagent web</div>
   </aside>

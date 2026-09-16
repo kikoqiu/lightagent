@@ -17,6 +17,7 @@ import (
 	"lightagent/internal/agent"
 	"lightagent/internal/llm"
 	"lightagent/internal/markdown"
+	"lightagent/internal/slash"
 	"lightagent/internal/store"
 	"lightagent/internal/termcolor"
 )
@@ -985,7 +986,7 @@ func (c *CLI) redrawInput() {
 // other line goes to the agent. When echo is true the message is printed first
 // (raw mode hides the editor region on submit). It returns true to exit.
 func (c *CLI) dispatch(ctx context.Context, line string, echo bool) bool {
-	if isCommandLine(line) {
+	if slash.IsCommandLine(line) {
 		return c.handleCommand(ctx, line)
 	}
 	if echo {
@@ -1118,7 +1119,7 @@ func (c *CLI) runScanner(ctx context.Context) error {
 			}
 			continue
 		}
-		if isCommandLine(line) {
+		if slash.IsCommandLine(line) {
 			if c.handleCommand(ctx, line) {
 				c.shutdown()
 				return nil
@@ -1162,11 +1163,12 @@ func (c *CLI) shutdown() {
 		}
 	}
 
-	if err := c.store.Save(c.snapshot()); err != nil {
+	path, err := c.SaveSession()
+	if err != nil {
 		c.write(termcolor.Red("[error] ") + "failed to save session: " + err.Error() + "\n")
-	} else {
-		c.write(termcolor.Gray("session saved to "+c.store.Path()) + "\n")
+		return
 	}
+	c.write(termcolor.Gray("session saved to "+path) + "\n")
 }
 
 // confirm asks a yes/no question. In raw mode it reads a single key; elsewhere
@@ -1390,57 +1392,48 @@ func indentAfterFirst(s, indent string) string {
 	return strings.ReplaceAll(s, "\n", "\n"+indent)
 }
 
-// normalizeCommand folds the full-width characters an East Asian IME produces
-// ("／？") onto their ASCII equivalents so "/？" works like "/?".
-func normalizeCommand(s string) string {
-	return strings.NewReplacer("／", "/", "？", "?").Replace(s)
-}
-
-// isCommandLine reports whether line starts a slash command.
-func isCommandLine(line string) bool {
-	return strings.HasPrefix(line, "/") || strings.HasPrefix(line, "／")
-}
-
 // handleCommand processes a slash command. It returns true to exit.
 func (c *CLI) handleCommand(ctx context.Context, line string) bool {
-	fields := strings.Fields(line)
-	cmd := strings.ToLower(normalizeCommand(fields[0]))
+	cmd, args, known := slash.Split(line)
+	if !known {
+		c.write(termcolor.Red("[error] ") + "unknown command " + cmd + "; try /help\n")
+		return false
+	}
 
 	switch cmd {
-	case "/help", "/?":
+	case "/help":
 		c.write(helpText())
-	case "/exit", "/quit", "/q":
+	case "/exit":
 		c.write(termcolor.Gray("bye") + "\n")
 		return true
 	case "/new":
 		c.agent.Reset()
 		c.write(termcolor.Cyan("[info] ") + "started a new conversation (in memory; /save to persist)\n")
 	case "/save":
-		if err := c.store.Save(c.snapshot()); err != nil {
+		path, err := c.SaveSession()
+		if err != nil {
 			c.write(termcolor.Red("[error] ") + "failed to save session: " + err.Error() + "\n")
-		} else {
-			c.write(termcolor.Cyan("[info] ") + "session saved to " + c.store.Path() + "\n")
+			break
 		}
+		c.write(termcolor.Cyan("[info] ") + "session saved to " + path + "\n")
 	case "/compact":
 		if c.agent.Busy() {
 			c.write(termcolor.Red("[error] ") + "a turn is running; try again when idle\n")
 			break
 		}
 		c.write(termcolor.Cyan("[info] ") + c.agent.CompactNow(ctx) + "\n")
-	case "/stop", "/interrupt":
+	case "/stop":
 		if !c.agent.Interrupt() {
 			c.write(termcolor.Gray("[info] nothing to interrupt") + "\n")
 		}
 		// The interrupted marker and the end of the turn are rendered by the
 		// event loop.
-	case "/history", "/context":
-		c.write(termcolor.Cyan("[info] ") + formatUsage(c.agent.Stats()) + "\n")
-	case "/result", "/results":
-		c.write(c.toggleToolResults(fields[1:]) + "\n")
+	case "/history":
+		c.write(termcolor.Cyan("[info] ") + slash.UsageText(c.agent.Stats()) + "\n")
+	case "/result":
+		c.write(c.toggleToolResults(args) + "\n")
 	case "/markdown":
-		c.write(c.toggleMarkdown(fields[1:]) + "\n")
-	default:
-		c.write(termcolor.Red("[error] ") + "unknown command " + cmd + "; try /help\n")
+		c.write(c.toggleMarkdown(args) + "\n")
 	}
 	return false
 }
@@ -1451,16 +1444,13 @@ func (c *CLI) toggleMarkdown(args []string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	on := !c.markdownOn
+	arg := ""
 	if len(args) > 0 {
-		switch strings.ToLower(args[0]) {
-		case "on", "true", "1", "yes":
-			on = true
-		case "off", "false", "0", "no":
-			on = false
-		default:
-			return termcolor.Red("[error] ") + "usage: /markdown [on|off]"
-		}
+		arg = args[0]
+	}
+	on, ok := slash.ToggleArg(arg, c.markdownOn)
+	if !ok {
+		return termcolor.Red("[error] ") + "usage: /markdown [on|off]"
 	}
 	c.markdownOn = on
 	if on && c.md == nil {
@@ -1478,16 +1468,13 @@ func (c *CLI) toggleMarkdown(args []string) string {
 // toggleToolResults applies a /result argument ("on"/"off"; no argument
 // toggles) and reports the new state. It defaults to on.
 func (c *CLI) toggleToolResults(args []string) string {
-	on := !c.agent.ToolResultsVisible()
+	arg := ""
 	if len(args) > 0 {
-		switch strings.ToLower(args[0]) {
-		case "on", "true", "1", "yes":
-			on = true
-		case "off", "false", "0", "no":
-			on = false
-		default:
-			return termcolor.Red("[error] ") + "usage: /result [on|off]"
-		}
+		arg = args[0]
+	}
+	on, ok := slash.ToggleArg(arg, c.agent.ToolResultsVisible())
+	if !ok {
+		return termcolor.Red("[error] ") + "usage: /result [on|off]"
 	}
 	c.agent.SetToolResultsVisible(on)
 	if on {
@@ -1536,58 +1523,29 @@ func (c *CLI) snapshot() store.State {
 	}
 }
 
-// formatUsage renders the context-usage line used by /history.
-func formatUsage(st agent.Stats) string {
-	pct := 0.0
-	if st.ContextWindow > 0 {
-		pct = float64(st.EstimatedTok) * 100 / float64(st.ContextWindow)
+// SaveSession writes the current conversation to the session file and returns
+// the path it was written to. It backs /save in both front-ends: the mirror
+// registers it through web.Server.SetSessionSaver, so a save from the browser
+// writes exactly what the terminal would write.
+func (c *CLI) SaveSession() (string, error) {
+	if err := c.store.Save(c.snapshot()); err != nil {
+		return "", err
 	}
-	out := fmt.Sprintf("%d messages, ~%d tokens, context usage %.1f%% (~%d/%d)%s",
-		st.Messages, st.EstimatedTok, pct, st.EstimatedTok, st.ContextWindow, summarySuffix(st.Summary))
-	if st.UsageTokens > 0 {
-		out += fmt.Sprintf(", last api prompt %d tokens", st.UsageTokens)
-	}
-	return out
-}
-
-// summarySuffix reports whether a context summary is present.
-func summarySuffix(summary string) string {
-	if strings.TrimSpace(summary) == "" {
-		return ""
-	}
-	return ", compressed summary present"
+	return c.store.Path(), nil
 }
 
 // helpText lists the available commands. Command names are colored so they stand
 // out from their descriptions.
 func helpText() string {
-	type entry struct{ name, desc string }
-	entries := []entry{
-		{"/help, /?", "show this help"},
-		{"/new", "start a new conversation (clears the session)"},
-		{"/save", "write the current conversation to disk now"},
-		{"/stop", "interrupt the turn that is running (aliases: /interrupt)"},
-		{"/compact", "compress the context now"},
-		{"/history", "show message/token usage and context usage"},
-		{"/result", "show or hide tool/exec results (on|off, default on)"},
-		{"/markdown", "toggle markdown rendering (on|off)"},
-		{"/exit", "quit (you are asked whether to save)"},
-	}
-	width := 0
-	for _, e := range entries {
-		if n := displayColumns(e.name); n > width {
-			width = n
-		}
-	}
 	var b strings.Builder
 	b.WriteString(termcolor.BoldText("commands") + "\n")
-	for _, e := range entries {
-		pad := strings.Repeat(" ", width-displayColumns(e.name)+2)
-		b.WriteString("  " + termcolor.Cyan(e.name) + termcolor.Gray(pad+e.desc) + "\n")
-	}
+	// The table comes from the shared catalogue (internal/slash), so the
+	// terminal REPL and the web mirror always describe the same commands.
+	b.WriteString(slash.Table(func(name, rest string) string {
+		return termcolor.Cyan(name) + termcolor.Gray(rest)
+	}))
 	notes := []string{
 		"",
-		"aliases: /? = /help, /q|/quit = /exit, /context = /history, /results = /result",
 		"the conversation lives in memory only; use /save to persist it now.",
 		"input: Enter inserts a newline; Ctrl+J sends (Ctrl+Enter and Alt+Enter where the terminal reports them).",
 		"while a turn runs, type a message to insert it into the loop (steering).",

@@ -214,6 +214,9 @@ func runSession(o *options, stdout io.Writer) error {
 		// The login is a salted digest the browser computes, so the password and
 		// its public salt are all the mirror needs.
 		srv.SetPassword(cfg.Web.Password, cfg.Web.PasswordSalt)
+		// The page's /save writes through the CLI, so the browser and the
+		// terminal persist exactly the same session.
+		srv.SetSessionSaver(c.SaveSession)
 		srv.Start()
 		defer srv.Close()
 		webPort = srv.Port()

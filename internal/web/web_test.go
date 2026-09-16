@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -385,9 +386,7 @@ func TestInterruptAffordances(t *testing.T) {
 	srv := newTestServer(t, "")
 	events, cancel := srv.agent.Bus().Subscribe()
 	defer cancel()
-	if !srv.handleCommand("/stop") {
-		t.Fatal("/stop should be consumed by the mirror")
-	}
+	srv.handleCommand("/stop")
 	select {
 	case ev := <-events:
 		if ev.Type != agent.EventInfo || !strings.Contains(ev.Text, "nothing to interrupt") {
@@ -398,18 +397,20 @@ func TestInterruptAffordances(t *testing.T) {
 	}
 }
 
-func TestWebSocketHandshakeAndPing(t *testing.T) {
-	srv := newTestServer(t, "")
+// dialWS opens a raw WebSocket connection to the mirror and returns the socket
+// plus a reader positioned after the handshake headers: it is the client a page
+// would be, minus the cookie (the test servers run without a login).
+func dialWS(t *testing.T, srv *Server) (net.Conn, *bufio.Reader) {
+	t.Helper()
 	addr := "127.0.0.1:" + itoa(srv.Port())
 
 	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() { _ = conn.Close() })
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	// Handshake.
 	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
 	req := "GET /ws HTTP/1.1\r\n" +
 		"Host: " + addr + "\r\n" +
@@ -438,6 +439,12 @@ func TestWebSocketHandshakeAndPing(t *testing.T) {
 			break
 		}
 	}
+	return conn, reader
+}
+
+func TestWebSocketHandshakeAndPing(t *testing.T) {
+	srv := newTestServer(t, "")
+	conn, reader := dialWS(t, srv)
 
 	// The server pushes the current conversation first (a text frame) with the
 	// context-usage numbers the page needs for its header badge.
@@ -469,10 +476,49 @@ func TestWebSocketHandshakeAndPing(t *testing.T) {
 	}
 }
 
+// TestSlashCommandOverWebSocket drives the browser's own path end to end: the
+// page sends {"text":"/help"} and gets the command listing back, with no turn
+// started. It is the regression test for "the CLI commands do nothing in the
+// page", where such a line was handed to the model instead.
+func TestSlashCommandOverWebSocket(t *testing.T) {
+	srv := newTestServer(t, "")
+	conn, reader := dialWS(t, srv)
+
+	// The handshake is followed by the history frame.
+	if _, payload, err := readServerFrame(reader); err != nil {
+		t.Fatalf("read history frame: %v", err)
+	} else if !strings.Contains(string(payload), `"type":"history"`) {
+		t.Fatalf("first frame = %s", payload)
+	}
+
+	if err := writeMaskedFrame(conn, opText, []byte(`{"text":"/help"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		opcode, payload, err := readServerFrame(reader)
+		if err != nil {
+			t.Fatalf("read the answer to /help: %v", err)
+		}
+		if opcode != opText {
+			continue
+		}
+		if !strings.Contains(string(payload), "/compact") {
+			t.Fatalf("frame = %s, want the command listing", payload)
+		}
+		break
+	}
+	if srv.agent.Busy() {
+		t.Fatal("/help over the socket must not start a turn")
+	}
+	if len(srv.agent.History()) != 0 {
+		t.Fatal("/help over the socket must not reach the model")
+	}
+}
+
 // TestIndexAndAssets verifies the page wires the vendored markdown libraries and
 // its own stylesheet/scripts. The UI is public (it carries no data and the sign-in
-// dialog has to load before there is a session), and only the markdown flag is
-// injected.
+// dialog has to load before there is a session), and the runtime switches plus
+// the command rail are injected.
 func TestIndexAndAssets(t *testing.T) {
 	srv := newTestServer(t, "secret")
 	base := baseURL(srv)
@@ -496,13 +542,23 @@ func TestIndexAndAssets(t *testing.T) {
 		`id="usage"`,
 		`id="loginModal"`,
 		"markdown: true",
+		// The rail is filled from the injected command list, which the server
+		// builds from the shared slash catalogue: primary and folded commands
+		// are distinguished there.
+		`id="cmds"`,
+		`id="cmdToggle"`,
+		`"primary":true`,
+		`"name":"/compact"`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("page does not carry %q: %s", want, page)
 		}
 	}
 	// Every placeholder must be resolved before the page reaches the browser.
-	for _, ph := range []string{"__LIGHTAGENT_TOKEN__", "__LIGHTAGENT_ASSET_QUERY__", "__LIGHTAGENT_MARKDOWN__"} {
+	for _, ph := range []string{
+		"__LIGHTAGENT_TOKEN__", "__LIGHTAGENT_ASSET_QUERY__",
+		"__LIGHTAGENT_MARKDOWN__", "__LIGHTAGENT_RESULT__", "__LIGHTAGENT_COMMANDS__",
+	} {
 		if strings.Contains(page, ph) {
 			t.Fatalf("page still carries the unresolved placeholder %s: %s", ph, page)
 		}
@@ -536,6 +592,14 @@ func TestIndexAndAssets(t *testing.T) {
 	}
 	if !strings.Contains(string(scriptBody), "e.ctrlKey") {
 		t.Fatal("app.js does not wire Ctrl+Enter to send")
+	}
+	// The rail is drawn by app.js from the injected catalogue, it folds what the
+	// catalogue does not mark primary, and a click sends the command over the
+	// same socket as the composer.
+	for _, want := range []string{"buildCommands", "setCommandsOpen", "row.className = 'folded'", "sendCommand(cmd.name"} {
+		if !strings.Contains(string(scriptBody), want) {
+			t.Errorf("app.js does not build the command rail (%q is missing)", want)
+		}
 	}
 
 	asset, err := http.Get(base + "/assets/marked.min.js")
@@ -573,7 +637,10 @@ func TestIndexMarkdownOff(t *testing.T) {
 		t.Fatalf("stylesheet URL should carry no token query: %s", page)
 	}
 	// With auth off the token is injected as an empty string, not a placeholder.
-	for _, ph := range []string{"__LIGHTAGENT_TOKEN__", "__LIGHTAGENT_ASSET_QUERY__", "__LIGHTAGENT_MARKDOWN__"} {
+	for _, ph := range []string{
+		"__LIGHTAGENT_TOKEN__", "__LIGHTAGENT_ASSET_QUERY__",
+		"__LIGHTAGENT_MARKDOWN__", "__LIGHTAGENT_RESULT__", "__LIGHTAGENT_COMMANDS__",
+	} {
 		if strings.Contains(page, ph) {
 			t.Fatalf("page still carries the unresolved placeholder %s: %s", ph, page)
 		}
@@ -603,6 +670,226 @@ func TestResultCommandTogglesVisibility(t *testing.T) {
 	srv.handleClientMessage([]byte(`{"text":"/result on"}`))
 	if !srv.agent.ToolResultsVisible() {
 		t.Fatal("expected tool results visible after /result on")
+	}
+}
+
+// TestHelpCommandAnswersInThePage pins the fix for "the CLI commands do nothing
+// in the browser": /help is answered by the mirror with the shared command table
+// instead of being forwarded to the model.
+func TestHelpCommandAnswersInThePage(t *testing.T) {
+	srv := newTestServer(t, "")
+	events, cancel := srv.agent.Bus().Subscribe()
+	defer cancel()
+
+	srv.handleClientMessage([]byte(`{"text":"/help"}`))
+	if srv.agent.Busy() {
+		t.Fatal("/help must not start a turn")
+	}
+	if len(srv.agent.History()) != 0 {
+		t.Fatal("/help must not reach the model")
+	}
+	rows := decodeHistory(t, srv)
+	if len(rows) != 1 || rows[0].Role != "info" {
+		t.Fatalf("rows = %+v, want a single info row", rows)
+	}
+	for _, want := range []string{"/help, /?", "/compact", "/markdown [on|off]", "terminal only: /exit"} {
+		if !strings.Contains(rows[0].Content, want) {
+			t.Fatalf("help row is missing %q:\n%s", want, rows[0].Content)
+		}
+	}
+	// The listing describes this page, so it stays off the terminal's bus.
+	select {
+	case ev := <-events:
+		t.Fatalf("the page-only /help leaked onto the agent bus: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestUnknownCommandIsRejected pins that a mistyped command is answered instead
+// of being sent to the model, exactly like the terminal REPL does.
+func TestUnknownCommandIsRejected(t *testing.T) {
+	srv := newTestServer(t, "")
+	srv.handleClientMessage([]byte(`{"text":"/bogus"}`))
+	if srv.agent.Busy() {
+		t.Fatal("an unknown command must not start a turn")
+	}
+	if len(srv.agent.History()) != 0 {
+		t.Fatal("an unknown command must not reach the model")
+	}
+	rows := decodeHistory(t, srv)
+	last := rows[len(rows)-1]
+	if last.Role != "error" || !strings.Contains(last.Content, "unknown command /bogus") {
+		t.Fatalf("row = %+v, want an unknown-command error", last)
+	}
+}
+
+// TestNewCommandClearsTheMirrorScrollback pins that /new drops the conversation
+// and the rows the page was showing with it.
+func TestNewCommandClearsTheMirrorScrollback(t *testing.T) {
+	srv := newTestServer(t, "")
+	bus := srv.agent.Bus()
+	bus.Publish(agent.Event{Type: agent.EventUser, Text: "hi"})
+	bus.Publish(agent.Event{Type: agent.EventAssistant, Text: "hello"})
+	waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 2 })
+
+	srv.handleClientMessage([]byte(`{"text":"/new"}`))
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 1 })
+	if rows[0].Role != "info" || !strings.Contains(rows[0].Content, "new conversation") {
+		t.Fatalf("rows = %+v, want the mirror to forget the old conversation", rows)
+	}
+	if len(srv.agent.History()) != 0 {
+		t.Fatal("the conversation should be empty after /new")
+	}
+}
+
+// TestMarkdownSwitchIsPageOnly pins that /markdown flips the browser's rendering
+// without announcing it on the shared bus: the terminal renders markdown with its
+// own switch, so the mirror must not claim a change it did not make.
+func TestMarkdownSwitchIsPageOnly(t *testing.T) {
+	srv := newTestServer(t, "")
+	events, cancel := srv.agent.Bus().Subscribe()
+	defer cancel()
+
+	srv.handleClientMessage([]byte(`{"text":"/markdown off"}`))
+	if srv.markdownEnabled() {
+		t.Fatal("markdown should be off after /markdown off")
+	}
+	var frame struct {
+		Type     string `json:"type"`
+		Markdown bool   `json:"markdown"`
+		Result   bool   `json:"result"`
+	}
+	if err := json.Unmarshal(srv.settingsFrame(), &frame); err != nil {
+		t.Fatalf("settingsFrame: %v", err)
+	}
+	if frame.Type != "settings" || frame.Markdown || !frame.Result {
+		t.Fatalf("settings frame = %+v", frame)
+	}
+	rows := decodeHistory(t, srv)
+	if last := rows[len(rows)-1]; last.Content != "markdown rendering off (raw output)" {
+		t.Fatalf("row = %+v", last)
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("the page-only /markdown leaked onto the agent bus: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestSaveCommandUsesTheRegisteredSaver pins that the browser's /save writes
+// through the callback the program registers, and reports failures as an error.
+func TestSaveCommandUsesTheRegisteredSaver(t *testing.T) {
+	srv := newTestServer(t, "")
+	events, cancel := srv.agent.Bus().Subscribe()
+	defer cancel()
+
+	srv.SetSessionSaver(func() (string, error) { return `C:\tmp\session.json`, nil })
+	srv.handleClientMessage([]byte(`{"text":"/save"}`))
+	select {
+	case ev := <-events:
+		if ev.Type != agent.EventInfo || !strings.Contains(ev.Text, "session saved to") {
+			t.Fatalf("event = %+v, want a save confirmation", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no feedback for /save")
+	}
+
+	srv.SetSessionSaver(func() (string, error) { return "", errors.New("disk full") })
+	srv.handleClientMessage([]byte(`{"text":"/save"}`))
+	select {
+	case ev := <-events:
+		if ev.Type != agent.EventError || !strings.Contains(ev.Text, "disk full") {
+			t.Fatalf("event = %+v, want the failure reported", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no feedback for a failed /save")
+	}
+}
+
+// TestSaveCommandWithoutASaver checks the one-shot-run case: the page is told
+// that saving is unavailable instead of failing silently.
+func TestSaveCommandWithoutASaver(t *testing.T) {
+	srv := newTestServer(t, "")
+	events, cancel := srv.agent.Bus().Subscribe()
+	defer cancel()
+
+	srv.handleClientMessage([]byte(`{"text":"/save"}`))
+	select {
+	case ev := <-events:
+		if ev.Type != agent.EventError || !strings.Contains(ev.Text, "not available") {
+			t.Fatalf("event = %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no feedback for /save")
+	}
+}
+
+// TestSharedCommandsAnswerOnTheBus pins that the commands changing state both
+// front-ends share report through the agent bus, so the terminal and every
+// browser read the same feedback.
+func TestSharedCommandsAnswerOnTheBus(t *testing.T) {
+	cases := []struct {
+		text string
+		want string
+	}{
+		{"/history", "messages, ~"},
+		{"/compact", "nothing to compress yet"},
+		{"/result off", "hiding tool/exec results"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.text, func(t *testing.T) {
+			srv := newTestServer(t, "")
+			srv.handleClientMessage([]byte(`{"text":"` + tc.text + `"}`))
+			rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) > 0 })
+			last := rows[len(rows)-1]
+			if last.Role != "info" || !strings.Contains(last.Content, tc.want) {
+				t.Fatalf("row = %+v, want an info containing %q", last, tc.want)
+			}
+			if srv.agent.Busy() {
+				t.Fatalf("%s must not start a turn", tc.text)
+			}
+		})
+	}
+}
+
+// TestExitCommandStaysPageLocal pins that /exit cannot end the shared session
+// from a browser: it explains itself and leaves the agent alone.
+func TestExitCommandStaysPageLocal(t *testing.T) {
+	srv := newTestServer(t, "")
+	events, cancel := srv.agent.Bus().Subscribe()
+	defer cancel()
+
+	srv.handleClientMessage([]byte(`{"text":"/exit"}`))
+	if srv.agent.Busy() {
+		t.Fatal("/exit must not start a turn")
+	}
+	rows := decodeHistory(t, srv)
+	if last := rows[len(rows)-1]; last.Role != "info" || !strings.Contains(last.Content, "close the tab") {
+		t.Fatalf("row = %+v, want the terminal-only explanation", last)
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("/exit leaked onto the agent bus: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestHistoryFrameCarriesTheSwitches pins that a page reads the current switch
+// values from its history frame, so a tab reconnecting after another one (or the
+// CLI) flipped them is back in sync.
+func TestHistoryFrameCarriesTheSwitches(t *testing.T) {
+	srv := newTestServerWithMarkdown(t, "", false)
+	srv.agent.SetToolResultsVisible(false)
+
+	var frame struct {
+		Markdown bool `json:"markdown"`
+		Result   bool `json:"result"`
+	}
+	if err := json.Unmarshal(srv.historyFrame(), &frame); err != nil {
+		t.Fatalf("historyFrame: %v", err)
+	}
+	if frame.Markdown || frame.Result {
+		t.Fatalf("frame = %+v, want both switches off", frame)
 	}
 }
 

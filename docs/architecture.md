@@ -14,6 +14,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 | `internal/mcp` | MCP 客户端（纯标准库）：JSON-RPC 2.0 over stdio / Streamable HTTP / HTTP+SSE；配置驱动的 `Manager` 与 `tools.Tool` 适配器 |
 | `internal/store` | 单会话持久化（`CWD/.lightagent/session.json`） |
 | `internal/cli` | 彩色 REPL、斜杠命令、Markdown 流式渲染（未完成行作为预览绘制在提示符上方，按终端宽度折行、最多 8 行，因此超出首行的文本也边收边显示）、提示区原地逐行重绘（不整块擦除，老式 Windows 控制台才不会闪屏）、`[thinking]` 思考流式块（同样应用 Markdown）、异步渲染事件 |
+| `internal/slash` | 斜杠命令表（名称 / 别名 / 参数 / 说明 / 网页是否常显）：CLI 的 `/help`、网页的 `/help` 与左侧命令栏都由此生成；同时提供命令解析（全角斜杠、别名归一）、on/off 参数解析与 `/history` 用量文案 |
 | `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown |
 | `internal/markdown` | 无依赖的 Markdown → ANSI 渲染（CLI 用），按行流式输出并暴露未完成行（`Pending`）供预览 |
 | `internal/termcolor` | ANSI 彩色封装（检测到终端支持才着色） |
