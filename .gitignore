@@ -1,0 +1,11 @@
+# Runtime state and local configuration (never commit these)
+/.lightagent/
+/config.json
+/agent.md
+
+# Build artifacts
+/build/
+/lightagent
+/lightagent.exe
+*.exe~
+*.log

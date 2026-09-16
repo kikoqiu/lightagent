@@ -1,0 +1,466 @@
+  :root {
+    color-scheme: dark;
+    --bg:#080b11;
+    --bg-elev:#121a26;
+    --bg-elev-2:#1a2433;
+    --border:#25324a;
+    --border-soft:#1b2536;
+    --fg:#dce4ef;
+    --fg-muted:#95a4b8;
+    --fg-dim:#67748a;
+    --accent:#5aa2ff;
+    --accent-2:#a371f7;
+    --green:#3fb950;
+    --yellow:#e3b341;
+    --red:#ff6b63;
+    /* ANSI-approximating accents, kept close to the CLI tool-call palette */
+    --cyan:#61d6d6;
+    --gray:#767676;
+    --radius:12px;
+    --radius-sm:8px;
+    --sidebar-w:292px;
+    --shadow:0 18px 44px -24px rgba(0,0,0,.85);
+    --font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body {
+    margin:0;
+    font-family:var(--font);
+    font-size:14px;
+    line-height:1.6;
+    color:var(--fg);
+    background:
+      radial-gradient(1200px 640px at 20% -280px, #16283f 0%, transparent 70%),
+      radial-gradient(900px 520px at 96% -200px, #251a3e 0%, transparent 68%),
+      var(--bg);
+    height:100vh;
+    height:100dvh;
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+    -webkit-text-size-adjust:100%;
+  }
+
+  /* ---- app shell: one column on phones, rail + content on desktop ---- */
+  /* .app is the positioning context for the config editor modal: the overlay is
+     absolutely positioned, never fixed, so the layout stays in the dynamic
+     viewport on mobile. */
+  .app { display:grid; grid-template-columns:1fr; height:100vh; height:100dvh; position:relative; }
+  .main { display:flex; flex-direction:column; min-width:0; min-height:0; }
+
+  /* ---- side rail (desktop only) ---- */
+  .sidebar {
+    display:none; flex-direction:column; gap:14px; min-height:0;
+    padding:18px 16px calc(18px + env(safe-area-inset-bottom));
+    background:linear-gradient(180deg, rgba(19,27,40,.92), rgba(11,16,24,.78));
+    border-right:1px solid var(--border-soft);
+    overflow-y:auto; overscroll-behavior:contain;
+  }
+  .side-head { display:flex; align-items:center; gap:11px; padding:2px 4px 4px; }
+  .side-head .logo {
+    flex:0 0 auto; width:32px; height:32px; border-radius:10px; position:relative;
+    background:linear-gradient(135deg, #4f8cff 0%, #a371f7 100%);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.18), 0 10px 24px -12px rgba(90,162,255,.95);
+  }
+  .side-head .logo::after { content:""; position:absolute; inset:8px; border-radius:4px; background:rgba(8,11,17,.82); }
+  .side-head .brand b { display:block; font-size:15px; font-weight:800; letter-spacing:.2px; }
+  .side-head .brand small { display:block; color:var(--fg-dim); font-size:10px; letter-spacing:1.1px; text-transform:uppercase; }
+  .card {
+    background:linear-gradient(180deg, rgba(26,36,51,.72), rgba(16,23,34,.58));
+    border:1px solid var(--border-soft); border-radius:var(--radius);
+    padding:13px 14px; box-shadow:var(--shadow);
+  }
+  .card-title {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    font-size:10px; font-weight:700; letter-spacing:1.1px; text-transform:uppercase;
+    color:var(--fg-dim); margin-bottom:10px;
+  }
+  .card-pct { color:var(--accent); font-size:11px; letter-spacing:0; text-transform:none; }
+  .card-note { margin-top:8px; color:var(--fg-dim); font-size:11px; }
+  .meter { height:8px; border-radius:999px; overflow:hidden; background:rgba(8,11,17,.7); border:1px solid var(--border-soft); }
+  .meter > span {
+    display:block; height:100%; width:0%;
+    background:linear-gradient(90deg, var(--accent), var(--accent-2));
+    transition:width .35s ease, background .3s;
+  }
+  .meter > span.warm { background:linear-gradient(90deg, var(--yellow), #f0883e); }
+  .meter > span.hot { background:linear-gradient(90deg, #ff8a3d, var(--red)); }
+  .actions { display:flex; flex-wrap:wrap; gap:8px; }
+  .card.tips ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+  .card.tips li { display:flex; align-items:center; gap:8px; color:var(--fg-muted); font-size:12px; }
+  .card.tips li span { margin-left:auto; color:var(--fg-dim); font-size:11px; }
+  kbd {
+    font-family:inherit; font-size:11px; color:var(--fg);
+    background:var(--bg-elev); border:1px solid var(--border); border-bottom-width:2px;
+    border-radius:6px; padding:1px 6px;
+  }
+  .card.tips code { color:var(--accent); font-size:11.5px; }
+  .side-foot { margin-top:auto; padding:6px 4px 0; color:var(--fg-dim); font-size:10.5px; letter-spacing:.6px; text-transform:uppercase; }
+
+  /* ---- top bar ---- */
+  header {
+    flex:0 0 auto;
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:10px max(14px, env(safe-area-inset-right)) 10px max(14px, env(safe-area-inset-left));
+    padding-top:calc(10px + env(safe-area-inset-top));
+    background:linear-gradient(180deg, rgba(15,21,30,.94), rgba(15,21,30,.72));
+    backdrop-filter:blur(12px);
+    border-bottom:1px solid var(--border-soft);
+  }
+  header .logo {
+    flex:0 0 auto;
+    width:24px; height:24px;
+    border-radius:8px; position:relative;
+    background:linear-gradient(135deg, #4f8cff 0%, #a371f7 100%);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.16), 0 8px 18px -10px rgba(90,162,255,.9);
+  }
+  header .logo::after { content:""; position:absolute; inset:6px; border-radius:3px; background:rgba(8,11,17,.8); }
+  header .brand { display:flex; flex-direction:column; line-height:1.15; min-width:0; }
+  header .brand b { color:var(--fg); font-size:14.5px; font-weight:800; letter-spacing:.2px; }
+  header .brand small {
+    color:var(--fg-dim); font-size:10px; letter-spacing:.7px; text-transform:uppercase;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .head-right { margin-left:auto; display:flex; align-items:center; gap:8px; min-width:0; }
+  header .dot {
+    flex:0 0 auto; width:9px; height:9px; border-radius:50%;
+    background:var(--red); box-shadow:0 0 0 3px rgba(255,107,99,.16);
+    transition:background .2s, box-shadow .2s;
+  }
+  header .dot.on { background:var(--green); box-shadow:0 0 0 3px rgba(63,185,80,.18); }
+  header .usage {
+    min-width:0; max-width:44vw;
+    color:var(--fg-muted); font-size:11.5px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    background:var(--bg-elev); border:1px solid var(--border-soft); border-radius:999px; padding:3px 10px;
+  }
+  header .usage:empty { display:none; }
+  header .run {
+    display:none; align-items:center; gap:6px;
+    color:var(--yellow); font-size:11.5px; white-space:nowrap;
+    background:rgba(227,179,65,.12); border:1px solid rgba(227,179,65,.32);
+    border-radius:999px; padding:3px 10px;
+  }
+  header .run.on { display:inline-flex; }
+  header .run .spin {
+    width:9px; height:9px; border:2px solid rgba(227,179,65,.3);
+    border-top-color:var(--yellow); border-radius:50%; animation:spin .8s linear infinite;
+  }
+  /* The elapsed badge next to the spinner counts the running turn. Tabular
+     figures keep the badge from shifting as the tenths roll over. */
+  header .run #elapsed { color:rgba(227,179,65,.8); font-variant-numeric:tabular-nums; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* ---- transcript ---- */
+  #log {
+    flex:1 1 auto; min-height:0;
+    overflow-y:auto; overscroll-behavior:contain;
+    -webkit-overflow-scrolling:touch;
+    padding:22px max(16px, calc(50% - 460px)) 26px;
+  }
+  #log::-webkit-scrollbar { width:10px; height:10px; }
+  #log::-webkit-scrollbar-thumb { background:#2b3646; border:3px solid transparent; border-radius:8px; background-clip:content-box; }
+  #log::-webkit-scrollbar-thumb:hover { background:#3a4658; background-clip:content-box; }
+  #log::-webkit-scrollbar-track { background:transparent; }
+  #log:empty::after {
+    content:"Waiting for messages…"; display:block; margin-top:56px;
+    text-align:center; color:var(--fg-dim); font-size:13px;
+  }
+
+  .row { margin:0 0 15px; word-break:break-word; animation:rise .22s ease both; }
+  @keyframes rise { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+  .role {
+    display:block;
+    font-size:10px; font-weight:700; letter-spacing:.9px; text-transform:uppercase;
+    color:var(--fg-dim); margin-bottom:4px;
+  }
+  .role::before {
+    content:""; display:inline-block; width:5px; height:5px; border-radius:50%;
+    background:currentColor; margin-right:6px; vertical-align:1px;
+  }
+  .text { display:block; white-space:pre-wrap; }
+  .text.md { white-space:normal; }
+  .text.md > :first-child { margin-top:0; }
+  .text.md > :last-child { margin-bottom:0; }
+  .text.md pre, .text.md pre code { white-space:pre; }
+
+  .user { text-align:right; }
+  .user .role { color:var(--green); }
+  .user .text {
+    display:inline-block; text-align:left; max-width:86%;
+    background:linear-gradient(180deg, rgba(90,162,255,.18), rgba(90,162,255,.10));
+    border:1px solid rgba(90,162,255,.32);
+    border-radius:16px 16px 5px 16px;
+    padding:9px 13px; box-shadow:var(--shadow);
+  }
+  .assistant .role { color:var(--accent); }
+  .assistant .text { border-left:2px solid rgba(90,162,255,.35); padding-left:12px; }
+
+  .reasoning { border-left:2px solid var(--border); padding-left:12px; color:var(--fg-muted); font-size:13px; }
+  .reasoning .role { color:var(--fg-muted); }
+  .reasoning .text:not(.md) { font-style:italic; }
+
+  .tool, .result, .error, .interrupted { border-left:2px solid transparent; padding-left:12px; font-size:12.5px; }
+  .tool { color:var(--yellow); border-left-color:var(--yellow); }
+  .result { color:var(--fg-muted); border-left-color:var(--border); }
+  .error { color:var(--red); border-left-color:var(--red); }
+  .interrupted { color:var(--yellow); border-left-color:var(--yellow); }
+  .result .text, .error .text { background:rgba(8,11,17,.4); border-radius:var(--radius-sm); padding:6px 10px; }
+  /* tool call: the function name, then one line per argument, none indented.
+     The line breaks are carried by the text (the row is pre-wrap), so these
+     rules only colour the parts and never affect the layout. The palette
+     mirrors the CLI: bold yellow name, bold cyan argument names, gray value. */
+  .tool .fn { font-weight:700; color:var(--yellow); }
+  .tool .arg-name { font-weight:700; color:var(--cyan); }
+  .tool .arg-sep, .tool .arg-val, .tool .arg-raw { color:var(--gray); }
+
+  /* ---- markdown ---- */
+  .row p { margin:0 0 8px; }
+  .row h1, .row h2, .row h3, .row h4, .row h5, .row h6 { margin:15px 0 7px; line-height:1.3; }
+  .row h1 { font-size:19px; } .row h2 { font-size:17px; } .row h3 { font-size:15px; }
+  .row h4, .row h5, .row h6 { font-size:14px; }
+  .row ul, .row ol { margin:0 0 8px; padding-left:22px; }
+  .row li { margin:2px 0; }
+  .row code { background:rgba(8,11,17,.6); border:1px solid var(--border-soft); border-radius:5px; padding:1px 5px; font-size:.92em; }
+  .row pre {
+    background:linear-gradient(180deg, #0d1420, #0a0f18);
+    border:1px solid var(--border); border-radius:var(--radius);
+    padding:12px 14px; overflow-x:auto; margin:0 0 8px; box-shadow:var(--shadow);
+  }
+  .row pre code { background:none; border:0; padding:0; }
+  .row blockquote { margin:0 0 8px; padding:2px 0 2px 12px; border-left:3px solid var(--border); color:var(--fg-muted); }
+  .row hr { border:0; border-top:1px solid var(--border-soft); margin:15px 0; }
+  .row a { color:var(--accent); text-decoration:none; }
+  .row a:hover { text-decoration:underline; }
+  .row del { color:var(--fg-dim); }
+  .text.md table { border-collapse:collapse; margin:0 0 8px; display:block; overflow-x:auto; max-width:100%; }
+  .text.md th, .text.md td { border:1px solid var(--border); padding:6px 11px; text-align:left; }
+  .text.md th { background:var(--bg-elev); }
+  .text.md tbody tr:nth-child(even) { background:rgba(16,22,31,.7); }
+  /* ---- composer ---- */
+  footer {
+    flex:0 0 auto;
+    background:linear-gradient(180deg, rgba(15,21,30,.72), rgba(15,21,30,.94));
+    backdrop-filter:blur(12px);
+    border-top:1px solid var(--border-soft);
+    padding:10px max(14px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+  }
+  footer .composer { display:flex; align-items:flex-end; gap:8px; width:100%; max-width:920px; margin:0 auto; }
+  textarea {
+    flex:1 1 auto; min-width:0; resize:none; height:44px; min-height:44px; max-height:40dvh;
+    background:var(--bg-elev); color:var(--fg);
+    border:1px solid var(--border); border-radius:var(--radius);
+    padding:11px 13px; font-family:inherit; font-size:16px; line-height:1.4;
+    outline:none; transition:border-color .15s, box-shadow .15s;
+  }
+  textarea::placeholder { color:var(--fg-dim); }
+  textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(90,162,255,.18); }
+  button {
+    flex:0 0 auto; min-height:44px; padding:0 18px;
+    border:1px solid transparent; border-radius:var(--radius);
+    background:linear-gradient(180deg, #4ac163, var(--green)); color:#04160a;
+    font-family:inherit; font-size:13.5px; font-weight:700; letter-spacing:.2px;
+    cursor:pointer; transition:filter .15s, background .15s, transform .05s, box-shadow .15s;
+    box-shadow:0 10px 22px -14px rgba(63,185,80,.95);
+  }
+  button.ghost {
+    background:rgba(8,11,17,.5); color:var(--fg-muted); border-color:var(--border);
+    box-shadow:none; font-weight:600; min-height:36px; padding:0 14px; font-size:12.5px;
+  }
+  button.ghost:hover { color:var(--fg); border-color:var(--accent); }
+  button:hover { filter:brightness(1.08); }
+  button:active { transform:translateY(1px); }
+  button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button:disabled { opacity:.5; cursor:default; filter:none; transform:none; }
+  button.stop { display:none; background:var(--bg-elev-2); color:var(--fg-muted); border-color:var(--border); box-shadow:none; }
+  button.stop:hover { background:#22303f; color:var(--fg); }
+  button.stop.on { display:inline-block; }
+
+  /* ---- config editor: control form + raw JSON mode ---- */
+  /* The gear lives in the header (all layouts) and in the side rail card, so the
+     editor is reachable on phones too. */
+  button.ghost.gear { min-width:36px; min-height:36px; padding:0; font-size:15px; line-height:1; }
+  .modal {
+    position:absolute; inset:0; z-index:50;
+    display:flex; align-items:center; justify-content:center;
+    padding:max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right))
+            calc(14px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+  }
+  .modal[hidden] { display:none; }
+  .modal-backdrop { position:absolute; inset:0; background:rgba(4,7,12,.72); }
+  .modal-panel {
+    position:relative; display:flex; flex-direction:column; gap:10px;
+    width:100%; max-width:920px; max-height:100%; min-height:0;
+    padding:16px; border:1px solid var(--border); border-radius:var(--radius);
+    background:linear-gradient(180deg, rgba(26,36,51,.99), rgba(14,20,30,.99));
+    box-shadow:var(--shadow); outline:none;
+  }
+  .modal-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .modal-title { display:flex; flex-direction:column; min-width:0; flex:1 1 220px; }
+  .modal-title b { font-size:14px; font-weight:800; letter-spacing:.2px; }
+  .modal-title small { color:var(--fg-dim); font-size:11px; overflow-wrap:anywhere; }
+  .tabs { display:flex; gap:4px; margin-left:auto; padding:3px; border-radius:999px; background:rgba(8,11,17,.6); border:1px solid var(--border-soft); }
+  .tab {
+    min-height:0; padding:5px 12px; border-radius:999px; border:1px solid transparent;
+    background:transparent; color:var(--fg-dim); box-shadow:none;
+    font-family:inherit; font-size:12px; font-weight:600; letter-spacing:.2px;
+  }
+  .tab:hover { color:var(--fg); filter:none; }
+  .tab.on { background:linear-gradient(180deg, #2b3b52, #223044); color:var(--fg); border-color:var(--border); }
+  .modal-head > button.ghost { flex:0 0 auto; }
+  .modal-body { flex:1 1 auto; min-height:0; overflow:auto; overscroll-behavior:contain; }
+  #configText[hidden], .form[hidden] { display:none; }
+  /* The raw document is edited as plain text: the composer's 16px/auto-grow rules
+     would make JSON unreadable, so the editor overrides them. */
+  #configText {
+    min-height:320px; height:auto; max-height:none;
+    width:100%; font-size:13px; line-height:1.5;
+    white-space:pre; overflow:auto; resize:vertical; tab-size:2;
+  }
+  /* ---- form mode: one card per section, one row per option ---- */
+  .form { display:flex; flex-direction:column; gap:10px; }
+  .sect { border:1px solid var(--border-soft); border-radius:var(--radius-sm); background:rgba(12,17,25,.45); }
+  .sect > summary {
+    display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+    padding:10px 13px; cursor:pointer; user-select:none; list-style:none;
+  }
+  .sect > summary::-webkit-details-marker { display:none; }
+  .sect > summary::before {
+    content:"▸"; color:var(--fg-dim); font-size:11px;
+    transition:transform .15s ease; transform-origin:center;
+  }
+  .sect[open] > summary::before { transform:rotate(90deg); }
+  .sect > summary:hover .sect-title { color:var(--accent); }
+  .sect-title { font-size:12.5px; font-weight:700; letter-spacing:.3px; }
+  .sect-note { color:var(--fg-dim); font-size:11px; }
+  .sect-body { padding:2px 13px 12px; display:flex; flex-direction:column; gap:2px; }
+  .field {
+    display:grid; grid-template-columns:minmax(210px, 42%) 1fr;
+    gap:6px 14px; align-items:start; padding:7px 0;
+    border-top:1px dashed var(--border-soft);
+  }
+  .field:first-child { border-top:0; }
+  .field-label { display:flex; flex-direction:column; gap:2px; min-width:0; cursor:pointer; }
+  .field-key { font-size:12px; color:var(--fg); overflow-wrap:anywhere; }
+  .field-help { font-size:10.5px; color:var(--fg-dim); line-height:1.45; }
+  .tag {
+    align-self:flex-start; margin-top:2px; padding:1px 6px; border-radius:999px;
+    background:rgba(163,113,247,.16); color:var(--accent-2); font-size:9.5px;
+    letter-spacing:.6px; text-transform:uppercase;
+  }
+  .field-control { display:flex; flex-direction:column; gap:4px; min-width:0; }
+  .field input[type=text], .field input[type=password], .field input[type=number], .field select,
+  .field textarea {
+    width:100%; min-height:34px; height:auto; max-height:none; flex:none;
+    padding:6px 9px; font-family:inherit; font-size:12.5px; line-height:1.45;
+    color:var(--fg); background:var(--bg-elev);
+    border:1px solid var(--border); border-radius:var(--radius-sm);
+    outline:none; transition:border-color .15s, box-shadow .15s;
+  }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    border-color:var(--accent); box-shadow:0 0 0 3px rgba(90,162,255,.16);
+  }
+  .field textarea { resize:vertical; white-space:pre; tab-size:2; }
+  .field textarea.json-box { min-height:88px; font-size:11.5px; color:var(--fg-muted); }
+  .field select { appearance:none; cursor:pointer; }
+  .field input.switch {
+    appearance:none; width:40px; height:22px; margin:6px 0 0; border-radius:999px;
+    border:1px solid var(--border); background:rgba(8,11,17,.7); position:relative; cursor:pointer;
+    transition:background .15s, border-color .15s; flex:none;
+  }
+  .field input.switch::after {
+    content:""; position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%;
+    background:var(--fg-dim); transition:transform .15s ease, background .15s;
+  }
+  .field input.switch:checked { background:rgba(63,185,80,.28); border-color:var(--green); }
+  .field input.switch:checked::after { transform:translateX(18px); background:var(--green); }
+  .field input[type=range] {
+    appearance:none; width:100%; height:22px; margin:4px 0 0; background:transparent; cursor:pointer;
+  }
+  .field input[type=range]::-webkit-slider-runnable-track { height:5px; border-radius:999px; background:rgba(8,11,17,.85); border:1px solid var(--border-soft); }
+  .field input[type=range]::-webkit-slider-thumb { appearance:none; margin-top:-5px; width:15px; height:15px; border-radius:50%; background:var(--accent); border:0; }
+  .field input[type=range]::-moz-range-track { height:5px; border-radius:999px; background:rgba(8,11,17,.85); border:1px solid var(--border-soft); }
+  .field input[type=range]::-moz-range-thumb { width:14px; height:14px; border:0; border-radius:50%; background:var(--accent); }
+  .field input[type=range]:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  .slider-out { font-size:11px; color:var(--accent); }
+  .field-err { display:none; font-size:10.5px; color:var(--red); }
+  .field.invalid input:not([type=range]), .field.invalid textarea, .field.invalid select { border-color:var(--red); }
+  .field.invalid .field-err { display:block; }
+  .field.invalid .field-key { color:var(--red); }
+  .modal-foot { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .modal-note { flex:1 1 auto; min-width:0; color:var(--fg-dim); font-size:11.5px; }
+  .modal-note.ok { color:var(--green); }
+  .modal-note.bad { color:var(--red); }
+  .modal-actions { margin-left:auto; display:flex; gap:8px; }
+
+  /* ---- sign-in dialog ---- */
+  /* It sits above the config editor: a session is what makes that panel reachable. */
+  .modal.login { z-index:60; }
+  .login-panel { max-width:420px; }
+  .login-form { display:flex; flex-direction:column; gap:12px; }
+  .login-field { display:flex; flex-direction:column; gap:4px; }
+  .login-form input[type=password], .login-form input[type=text] {
+    width:100%; min-height:40px; padding:8px 10px;
+    color:var(--fg); background:var(--bg-elev);
+    border:1px solid var(--border); border-radius:var(--radius-sm);
+    font-family:inherit; font-size:14px; outline:none;
+    transition:border-color .15s, box-shadow .15s;
+  }
+  .login-form input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(90,162,255,.16); }
+  /* The fixed username stays in the form so a password manager offers to save the
+     password, but it is taken out of the visual flow. */
+  .login-user { position:absolute; left:-9999px; width:1px; height:1px; }
+  .login-remember { display:flex; align-items:flex-start; gap:8px; color:var(--fg-muted); font-size:11.5px; line-height:1.5; }
+  .login-remember input { margin:2px 0 0; accent-color:var(--green); }
+  .login-status { min-height:16px; font-size:11.5px; color:var(--fg-dim); }
+  .login-status.bad { color:var(--red); }
+  .login-form button[type=submit] { width:100%; }
+  /* A session exists and a password is configured: the header shows the way out. */
+  header #signOut { min-height:36px; font-size:12px; }
+
+  /* ---- password row in the config form ---- */
+  .secret-state { font-size:11.5px; color:var(--fg-dim); }
+  .secret-state.on { color:var(--green); }
+  .secret-row { display:flex; gap:8px; }
+  .secret-row input { flex:1 1 auto; min-width:0; }
+  .secret-row button { flex:0 0 auto; }
+
+  /* ---- responsive: phones vs desktop ---- */
+  @media (min-width: 1000px) {
+    .app { grid-template-columns:var(--sidebar-w) 1fr; }
+    .sidebar { display:flex; }
+    header .brand small { font-size:10.5px; }
+  }
+  @media (max-width: 720px) {
+    .user .text { max-width:92%; }
+    .assistant .text { padding-left:10px; }
+    .field { grid-template-columns:1fr; gap:4px; }
+    .field-help { font-size:11px; }
+  }
+  @media (max-width: 480px) {
+    header {
+      gap:8px;
+      padding:8px max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left));
+      padding-top:calc(8px + env(safe-area-inset-top));
+    }
+    header .brand b { font-size:13.5px; }
+    #log { padding:14px max(12px, calc(50% - 460px)) 18px; }
+    footer {
+      padding:8px max(12px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    }
+    header .usage { font-size:11px; max-width:38vw; }
+    header .run { padding:3px 8px; }
+    header .run #runText { display:none; }
+    button { padding:0 14px; }
+  }
+  @media (max-height: 460px) {
+    header .brand small { display:none; }
+  }
+  /* The reduced-motion preference stills the transcript's entrance animation;
+     the busy spinner deliberately keeps turning. It is the only cue that the
+     agent is working, and a frozen ring reads as a hung UI. */
+  @media (prefers-reduced-motion: reduce) {
+    .row { animation:none; }
+  }

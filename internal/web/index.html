@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="dark light">
+<title>lightagent</title>
+<script>
+  // Runtime configuration injected by the server: whether replies are rendered
+  // as markdown in the browser. Sessions are cookie based, so no token is needed
+  // here (see auth.js).
+  window.__LIGHTAGENT__ = { markdown: __LIGHTAGENT_MARKDOWN__ };
+</script>
+<link rel="stylesheet" href="app.css">
+<script src="assets/marked.min.js"></script>
+<script src="assets/dompurify.min.js"></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" aria-label="session panel">
+    <div class="side-head">
+      <span class="logo" aria-hidden="true"></span>
+      <span class="brand"><b>Console</b><small>local agent</small></span>
+    </div>
+    <section class="card">
+      <div class="card-title"><span>Context window</span><span class="card-pct" id="meterPct">—</span></div>
+      <div class="meter" role="progressbar" aria-label="context usage"><span id="meterFill"></span></div>
+      <div class="card-note" id="meterNote">waiting for usage…</div>
+    </section>
+    <section class="card">
+      <div class="card-title"><span>Quick actions</span></div>
+      <div class="actions">
+        <button id="results" class="ghost" type="button">Hide results</button>
+      </div>
+    </section>
+    <section class="card">
+      <div class="card-title"><span>Configuration</span></div>
+      <div class="actions">
+        <button class="ghost" type="button" data-config-open>Edit config.json</button>
+      </div>
+      <div class="card-note">Saved changes apply after a restart.</div>
+    </section>
+    <section class="card tips">
+      <div class="card-title"><span>Shortcuts</span></div>
+      <ul>
+        <li><kbd>Ctrl</kbd>+<kbd>Enter</kbd><span>send</span></li>
+        <li><kbd>Enter</kbd><span>newline</span></li>
+        <li><code>/stop</code><span>interrupt</span></li>
+        <li><code>/result</code><span>tool output</span></li>
+      </ul>
+    </section>
+    <div class="side-foot">lightagent web</div>
+  </aside>
+  <div class="main">
+    <header>
+      <span class="logo" aria-hidden="true"></span>
+      <span class="brand"><b>lightagent</b><small id="status">connecting…</small></span>
+      <span class="head-right">
+        <span class="run" id="run"><span class="spin"></span><span id="runText">running</span><span id="elapsed"></span></span>
+        <span class="usage" id="usage"></span>
+        <span class="dot" id="dot" title="disconnected" aria-label="connection status"></span>
+        <button class="ghost" id="signOut" type="button" title="sign out" hidden>Sign out</button>
+        <button class="ghost gear" type="button" data-config-open title="edit config.json" aria-label="edit config.json">⚙</button>
+      </span>
+    </header>
+    <div id="log" role="log" aria-live="polite"></div>
+    <footer>
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Message lightagent…  (Ctrl+Enter = send)" aria-label="message"></textarea>
+        <button id="stop" class="stop" title="interrupt the running turn" aria-label="stop" type="button">Stop</button>
+        <button id="send" aria-label="send" type="button">Send</button>
+      </div>
+    </footer>
+  </div>
+  <div class="modal" id="configModal" hidden>
+    <div class="modal-backdrop" data-config-close></div>
+    <div class="modal-panel" id="configPanel" role="dialog" aria-modal="true" aria-labelledby="configTitle" tabindex="-1">
+      <div class="modal-head">
+        <span class="modal-title"><b id="configTitle">config.json</b><small id="configPath"></small></span>
+        <div class="tabs" role="tablist" aria-label="editor mode">
+          <button class="tab on" id="modeForm" type="button" role="tab" aria-selected="true">Form</button>
+          <button class="tab" id="modeJSON" type="button" role="tab" aria-selected="false">JSON</button>
+        </div>
+        <button class="ghost" type="button" data-config-close aria-label="close the config editor">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form" id="configForm"></div>
+        <textarea id="configText" hidden spellcheck="false" autocomplete="off" aria-label="config.json contents"></textarea>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-note" id="configStatus"></span>
+        <span class="modal-actions">
+          <button class="ghost" id="configReload" type="button">Reload</button>
+          <button id="configSave" type="button">Save</button>
+        </span>
+      </div>
+    </div>
+  </div>
+  <div class="modal login" id="loginModal" hidden>
+    <div class="modal-backdrop"></div>
+    <div class="modal-panel login-panel" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+      <div class="modal-head">
+        <span class="modal-title"><b id="loginTitle">Sign in</b><small>lightagent</small></span>
+      </div>
+      <form class="login-form" id="loginForm" method="post" action="/api/login" autocomplete="on">
+        <!-- The username is fixed and ignored by the server; it is here so the
+             browser's password manager offers to save the password. -->
+        <input class="login-user" type="text" name="username" value="lightagent" autocomplete="username"
+               readonly aria-hidden="true" tabindex="-1">
+        <label class="login-field">
+          <span class="field-key">Password</span>
+          <input type="password" id="loginPassword" name="password" autocomplete="current-password" required>
+        </label>
+        <label class="login-remember">
+          <input type="checkbox" id="loginRemember" checked>
+          <span>Stay signed in on this browser</span>
+        </label>
+        <div class="login-status" id="loginStatus" role="status"></div>
+        <button id="loginSubmit" type="submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+<script src="auth.js"></script>
+<script src="config.js"></script>
+</body>
+</html>
