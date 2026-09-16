@@ -323,7 +323,6 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
   `true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不做转码；
   `false` 由 Go 按主机 ANSI 代码页（如 GBK）转换：输出解码为 UTF-8，输入编码为该代码页字节。
   非 Windows 主机始终 UTF-8。
-* `pty` 参数在 lightagent 中不支持，会明确报错。
 
 ### `manage_session`
 管理 `exec_command` 产生的后台会话：`poll`（轮询增量输出，支持长轮询）、

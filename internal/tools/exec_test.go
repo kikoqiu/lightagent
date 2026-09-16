@@ -591,9 +591,11 @@ func TestScriptLanguageSelection(t *testing.T) {
 	}
 }
 
-// TestExecCommandLanguageParameter verifies that both the tool description and
-// the `language` parameter advertise the selectable languages (with the detected
-// python version) and that the schema default is the host engine.
+// TestExecCommandLanguageParameter verifies the `language` parameter: the
+// selectable values are advertised by the enum (host engine first) and the host
+// engine is the default. The parameter description is a fixed wording, while the
+// host-dependent list (with the detected python version) is carried by the tool
+// description.
 func TestExecCommandLanguageParameter(t *testing.T) {
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
@@ -613,23 +615,25 @@ func TestExecCommandLanguageParameter(t *testing.T) {
 		t.Fatalf("language enum = %v, want %v", enum, scriptLanguageIDs())
 	}
 
+	// The parameter description is a plain statement: the model reads the
+	// selectable values from the enum checked above.
 	description, _ := param["description"].(string)
-	for _, id := range scriptLanguageIDs() {
-		if !strings.Contains(description, id) {
-			t.Errorf("the language description does not mention %q: %s", id, description)
-		}
-	}
-	if python := systemPython(); python.Found {
-		if !strings.Contains(description, python.Version) {
-			t.Errorf("the language description does not carry the python version %s: %s", python.Version, description)
-		}
-	} else if strings.Contains(description, ScriptLanguagePython) {
-		t.Errorf("the language description advertises python without an interpreter: %s", description)
+	if !strings.Contains(description, "Script language used to run") {
+		t.Errorf("the language parameter has no usable description: %q", description)
 	}
 
+	// The host-dependent list and the python version belong to the tool
+	// description.
 	toolDescription := tool.Description()
 	if !strings.Contains(toolDescription, "language") || !strings.Contains(toolDescription, host) {
 		t.Fatalf("the tool description does not advertise the language parameter: %s", toolDescription)
+	}
+	if python := systemPython(); python.Found {
+		if !strings.Contains(toolDescription, python.Version) {
+			t.Errorf("the tool description does not carry the python version %s: %s", python.Version, toolDescription)
+		}
+	} else if strings.Contains(toolDescription, ScriptLanguagePython) {
+		t.Errorf("the tool description advertises python without an interpreter: %s", toolDescription)
 	}
 }
 

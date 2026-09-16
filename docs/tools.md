@@ -29,7 +29,8 @@ type Tool interface {
     以 `-NoProfile -NonInteractive -Command` 运行）；非 Windows 为 `sh`（`sh -c`）。
   * `python`：**直接把 Python 解释器当作脚本引擎**（不经 shell，源码以 `-c` 传给解释器，
     因此脚本必须是自包含的 Python 程序）。仅当 PATH 上存在可用的 Python 时才可选，并把探测到的
-    **版本**与解释器路径注入 `language` 说明；未安装时该取值**完全不出现**——探测执行一次
+    **版本**与解释器路径写进工具描述里的 `language` 可选值说明（参数本身的 `description` 是固定
+    文案，可选值列表由 schema 的 `enum` 表达）；未安装时该取值**完全不出现**——探测执行一次
     `python -V`（5s 超时），Windows 的 Microsoft Store 占位程序会非零退出且不打印版本，故不会被误认。
   * 其它取值：返回 `unsupported language ...; available: ...`，不执行任何命令。
 * 子进程 stdio 编码：**参数 `use_utf8` 仅 Windows 存在**，默认取 `tools.exec.use_utf8`，可按次覆盖。
@@ -50,19 +51,17 @@ type Tool interface {
 * 硬超时 `run_timeout`（默认取 `exec.timeout_seconds`，3600s）到点强制结束进程；
   `run_timeout=0` 关闭硬超时。
 * 输出经 ANSI 清理、CR 重放（进度条折叠）后按 `max_lines`/`max_chars` 做头尾折叠。
-* **不支持 PTY**：`pty=true` 会返回错误。
 
 参数：
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `command` | string | 必填 | 脚本内容，由 `language` 解释 |
-| `language` | string | 宿主引擎（`ps` / `sh`，即宿主 shell） | 脚本语言；**省略/留空即用宿主 shell**。可选值与说明由主机动态生成（`ps`/`sh`、以及存在时的 `python`，并带 Python 版本） |
+| `language` | string | 宿主引擎（`ps` / `sh`，即宿主 shell） | 脚本语言；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`ps`/`sh`、以及存在时的 `python`）；参数自带的 `description` 是固定文案，各取值含义与 Python 版本在工具描述里 |
 | `wait_timeout` | int | `wait_seconds` | 同步等待秒数 |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
 | `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |
-| `pty` | bool | `false` | 不支持，必须为 false/省略 |
 | `max_lines` | int | `200` | 输出行数上限 |
 | `max_chars` | int | `30000` | 输出字符上限 |
 

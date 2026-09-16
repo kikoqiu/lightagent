@@ -281,7 +281,8 @@ func TestCrossOriginWritesAreRefused(t *testing.T) {
 
 // TestSetPasswordAppliesAtOnce checks the editor's password control: the file is
 // rewritten, the new credential works immediately (no restart), other sessions
-// are dropped, and clearing the password opens the mirror again.
+// are dropped, and clearing the password opens the mirror again while the file
+// keeps an empty web.password (its salt is dropped).
 func TestSetPasswordAppliesAtOnce(t *testing.T) {
 	srv := newTestServer(t, "hunter2")
 	path := seedConfigFile(t, srv, `{"openai":{"api_key":"sk-secret"},"web":{"host":"127.0.0.1","port":8791,"password":"hunter2","password_salt":"0123456789abcdef0123456789abcdef"}}`)
@@ -332,10 +333,23 @@ func TestSetPasswordAppliesAtOnce(t *testing.T) {
 	if status := getJSON(t, http.DefaultClient, baseURL(srv)+"/api/config", nil); status != http.StatusOK {
 		t.Fatalf("status = %d, want an open mirror", status)
 	}
-	for _, gone := range []string{"password", "password_salt"} {
-		if strings.Contains(readConfigString(t, path), gone) {
-			t.Fatalf("%s is still in the file:\n%s", gone, readConfigString(t, path))
-		}
+	// The file is written back the way the config schema serializes it:
+	// web.password is always present (empty here, which turns the login off),
+	// while web.password_salt drops out because it is empty.
+	cleared := readConfigString(t, path)
+	clearedCfg, err := config.Parse([]byte(cleared))
+	if err != nil {
+		t.Fatalf("parse the cleared config: %v", err)
+	}
+	if clearedCfg.Web.Password != "" || clearedCfg.Web.PasswordSalt != "" {
+		t.Fatalf("stored credential = %q / %q, want it cleared",
+			clearedCfg.Web.Password, clearedCfg.Web.PasswordSalt)
+	}
+	if !strings.Contains(cleared, `"password": ""`) {
+		t.Fatalf("the cleared password is not in the file:\n%s", cleared)
+	}
+	if strings.Contains(cleared, "password_salt") {
+		t.Fatalf("the leftover salt is still in the file:\n%s", cleared)
 	}
 }
 
