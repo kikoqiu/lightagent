@@ -186,14 +186,16 @@ type Tool interface {
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `path` | string | 必填 | 文件路径 |
-| `old_text` | string | 必填 | 待替换文本（字面量需唯一；`regex=true` 时为 RE2 正则；二进制时为编码字节串） |
-| `new_text` | string | 必填 | 替换文本；`regex=true` 可用 `$1`、`$2` 引用捕获组 |
-| `regex` | bool | `false` | 按 RE2 正则替换所有匹配 |
-| `encoding` | string | `utf8` | `utf8`/字符集标签（文本）；`hex`/`base64`（字节级替换，禁用 regex） |
+| `find` | string | 必填 | 待定位内容：`replace`/`insert` 为字面量（需唯一）；`regex` 为 RE2 正则；二进制编码时为编码字节串 |
+| `content` | string | 必填 | 写在匹配处的内容：`replace`/`regex` 为替换文本（`regex` 可用 `$1`、`$2` 引用捕获组）；`insert` 为插到匹配前方的文本 |
+| `mode` | string | `replace` | `replace` 替换唯一字面量匹配；`insert` 把 `content` 插到唯一字面量匹配之前（匹配本身保留）；`regex` 按 RE2 正则替换**所有**匹配 |
+| `encoding` | string | `utf8` | `utf8`/字符集标签（文本）；`hex`/`base64`（字节级编辑，禁用 `regex`） |
 
-* 字面量模式要求 `old_text` 恰好出现一次，否则报错要求提供更多上下文。
+* `replace`/`insert` 要求 `find` 恰好出现一次，否则报错要求提供更多上下文，并提示改用 `mode='regex'`。
+* `regex` **不要求唯一**：匹配多少次就替换多少次，成功反馈给出匹配次数（`regex "…" matched N occurrence(s), all replaced`）。
+* `insert` 只把 `content` 插到匹配前方，匹配内容原样保留。
 * 文本模式：先按字符集解码为 UTF-8 匹配，写回时再编码；CRLF 文件按 LF 匹配、写回恢复 CRLF。
-* 二进制模式：`old_text`/`new_text` 为 `hex`/`base64` 字节串，唯一替换。
+* 二进制模式（`hex`/`base64`）：`find`/`content` 为编码字节串，唯一匹配；`insert` 插到匹配字节之前。
 * JSON 转义生效：`\n` 是换行，`\\n` 是字面反斜杠加 n。
 
 ---

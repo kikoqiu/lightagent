@@ -356,8 +356,11 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 with one newline: \n, or \r\n for a CRLF file.]`（下一步要 `mode='a'` 续写就得在内容最前面自己加一个换行）。
 
 ### `edit_file`
-`old_text` → `new_text` 替换；默认字面量且要求唯一，`regex=true` 时按 RE2 正则替换所有匹配。
-`encoding` 支持字符集标签（解码匹配、写回再编码）与 `hex`/`base64` 字节级替换；
+按 `mode` 定位 `find` 并在匹配处写入 `content`：`mode='replace'`（默认）用 `content` 替换唯一的字面量 `find`；
+`mode='insert'` 把 `content` 插到唯一字面量 `find` 之前（匹配内容原样保留）；
+`mode='regex'` 把 `find` 当 RE2 正则，**允许不唯一**，所有匹配都被 `content` 替换（可用 `$1`、`$2` 引用捕获组），
+成功反馈给出匹配次数。
+`encoding` 支持字符集标签（解码匹配、写回再编码）与 `hex`/`base64` 字节级编辑（`regex` 不可用）；
 CRLF 文件按 LF 匹配、写回时恢复 CRLF。
 
 ---

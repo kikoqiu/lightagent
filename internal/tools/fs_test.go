@@ -296,7 +296,7 @@ func TestEditFileLiteral(t *testing.T) {
 	tool := NewEditFileTool()
 
 	res := tool.Execute(context.Background(), map[string]any{
-		"path": p, "old_text": "bar", "new_text": "BAR",
+		"path": p, "find": "bar", "content": "BAR",
 	})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
@@ -304,12 +304,15 @@ func TestEditFileLiteral(t *testing.T) {
 	if got := readFile(t, p); got != "foo BAR baz" {
 		t.Fatalf("content = %q", got)
 	}
+	if !strings.Contains(res.ForLLM, "mode=replace") {
+		t.Fatalf("result does not report the mode: %s", res.ForLLM)
+	}
 
 	res = tool.Execute(context.Background(), map[string]any{
-		"path": p, "old_text": "missing", "new_text": "x",
+		"path": p, "find": "missing", "content": "x",
 	})
 	if !res.IsError {
-		t.Fatal("expected an error when old_text is absent")
+		t.Fatal("expected an error when find is absent")
 	}
 }
 
@@ -317,10 +320,17 @@ func TestEditFileLiteralRequiresUnique(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "u.txt", "x x")
 	tool := NewEditFileTool()
 	res := tool.Execute(context.Background(), map[string]any{
-		"path": p, "old_text": "x", "new_text": "y",
+		"path": p, "find": "x", "content": "y",
 	})
 	if !res.IsError {
-		t.Fatal("expected an error when old_text is ambiguous")
+		t.Fatal("expected an error when find is ambiguous")
+	}
+	// The error points at the mode that accepts several matches.
+	if !strings.Contains(res.ForLLM, "mode='regex'") {
+		t.Fatalf("error does not suggest regex mode: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "x x" {
+		t.Fatalf("ambiguous edit modified the file: %q", got)
 	}
 }
 
@@ -328,13 +338,94 @@ func TestEditFileRegex(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "r.txt", "a1 b2 c3")
 	tool := NewEditFileTool()
 	res := tool.Execute(context.Background(), map[string]any{
-		"path": p, "old_text": `([a-z])(\d)`, "new_text": "$2$1", "regex": true,
+		"path": p, "find": `([a-z])(\d)`, "content": "$2$1", "mode": "regex",
 	})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
 	if got := readFile(t, p); got != "1a 2b 3c" {
 		t.Fatalf("content = %q", got)
+	}
+}
+
+// TestEditFileRegexAllowsNonUnique pins the difference from literal mode: a
+// pattern matching several times is not an error, every match is replaced and
+// the result reports how many were matched.
+func TestEditFileRegexAllowsNonUnique(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "r_many.txt", "a1 b2 c3")
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": `[a-z]`, "content": "X", "mode": "regex",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "X1 X2 X3" {
+		t.Fatalf("content = %q", got)
+	}
+	if !strings.Contains(res.ForLLM, "matched 3 occurrence(s)") {
+		t.Fatalf("result does not report the match count: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileInsertBeforeMatch pins insert mode: content lands in front of the
+// match and the match itself stays untouched, so the same find can be used
+// again.
+func TestEditFileInsertBeforeMatch(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "ins.txt", "alpha beta gamma")
+	tool := NewEditFileTool()
+
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "beta", "content": "BEFORE ", "mode": "insert",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "alpha BEFORE beta gamma" {
+		t.Fatalf("content = %q", got)
+	}
+
+	res = tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "beta", "content": "AGAIN ", "mode": "insert",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "alpha BEFORE AGAIN beta gamma" {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+// TestEditFileInsertRequiresUnique keeps the literal uniqueness rule in insert
+// mode: an ambiguous target is rejected and the file is left alone.
+func TestEditFileInsertRequiresUnique(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "ins_u.txt", "x x")
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "x", "content": "y", "mode": "insert",
+	})
+	if !res.IsError {
+		t.Fatal("expected an error when the insert target is ambiguous")
+	}
+	if got := readFile(t, p); got != "x x" {
+		t.Fatalf("ambiguous insert modified the file: %q", got)
+	}
+}
+
+// TestEditFileInvalidMode pins the argument contract: an unknown mode value is
+// rejected before the file is touched.
+func TestEditFileInvalidMode(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "m.txt", "one")
+	tool := NewEditFileTool()
+
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "one", "content": "two", "mode": "replace-all",
+	})
+	if !res.IsError || !strings.Contains(res.ForLLM, "invalid mode") {
+		t.Fatalf("unknown mode was not rejected: %+v", res)
+	}
+	if got := readFile(t, p); got != "one" {
+		t.Fatalf("an invalid call modified the file: %q", got)
 	}
 }
 
@@ -376,7 +467,7 @@ func TestEditFileGbk(t *testing.T) {
 
 	tool := NewEditFileTool()
 	res := tool.Execute(context.Background(), map[string]any{
-		"path": p, "old_text": "世界", "new_text": "地球", "encoding": "gbk",
+		"path": p, "find": "世界", "content": "地球", "encoding": "gbk",
 	})
 	if res.IsError {
 		t.Fatalf("edit failed: %s", res.ForLLM)
@@ -395,13 +486,61 @@ func TestEditFileCRLFPreserved(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "crlf.txt", "one\r\ntwo\r\n")
 	tool := NewEditFileTool()
 	res := tool.Execute(context.Background(), map[string]any{
-		"path": p, "old_text": "two", "new_text": "TWO",
+		"path": p, "find": "two", "content": "TWO",
 	})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
 	if got := readFile(t, p); got != "one\r\nTWO\r\n" {
 		t.Fatalf("CRLF not preserved: %q", got)
+	}
+}
+
+// TestEditFileInsertCRLFPreserved keeps the line-ending contract in insert
+// mode too: the restored CRLF file gets CRLF line endings inside the inserted
+// text as well.
+func TestEditFileInsertCRLFPreserved(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "crlf_ins.txt", "one\r\ntwo\r\n")
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "two", "content": "mid\n", "mode": "insert",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "one\r\nmid\r\ntwo\r\n" {
+		t.Fatalf("CRLF not preserved: %q", got)
+	}
+}
+
+// TestEditFileBinaryInsert covers the byte-level path: hex payloads are matched
+// and content is inserted in front of the find bytes.
+func TestEditFileBinaryInsert(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "bin.dat")
+	if err := os.WriteFile(p, []byte{0x00, 0x01, 0x02, 0x03}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "0102", "content": "ff", "mode": "insert", "encoding": "hex",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	got, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{0x00, 0xff, 0x01, 0x02, 0x03}; string(got) != string(want) {
+		t.Fatalf("bytes = %x, want %x", got, want)
+	}
+
+	res = tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "0102", "content": "ff", "mode": "regex", "encoding": "hex",
+	})
+	if !res.IsError {
+		t.Fatal("expected an error: regex mode is not available for binary payloads")
 	}
 }
 

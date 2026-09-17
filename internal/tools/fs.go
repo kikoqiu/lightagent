@@ -576,7 +576,19 @@ func noFinalNewlineNote() string {
 		"(mode='a'), start its content with one newline: \\n, or \\r\\n for a CRLF file.]"
 }
 
-// EditFileTool edits a file by replacing old_text with new_text.
+// Edit modes accepted by the "mode" argument of EditFileTool.
+const (
+	// editModeReplace swaps the matched literal for content (default).
+	editModeReplace = "replace"
+	// editModeInsert writes content in front of the matched literal.
+	editModeInsert = "insert"
+	// editModeRegex treats find as an RE2 pattern and replaces every match.
+	editModeRegex = "regex"
+)
+
+// EditFileTool edits a file by locating find and writing content at that spot:
+// the match is replaced (default), content is inserted in front of it, or the
+// pattern's every match is replaced.
 type EditFileTool struct{}
 
 // NewEditFileTool creates the editor.
@@ -587,10 +599,14 @@ func (t *EditFileTool) Name() string { return "edit_file" }
 
 // Description implements Tool.
 func (t *EditFileTool) Description() string {
-	return "Edit a file by replacing old_text with new_text. Literal (default): old_text must " +
-		"appear exactly once. regex=true: old_text is an RE2 regex, every match is replaced, and " +
-		"new_text may reference capture groups with $1, $2, ... ($$ = literal $). JSON escaping " +
-		"applies: \\n = newline, \\\\n = literal backslash-n. Only utf8 is supported."
+	return "Edit a file by locating find and writing content at that spot. mode='replace' (default): " +
+		"find is a literal that must appear exactly once and is replaced by content. mode='insert': " +
+		"unlike replace, content is prepended before the find (find is preserved, result: content + find). Note that insert is not insert line, no newline is automatically added. When find is not unique, an error will be reported, you can retry then. " +
+		"mode='regex': find is an RE2 pattern, one or many matches are allowed and every match is replaced " +
+		"by content, which may reference capture groups with $1, $2, ... ($$ = literal $). JSON escaping " +
+		"applies: \\n = newline, \\\\n = literal backslash-n. encoding: 'utf8' (default) text; 'hex'/'base64' literal byte-sequence " +
+		"edits (mode='regex' rejected); other values are charset labels (gbk, big5, shift_jis, " +
+		"windows-1252) for non-UTF-8 files."
 }
 
 // Parameters implements Tool.
@@ -602,18 +618,18 @@ func (t *EditFileTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "Path of the file to edit.",
 			},
-			"old_text": map[string]any{
+			"find": map[string]any{
 				"type":        "string",
-				"description": "Text to find: exact literal (must occur exactly once), or an RE2 regex when regex=true.",
+				"description": "Text to locate: an exact literal for mode='replace'/'insert' (must occur exactly once), an RE2 pattern for mode='regex', or the hex/base64 byte sequence when encoding is a binary representation.",
 			},
-			"new_text": map[string]any{
+			"content": map[string]any{
 				"type":        "string",
-				"description": "Replacement text; with regex=true use $1, $2, ... for capture groups.",
+				"description": "Text written at the match: the replacement for mode='replace'/'regex' (use $1, $2, ... for capture groups), or the text inserted before the match for mode='insert'.",
 			},
-			"regex": map[string]any{
-				"type":        "boolean",
-				"default":     false,
-				"description": "Treat old_text as an RE2 regex and replace every match.",
+			"mode": map[string]any{
+				"type":        "string",
+				"default":     "replace",
+				"description": "'replace' (default) swaps the unique literal find for content; 'insert' writes content in front of the unique literal find; 'regex' treats find as an RE2 pattern and replaces every match.",
 			},
 			"encoding": map[string]any{
 				"type":        "string",
@@ -621,7 +637,22 @@ func (t *EditFileTool) Parameters() map[string]any {
 				"description": "'utf8' (default) text; 'hex'/'base64' binary payloads (regex disabled); other values are charset labels (gbk, big5, shift_jis, windows-1252) for non-UTF-8 files.",
 			},
 		},
-		"required": []string{"path", "old_text", "new_text"},
+		"required": []string{"path", "find", "content"},
+	}
+}
+
+// parseEditMode validates the "mode" argument; an omitted mode means a literal
+// replacement.
+func parseEditMode(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", editModeReplace:
+		return editModeReplace, nil
+	case editModeInsert:
+		return editModeInsert, nil
+	case editModeRegex:
+		return editModeRegex, nil
+	default:
+		return "", fmt.Errorf("invalid mode %q: use 'replace' (default), 'insert' or 'regex'", raw)
 	}
 }
 
@@ -631,19 +662,26 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	if !ok || trimSpace(path) == "" {
 		return Fail("path is required")
 	}
-	oldText, ok := stringArg(args, "old_text")
+	find, ok := stringArg(args, "find")
 	if !ok {
-		return Fail("old_text is required")
+		return Fail("find is required")
 	}
-	newText, ok := stringArg(args, "new_text")
+	content, ok := stringArg(args, "content")
 	if !ok {
-		return Fail("new_text is required")
+		return Fail("content is required")
+	}
+	if find == "" {
+		return Fail("find must not be empty")
 	}
 	encodingRaw, _ := stringArg(args, "encoding")
 	encoding := normalizeContentEncoding(encodingRaw)
-	regexMode := boolArg(args, "regex")
-	if regexMode && contentEncodingIsBinary(encoding) {
-		return Fail(fmt.Sprintf("regex mode is only supported with text encodings; binary edits with encoding=%s are literal byte-sequence replacements", encoding))
+	modeRaw, _ := stringArg(args, "mode")
+	mode, err := parseEditMode(modeRaw)
+	if err != nil {
+		return Fail(err.Error())
+	}
+	if mode == editModeRegex && contentEncodingIsBinary(encoding) {
+		return Fail(fmt.Sprintf("mode='regex' is only supported with text encodings; binary edits with encoding=%s are literal byte-sequence edits", encoding))
 	}
 	if !contentEncodingIsBinary(encoding) && encoding != contentEncodingUTF8 {
 		if _, encErr := lookupCharsetEncoding(encoding); encErr != nil {
@@ -660,7 +698,7 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	var newBytes []byte
 
 	if contentEncodingIsBinary(encoding) {
-		newBytes, matches, err = payloadReplaceContent(raw, encoding, oldText, newText)
+		newBytes, matches, err = payloadEditContent(raw, encoding, find, content, mode == editModeInsert)
 		if err != nil {
 			return Fail(err.Error())
 		}
@@ -675,10 +713,13 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 			text = normalizeTextToLF(text)
 		}
 		var after string
-		if regexMode {
-			after, matches, err = regexReplaceText(text, oldText, newText)
-		} else {
-			after, matches, err = literalReplaceText(text, oldText, newText)
+		switch mode {
+		case editModeRegex:
+			after, matches, err = regexReplaceText(text, find, content)
+		case editModeInsert:
+			after, matches, err = insertBeforeText(text, find, content)
+		default:
+			after, matches, err = literalReplaceText(text, find, content)
 		}
 		if err != nil {
 			return Fail(err.Error())
@@ -696,51 +737,86 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 		return Fail(err.Error())
 	}
 
-	msg := fmt.Sprintf("File edited: %s | encoding=%s | replaced %d occurrence(s)", path, encoding, matches)
-	if regexMode {
-		msg += fmt.Sprintf(" | regex=%q", oldText)
-	}
-	return OK(msg)
+	return OK(editResultMessage(path, encoding, mode, find, matches))
 }
 
-// payloadReplaceContent decodes the old/new hex or base64 byte sequences and
-// replaces a unique occurrence of the old bytes in the file content.
-func payloadReplaceContent(content []byte, encoding, oldPayload, newPayload string) ([]byte, int, error) {
-	oldBytes, err := decodeContentPayload(oldPayload, encoding)
+// editResultMessage reports what the edit did, including how many occurrences
+// were matched: regex mode may legitimately hit more than one.
+func editResultMessage(path, encoding, mode, find string, matches int) string {
+	switch mode {
+	case editModeInsert:
+		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s | content inserted before the match (1 occurrence)",
+			path, mode, encoding)
+	case editModeRegex:
+		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s | regex %q matched %d occurrence(s), all replaced",
+			path, mode, encoding, find, matches)
+	default:
+		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s | replaced %d occurrence(s)",
+			path, mode, encoding, matches)
+	}
+}
+
+// payloadEditContent decodes the find/content hex or base64 byte sequences and
+// edits the unique occurrence of the find bytes: replace swaps them for the
+// content bytes, insert writes the content bytes in front of them.
+func payloadEditContent(fileContent []byte, encoding, findPayload, contentPayload string, insert bool) ([]byte, int, error) {
+	findBytes, err := decodeContentPayload(findPayload, encoding)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid %s old_text: %w", encoding, err)
+		return nil, 0, fmt.Errorf("invalid %s find: %w", encoding, err)
 	}
-	newBytes, err := decodeContentPayload(newPayload, encoding)
+	newBytes, err := decodeContentPayload(contentPayload, encoding)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid %s new_text: %w", encoding, err)
+		return nil, 0, fmt.Errorf("invalid %s content: %w", encoding, err)
 	}
-	if len(oldBytes) == 0 {
-		return nil, 0, fmt.Errorf("old_text decodes to an empty byte sequence; nothing to replace")
+	if len(findBytes) == 0 {
+		return nil, 0, fmt.Errorf("find decodes to an empty byte sequence; nothing to edit")
 	}
-	count := bytes.Count(content, oldBytes)
+	count := bytes.Count(fileContent, findBytes)
 	if count == 0 {
-		return nil, 0, fmt.Errorf("old_text bytes not found in file")
+		return nil, 0, fmt.Errorf("find bytes not found in file")
 	}
 	if count > 1 {
-		return nil, 0, fmt.Errorf("old_text bytes appear %d times. Please provide more context to make it unique", count)
+		return nil, 0, fmt.Errorf("find bytes appear %d times. Please provide more context to make it unique", count)
 	}
-	return bytes.Replace(content, oldBytes, newBytes, 1), 1, nil
+	if !insert {
+		return bytes.Replace(fileContent, findBytes, newBytes, 1), 1, nil
+	}
+	at := bytes.Index(fileContent, findBytes)
+	updated := make([]byte, 0, len(fileContent)+len(newBytes))
+	updated = append(updated, fileContent[:at]...)
+	updated = append(updated, newBytes...)
+	updated = append(updated, fileContent[at:]...)
+	return updated, 1, nil
 }
 
-// literalReplaceText replaces a unique literal occurrence of oldText.
-func literalReplaceText(text, oldText, newText string) (string, int, error) {
-	if !strings.Contains(text, oldText) {
-		return "", 0, fmt.Errorf("old_text not found in file. Make sure it matches exactly")
+// literalReplaceText replaces a unique literal occurrence of find.
+func literalReplaceText(text, find, content string) (string, int, error) {
+	count := strings.Count(text, find)
+	switch {
+	case count == 0:
+		return "", 0, fmt.Errorf("find not found in file. Make sure it matches exactly")
+	case count > 1:
+		return "", 0, fmt.Errorf("find appears %d times. Please provide more context to make it unique, or use mode='regex' to replace every match", count)
 	}
-	count := strings.Count(text, oldText)
-	if count > 1 {
-		return "", 0, fmt.Errorf("old_text appears %d times. Please provide more context to make it unique", count)
-	}
-	return strings.Replace(text, oldText, newText, 1), 1, nil
+	return strings.Replace(text, find, content, 1), 1, nil
 }
 
-// regexReplaceText replaces every RE2 match; newText may use $1, $2 groups.
-func regexReplaceText(text, pattern, newText string) (string, int, error) {
+// insertBeforeText inserts content immediately before the unique occurrence of
+// find; the match itself is left untouched.
+func insertBeforeText(text, find, content string) (string, int, error) {
+	at := strings.Index(text, find)
+	if at < 0 {
+		return "", 0, fmt.Errorf("find not found in file. Make sure it matches exactly")
+	}
+	if count := strings.Count(text, find); count > 1 {
+		return "", 0, fmt.Errorf("find appears %d times. Please provide more context to make it unique, or use mode='regex'", count)
+	}
+	return text[:at] + content + text[at:], 1, nil
+}
+
+// regexReplaceText replaces every RE2 match, however many there are; content
+// may use $1, $2 groups.
+func regexReplaceText(text, pattern, content string) (string, int, error) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return "", 0, fmt.Errorf("invalid regex pattern: %w", err)
@@ -749,5 +825,5 @@ func regexReplaceText(text, pattern, newText string) (string, int, error) {
 	if len(matches) == 0 {
 		return "", 0, fmt.Errorf("regex pattern %q does not match any content in the file", pattern)
 	}
-	return re.ReplaceAllString(text, newText), len(matches), nil
+	return re.ReplaceAllString(text, content), len(matches), nil
 }
