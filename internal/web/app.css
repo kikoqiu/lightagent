@@ -228,6 +228,16 @@
     border-radius:16px 16px 5px 16px;
     padding:9px 13px; box-shadow:var(--shadow);
   }
+  /* A message the page sent while the turn was still running: it is shown right
+     away, but marked until the agent sends it (the running reply keeps streaming
+     above it). The mark is the role's suffix, so the row needs no extra node. */
+  .user.pending .role { color:var(--fg-dim); }
+  .user.pending .role::after { content:" · pending"; }
+  .user.pending .text {
+    background:linear-gradient(180deg, rgba(90,162,255,.08), rgba(90,162,255,.04));
+    border-style:dashed; border-color:rgba(90,162,255,.28);
+    color:var(--fg-muted); box-shadow:none;
+  }
   .assistant .role { color:var(--accent); }
   .assistant .text { border-left:2px solid rgba(90,162,255,.35); padding-left:12px; }
 

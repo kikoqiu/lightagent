@@ -374,6 +374,35 @@ func TestScrollbackSkipsEmptyToolResult(t *testing.T) {
 	}
 }
 
+// TestSteeringRowOrder pins the page's handling of a message sent while the turn
+// is running: it is drawn right away and marked pending, every row the running
+// reply produces is inserted *above* it (so the previous round's feedback stays
+// first), and the row becomes an ordinary one when the agent sends the message. The
+// queued badge counts what is still waiting.
+func TestSteeringRowOrder(t *testing.T) {
+	for _, want := range []string{
+		"function addPendingRow(text)",
+		"function settlePendingRow(text)",
+		"addPendingRow(text);",
+		"settlePendingRow(ev.text || '')",
+		// Transcript rows are inserted before the pending messages.
+		"if (anchor) { log.insertBefore(row, anchor); } else { log.appendChild(row); }",
+		"pendingRows = [];",
+		// The badge counts the messages this page sent while the turn was running.
+		"var queued = 0;",
+		"queuedText()",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	for _, want := range []string{".user.pending .role::after", `content:" · pending"`} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the stylesheet is missing %q", want)
+		}
+	}
+}
+
 // TestHistorySummaryMarksTheTruncationPoint pins the reload path: a resumed
 // conversation replays the compressed-context summary as its first row, because
 // everything before the cut is gone and the summary is all that is left of it.

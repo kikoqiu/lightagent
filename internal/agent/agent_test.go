@@ -199,11 +199,15 @@ func newTestAgent(t *testing.T) *Agent {
 	return New(cfg, nil, tools.NewRegistry(), NewBus())
 }
 
-// TestDrainSteering verifies that queued steering messages become user turns.
+// TestDrainSteering verifies that queued steering messages become user turns and
+// are announced (with the client they came from) at that very moment: the row is
+// published when the message enters the conversation, not when it was queued.
 func TestDrainSteering(t *testing.T) {
 	a := newTestAgent(t)
-	a.steerCh <- "one"
-	a.steerCh <- "two"
+	events, cancel := a.Bus().Subscribe()
+	defer cancel()
+	a.steerCh <- steerMessage{source: "web", text: "one"}
+	a.steerCh <- steerMessage{source: "cli", text: "two"}
 
 	a.drainSteering()
 
@@ -217,6 +221,240 @@ func TestDrainSteering(t *testing.T) {
 	if history[1].Role != "user" || history[1].Content != "two" {
 		t.Fatalf("second = %+v", history[1])
 	}
+	for _, want := range []steerMessage{{source: "web", text: "one"}, {source: "cli", text: "two"}} {
+		select {
+		case ev := <-events:
+			if ev.Type != EventUser || ev.Text != want.text || ev.Source != want.source {
+				t.Fatalf("event = %+v, want user %q from %s", ev, want.text, want.source)
+			}
+		default:
+			t.Fatalf("no user event was announced for %q", want.text)
+		}
+	}
+}
+
+// TestSteeringDuringTheToolRoundLandsAfterTheRound covers the tool loop: a message
+// that arrives while the round's tool is still running cannot be wedged between the
+// assistant message and its tool feedback (a provider requires the tool messages to
+// follow the tool_calls message directly), so it joins the conversation after the
+// whole round — exactly where the model sees it — and the row is drawn there.
+func TestSteeringDuringTheToolRoundLandsAfterTheRound(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"calling the tool","tool_calls":[{"id":"c1","type":"function","function":{"name":"block","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"after steering"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	reg := tools.NewRegistry()
+	tool := &blockingTool{started: make(chan struct{}), release: make(chan struct{})}
+	reg.Register(tool)
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Submit("ask")
+	select {
+	case <-tool.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tool never ran")
+	}
+	// The round is still in flight: the message waits for its end.
+	a.Submit("steer")
+	close(tool.release)
+
+	got := drainEvents(t, events)
+	want := "user:ask, assistant:calling the tool, tool_call:block, tool_result:block, user:steer, assistant:after steering"
+	if order := strings.Join(eventOrder(got), ", "); order != want {
+		t.Fatalf("event order = %q, want %q", order, want)
+	}
+	if hist := a.History(); len(hist) != 5 {
+		t.Fatalf("history = %d messages, want 5", len(hist))
+	}
+}
+
+// TestSteeringDuringFinalReplyContinuesTheTurn covers a steering message that
+// arrives while the last reply is still streaming: the reply is not the end of the
+// turn then, so the message must reach the model in this very turn instead of
+// sitting in the queue until the user types again. It is announced once (the
+// front-ends already drew its row when it was queued).
+func TestSteeringDuringFinalReplyContinuesTheTurn(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"first part\"}}]}\n\n")
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			once.Do(func() { close(started) })
+			// Hold the reply open until the steering message has been queued.
+			<-release
+		} else {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"after steering\"}}]}\n\n")
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("ask")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first model call never started")
+	}
+	// The reply is streaming: this joins the running turn as steering.
+	a.Submit("steer")
+	close(release)
+
+	got := drainEvents(t, events)
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("model calls = %d, want 2: the steering message must be answered in this turn", n)
+	}
+	// The rows must follow the conversation: the steering message is announced
+	// when the turn folds it in, i.e. after the reply it interrupted.
+	want := "user:ask, assistant:first part, user:steer, assistant:after steering"
+	if order := strings.Join(eventOrder(got), ", "); order != want {
+		t.Fatalf("event order = %q, want %q", order, want)
+	}
+	hist := a.History()
+	roles := make([]string, 0, len(hist))
+	for _, m := range hist {
+		roles = append(roles, m.Role+":"+m.Content)
+	}
+	if got := strings.Join(roles, ", "); got != want {
+		t.Fatalf("history = %q, want %q", got, want)
+	}
+}
+
+// TestQueuedSteeringStartsAFollowUpTurn covers the other end of the turn: a
+// steering message that is still queued when the loop runs out (here the only
+// iteration is spent on a tool round) is not stranded. It is announced as a
+// silent user event — its row was drawn when it was queued — and answered by a
+// turn of its own.
+func TestQueuedSteeringStartsAFollowUpTurn(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch call {
+		case 1:
+			once.Do(func() { close(started) })
+			// Hold the response until the steering message has been queued.
+			<-release
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"stub","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+		default:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"after steering"},"finish_reason":"stop"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	// One iteration: it is spent on the tool round, so the queued steering
+	// message has no iteration left and the follow-up turn has to run it.
+	cfg.Agent.MaxToolIterations = 1
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "stub", desc: "stub"})
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Submit("ask")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first model call never started")
+	}
+	a.Submit("steer")
+	close(release)
+
+	got := drainTurns(t, events, 2)
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("model calls = %d, want the follow-up turn to ask the model again", n)
+	}
+	// The row is announced when the follow-up turn folds the message in, so it
+	// lands after everything the previous turn produced.
+	wantOrder := "user:ask, tool_call:stub, tool_result:stub, user:steer, assistant:after steering"
+	if order := strings.Join(eventOrder(got), ", "); order != wantOrder {
+		t.Fatalf("event order = %q, want %q", order, wantOrder)
+	}
+	hist := a.History()
+	roles := make([]string, 0, len(hist))
+	for _, m := range hist {
+		roles = append(roles, m.Role+":"+m.Content)
+	}
+	want := "user:ask, assistant:, tool:ok, user:steer, assistant:after steering"
+	if got := strings.Join(roles, ", "); got != want {
+		t.Fatalf("history = %q, want %q", got, want)
+	}
+}
+
+// eventOrder renders the events a front-end draws a row for as a compact
+// "kind:label" list, so a test can pin the order the transcript is drawn in.
+func eventOrder(events []Event) []string {
+	var out []string
+	for _, ev := range events {
+		switch ev.Type {
+		case EventUser, EventAssistant:
+			out = append(out, string(ev.Type)+":"+ev.Text)
+		case EventToolCall, EventToolResult:
+			out = append(out, string(ev.Type)+":"+ev.Name)
+		}
+	}
+	return out
 }
 
 // TestBuildMessagesIncludesSummary verifies the compressed summary is rendered
@@ -743,6 +981,30 @@ func drainEvents(t *testing.T, events <-chan Event) []Event {
 			}
 		case <-deadline:
 			t.Fatal("the turn did not finish")
+			return got
+		}
+	}
+}
+
+// drainTurns collects events until n turns have ended (each turn ends with its
+// own turn_done).
+func drainTurns(t *testing.T, events <-chan Event, n int) []Event {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	var got []Event
+	done := 0
+	for {
+		select {
+		case ev := <-events:
+			got = append(got, ev)
+			if ev.Type == EventTurnDone {
+				done++
+				if done >= n {
+					return got
+				}
+			}
+		case <-deadline:
+			t.Fatalf("only %d of %d turns finished", done, n)
 			return got
 		}
 	}

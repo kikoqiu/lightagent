@@ -9,6 +9,13 @@
   var sendEl = document.getElementById('send');
   var current = null;
   var currentText = '';
+  // pendingRows holds the rows of messages this page submitted while the turn was
+  // running (steering). Such a row is drawn right away, marked as pending, and
+  // every row the running reply still produces is inserted *before* it: the
+  // previous round's feedback always stays above the inserted message. When the
+  // agent sends the message the row becomes an ordinary one (see the user case in
+  // render), because that is the moment the message joins the conversation.
+  var pendingRows = [];
   var pendingRender = null;
   // reasoningRow/reasoningText stream the model's "thinking" (reasoning_delta);
   // it is finalized before the visible answer is drawn.
@@ -58,6 +65,16 @@
 
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
+  // queued counts the messages this page sent while the turn was already
+  // running. Their rows appear when the agent folds them into the conversation
+  // (after the reply they interrupted), so until then this count in the running
+  // pill is the only acknowledgement that they went through.
+  var queued = 0;
+
+  function queuedText() {
+    return queued > 0 ? ' · ' + queued + ' queued' : '';
+  }
+
   function elapsedText(ms) {
     var s = ms / 1000;
     if (s < 60) { return s.toFixed(1) + 's'; }
@@ -66,7 +83,7 @@
   }
 
   function tickTurn() {
-    if (elapsedEl) { elapsedEl.textContent = elapsedText(Date.now() - turnStart); }
+    if (elapsedEl) { elapsedEl.textContent = elapsedText(Date.now() - turnStart) + queuedText(); }
   }
 
   // A steering message joins the running turn, so an already-ticking clock is
@@ -84,12 +101,20 @@
     if (elapsedEl) { elapsedEl.textContent = ''; }
   }
 
+  // running reports whether a turn is in progress (see setRunning).
+  var running = false;
+
   // setRunning shows or hides the "running" indicator (and the Stop button). A
   // turn is in progress between a user message and the matching turn_done.
   function setRunning(on) {
     if (replaying) { return; }
+    running = !!on;
     if (on) { runEl.classList.add('on'); stopEl.classList.add('on'); startTurnTimer(); }
-    else { runEl.classList.remove('on'); stopEl.classList.remove('on'); stopTurnTimer(); }
+    else {
+      // The turn is over: nothing can be waiting to be folded in any more.
+      queued = 0;
+      runEl.classList.remove('on'); stopEl.classList.remove('on'); stopTurnTimer();
+    }
   }
 
   // setUsage renders the context-usage badge in the header and mirrors the
@@ -174,7 +199,8 @@
     reasoningText = '';
   }
 
-  function addRow(cls, role, text, renderMD) {
+  // buildRow creates one transcript row.
+  function buildRow(cls, role, text, renderMD) {
     var row = document.createElement('div');
     row.className = 'row ' + cls;
     if (role) {
@@ -186,11 +212,59 @@
     var t = document.createElement('span');
     setSpan(t, text, renderMD);
     row.appendChild(t);
+    return row;
+  }
+
+  // placeRow adds a transcript row to the log: at the end, or before the pending
+  // messages when some are waiting. The running reply's output is inserted before
+  // them, so it always stays above the message that interrupted it.
+  function placeRow(row) {
+    var anchor = pendingRows.length ? pendingRows[0].el : null;
     // Follow the new row only if the reader was at the bottom (sampled first).
+    var follow = atBottom();
+    if (anchor) { log.insertBefore(row, anchor); } else { log.appendChild(row); }
+    if (follow) { pinBottom(); }
+  }
+
+  function addRow(cls, role, text, renderMD) {
+    var row = buildRow(cls, role, text, renderMD);
+    placeRow(row);
+    return row;
+  }
+
+  // addPendingRow draws a message submitted here while the turn was running. It is
+  // appended after the pending rows already waiting (submission order) and stays
+  // marked until the agent sends it: settlePendingRow then turns it into an
+  // ordinary row, in place.
+  function addPendingRow(text) {
+    var row = buildRow('user pending', 'you', text, false);
+    appendRow(row);
+    pendingRows.push({ el: row, text: text });
+    return row;
+  }
+
+  // settlePendingRow turns the pending row of a message the agent has just sent
+  // into an ordinary one. It reports whether a row was converted; the row keeps
+  // its place, which is where the message entered the conversation.
+  function settlePendingRow(text) {
+    for (var i = 0; i < pendingRows.length; i++) {
+      if (pendingRows[i].text !== text) { continue; }
+      var row = pendingRows[i].el;
+      pendingRows.splice(i, 1);
+      // The pending mark rides on the class alone; the text is already the final
+      // one, since it is the message the agent recorded.
+      row.className = 'row user';
+      return true;
+    }
+    return false;
+  }
+
+  // appendRow puts a row at the very end of the log (the pending messages it
+  // queues behind), following it when the reader was at the bottom.
+  function appendRow(row) {
     var follow = atBottom();
     log.appendChild(row);
     if (follow) { pinBottom(); }
-    return row;
   }
 
   function setRow(el, text, renderMD) {
@@ -274,10 +348,9 @@
       box.appendChild(raw);
     }
     row.appendChild(box);
-    // Follow the new row only if the reader was at the bottom (sampled first).
-    var follow = atBottom();
-    log.appendChild(row);
-    if (follow) { pinBottom(); }
+    // A tool row belongs to the running reply, so it goes above the pending
+    // messages too.
+    placeRow(row);
     return row;
   }
 
@@ -422,7 +495,16 @@
     // block instead of an [info] line; it arrives either live with a compacted
     // event or replayed from the history frame.
     if (kind === 'summary') { addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN); return; }
-    if (kind === 'user') { setRunning(true); }
+    if (kind === 'user') {
+      setRunning(true);
+      // A message this page sent while the turn was running is being sent now:
+      // its pending row becomes an ordinary one, in place (it already sits after
+      // everything the interrupted reply produced).
+      if (settlePendingRow(ev.text || '')) {
+        if (queued) { queued--; tickTurn(); }
+        return;
+      }
+    }
     if (kind === 'turn_done' || kind === 'interrupted') { setRunning(false); }
     if (kind === 'reasoning_delta') {
       if (!reasoningRow) { reasoningRow = addRow('reasoning', 'thinking', '', MARKDOWN); }
@@ -478,6 +560,12 @@
     pinBottom();
     current = null;
     currentText = '';
+    // The rebuild replaces every row, so the open thinking row of a stream that
+    // is gone with it is dropped too (the next chunk draws a fresh one). Pending
+    // messages are gone as well: the agent draws their rows when it sends them.
+    reasoningRow = null;
+    reasoningText = '';
+    pendingRows = [];
     // The rows the voice was reading are gone: drop its buffers and silence it.
     TTS.reset();
     replaying = true;
@@ -558,6 +646,14 @@
     // (also makes the pending user row count as at-the-bottom) even when the
     // reader had scrolled back through history.
     pinBottom();
+    // A message sent while a turn is running joins it (steering): its row is drawn
+    // right away, marked pending, and the running reply keeps streaming above it
+    // until the agent sends it (addPendingRow / settlePendingRow).
+    if (running) {
+      addPendingRow(text);
+      queued++;
+      tickTurn();
+    }
     ws.send(JSON.stringify({ text: text }));
   }
   // autoGrow keeps the composer one row tall until the message wraps, then it

@@ -96,6 +96,12 @@ type CLI struct {
 	// reasoningBuf holds the still-arriving partial reasoning line: complete
 	// lines are committed dim as they arrive, the tail stays a preview.
 	reasoningBuf string
+	// pendingSends holds the messages typed here that the agent has not sent yet:
+	// they were queued behind a running turn. A terminal cannot move a row that is
+	// already printed, so the transcript row is the official one (printed when the
+	// message enters the conversation, i.e. after the reply it interrupted) while
+	// the pending line keeps the text visible in the prompt region until then.
+	pendingSends []string
 	// ctxTokens/ctxWindow are the latest context-usage numbers reported by the
 	// agent. They are drawn on the prompt row so the usage stays visible while
 	// a turn runs (and after it ends); zero means nothing was reported yet.
@@ -285,11 +291,20 @@ const emptyPromptHint = "[Ctrl+J to Send]"
 // first line, i.e. one prompt label wide.
 var inputIndent = strings.Repeat(" ", displayColumns(promptLabel))
 
-// userLine renders a user message with the prompt label; multi-line messages are
-// indented so they stay one visual block.
-func userLine(text string) string {
-	return termcolor.Color(promptLabel, termcolor.BoldCode, termcolor.GreenCode) + indentAfterFirst(text, inputIndent)
+// messageLine renders one user message: the label it is attributed to, followed
+// by the text with continuation lines indented so a multi-line message stays one
+// visual block.
+func messageLine(source, text string) string {
+	label := promptLabel
+	if source != "" && source != "cli" {
+		label = "you(" + source + ")> "
+	}
+	return termcolor.Color(label, termcolor.BoldCode, termcolor.GreenCode) +
+		indentAfterFirst(text, strings.Repeat(" ", displayColumns(label)))
 }
+
+// userLine renders a message typed in this terminal with the input prompt label.
+func userLine(text string) string { return messageLine("", text) }
 
 // brailleSpinnerFrames is the smooth Unicode spinner. It needs a console font
 // with braille coverage, which the legacy Windows console does not have (there
@@ -395,6 +410,13 @@ func (c *CLI) promptRegionLocked() []promptRow {
 	// does: a row wider than the terminal would be wrapped by the console itself,
 	// which the in-place repaint (it steps the caret between rows) cannot follow.
 	rows = append(rows, wrapPreviewRows(c.preview, c.rowLimit())...)
+	// Messages typed here that are still waiting behind the running turn: dim
+	// "(pending)" lines between the streaming preview and the prompt. They show
+	// the text right away without putting a row into the transcript, which stays
+	// ordered (the official row is printed when the message is sent).
+	for _, text := range c.pendingSends {
+		rows = append(rows, pendingMessageRows(text, c.rowLimit())...)
+	}
 	head, headWidth := c.promptHeadLocked()
 	limit := c.rowLimit()
 	if len(c.input) > 0 {
@@ -640,6 +662,33 @@ func wrapPreviewRows(pending string, limit int) []promptRow {
 	if len(rows) > maxPreviewRows {
 		rows = rows[len(rows)-maxPreviewRows:]
 	}
+	return rows
+}
+
+// pendingSuffix marks a message typed here that the agent has not sent yet.
+const pendingSuffix = " (pending)"
+
+// pendingMessageRows lays one still-waiting message out as the prompt-region rows
+// it occupies: the prompt label plus the text, wrapped and indented exactly like
+// the input box. The whole line is dim and the last row carries the pending mark.
+func pendingMessageRows(text string, limit int) []promptRow {
+	var rows []promptRow
+	for i, line := range strings.Split(text, "\n") {
+		prefix, prefixWidth := promptLabel, displayColumns(promptLabel)
+		if i > 0 {
+			prefix, prefixWidth = inputIndent, displayColumns(inputIndent)
+		}
+		rows = append(rows, wrapInputRows(prefix, prefixWidth, line, limit)...)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	for i := range rows {
+		rows[i].text = termcolor.DimText(rows[i].text)
+	}
+	last := len(rows) - 1
+	rows[last].text += termcolor.DimText(pendingSuffix)
+	rows[last].width += displayColumns(pendingSuffix)
 	return rows
 }
 
@@ -960,7 +1009,7 @@ func (c *CLI) runRaw(ctx context.Context, reader termReader) error {
 				c.redrawInput()
 				continue
 			}
-			exit := c.dispatch(ctx, text, true)
+			exit := c.dispatch(ctx, text)
 			if exit {
 				c.shutdown()
 				return nil
@@ -983,21 +1032,47 @@ func (c *CLI) redrawInput() {
 }
 
 // dispatch routes one submitted line: slash commands are handled locally, every
-// other line goes to the agent. When echo is true the message is printed first
-// (raw mode hides the editor region on submit). It returns true to exit.
-func (c *CLI) dispatch(ctx context.Context, line string, echo bool) bool {
+// other line goes to the agent. The message is not echoed here: the agent
+// announces it when it enters the conversation, so its row is drawn exactly where
+// it belongs — after the reply it interrupted when the turn was already running.
+// While such a message waits, its text stays visible as a pending line above the
+// prompt (see queuePendingSend). It returns true to exit.
+func (c *CLI) dispatch(ctx context.Context, line string) bool {
 	if slash.IsCommandLine(line) {
 		return c.handleCommand(ctx, line)
-	}
-	if echo {
-		c.write(userLine(line) + "\n")
 	}
 	busy := c.agent.Busy()
 	c.agent.SubmitFrom("cli", line)
 	if busy {
-		c.write(termcolor.DimText("(inserted into the running turn)") + "\n")
+		c.queuePendingSend(line)
 	}
 	return false
+}
+
+// queuePendingSend shows a message typed here that is waiting behind the running
+// turn: the prompt region carries it as a dim "(pending)" line until the agent
+// sends it, when the official row is printed and the line goes away. Modes without
+// a prompt region (the line scanner, a one-shot run) get a dim note instead.
+func (c *CLI) queuePendingSend(text string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.editing {
+		c.pendingSends = append(c.pendingSends, text)
+		c.printPromptLocked()
+		return
+	}
+	c.outLocked(termcolor.DimText("(queued; it joins the conversation after the current reply)") + "\n")
+}
+
+// settlePendingSendLocked drops the pending line of a message that has just been
+// sent, since the official row is written right after. The caller must hold c.mu.
+func (c *CLI) settlePendingSendLocked(text string) {
+	for i, pending := range c.pendingSends {
+		if pending == text {
+			c.pendingSends = append(c.pendingSends[:i], c.pendingSends[i+1:]...)
+			return
+		}
+	}
 }
 
 // PromptResult is the JSON document printed by a one-shot run with --json.
@@ -1130,7 +1205,7 @@ func (c *CLI) runScanner(ctx context.Context) error {
 
 		if c.agent.Busy() {
 			c.agent.SubmitFrom("cli", line)
-			c.write(termcolor.DimText("(inserted into the running turn)") + "\n")
+			c.write(termcolor.DimText("(queued; it joins the conversation after the current reply)") + "\n")
 			continue
 		}
 		// Hide the prompt while the turn streams; it is restored on turn-done.
@@ -1266,17 +1341,21 @@ func (c *CLI) render(ev agent.Event) {
 		}
 		c.busy = true
 		c.spinner = spinnerFrames[0]
-		// Locally typed input is already echoed by the terminal/editor; only
-		// messages injected by other clients (e.g. the web mirror) are shown.
-		if ev.Source == "" || ev.Source == "cli" {
+		// A message is announced when it enters the conversation, which is the
+		// point the agent publishes it from, so the row belongs exactly here:
+		// after the reply it interrupted. Messages typed in this terminal are
+		// drawn from here too (the editor no longer echoes them itself, see
+		// dispatch); the line-scanner and batch modes show the reply only.
+		if (ev.Source == "" || ev.Source == "cli") && !c.editing {
 			return
 		}
-		c.flushMarkdownLocked()
-		label := promptLabel
-		if ev.Source != "" {
-			label = "you(" + ev.Source + ")> "
+		// A message typed here was waiting as a pending line above the prompt:
+		// the official row replaces it now.
+		if ev.Source == "" || ev.Source == "cli" {
+			c.settlePendingSendLocked(ev.Text)
 		}
-		c.outLocked(termcolor.Color(label, termcolor.BoldCode, termcolor.GreenCode) + ev.Text + "\n")
+		c.flushMarkdownLocked()
+		c.outLocked(messageLine(ev.Source, ev.Text) + "\n")
 	case agent.EventAssistantDelta:
 		if c.md != nil && c.markdownOn {
 			// Complete lines are rendered as they arrive; the partial line is
@@ -1361,6 +1440,14 @@ func (c *CLI) render(ev agent.Event) {
 		c.flushMarkdownLocked()
 		c.outLocked("\n")
 		c.streaming = false
+		// A queued message always turns into a row — the agent either folds it
+		// into this turn or starts a new one for it — so nothing should be
+		// pending once the agent is idle: drop what is left over (a message the
+		// steering queue had to reject) instead of leaving a stale line above the
+		// prompt.
+		if !c.agent.Busy() {
+			c.pendingSends = nil
+		}
 		if !c.editing && !c.batch {
 			c.printPromptLocked()
 		}

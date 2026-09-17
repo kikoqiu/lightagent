@@ -65,7 +65,7 @@ type Agent struct {
 	// to stop the current operation.
 	cancelTurn context.CancelFunc
 
-	steerCh chan string
+	steerCh chan steerMessage
 
 	persist func(history []llm.Message, summary string)
 }
@@ -117,7 +117,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		autoSplitWrites:    cfg.Tools.WriteFile.AutoSplit,
 		contextWindow:      contextWindow,
 		toolResultsVisible: true,
-		steerCh:            make(chan string, 64),
+		steerCh:            make(chan steerMessage, 64),
 	}
 	a.compactor = &compactor{
 		client:                client,
@@ -329,11 +329,23 @@ func (a *Agent) Interrupt() bool {
 	return true
 }
 
-// pushSteer queues a steering message for the running turn.
+// steerMessage is one queued steering message: its text plus the client it came
+// from, which rides along to the user event published when the message is folded
+// into the conversation.
+type steerMessage struct {
+	source string
+	text   string
+}
+
+// pushSteer queues a steering message for the running turn. Nothing is announced
+// here: the row is published when the turn folds the message into the
+// conversation (see drainSteering), which is the point the message actually
+// belongs at — after the reply it interrupted. Announcing it earlier would draw
+// it in the middle of that reply (and would replay in the wrong place too, since
+// the mirror records the rows the bus carries).
 func (a *Agent) pushSteer(source, text string) {
-	a.bus.Publish(Event{Type: EventUser, Text: text, Source: source})
 	select {
-	case a.steerCh <- text:
+	case a.steerCh <- steerMessage{source: source, text: text}:
 	default:
 		a.bus.Publish(Event{Type: EventError, Text: "steering queue is full; message dropped"})
 	}
@@ -362,6 +374,14 @@ const maxConsecutiveTruncations = 3
 // context is cancelled by Interrupt, which stops the in-flight step and ends the
 // turn (see finishInterrupt).
 func (a *Agent) runLoop(ctx context.Context, userText string) {
+	a.runTurn(ctx, []string{userText})
+}
+
+// runTurn is the body of a turn: it records the turn's user messages (which the
+// caller has announced on the bus already), runs the LLM/tool loop and tears the
+// turn down. A turn that picks up queued steering messages passes them all at
+// once.
+func (a *Agent) runTurn(ctx context.Context, userTexts []string) {
 	defer func() {
 		a.mu.Lock()
 		a.busy = false
@@ -370,10 +390,18 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 		a.save()
 		a.bus.Publish(a.usageEvent())
 		a.bus.Publish(Event{Type: EventTurnDone})
+		// A steering message that arrived after the loop's last drain (the
+		// final reply was still streaming) has no iteration left to consume
+		// it: it is picked up as a turn of its own instead of sitting in the
+		// queue until the user types again.
+		a.startSteeringTurn()
 	}()
 
 	turnStart := a.historyLen()
-	a.appendMessage(llm.Message{Role: "user", Content: userText})
+	userCount := len(userTexts)
+	for _, text := range userTexts {
+		a.appendMessage(llm.Message{Role: "user", Content: text})
+	}
 	// Report the context size right away so the frontends show the new user
 	// message while the model call is still in flight.
 	a.bus.Publish(a.usageEvent())
@@ -391,7 +419,7 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 		resp, err := a.callLLM(ctx)
 		if err != nil {
 			if turnInterrupted(ctx, err) {
-				a.finishInterrupt(turnStart)
+				a.finishInterrupt(turnStart, userCount)
 				return
 			}
 			a.bus.Publish(Event{Type: EventError, Text: err.Error()})
@@ -425,6 +453,15 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 
 		if len(resp.ToolCalls) == 0 {
 			if resp.Finish != "length" {
+				if a.steeringPending() {
+					// A steering message arrived while this reply was
+					// still streaming: the reply is not the end of the
+					// turn then, so the turn carries on. The next
+					// iteration folds the message into the context —
+					// announcing its row there, after this reply — and
+					// calls the model again.
+					continue
+				}
 				return
 			}
 			// The provider ran out of max_tokens, typically while the model was
@@ -457,7 +494,7 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 				// every call after it, so the assistant/tool pairing stays
 				// valid in the next request) and end the turn.
 				a.reportInterruptedTools(resp.ToolCalls, idx)
-				a.finishInterrupt(turnStart)
+				a.finishInterrupt(turnStart, userCount)
 				return
 			}
 			rest, split := continuations[idx]
@@ -492,7 +529,7 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 		// once the payload is on disk in order.
 		if len(pendingSplits) > 0 {
 			if !a.runWriteSplits(ctx, pendingSplits) {
-				a.finishInterrupt(turnStart)
+				a.finishInterrupt(turnStart, userCount)
 				return
 			}
 		}
@@ -581,12 +618,13 @@ func (a *Agent) reportInterruptedTools(calls []llm.ToolCall, from int) {
 }
 
 // finishInterrupt ends a turn that the user cancelled. When the turn produced
-// nothing yet (it was cancelled while waiting for the model), the pending user
-// record is dropped so the conversation is left exactly as it was before the
+// nothing yet (it was cancelled while waiting for the model), the user records it
+// appended are dropped so the conversation is left exactly as it was before the
 // turn; otherwise the records stay and only a marker is reported. The next user
-// message then starts a fresh turn.
-func (a *Agent) finishInterrupt(turnStart int) {
-	if a.rollbackTurn(turnStart) {
+// message then starts a fresh turn. userCount is how many user messages the turn
+// recorded.
+func (a *Agent) finishInterrupt(turnStart, userCount int) {
+	if a.rollbackTurn(turnStart, userCount) {
 		a.bus.Publish(Event{
 			Type: EventInterrupted,
 			Text: "interrupted while waiting for the model; the pending message was discarded",
@@ -596,13 +634,20 @@ func (a *Agent) finishInterrupt(turnStart int) {
 	a.bus.Publish(Event{Type: EventInterrupted, Text: "interrupted; the turn was stopped"})
 }
 
-// rollbackTurn drops the record appended for this turn when nothing else was
+// rollbackTurn drops the records appended for this turn when nothing else was
 // produced. It reports whether it rolled back.
-func (a *Agent) rollbackTurn(turnStart int) bool {
+func (a *Agent) rollbackTurn(turnStart, userCount int) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.history) != turnStart+1 || a.history[turnStart].Role != "user" {
+	end := turnStart + userCount
+	if len(a.history) != end {
+		// Something was produced (or the history moved on): nothing to drop.
 		return false
+	}
+	for _, m := range a.history[turnStart:end] {
+		if m.Role != "user" {
+			return false
+		}
 	}
 	a.history = a.history[:turnStart]
 	return true
@@ -646,16 +691,77 @@ func (a *Agent) buildMessagesLocked() []llm.Message {
 	return msgs
 }
 
-// drainSteering folds any queued user messages into the history.
+// drainSteering folds the queued steering messages into the history, announcing
+// each of them as a user event right here: this is the moment the message becomes
+// part of the conversation, so the row every front-end draws (and the mirror
+// records for a later reload) sits exactly where the message sits in the history —
+// after the reply it interrupted, before the answer it steers.
 func (a *Agent) drainSteering() {
+	for _, m := range a.takeSteering() {
+		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source})
+		a.appendMessage(llm.Message{Role: "user", Content: m.text})
+	}
+}
+
+// steeringPending reports whether a steering message is still waiting to be
+// folded into the conversation.
+func (a *Agent) steeringPending() bool { return len(a.steerCh) > 0 }
+
+// takeSteering removes and returns every queued steering message, oldest first.
+func (a *Agent) takeSteering() []steerMessage {
+	var msgs []steerMessage
 	for {
 		select {
-		case text := <-a.steerCh:
-			a.appendMessage(llm.Message{Role: "user", Content: text})
+		case m := <-a.steerCh:
+			msgs = append(msgs, m)
 		default:
-			return
+			return msgs
 		}
 	}
+}
+
+// requeueSteering puts steering messages back into the queue, for the case where
+// another turn claimed the agent before they could be handed to a turn of their
+// own. A full queue drops them with the same error pushSteer reports.
+func (a *Agent) requeueSteering(msgs []steerMessage) {
+	for _, m := range msgs {
+		select {
+		case a.steerCh <- m:
+		default:
+			a.bus.Publish(Event{Type: EventError, Text: "steering queue is full; message dropped"})
+		}
+	}
+}
+
+// startSteeringTurn runs the steering messages still queued after a turn ended as
+// a turn of their own. They are announced here, like drainSteering announces the
+// ones a running turn folds in: the message joins the conversation at this point,
+// so its row belongs after everything the previous turn produced. It is a no-op
+// when nothing is queued.
+func (a *Agent) startSteeringTurn() {
+	msgs := a.takeSteering()
+	if len(msgs) == 0 {
+		return
+	}
+	a.mu.Lock()
+	if a.busy {
+		// A user message arrived while the turn was tearing down and already
+		// started the next turn: hand the messages back to it.
+		a.mu.Unlock()
+		a.requeueSteering(msgs)
+		return
+	}
+	a.busy = true
+	turnCtx, cancel := context.WithCancel(context.Background())
+	a.cancelTurn = cancel
+	a.mu.Unlock()
+
+	texts := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source})
+		texts = append(texts, m.text)
+	}
+	go a.runTurn(turnCtx, texts)
 }
 
 // setUsage records the provider-reported token accounting for the request just

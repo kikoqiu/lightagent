@@ -28,14 +28,16 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
    * 忙碌：把消息推入 `steerCh`（steering），并发布 `user` 事件。
 2. `runLoop` 执行：
    1. 追加第一条 user 消息并广播一次 `usage`（前端立刻反映新消息带来的用量）。
-   2. 每轮开始时 `drainSteering()`：把 `steerCh` 中的消息按序追加为 user 消息。
+   2. 每轮开始时 `drainSteering()`：把 `steerCh` 中的消息按序追加为 user 消息，**并在此刻广播
+      `user` 事件**——消息行出现在它真正进入对话的位置（它所打断的那条回复之后），因此各前端
+      画出的顺序、以及 web 回放缓冲记录的顺序，都与模型看到的消息顺序一致。
    3. `compactIfNeeded()`：估算 token 超阈值则压缩（见下）。
    4. `callLLM()`：构造 `[system, ...history]`，附带工具定义，流式调用；模型可见回答的增量
       文本发布为 `assistant_delta`；若服务商返回思考内容（`reasoning_content` / `reasoning`），
       其增量先发布为 `reasoning_delta`。
    5. 追加 assistant 消息（含组装后的思考 `reasoning_content`，会随后续请求回传）并广播
       `usage`。
-   6. 无 `tool_calls` 时：`finish_reason=length`（被 `max_tokens` 截断）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮（连续 3 次则停止）；否则回合结束。
+   6. 无 `tool_calls` 时：`finish_reason=length`（被 `max_tokens` 截断）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮（连续 3 次则停止）；否则回合结束——**但若此刻 `steerCh` 里还有消息**（流式过程中刚插入的），则本回合继续下一轮把它并入上下文，而不是结束回合。
    7. 逐个执行工具，发布 `tool_call` / `tool_result`，把结果作为 `tool` 消息追加；本轮结束后
       广播 `usage`（工具结果同样占用上下文），回到 2。
       * **write_file 自动拆解**（`tools.write_file.auto_split`，默认开启）：若某次 `write_file` 的
@@ -44,7 +46,9 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
         往返**（每段一个 `tool_call` + `tool_result`，续写段 `mode='a'`），全部写完才回到 2 继续问
         模型；第一段失败则丢弃其余分段并发布 `info`。
    8. 达到 `max_tool_iterations` 时发布 `info` 并结束。
-3. 结束时置 `busy=false`、保存会话、发布 `turn_done`。
+3. 结束时置 `busy=false`、保存会话、发布 `turn_done`；随后若 `steerCh` 仍非空（消息在最后一轮
+   **之后**才到，已无轮次可并入），则由 `startSteeringTurn()` 立刻把它们作为**独立的新回合**继续
+   处理，并在那里广播它们的 `user` 事件（与 `drainSteering` 同一时机语义），不会滞留到用户下次输入。
 
 > **中断**：每个回合有自己的可取消 context（`Agent.Interrupt()` 触发，CLI 的 Ctrl+C /
 > `/stop`、网页的 Stop 按钮 / `/stop`）。中断会取消正在进行的模型调用或工具调用：
@@ -54,7 +58,17 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 > 用户消息开始新回合。`exec_command` 的同步等待可被取消：中断会直接结束其进程。
 
 > steering 的语义：忙碌时用户输入不会丢失，而是在下一个安全点（下一轮 LLM 调用前）
-> 插入到对话里，因此 Agent 能在工具循环中途「听到」新的用户指令。
+> 插入到对话里，因此 Agent 能在工具循环中途「听到」新的用户指令。若消息是在**最后一轮**
+> 的流式过程中到达（该轮之后已无轮次可并入），本回合会**再跑一轮**把它并进去；若连这一轮
+> 都来不及（消息在回合收尾时才到，例如工具轮次已用尽 `max_tool_iterations`、或回合被中断），
+> 则由 `startSteeringTurn()` **立即开一个新回合**处理它。
+>
+> `user` 事件（也就是前端画的那条消息行）**不在入队时广播，而是在消息真正进入对话时**
+> （`drainSteering()` / `startSteeringTurn()`）才广播：这样消息行落在它进入对话的准确位置——
+> 它所打断的那条回复之后——前端无需任何"暂存/挪位"的猜测，刷新后的回放顺序也天然一致。
+> 在事件到达之前，发送方自己显示一条 **pending**（待发送）提示：网页是带 `· pending` 标记、
+> 且把本轮后续行都插在其之前的 pending 行（Agent 发送时原地转为普通行），终端是提示区里的
+> 灰色 `(pending)` 行（正式行随后按事件位置打印）。
 
 ## 事件总线
 
@@ -64,7 +78,9 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 事件类型（`EventType`）：`user`、`assistant_delta`、`reasoning_delta`、`assistant`、`tool_call`、
 `tool_result`、`info`、`error`、`compacted`、`usage`、`turn_done`、`interrupted`。
 
-`user` 事件带 `source` 字段（`cli` / `web` 等），前端据此避免回显自己的输入；
+`user` 事件带 `source` 字段（`cli` / `web` 等），前端据此决定标签与是否回显自己的输入；它由
+`drainSteering()` / `startSteeringTurn()` 在消息进入对话时广播（见上），因此各端的行顺序与
+上下文里的消息顺序一致。
 `usage` 事件带 `tokens` / `context_window`，用于上下文用量显示。它在上下文增长的每个时点
 （回合开始、每次模型回复、每轮工具执行后）广播，因此 tool 循环进行中前端也能实时刷新；
 `tokens` 以接口返回的 `usage.prompt_tokens` 为基准，再加上此后追加消息的估算。

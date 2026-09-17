@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -844,6 +847,198 @@ func TestSteeringKeepsTheTurnClock(t *testing.T) {
 	c.render(agent.Event{Type: agent.EventUser, Text: "steer", Source: "cli"})
 	if !c.busySince.Equal(started) {
 		t.Fatalf("busySince moved on a steering message: %v, want %v", c.busySince, started)
+	}
+}
+
+// TestInjectedSteeringIsDrawnWhereItLands pins the console rendering of a message
+// another client submitted while the turn was running: the agent announces the row
+// when the message enters the conversation (after the reply it interrupted), so the
+// terminal simply draws it there — nothing has to be held back or moved.
+func TestInjectedSteeringIsDrawnWhereItLands(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.render(agent.Event{Type: agent.EventAssistant, Text: "the reply"})
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventUser, Text: "steer from web", Source: "web"})
+	if out := buf.String(); !strings.Contains(out, "you(web)> steer from web") {
+		t.Fatalf("the injected message was not drawn: %q", out)
+	}
+	if !c.busy {
+		t.Fatal("a user event should mark the CLI busy")
+	}
+	// A multi-line message keeps its continuation lines aligned under the label.
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventUser, Text: "first\nsecond", Source: "web"})
+	if out := buf.String(); !strings.Contains(out, "first\n"+strings.Repeat(" ", displayColumns("you(web)> "))+"second") {
+		t.Fatalf("the continuation line is not aligned: %q", out)
+	}
+}
+
+// TestOwnMessageComesFromTheStream pins that a message typed in this terminal is
+// drawn by the event stream instead of being echoed by the editor: the row then
+// lands where the message enters the conversation, and it cannot be printed twice.
+// The line-scanner and batch modes keep showing the reply only.
+func TestOwnMessageComesFromTheStream(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.editing = true
+
+	c.render(agent.Event{Type: agent.EventUser, Text: "hello", Source: "cli"})
+	if out := buf.String(); !strings.Contains(out, "> hello") {
+		t.Fatalf("the submitted message was not drawn: %q", out)
+	}
+
+	scanner := newTestCLI(t)
+	var scannerBuf strings.Builder
+	scanner.out = &scannerBuf
+	scanner.render(agent.Event{Type: agent.EventUser, Text: "hello", Source: "cli"})
+	if scannerBuf.String() != "" {
+		t.Fatalf("the scanner mode drew its own message: %q", scannerBuf.String())
+	}
+}
+
+// TestInjectedSteeringLandsBetweenTheRounds drives the whole path — the real
+// agent, a streaming provider and the console render — for a message injected by
+// another client (the web mirror) while a reply is still arriving: it is written
+// once that reply's block is complete, so the two rounds of the turn stay in one
+// piece with the message between them.
+func TestInjectedSteeringLandsBetweenTheRounds(t *testing.T) {
+	noColors(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"first part\"}}]}\n\n")
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		once.Do(func() { close(started) })
+		// Hold the reply open until the other client has submitted its message.
+		<-release
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\" and rest\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	ag := agent.New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), agent.NewBus())
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	c := New(ag, st, "test-model", true)
+	var buf strings.Builder
+	c.out = &buf
+	// Subscribe the CLI to the bus the way Run does: every event is rendered.
+	events, cancel := ag.Bus().Subscribe()
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ev := range events {
+			c.render(ev)
+			if ev.Type == agent.EventTurnDone {
+				return
+			}
+		}
+	}()
+
+	ag.SubmitFrom("cli", "ask")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the model call never started")
+	}
+	// Wait for the console to have drawn part of the reply: only a block that is
+	// open holds an injected message back.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		streaming := c.streaming
+		c.mu.Unlock()
+		if streaming {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the console never rendered a streamed chunk")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	ag.SubmitFrom("web", "steer from web")
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the turn never finished")
+	}
+
+	out := buf.String()
+	first := strings.Index(out, "first part and rest")
+	message := strings.Index(out, "you(web)> steer from web")
+	second := strings.LastIndex(out, "first part and rest")
+	if first < 0 || message < 0 || second <= first {
+		t.Fatalf("output = %q, want two rendered replies with the message between them", out)
+	}
+	if !(first < message && message < second) {
+		t.Fatalf("the injected message must sit between the two rounds: %q", out)
+	}
+	if n := strings.Count(out, "you(web)> steer from web"); n != 1 {
+		t.Fatalf("the injected message was drawn %d times: %q", n, out)
+	}
+}
+
+// TestPendingSendIsShownAboveThePrompt pins the display of a message typed while
+// the turn is running: the prompt region carries its text dim and marked
+// "(pending)" right away, while the transcript row is only written when the agent
+// sends it — which keeps the rows in the order the model receives them.
+func TestPendingSendIsShownAboveThePrompt(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.editing = true
+
+	c.queuePendingSend("later")
+	if out := buf.String(); !strings.Contains(out, "> later"+pendingSuffix) {
+		t.Fatalf("the pending line is missing: %q", out)
+	}
+	if len(c.pendingSends) != 1 {
+		t.Fatalf("pending sends = %d, want 1", len(c.pendingSends))
+	}
+
+	// The agent sends it: the official row is written and the pending line goes.
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventUser, Text: "later", Source: "cli"})
+	out := buf.String()
+	if !strings.Contains(out, "> later\n") {
+		t.Fatalf("the official row is missing: %q", out)
+	}
+	if strings.Contains(out, pendingSuffix) {
+		t.Fatalf("the pending line is still drawn: %q", out)
+	}
+	if len(c.pendingSends) != 0 {
+		t.Fatalf("pending sends = %d, want none", len(c.pendingSends))
+	}
+
+	// A mode without a prompt region (the line scanner) prints the dim note
+	// instead: there is no region to show a pending line in.
+	scanner := newTestCLI(t)
+	var scannerBuf strings.Builder
+	scanner.out = &scannerBuf
+	scanner.queuePendingSend("later")
+	if out := scannerBuf.String(); !strings.Contains(out, "queued") {
+		t.Fatalf("the scanner mode printed no note: %q", out)
+	}
+	if len(scanner.pendingSends) != 0 {
+		t.Fatalf("the scanner mode queued a pending line: %d", len(scanner.pendingSends))
 	}
 }
 
