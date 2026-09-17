@@ -124,8 +124,6 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		contextWindow:         contextWindow,
 		maxTokens:             cfg.OpenAI.MaxTokens,
 		summarizeTokenPercent: summarizePercent,
-		basePrompt:            base,
-		tools:                 reg.Definitions(),
 	}
 	return a
 }
@@ -171,6 +169,25 @@ func (a *Agent) systemPrompt() string {
 		parts = append(parts, strings.Join(lines, "\n"))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// systemMessageLocked renders the system message every request carries: the
+// rendered system prompt with the current summary. It is the single place the
+// system message is built, so the ordinary calls and the summarizing one cannot
+// drift apart. The caller must hold a.mu.
+func (a *Agent) systemMessageLocked() llm.Message {
+	return llm.Message{Role: "system", Content: systemWithSummary(a.systemPrompt(), a.summary)}
+}
+
+// livePrefixLocked renders the fixed head of every request the conversation
+// sends — the system message and the declared tool schemas — in one snapshot.
+// Compaction passes it to the summarizing call verbatim, which keeps that call's
+// prefix byte-identical to the live ones. The caller must hold a.mu.
+func (a *Agent) livePrefixLocked() livePrefix {
+	return livePrefix{
+		systemPrompt: a.systemMessageLocked().Content,
+		tools:        a.reg.Definitions(),
+	}
 }
 
 // SetPersist registers an optional callback invoked after every turn and
@@ -260,8 +277,7 @@ func (a *Agent) contextTokensLocked() int {
 	if a.usage > 0 && a.usageAt >= 0 && a.usageAt <= len(a.history) {
 		return a.usage + EstimateMessagesTokens(a.history[a.usageAt:])
 	}
-	return EstimateMessagesTokens(a.history) +
-		EstimateMessageTokens(llm.Message{Role: "system", Content: systemWithSummary(a.systemPrompt(), a.summary)})
+	return EstimateMessagesTokens(a.history) + EstimateMessageTokens(a.systemMessageLocked())
 }
 
 // usageEvent builds a context-usage event. It is broadcast at every point the
@@ -625,7 +641,7 @@ func (a *Agent) appendMessage(m llm.Message) {
 // hold a.mu.
 func (a *Agent) buildMessagesLocked() []llm.Message {
 	msgs := make([]llm.Message, 0, len(a.history)+1)
-	msgs = append(msgs, llm.Message{Role: "system", Content: systemWithSummary(a.systemPrompt(), a.summary)})
+	msgs = append(msgs, a.systemMessageLocked())
 	msgs = append(msgs, a.history...)
 	return msgs
 }
@@ -666,7 +682,9 @@ func (a *Agent) compactIfNeeded(ctx context.Context) {
 		return
 	}
 	a.mu.Lock()
-	need := a.compactor.shouldCompact(a.history, a.summary, a.usage)
+	// The trigger is estimated against the very prefix the next request will
+	// carry, so the capability sections appended below the base prompt count.
+	need := a.compactor.shouldCompact(a.history, a.livePrefixLocked(), a.usage)
 	a.mu.Unlock()
 	if need {
 		a.doCompact(ctx, summarizeModeAuto)
@@ -691,6 +709,11 @@ func (a *Agent) doCompact(ctx context.Context, mode summarizeMode) bool {
 	a.mu.Lock()
 	hist := append([]llm.Message(nil), a.history...)
 	sum := a.summary
+	// The summarizing call reuses the live request prefix verbatim — the very
+	// system prompt and declared tools the ordinary calls send — so nothing
+	// below the base prompt is lost and the provider's cached prompt prefix
+	// stays valid across the pass.
+	prefix := a.livePrefixLocked()
 	a.mu.Unlock()
 
 	// Summarizing is a model call that can take a while, so the pass announces
@@ -706,7 +729,7 @@ func (a *Agent) doCompact(ctx context.Context, mode summarizeMode) bool {
 		Text: fmt.Sprintf("compacting context: summarizing %d of %d messages", cut, len(hist)),
 	})
 
-	newHist, newSum, changed, err := a.compactor.compact(ctx, hist, sum, mode)
+	newHist, newSum, changed, err := a.compactor.compact(ctx, hist, prefix, sum, mode)
 	if err != nil {
 		a.bus.Publish(Event{Type: EventError, Text: "compaction: " + err.Error()})
 	}

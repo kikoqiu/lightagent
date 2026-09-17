@@ -393,6 +393,142 @@ func TestAutoCompactionKeepsAUserMessage(t *testing.T) {
 	}
 }
 
+// TestCompactionRequestReusesLiveSystemPrompt pins the layout of the summarizing
+// call: it must carry the very system prompt the live conversation sends — the
+// sections appended below the base prompt (runtime line, working directory,
+// unlock rule, MCP info) included — followed by the messages being compressed
+// and the summarize instruction. Dropping those sections would leave the summary
+// without the environment its messages came from, and would invalidate the
+// provider's cached prompt prefix on every compaction.
+func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
+	// The request is mirrored so the summarizing call can be compared with the
+	// ordinary ones field by field.
+	type capturedRequest struct {
+		Messages []capturedMessage `json:"messages"`
+		Tools    json.RawMessage   `json:"tools"`
+	}
+	var (
+		mu     sync.Mutex
+		bodies []capturedRequest
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req capturedRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, req)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	cfg.Agent.SystemPrompt = "custom base"
+	// A tiny window with a 1% trigger compresses on the first iteration, and the
+	// retention budget leaves no room for the newest turn, so the whole tail is
+	// summarized.
+	cfg.Context.ContextWindow = 100
+	cfg.Context.SummarizeTokenPercent = 1
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "exec_command", desc: "run a command"})
+	reg.RegisterDeferred(agentStubTool{name: "mcp_github_create_issue", desc: "Create a GitHub issue"})
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a.SetMCPServers([]MCPServerInfo{{
+		Server:        "playwright",
+		ToolCount:     26,
+		ServerName:    "Playwright",
+		ServerVersion: "1.64.0",
+	}})
+
+	a.Load([]llm.Message{
+		userRunes("old ", 100),
+		{Role: "assistant", Content: "old answer"},
+	}, "")
+	a.Submit(userRunes("question ", 100).Content)
+	drainEvents(t, events)
+
+	mu.Lock()
+	captured := append([]capturedRequest(nil), bodies...)
+	mu.Unlock()
+
+	var digest, live *capturedRequest
+	for i := range captured {
+		body := &captured[i]
+		if len(body.Messages) == 0 {
+			continue
+		}
+		if last := body.Messages[len(body.Messages)-1]; last.Content == summarizeAppendInstruction {
+			digest = body
+			continue
+		}
+		if body.Messages[0].Role == "system" {
+			live = body
+		}
+	}
+	if digest == nil {
+		t.Fatalf("no summarizing call captured (%d requests)", len(captured))
+	}
+	if live == nil {
+		t.Fatal("no ordinary model call captured")
+	}
+
+	// The pass ran with an empty summary and produced "done", so the capability
+	// sections alone are what the summarizing call had to send, and the ordinary
+	// request after it must start with exactly that plus the new summary.
+	a.mu.Lock()
+	capabilities := a.systemPrompt()
+	a.mu.Unlock()
+	for _, want := range []string{
+		"custom base",
+		RuntimeInfo(),
+		"working directory: ",
+		"**Tool Discovery & Unlock**",
+		"MCP server `playwright` is connected.",
+	} {
+		if !strings.Contains(capabilities, want) {
+			t.Fatalf("the live system prompt lost %q:\n%s", want, capabilities)
+		}
+	}
+	if digest.Messages[0].Role != "system" {
+		t.Fatalf("the summarizing call starts with %q, want the system prompt", digest.Messages[0].Role)
+	}
+	// Byte for byte: the summarizing call carries the live system prompt
+	// verbatim, so the model summarizes with the same environment it had while
+	// producing those messages, and the provider's cached prefix still applies.
+	if got := digest.Messages[0].Content; got != capabilities {
+		t.Fatalf("the summarizing call must carry the live system prompt byte for byte:\ngot:\n%q\nwant:\n%q",
+			got, capabilities)
+	}
+	if want := systemWithSummary(capabilities, "done"); live.Messages[0].Content != want {
+		t.Fatalf("the live request system prompt = %q, want %q", live.Messages[0].Content, want)
+	}
+	// The declared tools ride along unchanged too.
+	if string(digest.Tools) != string(live.Tools) {
+		t.Fatalf("the summarizing call declares different tools:\ndigest: %s\nlive: %s", digest.Tools, live.Tools)
+	}
+	if !strings.Contains(string(digest.Tools), `"exec_command"`) {
+		t.Fatalf("the declared tools were not captured: %s", digest.Tools)
+	}
+
+	// The messages being compressed sit between that prefix and the instruction.
+	sawBatch := false
+	for _, m := range digest.Messages {
+		if m.Role == "assistant" && m.Content == "old answer" {
+			sawBatch = true
+		}
+	}
+	if !sawBatch {
+		t.Fatalf("the summarizing call dropped the batch: %+v", digest.Messages)
+	}
+}
+
 // TestContextTokensAnchorsToProviderUsage verifies a reported prompt-token
 // count anchors the context size while messages appended afterwards are
 // estimated on top of it.

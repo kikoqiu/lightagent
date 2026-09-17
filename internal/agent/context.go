@@ -68,16 +68,28 @@ const summarizeAppendInstruction = `Context is full, summarize the conversation 
 - System prompt except the original summary is fully preserved, so do NOT include it in the summary you generate.
 - Output the summary and do NOT add any explanatory meta-language.`
 
+// livePrefix is the fixed head of every request the running conversation sends:
+// the rendered system message and the declared tool schemas. The summarizing
+// call reuses it verbatim, so a compaction never changes what the provider sees
+// in front of the compressed messages — nothing below the base prompt is lost
+// and a provider-side prompt cache keeps its prefix.
+type livePrefix struct {
+	systemPrompt string
+	tools        []llm.ToolDef
+}
+
 // compactor implements the single, global context-compression strategy:
 // summarize the older portion of the conversation and store the digest in the
 // system prompt, keeping the most recent messages intact.
+//
+// The request prefix is deliberately not stored here: every pass receives the
+// one the live conversation renders (system prompt plus declared tools), so the
+// summarizing call cannot drift away from the ordinary requests.
 type compactor struct {
 	client                *llm.Client
 	contextWindow         int
 	maxTokens             int
 	summarizeTokenPercent int
-	basePrompt            string
-	tools                 []llm.ToolDef
 }
 
 // tokenLimit returns the effective compaction trigger in tokens.
@@ -90,13 +102,11 @@ func (c *compactor) tokenLimit() int {
 }
 
 // shouldCompact reports whether the conversation exceeds the trigger (a
-// percentage of the context window).
-func (c *compactor) shouldCompact(history []llm.Message, summary string, usageTokens int) bool {
+// percentage of the context window). The prefix is the one the next request will
+// carry, so the system prompt counts towards the trigger like any other context.
+func (c *compactor) shouldCompact(history []llm.Message, prefix livePrefix, usageTokens int) bool {
 	estimate := EstimateMessagesTokens(history)
-	estimate += EstimateMessageTokens(llm.Message{Role: "system", Content: c.basePrompt})
-	if summary != "" {
-		estimate += EstimateMessageTokens(llm.Message{Role: "system", Content: summary})
-	}
+	estimate += EstimateMessageTokens(llm.Message{Role: "system", Content: prefix.systemPrompt})
 	if usageTokens > estimate {
 		estimate = usageTokens
 	}
@@ -237,10 +247,12 @@ func (c *compactor) cut(history []llm.Message, mode summarizeMode) (int, bool) {
 	return cut, true
 }
 
-// compact compresses history. It returns the new history, the new summary,
+// compact compresses history. prefix is the live request prefix (system prompt
+// with the existing summary plus the declared tools), which the digest call
+// reuses verbatim (see digest). It returns the new history, the new summary,
 // whether a change happened, and any error. On summarization failure it falls
 // back to dropping the oldest messages so the turn can continue.
-func (c *compactor) compact(ctx context.Context, history []llm.Message, summary string, mode summarizeMode) ([]llm.Message, string, bool, error) {
+func (c *compactor) compact(ctx context.Context, history []llm.Message, prefix livePrefix, summary string, mode summarizeMode) ([]llm.Message, string, bool, error) {
 	cut, ok := c.cut(history, mode)
 	if !ok {
 		return history, summary, false, nil
@@ -252,7 +264,7 @@ func (c *compactor) compact(ctx context.Context, history []llm.Message, summary 
 	// when it is non-empty, so this only fires on a fully compressed tail.
 	tail := ensureUserMessage(history[cut:])
 
-	digest, err := c.digest(ctx, batch, summary)
+	digest, err := c.digest(ctx, batch, prefix)
 	if err != nil || digest == "" {
 		if err == nil {
 			err = fmt.Errorf("empty summary returned")
@@ -263,19 +275,24 @@ func (c *compactor) compact(ctx context.Context, history []llm.Message, summary 
 }
 
 // digest asks the model for a summary of batch. It reuses the live conversation
-// layout — system prompt (with the existing summary) followed by the messages
-// being compressed — and appends the summarize instruction as the final user
-// message。
-func (c *compactor) digest(ctx context.Context, batch []llm.Message, existingSummary string) (string, error) {
+// layout — the very request prefix the running conversation sends (system prompt
+// with the current summary, and the same declared tools) followed by the
+// messages being compressed — and appends the summarize instruction as the final
+// user message. Reusing that prefix verbatim matters twice over: the model
+// summarizing knows the same environment (runtime, working directory, unlock
+// rule, MCP servers) as it did while the messages were produced, and the call
+// shares its prefix with the live requests, so the provider can serve it from
+// its cached prompt prefix instead of re-processing a different one.
+func (c *compactor) digest(ctx context.Context, batch []llm.Message, prefix livePrefix) (string, error) {
 	if c.client == nil {
 		return "", fmt.Errorf("no llm client")
 	}
 	msgs := make([]llm.Message, 0, len(batch)+2)
-	msgs = append(msgs, llm.Message{Role: "system", Content: systemWithSummary(c.basePrompt, existingSummary)})
+	msgs = append(msgs, llm.Message{Role: "system", Content: prefix.systemPrompt})
 	msgs = append(msgs, batch...)
 	msgs = append(msgs, llm.Message{Role: "user", Content: summarizeAppendInstruction})
 
-	resp, err := c.client.Chat(ctx, msgs, c.tools, nil, nil)
+	resp, err := c.client.Chat(ctx, msgs, prefix.tools, nil, nil)
 	if err != nil {
 		return "", err
 	}

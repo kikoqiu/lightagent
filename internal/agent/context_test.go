@@ -197,15 +197,19 @@ func TestSummarizeTailCutBudgetHoldsOnlyNewestTurn(t *testing.T) {
 
 func TestShouldCompact(t *testing.T) {
 	c := &compactor{contextWindow: 1000, summarizeTokenPercent: 50}
-	if c.shouldCompact(nil, "", 0) {
+	if c.shouldCompact(nil, livePrefix{}, 0) {
 		t.Fatal("empty context should not trigger compaction")
 	}
 	big := []llm.Message{{Role: "user", Content: strings.Repeat("a", 3000)}}
-	if !c.shouldCompact(big, "", 0) {
+	if !c.shouldCompact(big, livePrefix{}, 0) {
 		t.Fatal("oversized context should trigger compaction")
 	}
+	// The system prompt counts as context too, capability sections included.
+	if !c.shouldCompact(nil, livePrefix{systemPrompt: strings.Repeat("p", 3000)}, 0) {
+		t.Fatal("an oversized system prompt should trigger compaction")
+	}
 	// A reported usage larger than the estimate also triggers.
-	if !c.shouldCompact(nil, "", 600) {
+	if !c.shouldCompact(nil, livePrefix{}, 600) {
 		t.Fatal("usage above the limit should trigger compaction")
 	}
 }
@@ -253,7 +257,7 @@ func TestCompactKeepsAUserMessageWhenEverythingIsCut(t *testing.T) {
 		userRunes("q", 100),
 		{Role: "assistant", Content: "answer"},
 	}
-	newHist, summary, changed, err := c.compact(context.Background(), hist, "carried", summarizeModeAuto)
+	newHist, summary, changed, err := c.compact(context.Background(), hist, livePrefix{}, "carried", summarizeModeAuto)
 	if !changed {
 		t.Fatal("expected the whole tail to be compressed")
 	}
