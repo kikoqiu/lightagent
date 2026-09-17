@@ -1,0 +1,114 @@
+name: Go Build & Release
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]      # 推送带 tag (如 v1.0.0) 时自动触发
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  # 应用名：留空则默认自动使用仓库名
+  APP_NAME: ""
+  # 版本号：若推送了 tag 则取 tag 名，否则取 commit 的短 SHA
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run Tests
+        run: go test -v ./...
+
+      - name: Cross Compile Binaries
+        run: |
+          # 1. 确定应用名称
+          APP_NAME="${APP_NAME:-${{ github.event.repository.name }}}"
+          OUT_DIR="build"
+          mkdir -p "$OUT_DIR"
+
+          # 2. 编译环境变量 (保留 build.bat 的优化参数)
+          export CGO_ENABLED=0
+          export GOFLAGS="-trimpath"
+          
+          LDFLAGS="-s -w"
+          if [ -n "$VERSION" ]; then
+            LDFLAGS="$LDFLAGS -X main.version=$VERSION"
+          fi
+
+          echo "============================================================"
+          echo " app     : $APP_NAME"
+          echo " output  : $OUT_DIR"
+          echo " version : $VERSION"
+          echo "============================================================"
+
+          # 3. 常见目标平台列表：格式为 "OS/ARCH" 或 "OS/ARCH/GOARM"
+          TARGETS=(
+            # --- macOS (Darwin) ---
+            "darwin/arm64"      # Apple Silicon (M1/M2/M3/M4)
+            "darwin/amd64"      # Intel Mac
+
+            # --- Linux ---
+            "linux/amd64"       # 常见 64位 Linux (服务器 / PC)
+            "linux/arm64"       # 常见 64位 ARM (云服务器 / 树莓派 64位)
+            "linux/arm/7"       # 32位 ARMv7 (树莓派 2/3/4 的 32位系统)
+            "linux/386"         # 32位 x86 Linux
+
+            # --- Windows ---
+            "windows/amd64"     # 主流 64位 Windows
+            "windows/arm64"     # 骁龙 / Surface ARM 笔记本
+            "windows/386"       # 32位 Windows (老旧机器 / 兼容性)
+
+            # --- 其他常见嵌入式 / 路由器平台（按需取消注释）---
+            # "linux/mipsle"    # 常见家用路由器 (MIPS 架构)
+            # "linux/riscv64"   # RISC-V 开发板
+            # "freebsd/amd64"   # FreeBSD 服务器
+          )
+
+          for target in "${TARGETS[@]}"; do
+            IFS='/' read -r os arch arm <<< "$target"
+            
+            # Windows 自动追加 .exe 后缀
+            ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+
+            # 生成文件名（例如：app-linux-arm7 或 app-windows-amd64.exe）
+            bin_name="${APP_NAME}-${os}-${arch}${arm}${ext}"
+            out_path="${OUT_DIR}/${bin_name}"
+
+            echo ""
+            echo "[build] ${os}/${arch} ${arm:+GOARM=$arm} -> ${bin_name}"
+
+            # 编译
+            if [ -n "$arm" ]; then
+              GOOS=$os GOARCH=$arch GOARM=$arm go build -ldflags "$LDFLAGS" -o "$out_path" .
+            else
+              GOOS=$os GOARCH=$arch go build -ldflags "$LDFLAGS" -o "$out_path" .
+            fi
+          done
+
+          # 4. 生成 sha256 校验和文件（便于用户校验文件完整性）
+          cd "$OUT_DIR"
+          sha256sum * > sha256sums.txt
+          cd - > /dev/null
+
+          echo ""
+          echo "============================================================"
+          echo "[OK] All targets built successfully:"
+          ls -lh "$OUT_DIR"
+
+      # 5. 上传构建产物至 GitHub Actions Artifacts
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-binaries
+          path: build/
