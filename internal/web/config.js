@@ -111,6 +111,7 @@
         { path: 'tools.discovery.mode', type: 'select', options: [{ value: 'unlock', label: 'unlock — visibility decoupled from execution' }], help: 'unlock is the only supported mode' },
         { path: 'tools.discovery.ttl', type: 'number', min: 1, help: 'how many tool calls an unlocked tool stays usable' },
         { path: 'tools.discovery.max_search_results', type: 'number', min: 1, help: 'hits reported per search' },
+        { path: 'tools.discovery.min_match_rate', type: 'slider', min: 0.05, max: 1, step: 0.05, fallback: 0.5, help: 'share of the query keywords a function must contain to be reported' },
         { path: 'tools.discovery.use_bm25', type: 'bool', help: 'required by MCP: find/unlock needs the BM25 search' }
       ]
     },

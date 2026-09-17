@@ -155,7 +155,7 @@ source <(lightagent completion bash)       # bash 补全
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
-    "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 50, "use_bm25": true },
+    "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
       "enabled": false,
       "servers": {

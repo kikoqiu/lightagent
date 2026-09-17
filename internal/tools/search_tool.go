@@ -19,6 +19,10 @@ type searchDoc struct {
 type BM25SearchTool struct {
 	registry         *Registry
 	maxSearchResults int
+	// minMatchRate is the minimum share of the query's keywords a locked
+	// function must contain to be reported (0.5 = half of them). It keeps a
+	// single incidental keyword from flooding the result set.
+	minMatchRate float64
 
 	// Cache: the lowercased text snapshot, rebuilt only when the registry
 	// version changes (new deferred tools registered).
@@ -27,9 +31,11 @@ type BM25SearchTool struct {
 }
 
 // NewBM25SearchTool creates the unlock-mode BM25 discovery search tool over the
-// registry's deferred (locked) function library.
-func NewBM25SearchTool(r *Registry, maxSearchResults int) *BM25SearchTool {
-	return &BM25SearchTool{registry: r, maxSearchResults: maxSearchResults}
+// registry's deferred (locked) function library. maxSearchResults caps the
+// reported hits and minMatchRate is the keyword match rate below which a
+// function is not reported at all (a non-positive rate reports every match).
+func NewBM25SearchTool(r *Registry, maxSearchResults int, minMatchRate float64) *BM25SearchTool {
+	return &BM25SearchTool{registry: r, maxSearchResults: maxSearchResults, minMatchRate: minMatchRate}
 }
 
 func (t *BM25SearchTool) Name() string {
@@ -67,7 +73,7 @@ func (t *BM25SearchTool) Execute(_ context.Context, args map[string]any) *Result
 		return Silent("No locked functions found matching the query.")
 	}
 
-	ranked := engine.search(query, t.maxSearchResults)
+	ranked := engine.search(query, t.maxSearchResults, t.minMatchRate)
 	if len(ranked) == 0 {
 		return Silent("No locked functions found matching the query.")
 	}

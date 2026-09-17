@@ -21,6 +21,16 @@ import (
 // or in-word (glued to ASCII alphanumerics, e.g. "word" inside "password"). Both
 // match — the search stays permissive — but an in-word occurrence carries only a
 // fraction of the term frequency weight, so whole-word hits rank higher.
+//
+// Ranking is two-level: the keyword match rate (the share of the query's
+// keywords a document contains) decides first, the BM25 score only breaks ties.
+// A document below the caller's minimum match rate is dropped, so one incidental
+// keyword cannot flood the result set with barely related functions.
+//
+// The query terms are used as tokenized: a keyword repeated in the query counts
+// once per occurrence. That repetition raises both the keyword total of the
+// match rate and the term-frequency weight of the BM25 score, so a term the
+// caller stressed twice weighs more than one mentioned once.
 
 const (
 	// defaultBM25K1 is the term-frequency saturation factor.
@@ -83,24 +93,36 @@ func newBM25Engine[T any](corpus []T, textFunc func(T) string) *bm25Engine[T] {
 // bm25Result is a single ranked result from a search call.
 type bm25Result[T any] struct {
 	Document T
-	Score    float32
+	// MatchRate is the share of the query's keyword occurrences (a repeated
+	// keyword counts once per occurrence) that the document contains, in [0, 1].
+	MatchRate float64
+	Score     float32
 }
 
 // search tokenizes query and ranks the corpus against it. Every query term is
 // matched as a plain substring of each document's text; whole-word occurrences
-// weigh more than in-word ones. It returns an empty slice (not nil) when there
-// are no matches.
-func (e *bm25Engine[T]) search(query string, topK int) []bm25Result[T] {
+// weigh more than in-word ones. Duplicate query terms are kept and each
+// occurrence counts as one keyword. Documents matching less than minMatchRate of
+// the query keywords are dropped (a non-positive minMatchRate keeps every match);
+// the rest are ordered by match rate first, BM25 score second. It returns an
+// empty slice (not nil) when there are no matches.
+func (e *bm25Engine[T]) search(query string, topK int, minMatchRate float64) []bm25Result[T] {
 	if topK <= 0 {
 		return []bm25Result[T]{}
 	}
 
-	queryTerms := bm25Dedupe(bm25Tokenize(query))
+	// Duplicates are deliberately not removed: each occurrence is one keyword,
+	// so a repeated term adds matching weight and raises the keyword total.
+	queryTerms := bm25Tokenize(query)
 	if len(queryTerms) == 0 || len(e.texts) == 0 {
 		return []bm25Result[T]{}
 	}
 
+	totalKeywords := float64(len(queryTerms))
 	scores := make(map[int32]float32, 16)
+	// keywordHits counts, per document, how many query keyword occurrences it
+	// contains; that count over totalKeywords is the match rate.
+	keywordHits := make(map[int32]int32, 16)
 	for _, term := range queryTerms {
 		matches := e.matchTerm(term)
 		if len(matches) == 0 {
@@ -112,6 +134,7 @@ func (e *bm25Engine[T]) search(query string, topK int) []bm25Result[T] {
 		idf := float32(math.Log((n-df+0.5)/(df+0.5) + 1))
 
 		for _, m := range matches {
+			keywordHits[m.docID]++
 			denom := m.tf + e.docLenNorm[m.docID]
 			if denom == 0 {
 				continue
@@ -125,25 +148,34 @@ func (e *bm25Engine[T]) search(query string, topK int) []bm25Result[T] {
 
 	heap := make([]bm25ScoredDoc, 0, topK)
 	for docID, sc := range scores {
+		matchRate := float64(keywordHits[docID]) / totalKeywords
+		if matchRate < minMatchRate {
+			continue
+		}
+		candidate := bm25ScoredDoc{docID: docID, matchRate: matchRate, score: sc}
 		switch {
 		case len(heap) < topK:
-			heap = append(heap, bm25ScoredDoc{docID: docID, score: sc})
+			heap = append(heap, candidate)
 			if len(heap) == topK {
 				bm25MinHeapify(heap)
 			}
-		case sc > heap[0].score:
-			heap[0] = bm25ScoredDoc{docID: docID, score: sc}
+		case bm25Outranks(candidate, heap[0]):
+			heap[0] = candidate
 			bm25SiftDown(heap, 0)
 		}
 	}
+	if len(heap) == 0 {
+		return []bm25Result[T]{}
+	}
 
-	sort.Slice(heap, func(i, j int) bool { return heap[i].score > heap[j].score })
+	sort.Slice(heap, func(i, j int) bool { return bm25Outranks(heap[i], heap[j]) })
 
 	out := make([]bm25Result[T], len(heap))
 	for i, h := range heap {
 		out[i] = bm25Result[T]{
-			Document: e.corpus[h.docID],
-			Score:    h.score,
+			Document:  e.corpus[h.docID],
+			MatchRate: h.matchRate,
+			Score:     h.score,
 		}
 	}
 	return out
@@ -269,26 +301,27 @@ func bm25IsLower(c byte) bool { return c >= 'a' && c <= 'z' }
 // bm25IsDigit reports whether c is an ASCII digit.
 func bm25IsDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-// bm25Dedupe returns a new slice with duplicate tokens removed, preserving
-// first-occurrence order.
-func bm25Dedupe(tokens []string) []string {
-	seen := make(map[string]struct{}, len(tokens))
-	out := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		if _, ok := seen[t]; !ok {
-			seen[t] = struct{}{}
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
+// bm25ScoredDoc is one ranked candidate. matchRate is the share of the query's
+// keyword occurrences the document contains, score its BM25 score.
 type bm25ScoredDoc struct {
-	docID int32
-	score float32
+	docID     int32
+	matchRate float64
+	score     float32
 }
 
-// bm25MinHeapify builds a min-heap in-place using Floyd's algorithm: O(k).
+// bm25Outranks reports whether a ranks above b. The keyword match rate is the
+// first criterion — a document covering more of the query is more relevant than
+// a verbose one covering less — and the BM25 score only breaks ties.
+func bm25Outranks(a, b bm25ScoredDoc) bool {
+	if a.matchRate != b.matchRate {
+		return a.matchRate > b.matchRate
+	}
+	return a.score > b.score
+}
+
+// bm25MinHeapify builds a min-heap in-place using Floyd's algorithm: O(k). The
+// heap's root is the worst-ranked document, so a better candidate can replace it
+// in O(log k).
 func bm25MinHeapify(h []bm25ScoredDoc) {
 	for i := len(h)/2 - 1; i >= 0; i-- {
 		bm25SiftDown(h, i)
@@ -299,18 +332,18 @@ func bm25MinHeapify(h []bm25ScoredDoc) {
 func bm25SiftDown(h []bm25ScoredDoc, i int) {
 	n := len(h)
 	for {
-		smallest := i
+		worst := i
 		l, r := 2*i+1, 2*i+2
-		if l < n && h[l].score < h[smallest].score {
-			smallest = l
+		if l < n && bm25Outranks(h[worst], h[l]) {
+			worst = l
 		}
-		if r < n && h[r].score < h[smallest].score {
-			smallest = r
+		if r < n && bm25Outranks(h[worst], h[r]) {
+			worst = r
 		}
-		if smallest == i {
+		if worst == i {
 			break
 		}
-		h[i], h[smallest] = h[smallest], h[i]
-		i = smallest
+		h[i], h[worst] = h[worst], h[i]
+		i = worst
 	}
 }

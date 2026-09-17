@@ -88,7 +88,7 @@ func TestDeferredToolsStayOutOfDefinitions(t *testing.T) {
 // and descriptions without unlocking anything.
 func TestBM25DiscoveryIsDiscoveryOnly(t *testing.T) {
 	reg := newDiscoveryRegistry()
-	search := NewBM25SearchTool(reg, 5)
+	search := NewBM25SearchTool(reg, 5, 0.5)
 
 	res := search.Execute(context.Background(), map[string]any{"query": "create a github issue"})
 	if res.IsError {
@@ -113,18 +113,18 @@ func TestBM25DiscoveryIsDiscoveryOnly(t *testing.T) {
 func TestBM25DiscoveryEmptyLibraryAndNoMatch(t *testing.T) {
 	empty := NewRegistry()
 	empty.Register(stubTool{name: coreName, desc: "run a shell command"})
-	res := NewBM25SearchTool(empty, 5).Execute(context.Background(), map[string]any{"query": "anything"})
+	res := NewBM25SearchTool(empty, 5, 0.5).Execute(context.Background(), map[string]any{"query": "anything"})
 	if res.IsError || !strings.Contains(res.ForLLM, "No locked functions found") {
 		t.Fatalf("empty library result = %q (error=%v)", res.ForLLM, res.IsError)
 	}
 
 	reg := newDiscoveryRegistry()
-	res = NewBM25SearchTool(reg, 5).Execute(context.Background(), map[string]any{"query": "zzzzzqqqq"})
+	res = NewBM25SearchTool(reg, 5, 0.5).Execute(context.Background(), map[string]any{"query": "zzzzzqqqq"})
 	if res.IsError || !strings.Contains(res.ForLLM, "No locked functions found") {
 		t.Fatalf("no-match result = %q (error=%v)", res.ForLLM, res.IsError)
 	}
 
-	bad := NewBM25SearchTool(reg, 5).Execute(context.Background(), map[string]any{"query": "  "})
+	bad := NewBM25SearchTool(reg, 5, 0.5).Execute(context.Background(), map[string]any{"query": "  "})
 	if !bad.IsError {
 		t.Fatal("empty query must be rejected")
 	}
@@ -215,7 +215,7 @@ func TestGrantExpiresAfterTTLTick(t *testing.T) {
 		t.Fatalf("expired grant should reject the call: %q", res.ForLLM)
 	}
 	// Still discoverable.
-	res := NewBM25SearchTool(reg, 5).Execute(ctx, map[string]any{"query": "github issue"})
+	res := NewBM25SearchTool(reg, 5, 0.5).Execute(ctx, map[string]any{"query": "github issue"})
 	if res.IsError || !strings.Contains(res.ForLLM, deferredName) {
 		t.Fatalf("locked function should stay discoverable: %q", res.ForLLM)
 	}

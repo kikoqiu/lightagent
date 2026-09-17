@@ -240,7 +240,7 @@ func TestManagerUnlockFlowOverHTTP(t *testing.T) {
 	}
 
 	// Discover.
-	search := tools.NewBM25SearchTool(reg, 5)
+	search := tools.NewBM25SearchTool(reg, 5, 0.5)
 	res := search.Execute(context.Background(), map[string]any{"query": "echo a message"})
 	if res.IsError || !strings.Contains(res.ForLLM, name) {
 		t.Fatalf("search = %q (error=%v)", res.ForLLM, res.IsError)

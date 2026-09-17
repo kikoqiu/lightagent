@@ -285,7 +285,7 @@ func TestConfigEditorWiring(t *testing.T) {
 		"tools.read_file_lines.enabled", "tools.read_file_lines.max_read_file_size", "tools.read_file_lines.max_read_file_lines",
 		"tools.write_file.enabled", "tools.write_file.max_lines", "tools.write_file.auto_split", "tools.edit_file.enabled",
 		"tools.discovery.enabled", "tools.discovery.mode", "tools.discovery.ttl",
-		"tools.discovery.max_search_results", "tools.discovery.use_bm25",
+		"tools.discovery.max_search_results", "tools.discovery.min_match_rate", "tools.discovery.use_bm25",
 		"tools.mcp.enabled", "tools.mcp.servers",
 		"agent.max_tool_iterations", "agent.system_prompt", "agent.include_working_dir",
 		"ui.markdown",

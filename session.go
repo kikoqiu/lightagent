@@ -124,7 +124,7 @@ func runSession(o *options, stdout io.Writer) error {
 		reg.Register(tools.NewUnlockTool(reg, cfg.Tools.Discovery.TTL))
 		reg.Register(tools.NewDynamicCallTool(reg))
 		if cfg.Tools.Discovery.UseBM25 {
-			reg.Register(tools.NewBM25SearchTool(reg, cfg.Tools.Discovery.MaxSearchResults))
+			reg.Register(tools.NewBM25SearchTool(reg, cfg.Tools.Discovery.MaxSearchResults, cfg.Tools.Discovery.MinMatchRate))
 		}
 	}
 

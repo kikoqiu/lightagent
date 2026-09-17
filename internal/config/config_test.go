@@ -347,7 +347,7 @@ func TestDiscoveryConfigDefaults(t *testing.T) {
 	if d.EffectiveMode() != ToolDiscoveryModeUnlock {
 		t.Fatalf("mode = %q, want %q", d.EffectiveMode(), ToolDiscoveryModeUnlock)
 	}
-	if d.TTL != 50 || d.MaxSearchResults != 50 || !d.UseBM25 {
+	if d.TTL != 50 || d.MaxSearchResults != 10 || d.MinMatchRate != 0.5 || !d.UseBM25 {
 		t.Fatalf("discovery defaults = %+v", d)
 	}
 }
@@ -389,7 +389,7 @@ func TestDiscoveryConfigPartialFileDefaults(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	d := cfg.Tools.Discovery
-	if !d.Enabled || d.TTL != 50 || d.MaxSearchResults != 50 || !d.UseBM25 {
+	if !d.Enabled || d.TTL != 50 || d.MaxSearchResults != 10 || d.MinMatchRate != 0.5 || !d.UseBM25 {
 		t.Fatalf("merged discovery config = %+v, want defaults preserved", d)
 	}
 	if d.EffectiveMode() != ToolDiscoveryModeUnlock {

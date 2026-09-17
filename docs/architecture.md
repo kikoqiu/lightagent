@@ -189,7 +189,7 @@ name/arguments/id 等，即约 2.5 字符/token，另加每消息 12 字符的�
 MCP unlock 发现机制，由注册表 + 三个控制面工具组成：
 
 * **注册表**（`internal/tools/registry.go`）区分 *core* 与 *deferred* 工具。deferred 工具（锁定函数）不会被 `Definitions()` 下发到模型，只有在其名称有有效 grant 时 `Get`/`ExecuteArgs` 才允许执行，否则返回 `tool is locked` 错误。
-* **`tool_search_tool_bm25`**（`search_tool.go` + `bm25.go`）在 deferred 库上做 BM25 排序，只回名称+描述；引擎按注册表 `Version()` 缓存，仅在库变化时重建。发现**不注册、不授权**。
+* **`tool_search_tool_bm25`**（`search_tool.go` + `bm25.go`）在 deferred 库上排序：先按关键词匹配率降序（低于 `min_match_rate` 的直接丢弃），匹配率相同再按 BM25 分数降序，只回名称+描述；引擎按注册表 `Version()` 缓存，仅在库变化时重建。发现**不注册、不授权**。
 * **`unlock_tool`**（`unlock_tool.go`）写入 TTL grant 并下发规范化 XML `<tools>` schema；`ctx` 携带的 `UnlockLookup` 检查该 schema 是否仍在**当前有效（未压缩）上下文**里——在就只刷新授权并提示“之前已发过”，被压缩/淘汰则重新下发。
 * **`dynamic_call`**（`dynamic_call.go`）按名转发 `ExecuteArgs`，复用注册表的授权闸门。
 * **TTL**：`Agent.runLoop` 在**每个工具执行轮结束**调用 `reg.TickTTL()` 递减授权（与原 unlock 模式一致）；授权过期不影响函数仍可被搜索发现，模型重新 `unlock_tool` 即可。

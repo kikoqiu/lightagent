@@ -53,7 +53,7 @@
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
-    "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 50, "use_bm25": true },
+    "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
       "enabled": false,
       "servers": {
@@ -149,7 +149,8 @@ MCP unlock 发现机制：**锁定函数**（deferred）默认不下发给模型
 | `enabled` | bool | `false` | 仅当宿主**自行**通过 API 注册 deferred 工具时才需要显式开启；MCP 会自动启用该机制。控制面与提示词是否出现只取决于**是否确实存在锁定函数** |
 | `mode` | string | `"unlock"` | 仅支持 `unlock`（lightagent 未实现 classic 提升模式） |
 | `ttl` | int | `50` | `unlock_tool` 授权的保持轮数；**每个工具执行轮结束**递减一次，归零后函数重新锁定但仍可被搜索发现 |
-| `max_search_results` | int | `50` | 单次 BM25 搜索返回的最大函数数 |
+| `max_search_results` | int | `10` | 单次 BM25 搜索返回的最大函数数 |
+| `min_match_rate` | float | `0.5` | 关键词匹配率下限：函数必须命中的查询关键词占比（`0`~`1`），低于它的一律不返回。查询里**重复的关键词按出现次数各算 1 个词**，重复词既让分母变大也让权重变高。`0`（未配置）或大于 `1` 的取值回退到默认值 |
 | `use_bm25` | bool | `true` | 启用 BM25 自然语言搜索；lightagent 只有这一个发现搜索工具，故必须为 `true` |
 
 > * 控制面（`tool_search_tool_bm25` / `unlock_tool` / `dynamic_call`）与系统提示词里的机制说明、MCP 全局信息**只在存在锁定函数时**出现；没有锁定函数时不会往上下文插入任何多余内容。

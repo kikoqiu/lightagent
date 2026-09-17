@@ -99,6 +99,11 @@ type ToolsConfig struct {
 const (
 	// ToolDiscoveryModeUnlock decouples visibility from execution authority.
 	ToolDiscoveryModeUnlock = "unlock"
+
+	// defaultDiscoveryMinMatchRate is the share of the search query's keywords a
+	// locked function must contain to be reported. It is the built-in
+	// tools.discovery.min_match_rate default: half of the query keywords.
+	defaultDiscoveryMinMatchRate = 0.5
 )
 
 // ToolDiscoveryConfig configures the MCP tool-discovery / unlock control plane.
@@ -107,11 +112,12 @@ const (
 // The locked-function library itself is populated by the host through
 // Registry.RegisterDeferred.
 type ToolDiscoveryConfig struct {
-	Enabled          bool   `json:"enabled"`
-	Mode             string `json:"mode"`
-	TTL              int    `json:"ttl"`
-	MaxSearchResults int    `json:"max_search_results"`
-	UseBM25          bool   `json:"use_bm25"`
+	Enabled          bool    `json:"enabled"`
+	Mode             string  `json:"mode"`
+	TTL              int     `json:"ttl"`
+	MaxSearchResults int     `json:"max_search_results"`
+	MinMatchRate     float64 `json:"min_match_rate"`
+	UseBM25          bool    `json:"use_bm25"`
 }
 
 // EffectiveMode returns the discovery mode, defaulting to unlock.
@@ -293,7 +299,8 @@ func Default() *Config {
 				Enabled:          false,
 				Mode:             ToolDiscoveryModeUnlock,
 				TTL:              50,
-				MaxSearchResults: 50,
+				MaxSearchResults: 10,
+				MinMatchRate:     defaultDiscoveryMinMatchRate,
 				UseBM25:          true,
 			},
 		},
@@ -652,6 +659,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Tools.Discovery.MaxSearchResults <= 0 {
 		c.Tools.Discovery.MaxSearchResults = def.Tools.Discovery.MaxSearchResults
+	}
+	// min_match_rate is a share in (0, 1]: 0 (unset) and an impossible share
+	// both fall back to the built-in default.
+	if c.Tools.Discovery.MinMatchRate <= 0 || c.Tools.Discovery.MinMatchRate > 1 {
+		c.Tools.Discovery.MinMatchRate = def.Tools.Discovery.MinMatchRate
 	}
 	if c.Agent.MaxToolIterations <= 0 {
 		c.Agent.MaxToolIterations = def.Agent.MaxToolIterations
