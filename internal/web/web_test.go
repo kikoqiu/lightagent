@@ -99,7 +99,7 @@ func signedInClient(t *testing.T, srv *Server, password string) *http.Client {
 // not need to know which file carries a given marker now that the HTML, CSS and
 // JS live in separate embedded files.
 func pageSource() string {
-	return indexHTML + "\n" + appCSS + "\n" + appJS + "\n" + configJS + "\n" + authJS
+	return indexHTML + "\n" + appCSS + "\n" + appJS + "\n" + configJS + "\n" + authJS + "\n" + ttsJS
 }
 
 // TestPageIsPublic checks the shell is served without a session: the sign-in

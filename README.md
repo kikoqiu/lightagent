@@ -35,6 +35,7 @@
 | 13 | MCP 客户端 + 工具发现 / unlock | 纯标准库 MCP 客户端（stdio / Streamable HTTP / HTTP+SSE），server 在 `tools.mcp` 中配置；MCP 工具**恒为锁定函数**（永不进 `tools` 声明）：`tool_search_tool_bm25` 发现 → `unlock_tool` 下发 schema 并授权（TTL）→ `dynamic_call` 间接调用；系统提示词只注入 1 条全局 unlock 规则 + 每 server 1 条 MCP 全局信息（含 server 返回的 `serverInfo`/`instructions`） |
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板） |
 | 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
+| 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
 
 ---
 
@@ -305,6 +306,11 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
   Form 是分段控件表单（文本框 / 开关 / 滑杆 / 下拉 / 多行文本，按 `config.json` 的键逐项列出，留空即用内置默认），
   JSON 是整份文档原文；两者同步，改动实时写入将提交的文档。保存前两端都会校验（控件行内报错 + 服务端规则），
   **写回文件后重启生效**；`api_key` 打码回显（原样回传即保留原密钥），因此文件始终可启动。
+* 右上角 **🔊**（桌面端侧栏 “Read aloud” 卡片）打开**朗读面板**：用浏览器自带的语音合成读出 Agent 的输出。
+  **默认不启用**——侧栏卡片里的开关（与面板里的开关是同一个）打开后才朗读；浏览器不支持 Web Speech API 时
+  开关强制为关、控件禁用。可选**语言/语音**（按语音包分组，可 `Test`），朗读内容**二选一或多选**——回合的
+  最终文本，或 思考过程 / 工具调用（仅函数名）/ 文本反馈；开关与选择存在浏览器 `localStorage`
+  （**仅当前浏览器**，刷新保留，不进 `config.json`），刷新页面不会朗读历史（详见 [docs/web.md](docs/web.md)）。
 
 ---
 

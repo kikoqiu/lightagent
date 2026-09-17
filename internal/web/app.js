@@ -400,6 +400,10 @@
   // The mirror only connects once AUTH says the browser is (or need not be)
   // signed in, and drops the socket when a session ends.
   var AUTH = window.AUTH || { ok: function () { return true; }, ensure: function () { return Promise.resolve(true); }, onChange: function () {}, unauthorized: function () {} };
+  // Read-aloud (tts.js): every live event is handed to the voice panel, so it can
+  // read the same rows the transcript draws. A missing script degrades to a
+  // no-op, and a replayed history frame is skipped (see render).
+  var TTS = window.TTS || { event: function () {}, reset: function () {} };
 
   // The compressed-context summary is drawn as its own bordered block: it marks
   // the point where the older messages were cut out of the model context, so it
@@ -407,6 +411,10 @@
   var SUMMARY_ROLE = 'summary (older messages condensed)';
 
   function render(kind, ev) {
+    // Read-aloud follows the same event stream as the rows below (a replayed
+    // history frame is skipped: reloading the page must not read the whole
+    // conversation aloud).
+    if (!replaying) { TTS.event(kind, ev); }
     // Any event other than a further reasoning chunk ends the thinking row.
     if (kind !== 'reasoning_delta') { finishReasoning(); }
     if (kind === 'usage') { setUsage(ev.tokens || 0, ev.context_window || 0); return; }
@@ -470,6 +478,8 @@
     pinBottom();
     current = null;
     currentText = '';
+    // The rows the voice was reading are gone: drop its buffers and silence it.
+    TTS.reset();
     replaying = true;
     (ev.messages || []).forEach(function (m) {
       if (m.role === 'user') { render('user', { text: m.content }); }

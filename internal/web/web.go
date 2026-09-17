@@ -59,6 +59,14 @@ var configJS string
 //go:embed auth.js
 var authJS string
 
+// tts.js is the read-aloud panel: the agent's output is spoken by the browser's
+// own speech synthesis (the Web Speech API, i.e. Chrome's built-in TTS) and its
+// switches live in localStorage, so nothing about it reaches the server. It is
+// embedded like the other page files.
+//
+//go:embed tts.js
+var ttsJS string
+
 // maxPortTries is how many ports to attempt when the configured one is busy.
 const maxPortTries = 50
 
@@ -262,6 +270,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/app.js", staticAsset(appJS, "application/javascript; charset=utf-8"))
 	mux.HandleFunc("/config.js", staticAsset(configJS, "application/javascript; charset=utf-8"))
 	mux.HandleFunc("/auth.js", staticAsset(authJS, "application/javascript; charset=utf-8"))
+	mux.HandleFunc("/tts.js", staticAsset(ttsJS, "application/javascript; charset=utf-8"))
 	if sub, err := fs.Sub(assetsFS, "assets"); err == nil {
 		mux.Handle("/assets/", noCache(http.StripPrefix("/assets/", http.FileServer(http.FS(sub)))))
 	}

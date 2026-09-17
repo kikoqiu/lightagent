@@ -52,6 +52,17 @@
       </div>
       <div class="card-note">Saved changes apply after a restart.</div>
     </section>
+    <section class="card">
+      <div class="card-title"><span>Read aloud</span></div>
+      <label class="card-switch">
+        <input class="switch" type="checkbox" id="ttsRailOn">
+        <span>Speak the agent's output</span>
+      </label>
+      <div class="actions">
+        <button class="ghost tts-open" type="button" data-tts-open>Voice settings</button>
+      </div>
+      <div class="card-note">Off by default; voice and switches are stored in this browser.</div>
+    </section>
     <div class="side-foot">lightagent web</div>
   </aside>
   <div class="main">
@@ -63,6 +74,7 @@
         <span class="usage" id="usage"></span>
         <span class="dot" id="dot" title="disconnected" aria-label="connection status"></span>
         <button class="ghost" id="signOut" type="button" title="sign out" hidden>Sign out</button>
+        <button class="ghost tts-open" id="ttsOpen" type="button" data-tts-open title="read aloud (browser speech)" aria-label="read-aloud settings">🔊</button>
         <button class="ghost gear" type="button" data-config-open title="edit config.json" aria-label="edit config.json">⚙</button>
       </span>
     </header>
@@ -99,6 +111,55 @@
       </div>
     </div>
   </div>
+  <div class="modal" id="ttsModal" hidden>
+    <div class="modal-backdrop" data-tts-close></div>
+    <div class="modal-panel" id="ttsPanel" role="dialog" aria-modal="true" aria-labelledby="ttsTitle" tabindex="-1">
+      <div class="modal-head">
+        <span class="modal-title"><b id="ttsTitle">Read aloud</b><small>Web Speech API · this browser only</small></span>
+        <button class="ghost" type="button" data-tts-close aria-label="close the read-aloud settings">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form" id="ttsForm">
+          <div class="field">
+            <label class="field-label" for="ttsOn">
+              <span class="field-key">Read aloud</span>
+              <span class="field-help">The agent's output is spoken by this browser (the Web Speech API); nothing is sent anywhere.</span>
+            </label>
+            <div class="field-control"><input class="switch" type="checkbox" id="ttsOn"></div>
+          </div>
+          <div class="field">
+            <label class="field-label" for="ttsLang">
+              <span class="field-key">Language</span>
+              <span class="field-help">Voices installed in this browser, grouped by language; “System default” lets the browser choose. “Test” reads a sample.</span>
+            </label>
+            <div class="field-control"><select id="ttsLang" aria-label="speech language and voice"></select></div>
+          </div>
+          <div class="field">
+            <span class="field-label">
+              <span class="field-key">What to read</span>
+              <span class="field-help">One reading per round, or the rows ticked below as they arrive.</span>
+            </span>
+            <div class="field-control">
+              <label class="tts-pick"><input type="radio" name="ttsMode" value="final"><span>Final summary of the round (the round's last reply text)</span></label>
+              <label class="tts-pick"><input type="radio" name="ttsMode" value="custom"><span>Only what is ticked below</span></label>
+              <div class="tts-picks" id="ttsPicks">
+                <label class="tts-pick"><input type="checkbox" id="ttsThinking"><span>Thinking process</span></label>
+                <label class="tts-pick"><input type="checkbox" id="ttsTools"><span>Tool calls (tool name)</span></label>
+                <label class="tts-pick"><input type="checkbox" id="ttsText"><span>Text feedback (reply text)</span></label>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-note" id="ttsStatus"></span>
+        <span class="modal-actions">
+          <button class="ghost" id="ttsTest" type="button">Test</button>
+          <button class="ghost" id="ttsStop" type="button">Stop</button>
+        </span>
+      </div>
+    </div>
+  </div>
   <div class="modal login" id="loginModal" hidden>
     <div class="modal-backdrop"></div>
     <div class="modal-panel login-panel" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
@@ -124,6 +185,9 @@
     </div>
   </div>
 </div>
+<!-- tts.js loads before app.js: the transcript feeds its events straight into
+     window.TTS. -->
+<script src="tts.js"></script>
 <script src="app.js"></script>
 <script src="auth.js"></script>
 <script src="config.js"></script>

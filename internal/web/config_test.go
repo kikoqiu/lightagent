@@ -304,7 +304,7 @@ func TestConfigEditorWiring(t *testing.T) {
 // has to load before there is a session).
 func TestConfigScriptIsServed(t *testing.T) {
 	srv := newTestServer(t, "secret")
-	for _, script := range []string{"/config.js", "/auth.js", "/app.js"} {
+	for _, script := range []string{"/config.js", "/auth.js", "/app.js", "/tts.js"} {
 		resp, err := http.Get(baseURL(srv) + script)
 		if err != nil {
 			t.Fatalf("GET %s: %v", script, err)
