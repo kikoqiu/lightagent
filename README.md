@@ -345,6 +345,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 后续内容直到 2 行非空行（恰好为空的行输出空行，纯空白行按原样输出并计入）或内容结束，最后以
 `...` 收尾。
 `encoding`：`utf8`（默认）写文本；`hex`/`base64` 解码二进制载荷；其它标签按字符集编码。
+行尾按原样写入，系统不会自动补换行；因此写入的文本不以换行结尾时，成功反馈后面会追加一条
+`[no trailing newline: the system never adds one. If the next call appends (mode='a'), start its content
+with one newline: \n, or \r\n for a CRLF file.]`（下一步要 `mode='a'` 续写就得在内容最前面自己加一个换行）。
 
 ### `edit_file`
 `old_text` → `new_text` 替换；默认字面量且要求唯一，`regex=true` 时按 RE2 正则替换所有匹配。

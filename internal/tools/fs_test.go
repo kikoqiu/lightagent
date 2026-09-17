@@ -102,6 +102,10 @@ const truncationGuidance = "\nDo NOT write the file in fewer lines than the orig
 	"\nWrite the file in several calls with mode='a'. The newline that ended the last written line has already been written for you, so start the next call with the next line's text directly (no leading newline). Keep the trailing newline of your final line if the original has one: the system never inserts it for you. " +
 	"\n\nThe exact truncated lines are displayed as follows (CRITICAL: Check THESE LINES directly, NEVER issue a duplicate read in the next step):"
 
+// noFinalNewlineMarker is a stable fragment of the notice a successful write
+// result carries when the text payload does not end with a newline.
+const noFinalNewlineMarker = "no trailing newline"
+
 func TestWriteFileLineLimit(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "lim.txt")
@@ -160,6 +164,89 @@ func TestWriteFileLineLimitAppendRoundTrip(t *testing.T) {
 	}
 	if got := readFile(t, p); got != original {
 		t.Fatalf("content = %q, want %q", got, original)
+	}
+}
+
+// TestWriteFileNoFinalNewlineNote pins the notice a successful write result
+// carries when the text payload does not end with a newline: the write itself
+// still reports success, the file keeps the payload byte for byte, and the model
+// is told the missing final newline stays missing, plus that a follow-up append
+// has to open with that newline itself. Content that already ends with a newline
+// (LF or CRLF), an empty payload, a binary payload and a truncated write carry no
+// such notice.
+func TestWriteFileNoFinalNewlineNote(t *testing.T) {
+	dir := t.TempDir()
+	tool := NewWriteFileTool(FsConfig{MaxWriteLines: 100})
+	ctx := context.Background()
+	p := filepath.Join(dir, "no_eol.txt")
+
+	res := tool.Execute(ctx, map[string]any{"path": p, "content": "a\nb"})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.HasPrefix(res.ForLLM, "File created: ") {
+		t.Fatalf("result = %q, want the success line first", res.ForLLM)
+	}
+	if !strings.HasSuffix(res.ForLLM, noFinalNewlineNote()) {
+		t.Fatalf("result = %q, want it to end with the no-trailing-newline notice", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "If the next call appends") {
+		t.Fatalf("result = %q, want the notice to explain the leading newline of an append", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "a\nb" {
+		t.Fatalf("content = %q, want %q", got, "a\nb")
+	}
+
+	// Appending a tail without a newline reports it too: the file ends there.
+	res = tool.Execute(ctx, map[string]any{"path": p, "content": "\ntail", "mode": "a"})
+	if res.IsError {
+		t.Fatalf("append failed: %s", res.ForLLM)
+	}
+	if !strings.HasSuffix(res.ForLLM, noFinalNewlineNote()) {
+		t.Fatalf("append result = %q, want the no-trailing-newline notice", res.ForLLM)
+	}
+
+	// Content ending with a newline needs no notice, LF and CRLF alike.
+	for _, content := range []string{"a\nb\n", "a\r\nb\r\n"} {
+		res = tool.Execute(ctx, map[string]any{"path": p, "content": content})
+		if res.IsError {
+			t.Fatalf("write %q failed: %s", content, res.ForLLM)
+		}
+		if strings.Contains(res.ForLLM, noFinalNewlineMarker) {
+			t.Fatalf("result for %q = %q, want no notice", content, res.ForLLM)
+		}
+	}
+
+	// An empty payload has no last line to report.
+	res = tool.Execute(ctx, map[string]any{"path": p, "content": ""})
+	if res.IsError {
+		t.Fatalf("empty write failed: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, noFinalNewlineMarker) {
+		t.Fatalf("empty write result = %q, want no notice", res.ForLLM)
+	}
+
+	// A truncated write restores the newline of the last kept line, so it carries
+	// the truncation note only.
+	limited := NewWriteFileTool(FsConfig{MaxWriteLines: 2})
+	res = limited.Execute(ctx, map[string]any{"path": p, "content": "a\nb\nc"})
+	if res.IsError {
+		t.Fatalf("truncated write failed: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "[truncated: 2 of 3 lines written; continue with mode='a']") {
+		t.Fatalf("truncated result = %q, want the truncation note", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, noFinalNewlineMarker) {
+		t.Fatalf("truncated result = %q, want the truncation note only", res.ForLLM)
+	}
+
+	// Binary payloads are written whole and carry no line semantics.
+	res = tool.Execute(ctx, map[string]any{"path": filepath.Join(dir, "bin.dat"), "content": "0a0b", "encoding": "hex"})
+	if res.IsError {
+		t.Fatalf("binary write failed: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, noFinalNewlineMarker) {
+		t.Fatalf("binary result = %q, want no notice", res.ForLLM)
 	}
 }
 

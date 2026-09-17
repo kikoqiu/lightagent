@@ -172,6 +172,11 @@ type Tool interface {
   随后**从截断处原样**列出后续内容直到 **2 行非空行**（恰好为空的行输出为空行，纯空白行按原样
   输出并计入这 2 行）或内容结束，最后以 `...` 收尾；二进制载荷不受行数限制。
 * 行尾（LF/CRLF）按原样写入，系统不会自动补换行（唯一例外：截断时补回原文本身就存在的那个换行符）。
+  写入的文本**不以换行结尾**时，成功反馈（`File created/overwritten` 或 `Appended to`）之后追加一条
+  `[no trailing newline: the system never adds one. If the next call appends (mode='a'), start its content
+  with one newline: \n, or \r\n for a CRLF file.]` —— 文件就停在最后一个字符处，下一步若要 `mode='a'`
+  续写，**内容最前面要自己加一个换行**（LF 文件 `\n`，CRLF 文件 `\r\n`）。空内容、二进制载荷
+  （`hex`/`base64`）与截断写入不带这条提示。
 * `mode='c'` 对已存在文件报错；`mode='a'` 对不存在文件会创建并说明。
 
 ---

@@ -389,8 +389,13 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		}
 	} else {
 		kept, dropped, total, truncated := enforceWriteLineLimit(content, t.fs.MaxWriteLines)
-		if truncated {
+		switch {
+		case truncated:
+			// The cut restores the separator of the last kept line, so the tail
+			// that resumes the write is the only concern left to report.
 			note = truncationNote(dropped, t.fs.MaxWriteLines, total)
+		case kept != "" && !strings.HasSuffix(kept, "\n"):
+			note = noFinalNewlineNote()
 		}
 		data, err = decodeContentPayload(kept, encoding)
 		if err != nil {
@@ -560,6 +565,15 @@ func truncationNote(dropped []string, written, total int) string {
 	}
 	b.WriteString("\n...")
 	return b.String()
+}
+
+// noFinalNewlineNote renders the short note appended to a write result when the
+// text payload does not end with a newline: the file ends at the last character
+// written, and a follow-up append has to open with the newline the system never
+// adds on its own.
+func noFinalNewlineNote() string {
+	return "\n[no trailing newline: the system never adds one. If the next call appends " +
+		"(mode='a'), start its content with one newline: \\n, or \\r\\n for a CRLF file.]"
 }
 
 // EditFileTool edits a file by replacing old_text with new_text.
