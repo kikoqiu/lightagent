@@ -51,7 +51,7 @@
   "tools": {
     "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10, "use_utf8": true },
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
-    "write_file":      { "enabled": true, "max_lines": 200 },
+    "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 50, "use_bm25": true },
     "mcp": {
@@ -131,6 +131,7 @@
 | `read_file_lines.max_read_file_lines` | int | `200` | 单次读取行数预算 |
 | `write_file.enabled` | bool | `true` | 启用写文件工具 |
 | `write_file.max_lines` | int | `200` | 单次写入行数上限（超出截断） |
+| `write_file.auto_split` | bool | `true` | 模型一次写出的文本超过 `max_lines` 时，由 agent 自动拆成多次写入（见 [tools.md](tools.md#write_file)）；关闭后恢复"截断 + 提示续写"的旧行为 |
 | `edit_file.enabled` | bool | `true` | 启用编辑工具 |
 
 * `exec.use_utf8` 默认为 `true`：加载时先取默认值再合并文件，**省略该字段即保持开启**；

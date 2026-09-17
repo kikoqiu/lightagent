@@ -38,6 +38,11 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
    6. 无 `tool_calls` 时：`finish_reason=length`（被 `max_tokens` 截断）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮（连续 3 次则停止）；否则回合结束。
    7. 逐个执行工具，发布 `tool_call` / `tool_result`，把结果作为 `tool` 消息追加；本轮结束后
       广播 `usage`（工具结果同样占用上下文），回到 2。
+      * **write_file 自动拆解**（`tools.write_file.auto_split`，默认开启）：若某次 `write_file` 的
+        文本载荷超过 `write_file.max_lines`，该调用的参数在落库前先被改写成第一段（历史、前端展示与
+        后续请求回传的都是实际执行的参数），其余分段在本轮工具结果之后追加为**独立的 assistant/tool
+        往返**（每段一个 `tool_call` + `tool_result`，续写段 `mode='a'`），全部写完才回到 2 继续问
+        模型；第一段失败则丢弃其余分段并发布 `info`。
    8. 达到 `max_tool_iterations` 时发布 `info` 并结束。
 3. 结束时置 `busy=false`、保存会话、发布 `turn_done`。
 

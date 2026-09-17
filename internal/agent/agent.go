@@ -50,6 +50,11 @@ type Agent struct {
 
 	maxIter   int
 	compactor *compactor
+	// autoSplitWrites spreads a write_file payload that exceeds the tool's
+	// per-call line limit over several calls instead of letting it be
+	// truncated (see autoSplitWriteCalls). It comes from
+	// tools.write_file.auto_split and defaults to true.
+	autoSplitWrites bool
 	// contextWindow is the model context window in tokens (for usage display).
 	contextWindow int
 
@@ -109,6 +114,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		dirListing:         dirListing,
 		unlockRule:         unlockRule,
 		maxIter:            maxIter,
+		autoSplitWrites:    cfg.Tools.WriteFile.AutoSplit,
 		contextWindow:      contextWindow,
 		toolResultsVisible: true,
 		steerCh:            make(chan string, 64),
@@ -378,6 +384,13 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 
 		a.setUsage(resp.Usage)
 
+		// An oversized write_file payload is spread over several calls: the
+		// call the model made keeps the first part and the remaining parts run
+		// after this round as follow-up rounds (see runWriteSplits). The
+		// rewrite happens before the assistant message is recorded, so the
+		// history and the front-ends show the arguments that were executed.
+		continuations := a.autoSplitWriteCalls(resp.ToolCalls)
+
 		assistant := llm.Message{
 			Role:      "assistant",
 			Content:   resp.Content,
@@ -420,9 +433,9 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 		}
 		truncations = 0
 
+		var pendingSplits []llm.ToolCall
 		for idx, tc := range resp.ToolCalls {
-			a.bus.Publish(Event{Type: EventToolCall, Name: tc.Function.Name, Args: tc.Function.Arguments})
-			res, canceled := a.executeTool(ctx, tc)
+			res, canceled := a.dispatchToolCall(ctx, tc)
 			if canceled {
 				// The user stopped the turn: report the interrupted call (and
 				// every call after it, so the assistant/tool pairing stays
@@ -431,20 +444,21 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 				a.finishInterrupt(turnStart)
 				return
 			}
-			if a.ToolResultsVisible() {
-				a.bus.Publish(Event{
-					Type:    EventToolResult,
-					Name:    tc.Function.Name,
-					Text:    res.ForUser,
-					IsError: res.IsError,
-				})
+			rest, split := continuations[idx]
+			if !split {
+				continue
 			}
-			a.appendMessage(llm.Message{
-				Role:       "tool",
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-				Content:    res.ForLLM,
-			})
+			if res.IsError {
+				// The first part failed (a create-only call on an existing
+				// file, say): appending the rest would leave a file that stops
+				// in the middle of the payload, so the parts are dropped.
+				a.bus.Publish(Event{
+					Type: EventInfo,
+					Text: fmt.Sprintf("write_file: the first part failed, so the remaining %d part(s) were skipped", len(rest)),
+				})
+				continue
+			}
+			pendingSplits = append(pendingSplits, rest...)
 		}
 
 		// Expire unlock grants after each tool-execution round, exactly like
@@ -456,6 +470,16 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 		// Tool results grew the context without a model call; report the new
 		// size before the next round starts.
 		a.bus.Publish(a.usageEvent())
+
+		// The remaining parts of an auto-split write run as their own
+		// assistant/tool rounds right here, so the model is only asked again
+		// once the payload is on disk in order.
+		if len(pendingSplits) > 0 {
+			if !a.runWriteSplits(ctx, pendingSplits) {
+				a.finishInterrupt(turnStart)
+				return
+			}
+		}
 	}
 
 	a.bus.Publish(Event{
@@ -467,6 +491,33 @@ func (a *Agent) runLoop(ctx context.Context, userText string) {
 // turnInterrupted reports whether err came from cancelling the turn context.
 func turnInterrupted(ctx context.Context, err error) bool {
 	return ctx.Err() != nil && errors.Is(err, context.Canceled)
+}
+
+// dispatchToolCall publishes one tool call, runs it and records its answer as a
+// tool message, which is what keeps the assistant message's tool_calls paired.
+// It reports the result and whether the turn was cancelled before the call
+// finished.
+func (a *Agent) dispatchToolCall(ctx context.Context, tc llm.ToolCall) (*tools.Result, bool) {
+	a.bus.Publish(Event{Type: EventToolCall, Name: tc.Function.Name, Args: tc.Function.Arguments})
+	res, canceled := a.executeTool(ctx, tc)
+	if canceled {
+		return nil, true
+	}
+	if a.ToolResultsVisible() {
+		a.bus.Publish(Event{
+			Type:    EventToolResult,
+			Name:    tc.Function.Name,
+			Text:    res.ForUser,
+			IsError: res.IsError,
+		})
+	}
+	a.appendMessage(llm.Message{
+		Role:       "tool",
+		ToolCallID: tc.ID,
+		Name:       tc.Function.Name,
+		Content:    res.ForLLM,
+	})
+	return res, false
 }
 
 // executeTool runs one tool call and reports whether the turn was cancelled

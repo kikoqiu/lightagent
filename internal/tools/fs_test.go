@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -314,5 +315,115 @@ func TestEditFileCRLFPreserved(t *testing.T) {
 	}
 	if got := readFile(t, p); got != "one\r\nTWO\r\n" {
 		t.Fatalf("CRLF not preserved: %q", got)
+	}
+}
+
+// TestSplitWriteContentScale pins the chunking of a payload far beyond the
+// limit: a 500-line write under the default 200-line limit becomes three calls
+// that each stay inside the limit, and the concatenation is the payload again.
+func TestSplitWriteContentScale(t *testing.T) {
+	lines := make([]string, 500)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("l%d", i+1)
+	}
+	payload := strings.Join(lines, "\n")
+
+	chunks := splitWriteContent(payload, 200)
+	if len(chunks) != 3 {
+		t.Fatalf("chunks = %d, want 3 for 500 lines under a 200-line limit", len(chunks))
+	}
+	if got := strings.Join(chunks, ""); got != payload {
+		t.Fatalf("chunks do not rebuild the payload")
+	}
+	for i, chunk := range chunks {
+		if _, _, _, truncated := enforceWriteLineLimit(chunk, 200); truncated {
+			t.Fatalf("chunk %d exceeds the per-call limit", i+1)
+		}
+	}
+}
+
+func TestPlanWriteCallsNoSplit(t *testing.T) {
+	tool := NewWriteFileTool(FsConfig{MaxWriteLines: 5})
+	cases := []struct {
+		name string
+		args map[string]any
+	}{
+		{"fits in one call", map[string]any{"path": "a.txt", "content": "l1\nl2\nl3\nl4"}},
+		{"exactly the limit", map[string]any{"path": "a.txt", "content": "l1\nl2\nl3\nl4\nl5"}},
+		{"empty payload", map[string]any{"path": "a.txt", "content": ""}},
+		{"no content", map[string]any{"path": "a.txt"}},
+		{"encoded payload", map[string]any{"path": "a.txt", "encoding": "base64", "content": strings.Repeat("AA\n", 20)}},
+	}
+	for _, tc := range cases {
+		if _, split := tool.PlanWriteCalls(tc.args); split {
+			t.Errorf("%s: PlanWriteCalls split a call it should leave alone", tc.name)
+		}
+	}
+}
+
+// TestPlanWriteCallsChain writes a payload longer than the per-call limit through
+// the planned calls: every call stays inside the limit on its own (the tool adds
+// no truncation note), and the file ends up byte-identical to the payload.
+func TestPlanWriteCallsChain(t *testing.T) {
+	tool := NewWriteFileTool(FsConfig{MaxWriteLines: 5})
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		mode    string
+	}{
+		{"twelve lines", strings.Join([]string{"l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10", "l11", "l12"}, "\n"), ""},
+		{"trailing newline", "l1\nl2\nl3\nl4\nl5\nl6\nl7\n", ""},
+		{"crlf", "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7\r\nl8", ""},
+		{"append mode", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10", "a"},
+		{"create mode", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10", "c"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "chain.txt")
+			args := map[string]any{"path": p, "content": tc.content}
+			if tc.mode != "" {
+				args["mode"] = tc.mode
+			}
+
+			calls, split := tool.PlanWriteCalls(args)
+			if !split {
+				t.Fatalf("PlanWriteCalls did not split a payload longer than the limit")
+			}
+			if len(calls) < 2 {
+				t.Fatalf("planned calls = %d, want a chain", len(calls))
+			}
+			// The model's own arguments must stay untouched, and the planned
+			// calls must not share one map.
+			if args["content"] != tc.content {
+				t.Fatalf("PlanWriteCalls mutated the caller's content")
+			}
+			if got := calls[0]["mode"]; got != args["mode"] {
+				t.Fatalf("first call mode = %v, want the requested %v", got, args["mode"])
+			}
+			for i, call := range calls {
+				if i > 0 && call["mode"] != "a" {
+					t.Fatalf("call %d mode = %v, want append", i+1, call["mode"])
+				}
+				chunk, _ := call["content"].(string)
+				if _, _, _, truncated := enforceWriteLineLimit(chunk, 5); truncated {
+					t.Fatalf("call %d carries more lines than one call accepts", i+1)
+				}
+			}
+
+			for i, call := range calls {
+				res := tool.Execute(ctx, call)
+				if res.IsError {
+					t.Fatalf("call %d failed: %s", i+1, res.ForLLM)
+				}
+				if strings.Contains(res.ForLLM, "truncated") {
+					t.Fatalf("call %d reported truncation: %s", i+1, res.ForLLM)
+				}
+			}
+			if got := readFile(t, p); got != tc.content {
+				t.Fatalf("content = %q, want the original payload %q", got, tc.content)
+			}
+		})
 	}
 }

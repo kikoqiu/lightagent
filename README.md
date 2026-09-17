@@ -152,7 +152,7 @@ source <(lightagent completion bash)       # bash 补全
   "tools": {
     "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10 },
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
-    "write_file":      { "enabled": true, "max_lines": 200 },
+    "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 50, "use_bm25": true },
     "mcp": {
@@ -335,7 +335,11 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 `euc-kr`、`windows-1252`）逐行解码为 UTF-8。
 
 ### `write_file`
-写入文件，`mode`：`o` 覆盖（默认）、`a` 追加、`c` 仅新建；超过行数上限会截断，并写入被截断处原有的
+写入文件，`mode`：`o` 覆盖（默认）、`a` 追加、`c` 仅新建。默认开启自动拆解
+（`tools.write_file.auto_split`）：模型一次给出的文本超过 `max_lines` 时，agent 把第一段留在模型自己
+那次调用里（历史与后续请求展示的参数也只有第一段），其余分段作为新的 `assistant`/`tool` 往返依次追加，
+拼接后与原文逐字节相同（续写段自动用 `mode='a'`，故 `max_lines=200`、原本 500 行会变成 3 个写入往返）；
+第一段失败则丢弃其余分段。关闭该开关后恢复旧行为：超限截断，并写入被截断处原有的
 换行符（CRLF 保持 `\r\n`），因此续写直接接下一行即可；提示首行给出
 `[truncated: N of M lines written; continue with mode='a']` 与续写要求，随后**从截断处原样**列出
 后续内容直到 2 行非空行（恰好为空的行输出空行，纯空白行按原样输出并计入）或内容结束，最后以

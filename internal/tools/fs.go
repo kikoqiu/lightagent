@@ -259,6 +259,20 @@ func looksBinary(sample []byte) bool {
 	return bytes.IndexByte(sample, 0) >= 0
 }
 
+// AutoSplitWriteTool is implemented by a write tool that can spread a payload
+// larger than its own per-call limit over several consecutive calls. The agent
+// loop consults it for every write_file call: instead of letting the call be cut
+// at the limit, the engine keeps the first slice in the model's own call and
+// replays the remaining slices as follow-up calls it makes itself.
+type AutoSplitWriteTool interface {
+	// PlanWriteCalls reports how one decoded call has to be carried out. split
+	// is false when the call keeps its arguments (the payload fits in a single
+	// call, or it cannot be cut line by line). Otherwise the returned maps are
+	// the arguments of the calls to run in order: the first replaces the call
+	// the model made, the rest continue the same write.
+	PlanWriteCalls(args map[string]any) (calls []map[string]any, split bool)
+}
+
 // WriteFileTool writes file content with overwrite/append/create modes.
 type WriteFileTool struct {
 	fs FsConfig
@@ -423,6 +437,82 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		}
 		return OK(fmt.Sprintf("File created: %s (did not previously exist)%s", path, note))
 	}
+}
+
+// PlanWriteCalls implements AutoSplitWriteTool: a text payload longer than the
+// per-call line limit is cut on line boundaries, so the agent can write it with
+// a chain of calls instead of truncating its tail.
+//
+// The chunks reconstruct the payload byte for byte when they are written in
+// order, and each one stays inside the limit as the truncation path counts it.
+// A chunk that ends a line keeps that newline — it is what lets the next call
+// start with the next line's text — and the accounting counts that separator as
+// a line, so every chunk but the last carries MaxWriteLines-1 payload lines.
+// Only the first call keeps the requested mode: the continuations always append,
+// because the file already exists by then.
+func (t *WriteFileTool) PlanWriteCalls(args map[string]any) ([]map[string]any, bool) {
+	content, ok := stringArg(args, "content")
+	if !ok || content == "" {
+		return nil, false
+	}
+	// An encoded payload (hex/base64) is written whole: the line limit does not
+	// apply to it, so there is nothing to spread.
+	encodingRaw, _ := stringArg(args, "encoding")
+	if contentEncodingIsBinary(normalizeContentEncoding(encodingRaw)) {
+		return nil, false
+	}
+	chunks := splitWriteContent(content, t.fs.MaxWriteLines)
+	if len(chunks) < 2 {
+		return nil, false
+	}
+	calls := make([]map[string]any, 0, len(chunks))
+	first := cloneArgs(args)
+	first["content"] = chunks[0]
+	calls = append(calls, first)
+	for _, chunk := range chunks[1:] {
+		next := cloneArgs(args)
+		next["content"] = chunk
+		next["mode"] = "a"
+		calls = append(calls, next)
+	}
+	return calls, true
+}
+
+// splitWriteContent cuts a text payload into the chunks of a consecutive write
+// chain, in order. Every chunk stays within limit lines as WriteFileTool counts
+// them, and joining the chunks reproduces the payload exactly. It returns nil
+// when the payload already fits in a single call.
+func splitWriteContent(content string, limit int) []string {
+	// A budget of one line leaves no room for the separator that keeps the
+	// chunks apart; the caller then keeps the truncation behaviour instead.
+	if limit < 2 {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) <= limit {
+		return nil
+	}
+	step := limit - 1
+	chunks := make([]string, 0, len(lines)/step+1)
+	for start := 0; start < len(lines); start += step {
+		end := start + step
+		if end >= len(lines) {
+			chunks = append(chunks, strings.Join(lines[start:], "\n"))
+			break
+		}
+		chunks = append(chunks, strings.Join(lines[start:end], "\n")+"\n")
+	}
+	return chunks
+}
+
+// cloneArgs copies a decoded argument map so a planned call can be adjusted
+// without touching the model's own arguments or its siblings.
+func cloneArgs(args map[string]any) map[string]any {
+	out := make(map[string]any, len(args))
+	for key, value := range args {
+		out[key] = value
+	}
+	return out
 }
 
 // truncationPreviewLines is how many non-blank dropped lines the truncation note

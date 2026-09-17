@@ -243,6 +243,12 @@ type FsToolConfig struct {
 type WriteToolConfig struct {
 	Enabled  bool `json:"enabled"`
 	MaxLines int  `json:"max_lines"`
+	// AutoSplit spreads a write whose payload exceeds max_lines over several
+	// calls instead of letting the tool truncate it: the model's own call keeps
+	// the first part and the agent appends the remaining parts, each in its own
+	// tool round. It defaults to true; loading starts from the defaults, so an
+	// explicit "auto_split": false is required to turn it off.
+	AutoSplit bool `json:"auto_split"`
 }
 
 // ToggleToolConfig is a simple enabled/disabled switch.
@@ -281,7 +287,7 @@ func Default() *Config {
 		Tools: ToolsConfig{
 			Exec:          ExecToolConfig{Enabled: true, TimeoutSeconds: 3600, WaitSeconds: 10, UseUTF8: true},
 			ReadFileLines: FsToolConfig{Enabled: true, MaxReadFileSize: 32000, MaxReadFileLines: 200},
-			WriteFile:     WriteToolConfig{Enabled: true, MaxLines: 200},
+			WriteFile:     WriteToolConfig{Enabled: true, MaxLines: 200, AutoSplit: true},
 			EditFile:      ToggleToolConfig{Enabled: true},
 			Discovery: ToolDiscoveryConfig{
 				Enabled:          false,

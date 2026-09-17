@@ -100,6 +100,7 @@
         { path: 'tools.read_file_lines.max_read_file_lines', type: 'number', min: 1, help: 'line cap per request' },
         { path: 'tools.write_file.enabled', type: 'bool', help: 'register write_file' },
         { path: 'tools.write_file.max_lines', type: 'number', min: 1, help: 'line cap per write; the rest is left for a follow-up call' },
+        { path: 'tools.write_file.auto_split', type: 'bool', help: 'spread an oversized write over several calls instead of truncating it' },
         { path: 'tools.edit_file.enabled', type: 'bool', help: 'register edit_file' }
       ]
     },

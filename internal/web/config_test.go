@@ -283,7 +283,7 @@ func TestConfigEditorWiring(t *testing.T) {
 		"web.host", "web.port", "web.password",
 		"tools.exec.enabled", "tools.exec.timeout_seconds", "tools.exec.wait_seconds", "tools.exec.use_utf8",
 		"tools.read_file_lines.enabled", "tools.read_file_lines.max_read_file_size", "tools.read_file_lines.max_read_file_lines",
-		"tools.write_file.enabled", "tools.write_file.max_lines", "tools.edit_file.enabled",
+		"tools.write_file.enabled", "tools.write_file.max_lines", "tools.write_file.auto_split", "tools.edit_file.enabled",
 		"tools.discovery.enabled", "tools.discovery.mode", "tools.discovery.ttl",
 		"tools.discovery.max_search_results", "tools.discovery.use_bm25",
 		"tools.mcp.enabled", "tools.mcp.servers",
