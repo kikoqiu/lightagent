@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -672,8 +673,8 @@ func TestAutoCompactionKeepsAUserMessage(t *testing.T) {
 
 // TestCompactionRequestReusesLiveSystemPrompt pins the layout of the summarizing
 // call: it must carry the very system prompt the live conversation sends — the
-// sections appended below the base prompt (runtime line, working directory,
-// unlock rule, MCP info) included — followed by the messages being compressed
+// sections appended below the base prompt (unlock rule, MCP info, runtime line,
+// working directory) included — followed by the messages being compressed
 // and the summarize instruction. Dropping those sections would leave the summary
 // without the environment its messages came from, and would invalidate the
 // provider's cached prompt prefix on every compaction.
@@ -1102,15 +1103,23 @@ func TestSystemPromptMCPGlobalInfo(t *testing.T) {
 	}
 }
 
-// TestSystemPromptWorkingDirListing verifies the current-directory section is
-// injected by default and suppressed when agent.include_working_dir is off.
-func TestSystemPromptWorkingDirListing(t *testing.T) {
+// TestSystemPromptWorkingDirectory verifies the working-directory line is
+// injected by default, suppressed when agent.include_working_dir is off, and
+// states the path only — the directory's children are never listed.
+func TestSystemPromptWorkingDirectory(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
 	on := New(config.Default(), nil, tools.NewRegistry(), NewBus())
 	on.mu.Lock()
 	enabled := on.buildMessagesLocked()[0].Content
 	on.mu.Unlock()
-	if !strings.Contains(enabled, "working directory: ") {
-		t.Fatalf("working-directory listing missing by default:\n%s", enabled)
+	if want := "working directory: " + cwd; !strings.HasSuffix(enabled, want) {
+		t.Fatalf("system prompt must end with %q:\n%s", want, enabled)
+	}
+	if n := strings.Count(enabled, "working directory: "); n != 1 {
+		t.Fatalf("working-directory line count = %d, want 1:\n%s", n, enabled)
 	}
 
 	cfg := config.Default()
@@ -1120,13 +1129,49 @@ func TestSystemPromptWorkingDirListing(t *testing.T) {
 	disabled := off.buildMessagesLocked()[0].Content
 	off.mu.Unlock()
 	if strings.Contains(disabled, "working directory: ") {
-		t.Fatalf("working-directory listing present while disabled:\n%s", disabled)
+		t.Fatalf("working-directory line present while disabled:\n%s", disabled)
 	}
 }
 
-// TestSystemPromptRuntimeLine verifies the runtime line is appended at run time
-// right after the base prompt — also when the base prompt comes from agent.md —
-// so the environment is never baked into the prompt file.
+// TestSystemPromptSectionOrder pins the layout of the system prompt: the base
+// prompt first, then the tool/machine capability sections (unlock rule, MCP
+// global info) and finally the host sections — the runtime line and the working
+// directory — at the bottom.
+func TestSystemPromptSectionOrder(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agent.SystemPrompt = "custom base"
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "exec_command", desc: "run a command"})
+	reg.RegisterDeferred(agentStubTool{name: "mcp_github_create_issue", desc: "Create a GitHub issue"})
+	a := New(cfg, nil, reg, NewBus())
+	a.SetMCPServers([]MCPServerInfo{{Server: "playwright", ToolCount: 26}})
+
+	a.mu.Lock()
+	content := a.buildMessagesLocked()[0].Content
+	a.mu.Unlock()
+
+	prev := -1
+	for _, section := range []string{
+		"custom base",
+		"**Tool Discovery & Unlock**",
+		"MCP server `playwright` is connected.",
+		RuntimeInfo(),
+		"working directory: ",
+	} {
+		at := strings.Index(content, section)
+		if at < 0 {
+			t.Fatalf("system prompt is missing %q:\n%s", section, content)
+		}
+		if at < prev {
+			t.Fatalf("system prompt puts %q before the section it must follow:\n%s", section, content)
+		}
+		prev = at
+	}
+}
+
+// TestSystemPromptRuntimeLine verifies the runtime line is appended at run time at
+// the bottom of the system prompt — also when the base prompt comes from agent.md
+// — so the environment is never baked into the prompt file.
 func TestSystemPromptRuntimeLine(t *testing.T) {
 	cfg := config.Default()
 	cfg.Agent.SystemPrompt = "custom base"
@@ -1136,9 +1181,12 @@ func TestSystemPromptRuntimeLine(t *testing.T) {
 	content := a.buildMessagesLocked()[0].Content
 	a.mu.Unlock()
 
-	want := "custom base\n\n" + RuntimeInfo()
-	if !strings.HasPrefix(content, want) {
-		t.Fatalf("system prompt should start with %q:\n%s", want, content)
+	if !strings.HasPrefix(content, "custom base\n\n") {
+		t.Fatalf("system prompt should start with the base prompt:\n%s", content)
+	}
+	want := RuntimeInfo() + "\n\nworking directory: "
+	if !strings.Contains(content, want) {
+		t.Fatalf("system prompt should carry %q at the bottom:\n%s", want, content)
 	}
 	if n := strings.Count(content, "Runtime: "); n != 1 {
 		t.Fatalf("runtime line count = %d, want 1:\n%s", n, content)

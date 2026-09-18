@@ -24,13 +24,14 @@ type Agent struct {
 	bus    *Bus
 	base   string
 	// runtimeInfo is the environment line (platform the binary runs on) added
-	// after the base prompt. It is generated in New instead of living in the
-	// prompt template, so agent.md never carries a hard-coded platform.
+	// at the bottom of the prompt. It is generated in New instead of living in
+	// the prompt template, so agent.md never carries a hard-coded platform.
 	runtimeInfo string
-	// dirListing is the optional current-directory section (working directory
-	// plus its direct children). It is empty when agent.include_working_dir is
-	// off or the directory cannot be read. It is set once in New.
-	dirListing string
+	// workingDirInfo is the optional working-directory line (the absolute
+	// directory the process runs in, nothing more). It is empty when
+	// agent.include_working_dir is off or the directory cannot be resolved. It
+	// is set once in New.
+	workingDirInfo string
 	// unlockRule is the single global "Tool Discovery & Unlock" mechanism
 	// section. It is non-empty only while locked (deferred) functions exist,
 	// so it is injected exactly once and only when it is meaningful.
@@ -80,12 +81,13 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 	if base == "" {
 		base = DefaultSystemPrompt()
 	}
-	// The current-directory listing gives the model an immediate view of the
-	// working directory without spending a tool call.
-	var dirListing string
+	// The working-directory line tells the model where the process runs without
+	// spending a tool call. Only the path is reported: the directory's children
+	// are not listed.
+	var workingDirInfo string
 	if cfg.Agent.IncludeWorkingDir {
 		if cwd, err := os.Getwd(); err == nil {
-			dirListing = DirectoryListing(cwd)
+			workingDirInfo = WorkingDirectoryInfo(cwd)
 		}
 	}
 	// The global unlock mechanism rule is injected exactly once, and only while
@@ -115,7 +117,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		bus:                bus,
 		base:               base,
 		runtimeInfo:        RuntimeInfo(),
-		dirListing:         dirListing,
+		workingDirInfo:     workingDirInfo,
 		unlockRule:         unlockRule,
 		summaryInSystem:    cfg.Agent.SummaryInSystemPrompt,
 		maxIter:            maxIter,
@@ -147,21 +149,15 @@ func (a *Agent) SetMCPServers(servers []MCPServerInfo) {
 }
 
 // systemPrompt renders the system prompt: the base prompt followed by the
-// capability sections — the runtime line, the current-directory listing, the
-// single global unlock rule and, per connected server, the MCP global info
-// line. The runtime line is generated here rather than coming from the base
-// prompt, so an agent.md never carries a hard-coded platform. The caller must
-// hold a.mu.
+// capability sections — the single global unlock rule and, per connected server,
+// the MCP global info line — and closing with the host sections, the runtime
+// line and the working-directory line. The host sections are generated here
+// rather than coming from the base prompt, so an agent.md never carries a
+// hard-coded platform or path. The caller must hold a.mu.
 func (a *Agent) systemPrompt() string {
 	parts := make([]string, 0, len(a.mcpInfo)+4)
 	if trimmed := strings.TrimRight(a.base, "\n"); trimmed != "" {
 		parts = append(parts, trimmed)
-	}
-	if a.runtimeInfo != "" {
-		parts = append(parts, a.runtimeInfo)
-	}
-	if a.dirListing != "" {
-		parts = append(parts, a.dirListing)
 	}
 	if a.unlockRule != "" {
 		parts = append(parts, a.unlockRule)
@@ -172,6 +168,12 @@ func (a *Agent) systemPrompt() string {
 			lines = append(lines, mcpServerInfoLine(info))
 		}
 		parts = append(parts, strings.Join(lines, "\n"))
+	}
+	if a.runtimeInfo != "" {
+		parts = append(parts, a.runtimeInfo)
+	}
+	if a.workingDirInfo != "" {
+		parts = append(parts, a.workingDirInfo)
 	}
 	return strings.Join(parts, "\n\n")
 }

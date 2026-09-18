@@ -266,11 +266,10 @@ type ToggleToolConfig struct {
 type AgentConfig struct {
 	MaxToolIterations int    `json:"max_tool_iterations"`
 	SystemPrompt      string `json:"system_prompt"`
-	// IncludeWorkingDir injects the current directory listing (the working
-	// directory plus its direct children, subdirectories annotated with their
-	// own direct-child count) into the system prompt. It defaults to true;
-	// loading starts from the defaults, so an explicit false is required to
-	// turn it off.
+	// IncludeWorkingDir appends the working-directory line (the absolute
+	// directory the process runs in, the path only) to the system prompt. It
+	// defaults to true; loading starts from the defaults, so an explicit false
+	// is required to turn it off.
 	IncludeWorkingDir bool `json:"include_working_dir"`
 	// SummaryInSystemPrompt selects where a request carries the accumulated
 	// context summary: false (the default) sends it as the first user message,

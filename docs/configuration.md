@@ -193,25 +193,23 @@ lightagent 内置一个**纯标准库**的 MCP 客户端。启动时按 `servers
 |------|------|------|------|
 | `max_tool_iterations` | int | `200` | 单个回合内工具循环的最大轮数 |
 | `system_prompt` | string | 空 | 自定义系统提示词；空则用内置默认（`agent.md` 优先级更高）。运行时环境行由程序自动追加，不必写在这里 |
-| `include_working_dir` | bool | `true` | 启动时把**当前目录清单**插入系统提示词（工作目录 + 直接子项；子目录附其直接子项数量）。省略即开启，显式 `false` 关闭 |
+| `include_working_dir` | bool | `true` | 启动时把**工作目录行**（仅进程所在目录的绝对路径，不列目录内容）追加到系统提示词末尾。省略即开启，显式 `false` 关闭 |
 | `summary_in_system_prompt` | bool | `false` | 发送时累积摘要的位置：`false` = 第一条用户消息（`[engine] CONVERSATION SUMMARY:` 开头）；`true` = 系统提示词末尾的 `# CONVERSATION SUMMARY` 段 |
 
-`include_working_dir` 插入的段落形如（子目录在前并带 `[直接子项数量]`，随后是文件）：
+`include_working_dir` 插入的段落只有一行，即进程的工作目录：
 
 ```
 working directory: D:\work\demo
-internal[4]
-docs[12]
-main.go
-go.mod
 ```
+
+目录里的子目录与文件**不再列出**（无论项目多大，这一段都是一行），需要时由模型用文件工具查看。
 
 由于加载时先取默认值再合并文件，省略 `include_working_dir` 即保持开启；关闭需显式写 `"include_working_dir": false`。
 
 `summary_in_system_prompt` 决定发送时累积摘要的位置，默认 `false`（第一条用户消息）：
 
 ```
-system: <基础提示词 + 运行时行 + 目录清单 + ……>
+system: <基础提示词 + unlock 规则 + MCP 信息 + 运行时行 + 工作目录行>
 user:   [engine] CONVERSATION SUMMARY:
         <累积摘要>
 user:   <历史里的第一条 user>
@@ -255,9 +253,11 @@ user:   <历史里的第一条 user>
 
 优先级：`agent.md` > `config.agent.system_prompt` > 内置默认。
 
-程序会在基础提示词之后**自动追加运行时环境行** `Runtime: <GOOS>/<GOARCH>.`（以及可选的目录清单、
-unlock 规则、MCP 信息），因此 `agent.md` / `agent.system_prompt` **不需要也不应**写这一行：
-`gen-agent-prompt` 导出的模板已不再包含它（旧模板里残留的 `Runtime: ...` 行可以直接删掉）。
+程序会在基础提示词之后**自动按顺序追加能力段落** —— unlock 规则、MCP 信息、运行时环境行
+`Runtime: <GOOS>/<GOARCH>.`、工作目录行 `working directory: <绝对路径>`（后者由
+`agent.include_working_dir` 控制，默认开启）—— 因此 `agent.md` / `agent.system_prompt`
+**不需要也不应**写这些内容：
+`gen-agent-prompt` 导出的模板已不再包含它们（旧模板里残留的 `Runtime: ...` 行可以直接删掉）。
 
 ### 片段导入：`@include("路径")`
 

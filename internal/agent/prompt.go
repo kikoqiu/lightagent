@@ -2,8 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -41,53 +39,16 @@ func RuntimeInfo() string {
 	return "Runtime: " + runtime.GOOS + "/" + runtime.GOARCH + "."
 }
 
-// DirectoryListing renders the current-directory section injected into the
-// system prompt. The first line is the absolute working directory and the second
-// a legend for the section format; the rest are its direct children, one per
-// line, with subdirectories listed first and annotated with their own
-// direct-child count in brackets:
-//
-//	working directory: /path/to/dir
-//	 dir[children count] / file
-//	subdir-a[3]
-//	subdir-b[0]
-//	file1
-//	file2
-//
-// It returns "" when dir cannot be read.
-func DirectoryListing(dir string) string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+// WorkingDirectoryInfo returns the working-directory line the agent appends to
+// its system prompt: the absolute path of the directory the process runs in. It
+// states the path only — the directory's children are deliberately left out, so
+// the section stays a single line however large the project is; the model uses
+// the file tools to inspect what it needs. It returns "" for an empty dir.
+func WorkingDirectoryInfo(dir string) string {
+	if dir == "" {
 		return ""
 	}
-
-	dirs := make([]string, 0, len(entries))
-	files := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		if !entry.IsDir() {
-			files = append(files, name)
-			continue
-		}
-		count := 0
-		if children, cerr := os.ReadDir(filepath.Join(dir, name)); cerr == nil {
-			count = len(children)
-		}
-		dirs = append(dirs, fmt.Sprintf("%s[%d]", name, count))
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "working directory: %s", dir)
-	b.WriteString("\n dir[children count] / file")
-	for _, line := range dirs {
-		b.WriteString("\n")
-		b.WriteString(line)
-	}
-	for _, line := range files {
-		b.WriteString("\n")
-		b.WriteString(line)
-	}
-	return b.String()
+	return "working directory: " + dir
 }
 
 // ToolUnlockRule renders the static system-prompt rule that explains the

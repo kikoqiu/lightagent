@@ -8,42 +8,30 @@ import (
 	"testing"
 )
 
-// TestDirectoryListing verifies the working-directory section format: the path
-// line, the format legend, then subdirectories (annotated with their direct-child
-// count) and finally files, each group sorted.
-func TestDirectoryListing(t *testing.T) {
+// TestWorkingDirectoryInfo verifies the working-directory line states the path
+// only: the directory's children are never listed, so the section stays one line
+// however large the project is.
+func TestWorkingDirectoryInfo(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"a.txt", "b.txt"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	for _, sub := range []string{"alpha", "beta"} {
-		if err := os.Mkdir(filepath.Join(dir, sub), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// alpha holds two direct children; beta stays empty.
-	for _, name := range []string{"one.go", "two.go"} {
-		if err := os.WriteFile(filepath.Join(dir, "alpha", name), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.Mkdir(filepath.Join(dir, "alpha"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 
-	got := DirectoryListing(dir)
-	want := "working directory: " + dir + "\n" +
-		" dir[children count] / file\n" +
-		"alpha[2]\nbeta[0]\na.txt\nb.txt"
+	got := WorkingDirectoryInfo(dir)
+	want := "working directory: " + dir
 	if got != want {
-		t.Fatalf("DirectoryListing =\n%s\nwant\n%s", got, want)
+		t.Fatalf("WorkingDirectoryInfo = %q, want %q", got, want)
 	}
 }
 
-// TestDirectoryListingUnreadable verifies an unreadable directory yields an
-// empty section instead of an error.
-func TestDirectoryListingUnreadable(t *testing.T) {
-	if got := DirectoryListing(filepath.Join(t.TempDir(), "missing")); got != "" {
-		t.Fatalf("DirectoryListing of a missing dir = %q, want empty", got)
+// TestWorkingDirectoryInfoEmpty verifies an unknown directory yields an empty
+// section instead of a path line.
+func TestWorkingDirectoryInfoEmpty(t *testing.T) {
+	if got := WorkingDirectoryInfo(""); got != "" {
+		t.Fatalf("WorkingDirectoryInfo of an empty dir = %q, want empty", got)
 	}
 }
 

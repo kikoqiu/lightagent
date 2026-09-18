@@ -186,7 +186,7 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
    聊天模板要求请求里至少有一条 user 查询，否则接口直接返回 400。
 
 被压缩的部分（切点之前）按 append_instruction 模式交给模型总结：总结请求原样复用**实时请求的
-请求头** —— 系统提示（基础提示词 + 运行时行 + 目录清单 + unlock 规则 + MCP 全局信息）与同一份
+请求头** —— 系统提示（基础提示词 + unlock 规则 + MCP 全局信息 + 运行时行 + 工作目录行）与同一份
 tools 声明都由 `Agent.livePrefixLocked()` 这一处渲染，摘要由 `headMessages()` 放到配置指定的位置，
 只是把它放到被压缩消息之前、并在末尾追加压缩指令。因此模型总结时所处的环境与产生这些消息时一致
 （基础提示词以下的段落不会被丢掉），请求前缀与实时请求逐字节相同——服务端提示缓存仍可命中该前缀，
@@ -207,7 +207,7 @@ CLI `/compact` 会以**手动模式**触发（更保守的保留窗口）。
 该开关决定**发送时**累积摘要放在哪里，默认 `false`（第一条用户消息）：
 
 ```
-system: <基础提示词 + 运行时行 + 目录清单 + ……>
+system: <基础提示词 + unlock 规则 + MCP 信息 + 运行时行 + 工作目录行>
 user:   [engine] CONVERSATION SUMMARY:
         <累积摘要>
 user:   <历史里的第一条 user>
@@ -234,11 +234,12 @@ name/arguments/id 等，即约 2.5 字符/token，另加每消息 12 字符的�
 `agent.md` 支持 `@include("路径")` 片段导入（文件/目录、相对/绝对、可嵌套），在读取时展开。
 详见 [configuration.md](configuration.md)。
 
-基础提示词之后按顺序追加能力段落：① 运行时环境行（`agent.RuntimeInfo()`，每次运行生成，**不写进**
-`agent.md`）；② 当前目录清单（`agent.include_working_dir`，默认开启，`agent.DirectoryListing()`
-在 `agent.New` 时生成一次）；③ 存在锁定函数时的全局 unlock 规则；④ 每个已连接 MCP server 的 MCP 全局信息；
-⑤ 累积的上下文摘要（**仅** `agent.summary_in_system_prompt = true`；默认摘要不在系统提示里，而是
-作为一条独立的 `[engine]` 消息紧跟其后，见 [上下文压缩](#摘要的放置agentsummary_in_system_prompt)）。
+基础提示词之后按顺序追加能力段落：① 存在锁定函数时的全局 unlock 规则；② 每个已连接 MCP server 的
+MCP 全局信息；③ 运行时环境行（`agent.RuntimeInfo()`，每次运行生成，**不写进** `agent.md`）；
+④ 工作目录行（`agent.include_working_dir`，默认开启，`agent.WorkingDirectoryInfo()` 在 `agent.New`
+时生成一次，**只有路径**，不列出目录内容）；⑤ 累积的上下文摘要（**仅** `agent.summary_in_system_prompt = true`；
+默认摘要不在系统提示里，而是作为一条独立的 `[engine]` 消息紧跟其后，见
+[上下文压缩](#摘要的放置agentsummary_in_system_prompt)）。
 
 ## MCP 工具发现 / unlock 控制面
 

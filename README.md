@@ -181,8 +181,8 @@ source <(lightagent completion bash)       # bash 补全
 * 配置文件位置 = 可执行文件所在目录（可用 `LIGHTAGENT_CONFIG` 覆盖）。
 * `web.port > 0` 即开启 web 服务；`web.host` 为空时绑定 `127.0.0.1`；`web.password` 非空时要求**登录**。
 * 系统提示词优先级：`agent.md`（程序目录）> `agent.system_prompt` > 内置默认。
-* 运行时环境行 `Runtime: <os>/<arch>.`（以及可选的目录清单等）由程序在基础提示词之后自动追加，
-  `agent.md` / `agent.system_prompt` 不需要（也不应）写它。
+* 运行时环境行 `Runtime: <os>/<arch>.` 与工作目录行 `working directory: <路径>`（以及可选的 unlock 规则、
+  MCP 信息）由程序在基础提示词之后自动追加，`agent.md` / `agent.system_prompt` 不需要（也不应）写它们。
 * `agent.md` 支持片段导入：独占一行的 `@include("路径")` 会替换为对应文件（或目录下所有文件）的内容，
   相对路径基于该文件目录，支持嵌套与绝对路径。详见
   [configuration.md](docs/configuration.md#系统提示词覆盖agentmd)。
