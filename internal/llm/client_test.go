@@ -154,6 +154,266 @@ func TestReadStreamAssemblesToolCalls(t *testing.T) {
 	}
 }
 
+// TestReadStreamAcceptsBothArgumentsShapes covers how providers deliver a tool
+// call's arguments: OpenAI splits the JSON text over several chunks, while some
+// servers send the value itself ({"arguments":{}}) or omit it for a tool that
+// takes no parameters. They all assemble into the same wire-level text, so a
+// complete call is never mistaken for a truncated one.
+func TestReadStreamAcceptsBothArgumentsShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		call string
+		want string
+	}{
+		{
+			name: "raw json value",
+			call: `{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":{"command":"ls","n":2}}}`,
+			want: `{"command":"ls","n":2}`,
+		},
+		{
+			name: "null arguments",
+			call: `{"index":0,"id":"call_1","type":"function","function":{"name":"ping","arguments":null}}`,
+			want: "",
+		},
+		{
+			name: "no arguments key",
+			call: `{"index":0,"id":"call_1","type":"function","function":{"name":"ping"}}`,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := strings.Join([]string{
+				`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[` + tc.call + `]}}]}`,
+				`data: {"choices":[{"finish_reason":"tool_calls"}]}`,
+				`data: [DONE]`,
+				``,
+			}, "\n")
+
+			client := &Client{}
+			resp, err := client.readStream(strings.NewReader(stream), nil, nil)
+			if err != nil {
+				t.Fatalf("readStream: %v", err)
+			}
+			if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Function.Arguments != tc.want {
+				t.Fatalf("tool calls = %+v, want arguments %q", resp.ToolCalls, tc.want)
+			}
+		})
+	}
+}
+
+// TestIncompleteResponsesAreClassified pins the condition reserved for the
+// recovery path (see Agent.runTurn): a half-built reply is recognisable through
+// IsIncompleteResponse, while unrelated failures are not.
+func TestIncompleteResponsesAreClassified(t *testing.T) {
+	cases := []struct {
+		name string
+		resp *Response
+	}{
+		{
+			name: "truncated arguments",
+			resp: &Response{Finish: "stop", ToolCalls: []ToolCall{{Function: ToolCallFunction{Name: "write_file", Arguments: `{"path":"a`}}}},
+		},
+		{
+			name: "nameless call",
+			resp: &Response{Finish: "tool_calls", ToolCalls: []ToolCall{{ID: "c1"}}},
+		},
+		{
+			name: "length with calls pending",
+			resp: &Response{Finish: "length", ToolCalls: []ToolCall{{Function: ToolCallFunction{Name: "ping", Arguments: "{}"}}}},
+		},
+		{
+			name: "content filter",
+			resp: &Response{Finish: "content_filter"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateResponse(tc.resp); !IsIncompleteResponse(err) {
+				t.Fatalf("validateResponse = %v, want an incomplete-response error", err)
+			}
+		})
+	}
+
+	complete := &Response{Finish: "stop", ToolCalls: []ToolCall{{Function: ToolCallFunction{Name: "ping", Arguments: "{}"}}}}
+	if err := validateResponse(complete); err != nil {
+		t.Fatalf("validateResponse(complete reply) = %v", err)
+	}
+	if IsIncompleteResponse(fmt.Errorf("api error 401: bad key")) {
+		t.Fatal("an API error was classified as an incomplete response")
+	}
+	if IsIncompleteResponse(nil) {
+		t.Fatal("nil was classified as an incomplete response")
+	}
+}
+
+// TestReadStreamIncompleteToolCallFails covers a provider that ends the stream
+// with a normal-looking finish_reason after delivering only half of a tool
+// call: the accumulated arguments are not valid JSON, so the call never fully
+// arrived. Keeping it would execute (and replay) a call with truncated
+// arguments, so it is reported as an error instead of ending the turn.
+func TestReadStreamIncompleteToolCallFails(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file_lines","arguments":"{\"pa"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	client := &Client{}
+	_, err := client.readStream(strings.NewReader(stream), nil, nil)
+	if err == nil {
+		t.Fatal("expected the incomplete tool call to fail")
+	}
+	if !strings.Contains(err.Error(), "read_file_lines") || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("error = %v, want an incomplete-tool-call message naming the tool", err)
+	}
+}
+
+// TestReadStreamToolCallWithoutNameFails covers the other half-call shape: the
+// stream ends after the call's id was sent but before its function name
+// arrived, so there is no tool to run.
+func TestReadStreamToolCallWithoutNameFails(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function"}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	client := &Client{}
+	_, err := client.readStream(strings.NewReader(stream), nil, nil)
+	if err == nil {
+		t.Fatal("expected the nameless tool call to fail")
+	}
+	if !strings.Contains(err.Error(), "function name") {
+		t.Fatalf("error = %v, want a missing-function-name message", err)
+	}
+}
+
+// TestReadStreamLengthWithToolCallsFails covers a reply cut off at max_tokens
+// while tool calls were being emitted: even when the accumulated arguments
+// happen to parse, the call list may be short, so the turn fails with the
+// setting to raise instead of running a possibly incomplete call.
+func TestReadStreamLengthWithToolCallsFails(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{\"command\":\"ls\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"length"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	client := &Client{}
+	_, err := client.readStream(strings.NewReader(stream), nil, nil)
+	if err == nil {
+		t.Fatal("expected a truncated tool-call list to fail")
+	}
+	if !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("error = %v, want a max_tokens hint", err)
+	}
+}
+
+// TestReadStreamLengthWithoutToolCallsIsReturned pins that a plain truncation
+// (no tool calls) is not an error here: the agent picks it up and continues the
+// turn from the assistant message it recorded.
+func TestReadStreamLengthWithoutToolCallsIsReturned(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":"length"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	client := &Client{}
+	resp, err := client.readStream(strings.NewReader(stream), nil, nil)
+	if err != nil {
+		t.Fatalf("readStream: %v", err)
+	}
+	if resp.Finish != "length" || resp.Reasoning != "think" {
+		t.Fatalf("response = %+v, want the truncation reported to the caller", resp)
+	}
+}
+
+// TestReadStreamContentFilterFails covers a provider that stops the reply with
+// content_filter: the answer is incomplete, so it must not be presented as one.
+func TestReadStreamContentFilterFails(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"par"},"finish_reason":"content_filter"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	client := &Client{}
+	_, err := client.readStream(strings.NewReader(stream), nil, nil)
+	if err == nil {
+		t.Fatal("expected a filtered reply to fail")
+	}
+	if !strings.Contains(err.Error(), "content_filter") {
+		t.Fatalf("error = %v, want the finish_reason named", err)
+	}
+}
+
+// TestReadJSONIncompleteToolCallFails checks the non-streaming path applies the
+// same completeness rules as the streamed one.
+func TestReadJSONIncompleteToolCallFails(t *testing.T) {
+	body := `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"exec_command","arguments":"{\"command\":"}}]},"finish_reason":"stop"}]}`
+
+	client := &Client{}
+	if _, err := client.readJSON(strings.NewReader(body), nil); err == nil {
+		t.Fatal("expected the incomplete tool call to fail")
+	} else if !strings.Contains(err.Error(), "exec_command") {
+		t.Fatalf("error = %v, want the tool name in the message", err)
+	}
+}
+
+// TestReadStreamCorruptFrameFails covers a provider (or proxy) that flushes a
+// chat chunk cut in half: the frame looks like JSON but does not parse, so the
+// reply cannot be assembled and fails instead of silently dropping the fragment
+// (which is how a tool call ends up half delivered while the turn looks fine).
+func TestReadStreamCorruptFrameFails(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"Hel"}}]}`,
+		`data: {"choices":[{"delta":{"content":"lo"`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	client := &Client{}
+	_, err := client.readStream(strings.NewReader(stream), nil, nil)
+	if err == nil {
+		t.Fatal("expected the corrupt frame to fail the stream")
+	}
+	if !strings.Contains(err.Error(), "unparsable SSE frame") {
+		t.Fatalf("error = %v, want an unparsable-frame message", err)
+	}
+	// A cut frame is an incomplete reply too: the reserved recovery path
+	// must see it as such.
+	if !IsIncompleteResponse(err) {
+		t.Fatalf("error = %v, want an incomplete-response error", err)
+	}
+}
+
+// TestReadStreamSkipsHeartbeatFrames pins that non-JSON keep-alive payloads are
+// still tolerated: only frames that start like JSON but do not parse fail.
+func TestReadStreamSkipsHeartbeatFrames(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: ping`,
+		`data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	client := &Client{}
+	resp, err := client.readStream(strings.NewReader(stream), nil, nil)
+	if err != nil {
+		t.Fatalf("readStream: %v", err)
+	}
+	if resp.Content != "Hi" {
+		t.Fatalf("content = %q, want Hi", resp.Content)
+	}
+}
+
 // TestChatStreamsIncrementally verifies each SSE chunk reaches onDelta before
 // the stream finishes: the server holds its last chunk until the test has seen
 // the first one, so buffering the whole body would deadlock the assertion.

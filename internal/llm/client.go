@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -266,13 +267,129 @@ func (c *Client) readJSON(r io.Reader, onReasoning func(string)) (*Response, err
 	if reasoning != "" && onReasoning != nil {
 		onReasoning(reasoning)
 	}
-	return &Response{
+	resp := &Response{
 		Content:   choice.Message.Content,
 		Reasoning: reasoning,
 		ToolCalls: choice.Message.ToolCalls,
 		Usage:     parsed.Usage,
 		Finish:    choice.FinishReason,
-	}, nil
+	}
+	if err := validateResponse(resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// IncompleteResponseError reports a completion the client refused to accept
+// because the provider did not deliver it whole: a tool call whose arguments
+// never closed (or whose function name never arrived), a stream frame cut in
+// half, a reply truncated at max_tokens with tool calls pending, or a reply
+// stopped by the provider's content filter.
+//
+// The type is exported (with IsIncompleteResponse) so a caller can single this
+// out from transport and API failures: unlike a 401 or a dropped connection, an
+// incomplete reply is a condition the model itself could be asked to repair. No
+// caller branches on it yet: it is the condition reserved for a recovery path
+// that would hand the parse failure back to the model instead of ending the
+// turn (see the hook in Agent.runTurn; the policy is not decided).
+type IncompleteResponseError struct {
+	// Reason is the user-facing description of what was incomplete.
+	Reason string
+}
+
+// Error implements error.
+func (e *IncompleteResponseError) Error() string { return e.Reason }
+
+// IsIncompleteResponse reports whether err is a reply the provider did not
+// deliver whole. Nothing recovers from it today; the predicate is the condition
+// reserved for that recovery path.
+func IsIncompleteResponse(err error) bool {
+	var incomplete *IncompleteResponseError
+	return errors.As(err, &incomplete)
+}
+
+// incompleteResponsef builds the error for a reply the provider did not deliver
+// whole.
+func incompleteResponsef(format string, args ...any) error {
+	return &IncompleteResponseError{Reason: fmt.Sprintf(format, args...)}
+}
+
+// validateResponse rejects a completion the provider did not deliver whole. A
+// stream can end, with finish_reason "stop" even, after only part of a tool
+// call was sent: keeping it would execute (and send back) a call whose
+// arguments never fully arrived, and the turn would look like a normal finish.
+// The cases that indicate a truncated delivery are therefore turned into an
+// error naming what is wrong and which setting can help.
+func validateResponse(resp *Response) error {
+	if resp.Finish == "content_filter" {
+		return incompleteResponsef("the provider stopped the reply with finish_reason=content_filter; the answer is incomplete")
+	}
+	if resp.Finish == "length" && len(resp.ToolCalls) > 0 {
+		return incompleteResponsef(
+			"the provider cut the reply off at max_tokens (finish_reason=length) while sending %d tool call(s); the calls may be incomplete; raise openai.max_tokens",
+			len(resp.ToolCalls))
+	}
+	for _, tc := range resp.ToolCalls {
+		if tc.Function.Name == "" {
+			return incompleteResponsef(
+				"incomplete tool call from the provider (id=%q, finish_reason=%q): the stream ended before the function name arrived",
+				tc.ID, resp.Finish)
+		}
+		// An empty argument payload is legal (a tool that takes no
+		// parameters); anything else must be a complete JSON value.
+		args := strings.TrimSpace(tc.Function.Arguments)
+		if args == "" || json.Valid([]byte(args)) {
+			continue
+		}
+		if resp.Finish == "length" {
+			return incompleteResponsef(
+				"the provider cut the reply off at max_tokens (finish_reason=length) inside tool call %q: its arguments are incomplete; raise openai.max_tokens",
+				tc.Function.Name)
+		}
+		return incompleteResponsef(
+			"incomplete tool call %q from the provider (finish_reason=%q): its arguments are not valid JSON: %s",
+			tc.Function.Name, resp.Finish, errorSnippet(args))
+	}
+	return nil
+}
+
+// decodeArguments renders one streamed arguments fragment as JSON text. A JSON
+// string (the OpenAI shape, delivered in pieces) contributes its contents, so
+// the pieces concatenate into the complete document; a raw JSON value (some
+// servers send {"arguments":{}}) contributes its compact literal. An absent or
+// null value contributes nothing.
+func decodeArguments(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err != nil {
+		return string(raw)
+	}
+	return compact.String()
+}
+
+// looksLikeJSON reports whether a stream payload starts a JSON value, i.e. it
+// was meant to be a chat chunk rather than a heartbeat or vendor marker.
+func looksLikeJSON(data string) bool {
+	return strings.HasPrefix(data, "{") || strings.HasPrefix(data, "[")
+}
+
+// errorSnippet shortens a payload so it stays readable in an error message.
+func errorSnippet(s string) string {
+	const max = 200
+	if len(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) > max {
+		return string(runes[:max]) + "..."
+	}
+	return s
 }
 
 // firstNonEmpty returns the first non-empty string, or "" when all are empty.
@@ -300,8 +417,12 @@ type streamChunk struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
+					Name string `json:"name"`
+					// OpenAI streams the arguments as JSON text split
+					// over several chunks; some servers send the value
+					// itself ({"arguments":{}}). Kept raw so both are
+					// assembled into the same text (see decodeArguments).
+					Arguments json.RawMessage `json:"arguments"`
 				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
@@ -334,8 +455,14 @@ func (c *Client) readStream(r io.Reader, onDelta, onReasoning func(string)) (*Re
 
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// Ignore frames we cannot parse; providers occasionally emit
-			// keep-alive or vendor-specific payloads.
+			// Frames that are not JSON at all are keep-alive or
+			// vendor-specific payloads and are skipped. A frame that
+			// starts like JSON but does not parse is a chunk the
+			// provider cut short: skipping it would silently drop
+			// content or tool-call fragments, so the stream fails.
+			if looksLikeJSON(data) {
+				return nil, incompleteResponsef("unparsable SSE frame from the provider: %v (frame: %s)", err, errorSnippet(data))
+			}
 			continue
 		}
 		if chunk.Usage != nil {
@@ -375,7 +502,7 @@ func (c *Client) readStream(r io.Reader, onDelta, onReasoning func(string)) (*Re
 			if tc.Function.Name != "" {
 				acc.Function.Name = tc.Function.Name
 			}
-			acc.Function.Arguments += tc.Function.Arguments
+			acc.Function.Arguments += decodeArguments(tc.Function.Arguments)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -390,6 +517,9 @@ func (c *Client) readStream(r io.Reader, onDelta, onReasoning func(string)) (*Re
 			}
 			result.ToolCalls = append(result.ToolCalls, *tc)
 		}
+	}
+	if err := validateResponse(result); err != nil {
+		return nil, err
 	}
 	return result, nil
 }

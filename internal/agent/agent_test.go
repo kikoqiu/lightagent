@@ -1158,3 +1158,46 @@ func TestTurnStopsAfterConsecutiveTruncations(t *testing.T) {
 		t.Fatalf("history = %d messages, want user + %d assistant", len(hist), maxConsecutiveTruncations)
 	}
 }
+
+// TestIncompleteStreamedToolCallEndsTheTurnWithAnError covers the provider
+// defect where the stream closes with finish_reason "stop" after only half of a
+// tool call was sent: the turn must fail loudly (no tool is run, no reply is
+// recorded and no half tool_calls are replayed to the provider), not end as if
+// the model had finished.
+func TestIncompleteStreamedToolCallEndsTheTurnWithAnError(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\",\\\"content\\\":\\\"half\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("write it")
+	got := drainEvents(t, events)
+
+	if calls != 1 {
+		t.Fatalf("model calls = %d, want 1 (the turn must stop, not retry)", calls)
+	}
+	if !hasEvent(got, EventError, "not valid JSON") {
+		t.Fatalf("no error naming the incomplete tool call was published: %+v", got)
+	}
+	if hasEvent(got, EventToolCall, "") {
+		t.Fatal("the half-delivered tool call was dispatched")
+	}
+	if hist := a.History(); len(hist) != 1 || hist[0].Role != "user" {
+		t.Fatalf("history = %+v, want only the user message", hist)
+	}
+	if a.Busy() {
+		t.Fatal("the agent is still busy after the failure")
+	}
+}

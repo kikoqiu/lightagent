@@ -36,7 +36,21 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
       文本发布为 `assistant_delta`；若服务商返回思考内容（`reasoning_content` / `reasoning`），
       其增量先发布为 `reasoning_delta`。
    5. 追加 assistant 消息（含组装后的思考 `reasoning_content`，会随后续请求回传）并广播
-      `usage`。
+      `usage`。模型答复在返回前会做**完整性校验**（`llm.validateResponse`），不合格的响应直接
+      报错并结束本回合，不会写入历史：
+      * 工具调用的函数名为空，或参数不是合法 JSON —— 说明服务端把响应截断在调用中途
+        （即便它最后发的是 `finish_reason=stop`），按「半条工具调用」报错；
+      * `finish_reason=length` 且已产生 tool_calls —— 截断可能吃掉调用，提示提高
+        `openai.max_tokens`；
+      * `finish_reason=content_filter` —— 答复不完整；
+      * SSE 帧以 `{` / `[` 开头却无法解析 —— 帧被截断，静默丢弃会导致内容/工具片段丢失，故报错
+        （非 JSON 的心跳帧仍照旧忽略）。
+      参数既接受 OpenAI 的字符串分片，也接受少数服务端直接给出的 JSON 值
+      （`{"arguments":{}}`）或省略/`null`（无参调用），都先拼成同一份文本再校验。
+      无 tool_calls 的 `finish_reason=length` 不属于错误，交给下面的自动续跑处理。
+      以上「不完整答复」统一返回 `llm.IncompleteResponseError`（可用 `llm.IsIncompleteResponse`
+      判定），目前一律以 `error` 结束回合；`runTurn` 的错误分支处已标注**预留的恢复挂载点**
+      ——将来若要「把解析错误回喂模型、让它重发调用」，就在该处按这个判定分支（策略未定，暂不启用）。
    6. 无 `tool_calls` 时：`finish_reason=length`（被 `max_tokens` 截断）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮（连续 3 次则停止）；否则回合结束——**但若此刻 `steerCh` 里还有消息**（流式过程中刚插入的），则本回合继续下一轮把它并入上下文，而不是结束回合。
    7. 逐个执行工具，发布 `tool_call` / `tool_result`，把结果作为 `tool` 消息追加；本轮结束后
       广播 `usage`（工具结果同样占用上下文），回到 2。

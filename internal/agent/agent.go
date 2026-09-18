@@ -422,6 +422,18 @@ func (a *Agent) runTurn(ctx context.Context, userTexts []string) {
 				a.finishInterrupt(turnStart, userCount)
 				return
 			}
+			// Reserved recovery hook. llm.IsIncompleteResponse(err) is
+			// true when the provider delivered a half-built reply (a
+			// tool call whose arguments never closed, a frame cut in
+			// half, finish_reason=length with calls pending; see
+			// llm.IncompleteResponseError). Such a reply is exactly the
+			// case the model itself could repair, so instead of ending
+			// the turn here a future path could hand the parse failure
+			// back to the model -- re-issue the completion, or answer
+			// the partial calls with a "malformed call, try again" tool
+			// message. The policy (retry once? repair? give up after
+			// N?) is not decided, so the turn still fails today: branch
+			// on that predicate right here to add it.
 			a.bus.Publish(Event{Type: EventError, Text: err.Error()})
 			return
 		}
