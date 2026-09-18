@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"lightagent/internal/proc"
 )
 
 // maxOutputBufferSize caps the per-session output buffer at 1MB.
@@ -118,14 +120,16 @@ func (s *ProcessSession) startWatchdog(timeout time.Duration) {
 
 func (s *ProcessSession) expireAfterTimeout() {
 	s.mu.Lock()
-	if s.Status != "running" || s.proc == nil || s.proc.Process == nil {
+	if s.Status != "running" || s.proc == nil {
 		s.mu.Unlock()
 		return
 	}
-	proc := s.proc.Process
+	cmd := s.proc
 	s.mu.Unlock()
 
-	_ = proc.Kill()
+	// Kill the whole tree, not just the shell: a background child of the
+	// script must not outlive its session.
+	_ = proc.Kill(cmd)
 
 	s.mu.Lock()
 	if s.Status == "running" {
@@ -239,21 +243,20 @@ func (s *ProcessSession) Write(data string) error {
 	return err
 }
 
-// Kill terminates the process and marks the session done.
+// Kill terminates the process tree and marks the session done.
 func (s *ProcessSession) Kill() error {
 	s.mu.Lock()
 	if s.Status != "running" {
 		s.mu.Unlock()
 		return ErrSessionDone
 	}
-	proc := s.proc
+	cmd := s.proc
 	s.Status = "done"
 	s.ExitCode = -1
 	s.mu.Unlock()
 
-	if proc != nil && proc.Process != nil {
-		_ = proc.Process.Kill()
-	}
+	// The whole tree goes down: the shell plus everything it spawned.
+	_ = proc.Kill(cmd)
 	s.signalDone()
 	return nil
 }
@@ -303,6 +306,31 @@ func NewSessionManager() *SessionManager {
 // Stop shuts down the background cleanup goroutine.
 func (sm *SessionManager) Stop() {
 	sm.stopOnce.Do(func() { close(sm.stopCh) })
+}
+
+// KillAll terminates every session that is still running, so no process tree
+// outlives the manager. The engine calls it when lightagent exits.
+func (sm *SessionManager) KillAll() {
+	sm.mu.RLock()
+	running := make([]*ProcessSession, 0, len(sm.sessions))
+	for _, session := range sm.sessions {
+		if !session.IsDone() {
+			running = append(running, session)
+		}
+	}
+	sm.mu.RUnlock()
+
+	// A kill may briefly wait for its tree to exit on its own, so the
+	// independent trees are terminated in parallel and the exit stays short.
+	var wg sync.WaitGroup
+	for _, session := range running {
+		wg.Add(1)
+		go func(session *ProcessSession) {
+			defer wg.Done()
+			_ = session.Kill()
+		}(session)
+	}
+	wg.Wait()
 }
 
 // cleanupOldSessions removes done sessions older than 30 minutes.

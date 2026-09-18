@@ -50,6 +50,8 @@ type Tool interface {
   直接返回 `exit_code` 与输出；否则转入后台并返回 `session_id`。
 * 硬超时 `run_timeout`（默认取 `exec.timeout_seconds`，3600s）到点强制结束进程；
   `run_timeout=0` 关闭硬超时。
+* 每次调用都是一个会话，会话的根进程（宿主 shell 或 Python 解释器）是它**自己进程树的根**：
+  结束会话 / 硬超时 / lightagent 退出时整棵树一起结束（[进程树与退出](architecture.md#进程树与退出)）。
 * 输出经 ANSI 清理、CR 重放（进度条折叠）后按 `max_lines`/`max_chars` 做头尾折叠。
 
 参数：
@@ -119,10 +121,14 @@ type Tool interface {
 * `input`：写入 stdin。纯控制键会被翻译：`ctrl-c`、`ctrl-d`、`ctrl-z`、`enter`/`return`、
   `tab`、`esc`、`up`/`down`/`left`/`right`、`backspace`；其余文本原样写入（如需换行请写 `"\n"`）。
   stdio 编码在 `exec_command` 启动该会话时已确定（Windows 上的 `use_utf8`），`manage_session` 不再另行选择。
-* `kill`：结束进程并从会话池移除。
+* `kill`：结束**整棵进程树**（宿主 shell 及其派生的所有子进程；Windows 经 Job Object，Unix 经进程组，见 [architecture.md](architecture.md#进程树与退出)）并从会话池移除。
 * `list`：列出当前会话（id/command/status/pid）。
 
-> 已知限制：`kill` 通过结束该进程实现，不保证清理其派生的子进程树。
+> 进程树归属：会话的根进程是它自己进程树的根，因此
+> * 会话根进程自行退出时，它留下的后台子进程会被一并清理（会话池不会积累孤儿进程）；
+>   若该子进程还占着 stdout/stderr，会话最多再等 2s（`WaitDelay`）收敛输出，然后置为 completed 并清理它；
+> * lightagent 退出（正常退出、Ctrl+C、SIGTERM、终端挂断）时会结束所有仍在运行的会话——`exec_command` 启动的进程不会比 lightagent 活得更久；
+> * 仅 Windows 上「本进程被强杀」也能保证清理：kill-on-close 的 Job 句柄随 lightagent 进程关闭，OS 带走整棵树。
 
 ---
 
@@ -265,6 +271,7 @@ tool: <真实执行结果>
   * `stdio`：启动子进程，按行分隔 JSON-RPC（Windows 上 `npx`/`.cmd` 会自动经 `cmd /c` 启动）。
   * `http` / `streamable-http`：每个 JSON-RPC 消息一个 POST；响应可为 JSON 或 SSE；服务端返回的 `Mcp-Session-Id` 会在后续请求回传。
   * `sse`：旧版长连接事件流；从 `endpoint` 事件取得消息地址，响应经 `message` 事件送回。
+* **关闭**（lightagent 退出时）：`Manager.Close` 并行关闭每个 server。stdio server 先收到 **stdin EOF**（协议级关闭），最多等 2s 自行退出；超时**只强制结束这个 server 进程本身**（它派生出来的进程不属于我们），此后不再多等，所以 server 不响应也不会拖住 lightagent 退出；`http` 断开空闲连接、`sse` 取消长连接。详见 [进程树与退出](architecture.md#进程树与退出)。
 
 ### 工具注册
 

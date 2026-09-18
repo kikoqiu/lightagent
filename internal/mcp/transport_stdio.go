@@ -13,10 +13,20 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+
+	"lightagent/internal/proc"
 )
 
 // errStdioClosed is returned when the transport has been closed.
 var errStdioClosed = errors.New("mcp: transport closed")
+
+// shutdownGrace is how long a stdio server is given to exit on its own after its
+// stdin was closed: EOF on stdin is the protocol's shutdown signal, and a
+// well-behaved server exits then, flushing and cleaning up on the way out. A
+// server that is still running once the grace has passed is force-terminated;
+// nothing waits any longer than this.
+const shutdownGrace = 2 * time.Second
 
 // cappedBuffer is a concurrency-safe writer that keeps at most max bytes. It is
 // used to capture a bounded slice of a child process's stderr for diagnostics.
@@ -76,7 +86,12 @@ func newStdioTransport(command string, args, env []string) (*stdioTransport, err
 		_ = stdin.Close()
 		return nil, fmt.Errorf("mcp: open stdout: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	// The transport owns the server process only: the shutdown closes the process
+	// it launched and leaves whatever that process started alone (see
+	// proc.StartProcess). WaitDelay bounds the wait for the process's pipes by the
+	// same grace, so a child holding them open cannot stall the close either.
+	cmd.WaitDelay = shutdownGrace
+	if err := proc.StartProcess(cmd); err != nil {
 		_ = stdin.Close()
 		return nil, fmt.Errorf("mcp: start %q: %w", command, err)
 	}
@@ -224,10 +239,39 @@ func (t *stdioTransport) close() error {
 	t.closed = true
 	t.mu.Unlock()
 
+	// The process is reaped in the background. Its exit and the end of its output
+	// stream are the two ways the server can report that it is done, and no step
+	// below may wait indefinitely.
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		_ = t.cmd.Wait()
+		proc.Reap(t.cmd)
+	}()
+
+	// Closing stdin is the protocol-level shutdown: the server sees EOF and exits
+	// on its own, flushing and cleaning up as it goes. It gets at most
+	// shutdownGrace for that; a server that is still running afterwards is
+	// force-terminated — only the process we launched, whatever it spawned is not
+	// ours to end — and the close does not wait for anything beyond that.
 	_ = t.stdin.Close()
-	if t.cmd.Process != nil {
-		_ = t.cmd.Process.Kill()
+	if !t.waitDone(exited, shutdownGrace) {
+		_ = proc.Kill(t.cmd)
 	}
-	_ = t.cmd.Wait()
 	return nil
+}
+
+// waitDone reports whether the server finished within timeout: it was reaped
+// (exited is closed) or its output stream ended (t.done is closed).
+func (t *stdioTransport) waitDone(exited <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-exited:
+		return true
+	case <-t.done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

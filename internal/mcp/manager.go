@@ -190,7 +190,9 @@ func (m *Manager) CallTool(ctx context.Context, server, tool string, args map[st
 	return renderCallResult(res), res.IsError, nil
 }
 
-// Close closes every server connection.
+// Close closes every server connection. The connections are shut down in
+// parallel: a stdio server may be given a moment to exit on its own before its
+// tree is force-terminated, and the exit path must not serialize those waits.
 func (m *Manager) Close() error {
 	if m == nil {
 		return nil
@@ -201,16 +203,23 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
-	conns := m.conns
+	clients := make([]*Client, 0, len(m.conns))
+	for _, client := range m.conns {
+		clients = append(clients, client)
+	}
 	m.conns = make(map[string]*Client)
 	m.mu.Unlock()
 
-	var errs []error
-	for _, client := range conns {
-		if err := client.close(); err != nil {
-			errs = append(errs, err)
-		}
+	errs := make([]error, len(clients))
+	var wg sync.WaitGroup
+	for i, client := range clients {
+		wg.Add(1)
+		go func(i int, client *Client) {
+			defer wg.Done()
+			errs[i] = client.close()
+		}(i, client)
 	}
+	wg.Wait()
 	return errors.Join(errs...)
 }
 

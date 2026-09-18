@@ -5,9 +5,33 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+// Helper environment variables: helperModeEnv selects a variant of the helper
+// server, helperMarkerEnv names the file the stubborn variant writes when it
+// survived the shutdown, and helperChildEnv names the file the detached variant
+// reports its lingering child in (so the test can end it).
+const (
+	helperModeEnv   = "LIGHTAGENT_MCP_HELPER_MODE"
+	helperMarkerEnv = "LIGHTAGENT_MCP_MARKER"
+	helperChildEnv  = "LIGHTAGENT_MCP_CHILD_PID"
+)
+
+// helperMarkerDelay is how long the stubborn helper waits after seeing EOF on
+// stdin before proving it is still alive. It has to exceed the transport's
+// shutdown grace, so the marker can only appear when the forced termination
+// failed.
+const helperMarkerDelay = shutdownGrace + 400*time.Millisecond
+
+// lingerDuration is how long the "linger" helper holds its parent's pipes open
+// before it leaves on its own.
+const lingerDuration = 10 * time.Second
 
 // TestHelperProcess is not a real test: when LIGHTAGENT_MCP_HELPER=1 it acts as
 // a minimal MCP server speaking newline-delimited JSON-RPC over stdin/stdout.
@@ -15,6 +39,26 @@ import (
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("LIGHTAGENT_MCP_HELPER") != "1" {
 		return
+	}
+	switch os.Getenv(helperModeEnv) {
+	case "linger":
+		// Not a server at all: it only holds the pipes of the process that
+		// spawned it open for a while.
+		time.Sleep(lingerDuration)
+		os.Exit(0)
+	case "detached":
+		// Leave such a child behind, then behave like a normal server.
+		child := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+		child.Env = append(os.Environ(), "LIGHTAGENT_MCP_HELPER=1", helperModeEnv+"=linger")
+		// Inheriting our stdout is what keeps the stream open for the transport.
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(1)
+		}
+		if path := os.Getenv(helperChildEnv); path != "" {
+			_ = os.WriteFile(path, []byte(strconv.Itoa(child.Process.Pid)), 0o644)
+		}
 	}
 	reader := bufio.NewReader(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
@@ -36,6 +80,15 @@ func TestHelperProcess(t *testing.T) {
 			}
 		}
 		if err != nil {
+			if os.Getenv(helperModeEnv) == "ignore-eof" {
+				// A server that ignores the protocol shutdown (EOF on stdin):
+				// only the forced termination can end it. The marker it leaves
+				// behind when it is still alive proves the difference.
+				time.Sleep(helperMarkerDelay)
+				if marker := os.Getenv(helperMarkerEnv); marker != "" {
+					_ = os.WriteFile(marker, []byte("still running"), 0o644)
+				}
+			}
 			os.Exit(0)
 		}
 	}
@@ -146,6 +199,93 @@ func TestStdioClientEndToEnd(t *testing.T) {
 	}
 	if !bad.IsError {
 		t.Fatal("unknown tool should set isError")
+	}
+}
+
+// TestStdioTransportCloseTerminatesStubbornServer pins the forced half of the
+// shutdown: a server that ignores EOF on stdin is force-terminated once the
+// grace period passed, and the close itself costs that grace at most.
+func TestStdioTransportCloseTerminatesStubbornServer(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "survived.txt")
+	env := append(os.Environ(),
+		"LIGHTAGENT_MCP_HELPER=1",
+		helperModeEnv+"=ignore-eof",
+		helperMarkerEnv+"="+marker,
+	)
+	tr, err := newStdioTransport(os.Args[0], []string{"-test.run=^TestHelperProcess$"}, env)
+	if err != nil {
+		t.Fatalf("newStdioTransport: %v", err)
+	}
+	client := newClient(tr)
+	if err := client.initialize(context.Background()); err != nil {
+		_ = client.close()
+		t.Fatalf("initialize: %v", err)
+	}
+
+	start := time.Now()
+	if err := client.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if elapsed, limit := time.Since(start), shutdownGrace+time.Second; elapsed > limit {
+		t.Fatalf("close took %v, want at most %v", elapsed, limit)
+	}
+	// The marker delay runs from the EOF that close delivered, so waiting a
+	// little past it catches a server that was not really terminated.
+	time.Sleep(helperMarkerDelay - shutdownGrace + 500*time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the server survived the shutdown")
+	}
+}
+
+// TestStdioTransportCloseIsBoundedWithADetachedChild pins the "never hang" part
+// of the shutdown: a server that exits on EOF but leaves a child holding its
+// pipes must not stall the close — the pipes are given up once the grace period
+// is over instead of waiting for them forever.
+func TestStdioTransportCloseIsBoundedWithADetachedChild(t *testing.T) {
+	childPIDFile := filepath.Join(t.TempDir(), "child.pid")
+	env := append(os.Environ(),
+		"LIGHTAGENT_MCP_HELPER=1",
+		helperModeEnv+"=detached",
+		helperChildEnv+"="+childPIDFile,
+	)
+	tr, err := newStdioTransport(os.Args[0], []string{"-test.run=^TestHelperProcess$"}, env)
+	if err != nil {
+		t.Fatalf("newStdioTransport: %v", err)
+	}
+	client := newClient(tr)
+	if err := client.initialize(context.Background()); err != nil {
+		_ = client.close()
+		t.Fatalf("initialize: %v", err)
+	}
+	// The lingering child belongs to the helper, not to the transport, so the
+	// test ends it.
+	t.Cleanup(func() { killPIDFromFile(t, childPIDFile) })
+
+	start := time.Now()
+	if err := client.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Noticing the exit costs the grace period at most (the pipes stay open);
+	// anything beyond that would mean a stuck shutdown.
+	if elapsed, limit := time.Since(start), shutdownGrace+time.Second; elapsed > limit {
+		t.Fatalf("close took %v, want at most %v", elapsed, limit)
+	}
+}
+
+// killPIDFromFile ends the process whose pid the helper reported, so the test
+// does not leave it behind (it outlives the transport by design).
+func killPIDFromFile(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return
+	}
+	if p, err := os.FindProcess(pid); err == nil {
+		_ = p.Kill()
 	}
 }
 

@@ -14,10 +14,16 @@ import (
 
 	"lightagent/internal/agent"
 	"lightagent/internal/config"
+	"lightagent/internal/proc"
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	watchShutdown()
+	code := run(os.Args[1:], os.Stdout, os.Stderr)
+	// Safety net for the normal return paths: nothing the agent started may
+	// outlive it, whichever way the session ended.
+	proc.Shutdown()
+	os.Exit(code)
 }
 
 // run parses args, dispatches subcommands and returns the process exit code.

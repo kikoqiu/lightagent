@@ -106,7 +106,14 @@ func (t *httpTransport) post(ctx context.Context, req *request, wantResponse boo
 	return &r, nil
 }
 
-func (t *httpTransport) close() error { return nil }
+// close releases the transport. HTTP requests are one-shot, so dropping the
+// idle connections is all that is left to do.
+func (t *httpTransport) close() error {
+	if t.client != nil {
+		t.client.CloseIdleConnections()
+	}
+	return nil
+}
 
 // readSSEResponse reads SSE events until it finds the JSON-RPC response whose
 // id matches wantID.

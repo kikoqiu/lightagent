@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"lightagent/internal/proc"
 )
 
 // execCommandDefaultWaitSeconds is the default synchronous wait window.
@@ -48,8 +50,12 @@ func NewExecEngine(timeoutSeconds, waitSeconds int, useUTF8 bool) *ExecEngine {
 // Sessions exposes the shared session manager.
 func (e *ExecEngine) Sessions() *SessionManager { return e.sessions }
 
-// Close stops the session cleanup goroutine.
-func (e *ExecEngine) Close() { e.sessions.Stop() }
+// Close terminates every session that is still running and stops the session
+// cleanup goroutine, so no child process tree outlives the engine.
+func (e *ExecEngine) Close() {
+	e.sessions.KillAll()
+	e.sessions.Stop()
+}
 
 // runTimeoutDefault returns the effective hard-lifetime default.
 func (e *ExecEngine) runTimeoutDefault() time.Duration {
@@ -71,6 +77,14 @@ func childCodec(useUTF8 bool) consoleCodec {
 	}
 	return hostConsoleCodec()
 }
+
+// execWaitDelay bounds how long the session waits for the output pipes after the
+// script's process itself has exited. A root that exits while a background
+// program of the script still holds them open would otherwise strand the
+// session in "running" until the hard timeout; with the delay the session
+// finishes and the leftover program is terminated by the teardown (see
+// proc.Reap).
+const execWaitDelay = 2 * time.Second
 
 // launch starts command and returns its session. language (see
 // resolveScriptLanguage) selects the script engine: the host shell or a Python
@@ -111,8 +125,11 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 	stderr := newConsoleOutputWriter(session.appendOutput, codec.charset)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	cmd.WaitDelay = execWaitDelay
 
-	if err := cmd.Start(); err != nil {
+	// The child leads its own process tree, so the session owns everything the
+	// script spawns (see internal/proc).
+	if err := proc.Start(cmd); err != nil {
 		_ = stdin.Close()
 		return nil, fmt.Errorf("start command: %w", err)
 	}
@@ -121,6 +138,10 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 
 	go func() {
 		waitErr := cmd.Wait()
+		// The root process is gone; whatever it left behind in its tree (a
+		// program the script started in the background, for example) is
+		// terminated with it, so a finished session leaks nothing.
+		proc.Reap(cmd)
 		_ = stdin.Close()
 		// Wait returned, so the output copiers are done: flush the decoders so
 		// a character split by the final pipe read is still emitted.
@@ -128,12 +149,13 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 		_ = stderr.Close()
 
 		code := 0
-		if waitErr != nil {
-			if exitErr, ok := waitErr.(*exec.ExitError); ok {
-				code = exitErr.ExitCode()
-			} else {
-				code = -1
-			}
+		switch {
+		case cmd.ProcessState != nil:
+			// The real exit status, also when Wait reported something else on
+			// top of it (ErrWaitDelay after a leftover program held the pipes).
+			code = cmd.ProcessState.ExitCode()
+		case waitErr != nil:
+			code = -1
 		}
 		session.mu.Lock()
 		if session.Status == "running" {

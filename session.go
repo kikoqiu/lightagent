@@ -173,6 +173,10 @@ func runSession(o *options, stdout io.Writer) error {
 
 	c := cli.New(ag, st, client.Model(), cfg.UI.Markdown)
 	c.SetOutput(out)
+	// A signal-triggered exit happens while the editor is still running, so
+	// runRaw's deferred terminal restore would never run; the shutdown hook
+	// covers that path.
+	onShutdown(c.RestoreTerminal)
 	switch {
 	case o.save:
 		c.SetSaveMode(cli.SaveAlways)

@@ -339,6 +339,10 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 若超时则自动转入后台并返回 `session_id`。硬超时由 `run_timeout`（默认取配置）限制。
 输出经 ANSI 清理与头尾折叠。
 
+每次调用自成一个**进程树**：结束会话、硬超时、lightagent 退出（含 Ctrl+C / SIGTERM）
+都会结束整棵树，不留后台孤儿进程。详见
+[进程树与退出](docs/architecture.md#进程树与退出)。
+
 * `language` 选择脚本语言：Windows `ps`（PowerShell）、Unix `sh`（宿主 shell），
   以及系统装了 Python 时的 `python`（**直接以解释器为引擎**，源码经 `-c` 传入）；
   **省略该参数即用宿主 shell**。可选值按主机动态生成，Python 不存在时不出现；
@@ -350,7 +354,7 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 
 ### `manage_session`
 管理 `exec_command` 产生的后台会话：`poll`（轮询增量输出，支持长轮询）、
-`input`（写入 stdin，支持 `ctrl-c`、`enter` 等控制键）、`kill`、`list`。
+`input`（写入 stdin，支持 `ctrl-c`、`enter` 等控制键）、`kill`（结束整棵进程树）、`list`。
 
 ### `read_file_lines`
 按行读取文本文件，1 起算的 `start_line` + `max_lines` 分页，输出带行号范围表头与
@@ -413,5 +417,4 @@ token 预算 + 回合数上限：
 
 ## 已知限制
 
-* `manage_session kill` 通过结束进程实现，不保证清理其派生的子进程树。
 * 上下文 token 以上一次接口返回的 `usage.prompt_tokens` 为基准，其后追加的消息为估算值。

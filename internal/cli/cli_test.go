@@ -225,7 +225,10 @@ func TestHelpTextListsAliases(t *testing.T) {
 }
 
 // TestFakeReader feeds a fixed sequence of keys to the raw-mode editor.
-type fakeReader struct{ keys []keyEvent }
+type fakeReader struct {
+	keys     []keyEvent
+	restored bool
+}
 
 func (f *fakeReader) ReadKey() (keyEvent, error) {
 	if len(f.keys) == 0 {
@@ -236,7 +239,24 @@ func (f *fakeReader) ReadKey() (keyEvent, error) {
 	return k, nil
 }
 
-func (f *fakeReader) Restore() {}
+func (f *fakeReader) Restore() { f.restored = true }
+
+// TestRestoreTerminalRestoresTheActiveReader pins the shutdown affordance: an
+// exit driven by a signal cannot run runRaw's deferred restore, so the CLI
+// offers one that works from the shutdown goroutine. Without an active raw
+// reader it must do nothing.
+func TestRestoreTerminalRestoresTheActiveReader(t *testing.T) {
+	c := newTestCLI(t)
+	reader := &fakeReader{}
+	c.reader = reader
+	c.RestoreTerminal()
+	if !reader.restored {
+		t.Fatal("RestoreTerminal did not restore the active reader")
+	}
+
+	plain := newTestCLI(t)
+	plain.RestoreTerminal() // no raw reader: must not panic
+}
 
 // TestConfirm covers the exit/save prompt: explicit keys win, Enter and
 // interrupt accept the default.

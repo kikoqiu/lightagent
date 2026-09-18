@@ -941,6 +941,19 @@ func (c *CLI) animate(stop <-chan struct{}) {
 	}
 }
 
+// RestoreTerminal returns the console to its normal mode when the raw editor is
+// active. A signal-triggered exit cannot rely on runRaw's deferred restore, so
+// the process shutdown path calls this instead; it is a no-op in line-scanner
+// mode and for batch runs.
+func (c *CLI) RestoreTerminal() {
+	c.mu.Lock()
+	reader := c.reader
+	c.mu.Unlock()
+	if reader != nil {
+		reader.Restore()
+	}
+}
+
 // runRaw drives the multi-line raw-mode editor.
 func (c *CLI) runRaw(ctx context.Context, reader termReader) error {
 	defer reader.Restore()

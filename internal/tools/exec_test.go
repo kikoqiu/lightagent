@@ -142,6 +142,98 @@ func TestExecCommandInterruptKillsProcess(t *testing.T) {
 	}
 }
 
+// TestEngineCloseKillsRunningSessions pins the engine exit path: closing the
+// engine (what a session shutdown does when lightagent exits) terminates the
+// sessions that are still running instead of leaving them behind. The heartbeat
+// file tells a real kill from a session that was only marked done.
+func TestEngineCloseKillsRunningSessions(t *testing.T) {
+	heartbeat := filepath.Join(t.TempDir(), "heartbeat.txt")
+	command := fmt.Sprintf("while true; do printf x >> '%s'; sleep 0.2; done", heartbeat)
+	if runtime.GOOS == "windows" {
+		command = fmt.Sprintf("while ($true) { Add-Content -LiteralPath '%s' -Value x; Start-Sleep -Milliseconds 200 }", heartbeat)
+	}
+
+	engine := NewExecEngine(300, 1, true)
+	tool := NewExecCommandTool(engine)
+	res := tool.Execute(context.Background(), map[string]any{"command": command, "wait_timeout": 1})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, `"status":"running"`) {
+		t.Fatalf("expected a background session: %s", res.ForLLM)
+	}
+	waitForHeartbeat(t, heartbeat)
+
+	engine.Close()
+
+	// The whole tree is gone, so the loop cannot write again. A session that
+	// was merely marked done would keep growing the file.
+	size := heartbeatSize(t, heartbeat)
+	time.Sleep(700 * time.Millisecond)
+	if grown := heartbeatSize(t, heartbeat); grown != size {
+		t.Fatalf("the session is still running: the heartbeat grew from %d to %d bytes", size, grown)
+	}
+}
+
+// TestExecCommandCompletesWhenALeftoverHoldsThePipes covers the shape a script
+// leaves behind when it starts a background program: the shell exits while that
+// program keeps stdout/stderr open, so the session must still reach "completed"
+// (execWaitDelay bounds the pipe wait) and the leftover program must be
+// terminated instead of running on with the session.
+func TestExecCommandCompletesWhenALeftoverHoldsThePipes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PowerShell does not hand the parent's pipes to a detached program")
+	}
+	heartbeat := filepath.Join(t.TempDir(), "heartbeat.txt")
+	command := fmt.Sprintf("sh -c 'while true; do printf x >> %s; sleep 0.2; done' &", heartbeat)
+
+	engine := NewExecEngine(300, 10, true)
+	defer engine.Close()
+	tool := NewExecCommandTool(engine)
+
+	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, `"status":"completed"`) {
+		t.Fatalf("the session did not finish: %s", res.ForLLM)
+	}
+
+	waitForHeartbeat(t, heartbeat)
+	// Reap runs before the session is marked done, so the leftover program is
+	// already gone; the heartbeat must not grow anymore.
+	time.Sleep(700 * time.Millisecond)
+	size := heartbeatSize(t, heartbeat)
+	time.Sleep(700 * time.Millisecond)
+	if grown := heartbeatSize(t, heartbeat); grown != size {
+		t.Fatalf("the leftover program is still running: the heartbeat grew from %d to %d bytes", size, grown)
+	}
+}
+
+// waitForHeartbeat waits until the command under test has written to path.
+func waitForHeartbeat(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if heartbeatSize(t, path) > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s was never written", path)
+}
+
+// heartbeatSize returns the current size of the heartbeat file (0 when it does
+// not exist yet).
+func heartbeatSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
 // sessionIDFromResult extracts session_id from a commandResult JSON string.
 func sessionIDFromResult(t *testing.T, payload string) string {
 	t.Helper()

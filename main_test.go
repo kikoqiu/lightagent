@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -211,5 +212,40 @@ func TestPrintConfig(t *testing.T) {
 	}
 	if !strings.Contains(body, `"api_key": "***"`) {
 		t.Fatalf("api key should be masked: %q", body)
+	}
+}
+
+// TestSignalStatus pins the exit status a signal-triggered exit reports: the
+// conventional 128+N form shells use.
+func TestSignalStatus(t *testing.T) {
+	if got := signalStatus(os.Interrupt); got != 130 {
+		t.Fatalf("signalStatus(os.Interrupt) = %d, want 130", got)
+	}
+	if got := signalStatus(syscall.SIGTERM); got != 143 {
+		t.Fatalf("signalStatus(SIGTERM) = %d, want 143", got)
+	}
+}
+
+// TestShutdownHooksRunNewestFirst pins the order the signal exit uses: the
+// hooks mirror the LIFO order of the deferred teardown they stand in for.
+func TestShutdownHooksRunNewestFirst(t *testing.T) {
+	shutdownHooksMu.Lock()
+	saved := shutdownHooks
+	shutdownHooks = nil
+	shutdownHooksMu.Unlock()
+	t.Cleanup(func() {
+		shutdownHooksMu.Lock()
+		shutdownHooks = saved
+		shutdownHooksMu.Unlock()
+	})
+
+	var order []int
+	onShutdown(func() { order = append(order, 1) })
+	onShutdown(nil) // must be ignored
+	onShutdown(func() { order = append(order, 2) })
+
+	runShutdownHooks()
+	if len(order) != 2 || order[0] != 2 || order[1] != 1 {
+		t.Fatalf("hook order = %v, want [2 1]", order)
 	}
 }
