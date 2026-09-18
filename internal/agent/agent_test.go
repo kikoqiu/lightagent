@@ -457,28 +457,59 @@ func eventOrder(events []Event) []string {
 	return out
 }
 
-// TestBuildMessagesIncludesSummary verifies the compressed summary is rendered
-// into the system prompt while the history is appended after it.
-func TestBuildMessagesIncludesSummary(t *testing.T) {
+// TestBuildMessagesSummaryPlacement pins where a request carries the accumulated
+// summary: by default as the first user message, and with
+// agent.summary_in_system_prompt appended to the system prompt instead.
+func TestBuildMessagesSummaryPlacement(t *testing.T) {
+	hist := []llm.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "yo"}}
+
 	a := newTestAgent(t)
-	a.Load([]llm.Message{{Role: "user", Content: "hi"}}, "the summary")
+	a.Load(hist, "the summary")
 
 	a.mu.Lock()
 	msgs := a.buildMessagesLocked()
 	a.mu.Unlock()
 
-	if len(msgs) != 2 {
-		t.Fatalf("len = %d, want 2 (system + history)", len(msgs))
+	if len(msgs) != 4 {
+		t.Fatalf("len = %d, want 4 (system + summary + history)", len(msgs))
 	}
-	if msgs[0].Role != "system" {
-		t.Fatalf("first role = %q, want system", msgs[0].Role)
+	if msgs[0].Role != "system" || strings.Contains(msgs[0].Content, "the summary") {
+		t.Fatalf("system prompt = %q, want the capability sections only", msgs[0].Content)
+	}
+	if want := summaryUserPrefix + "the summary"; msgs[1].Role != "user" || msgs[1].Content != want {
+		t.Fatalf("summary message = %q, want %q", msgs[1].Content, want)
+	}
+	// The history rows follow the summary in their recorded order.
+	if msgs[2].Role != "user" || msgs[2].Content != "hi" {
+		t.Fatalf("first history message = %+v", msgs[2])
+	}
+	if msgs[3].Role != "assistant" || msgs[3].Content != "yo" {
+		t.Fatalf("second history message = %+v", msgs[3])
+	}
+	if got := a.History(); len(got) != 2 || got[0].Content != "hi" {
+		t.Fatalf("stored history = %+v, want the recorded rows", got)
+	}
+
+	// agent.summary_in_system_prompt: the summary rides in the system prompt and
+	// no extra message is sent.
+	cfg := config.Default()
+	cfg.Agent.SummaryInSystemPrompt = true
+	b := New(cfg, nil, tools.NewRegistry(), NewBus())
+	b.Load(hist, "the summary")
+
+	b.mu.Lock()
+	msgs = b.buildMessagesLocked()
+	b.mu.Unlock()
+
+	if len(msgs) != 3 {
+		t.Fatalf("len = %d, want 3 (system + history)", len(msgs))
 	}
 	if !strings.Contains(msgs[0].Content, "# CONVERSATION SUMMARY") ||
 		!strings.Contains(msgs[0].Content, "the summary") {
 		t.Fatalf("system prompt missing summary: %q", msgs[0].Content)
 	}
-	if msgs[1].Role != "user" || msgs[1].Content != "hi" {
-		t.Fatalf("history message = %+v", msgs[1])
+	if msgs[1].Content != "hi" {
+		t.Fatalf("first history message = %q, want the recorded row", msgs[1].Content)
 	}
 }
 
@@ -615,8 +646,10 @@ func TestAutoCompactionKeepsAUserMessage(t *testing.T) {
 		t.Fatalf("history[1] = %+v, want the model reply", hist[1])
 	}
 
-	// The model call that follows the pass must have carried that marker, and
-	// only it: a request without a user message is what the provider rejected.
+	// The request that follows the pass must still carry the engine continue
+	// marker: a request without a user message is what the provider rejected.
+	// The summary of the pass is the first user message, the marker follows at
+	// the end.
 	mu.Lock()
 	last := bodies[len(bodies)-1]
 	mu.Unlock()
@@ -626,8 +659,14 @@ func TestAutoCompactionKeepsAUserMessage(t *testing.T) {
 			users = append(users, m.Content)
 		}
 	}
-	if len(users) != 1 || users[0] != contextContinueMessage {
-		t.Fatalf("final request user messages = %q, want only the engine continue marker", users)
+	want := []string{summaryUserPrefix + "done", contextContinueMessage}
+	if len(users) != len(want) {
+		t.Fatalf("final request user messages = %q, want %q", users, want)
+	}
+	for i := range want {
+		if users[i] != want[i] {
+			t.Fatalf("final request user messages = %q, want %q", users, want)
+		}
 	}
 }
 
@@ -702,7 +741,7 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 		if len(body.Messages) == 0 {
 			continue
 		}
-		if last := body.Messages[len(body.Messages)-1]; last.Content == summarizeAppendInstruction {
+		if last := body.Messages[len(body.Messages)-1]; strings.HasPrefix(last.Content, summarizeInstructionIntro) {
 			digest = body
 			continue
 		}
@@ -744,8 +783,18 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 		t.Fatalf("the summarizing call must carry the live system prompt byte for byte:\ngot:\n%q\nwant:\n%q",
 			got, capabilities)
 	}
-	if want := systemWithSummary(capabilities, "done"); live.Messages[0].Content != want {
-		t.Fatalf("the live request system prompt = %q, want %q", live.Messages[0].Content, want)
+	// The summary lands where the configuration asks for it: as the first user
+	// message of the request that follows the pass, with the capability sections
+	// carried byte for byte in front of it.
+	if got := live.Messages[0].Content; got != capabilities {
+		t.Fatalf("the live request must carry the capability sections byte for byte:\ngot:\n%q\nwant:\n%q",
+			got, capabilities)
+	}
+	if want := summaryUserPrefix + "done"; live.Messages[1].Role != "user" || live.Messages[1].Content != want {
+		t.Fatalf("live summary message = %+v, want %q", live.Messages[1], want)
+	}
+	if want := contextContinueMessage; live.Messages[2].Content != want {
+		t.Fatalf("live first history message = %q, want %q", live.Messages[2].Content, want)
 	}
 	// The declared tools ride along unchanged too.
 	if string(digest.Tools) != string(live.Tools) {
@@ -764,6 +813,135 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 	}
 	if !sawBatch {
 		t.Fatalf("the summarizing call dropped the batch: %+v", digest.Messages)
+	}
+}
+
+// TestCompactionDigestCarriesSummaryWhereTheLiveCallDoes verifies the
+// summarizing call mirrors the placement of the accumulated summary, which is
+// what keeps its prefix identical to the live requests: by default the summary is
+// the first user message, in front of the batch, and with
+// agent.summary_in_system_prompt it rides in the system prompt instead.
+func TestCompactionDigestCarriesSummaryWhereTheLiveCallDoes(t *testing.T) {
+	for _, inSystem := range []bool{false, true} {
+		name := "summary message"
+		if inSystem {
+			name = "system prompt"
+		}
+		t.Run(name, func(t *testing.T) {
+			var (
+				mu     sync.Mutex
+				bodies [][]capturedMessage
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Messages []capturedMessage `json:"messages"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				mu.Lock()
+				bodies = append(bodies, req.Messages)
+				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+			}))
+			defer srv.Close()
+
+			cfg := config.Default()
+			cfg.OpenAI.APIBase = srv.URL
+			cfg.OpenAI.Stream = false
+			cfg.Agent.SummaryInSystemPrompt = inSystem
+			// A tiny window with a 1% trigger compresses on the first iteration,
+			// and a retention budget of a few tokens leaves no room for the newest
+			// turn, so the whole tail — the batch being summarized included — is
+			// compressed.
+			cfg.Context.ContextWindow = 100
+			cfg.Context.SummarizeTokenPercent = 1
+			bus := NewBus()
+			events, cancel := bus.Subscribe()
+			defer cancel()
+			a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+			a.Load([]llm.Message{
+				userRunes("old ", 100),
+				{Role: "assistant", Content: "old answer"},
+			}, "carried over")
+			a.Submit(userRunes("question ", 100).Content)
+			drainEvents(t, events)
+
+			mu.Lock()
+			captured := append([][]capturedMessage(nil), bodies...)
+			mu.Unlock()
+
+			var digest []capturedMessage
+			for _, msgs := range captured {
+				if len(msgs) > 0 && strings.HasPrefix(msgs[len(msgs)-1].Content, summarizeInstructionIntro) {
+					digest = msgs
+				}
+			}
+			if digest == nil {
+				t.Fatalf("no summarizing call captured (%d requests)", len(captured))
+			}
+			if digest[0].Role != "system" || digest[1].Role != "user" {
+				t.Fatalf("the summarizing call does not start with system + user: %+v", digest[:2])
+			}
+			if inSystem {
+				if !strings.Contains(digest[0].Content, "# CONVERSATION SUMMARY") ||
+					!strings.Contains(digest[0].Content, "carried over") {
+					t.Fatalf("the summarizing system prompt lost the summary: %q", digest[0].Content)
+				}
+				if strings.Contains(digest[1].Content, summaryUserPrefix) {
+					t.Fatalf("the summary must not be duplicated in a message of its own: %q", digest[1].Content)
+				}
+				return
+			}
+			if strings.Contains(digest[0].Content, "carried over") {
+				t.Fatalf("the summarizing system prompt must not carry the summary: %q", digest[0].Content)
+			}
+			if want := summaryUserPrefix + "carried over"; digest[1].Content != want {
+				t.Fatalf("the summarizing summary message = %q, want %q", digest[1].Content, want)
+			}
+			// The batch follows the summary as it was recorded.
+			if want := userRunes("old ", 100).Content; digest[2].Role != "user" || digest[2].Content != want {
+				t.Fatalf("the summarizing batch starts with %+v, want the user turn %q", digest[2], want)
+			}
+		})
+	}
+}
+
+// TestCompactionReplacesTheSummary verifies a pass stores the report the model
+// wrote as the new accumulated summary: the summarizing call carried the previous
+// summary and asked for the complete text, so the field ends up holding that full
+// update.
+func TestCompactionReplacesTheSummary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"rewritten report"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	// A tiny window with a 1% trigger compresses on the first pass, and the
+	// retention budget leaves no room for the newest turn, so the whole history
+	// is summarized.
+	cfg.Context.ContextWindow = 100
+	cfg.Context.SummarizeTokenPercent = 1
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), NewBus())
+
+	a.Load([]llm.Message{
+		userRunes("old ", 100),
+		{Role: "assistant", Content: "old answer"},
+		{Role: "user", Content: "more"},
+		{Role: "assistant", Content: "more answer"},
+	}, "carried over")
+
+	if msg := a.CompactNow(context.Background()); msg != "" {
+		t.Fatalf("CompactNow = %q, want no extra note", msg)
+	}
+	if got := a.Summary(); got != "rewritten report" {
+		t.Fatalf("summary = %q, want the report the model returned", got)
 	}
 }
 

@@ -74,7 +74,8 @@
   "agent": {
     "max_tool_iterations": 200,
     "system_prompt": "",
-    "include_working_dir": true
+    "include_working_dir": true,
+    "summary_in_system_prompt": false     // 发送时摘要的位置：默认第一条用户消息；true 则写进系统提示词
   },
   "ui": {
     "markdown": true
@@ -193,6 +194,7 @@ lightagent 内置一个**纯标准库**的 MCP 客户端。启动时按 `servers
 | `max_tool_iterations` | int | `200` | 单个回合内工具循环的最大轮数 |
 | `system_prompt` | string | 空 | 自定义系统提示词；空则用内置默认（`agent.md` 优先级更高）。运行时环境行由程序自动追加，不必写在这里 |
 | `include_working_dir` | bool | `true` | 启动时把**当前目录清单**插入系统提示词（工作目录 + 直接子项；子目录附其直接子项数量）。省略即开启，显式 `false` 关闭 |
+| `summary_in_system_prompt` | bool | `false` | 发送时累积摘要的位置：`false` = 第一条用户消息（`[engine] CONVERSATION SUMMARY:` 开头）；`true` = 系统提示词末尾的 `# CONVERSATION SUMMARY` 段 |
 
 `include_working_dir` 插入的段落形如（子目录在前并带 `[直接子项数量]`，随后是文件）：
 
@@ -205,6 +207,20 @@ go.mod
 ```
 
 由于加载时先取默认值再合并文件，省略 `include_working_dir` 即保持开启；关闭需显式写 `"include_working_dir": false`。
+
+`summary_in_system_prompt` 决定发送时累积摘要的位置，默认 `false`（第一条用户消息）：
+
+```
+system: <基础提示词 + 运行时行 + 目录清单 + ……>
+user:   [engine] CONVERSATION SUMMARY:
+        <累积摘要>
+user:   <历史里的第一条 user>
+...
+```
+
+设为 `true` 则把摘要追加到系统提示词末尾的 `# CONVERSATION SUMMARY` 段。该开关只作用于发送前
+组装的消息列表（`history`、会话文件与 CLI/web 显示不变）。细节见
+[architecture.md](architecture.md#摘要的放置agentsummary_in_system_prompt)。
 
 ### `ui`
 
@@ -281,4 +297,5 @@ lightagent gen-agent-prompt -f     # 强制覆盖
 3. 非法/越界值回退默认：`temperature=0` 视为未设置；`summarize_token_percent` 不在
    `(0,100]` 时回退；负的 `keep_recent_messages` 回退。
 4. 若存在 `agent.md`，覆盖 `agent.system_prompt`（文件中的 `@include` 会先展开）。
-5. `ui.markdown` 与 `agent.include_working_dir` 默认 `true`，仅在文件中显式写 `false` 才会关闭。
+5. `ui.markdown` 与 `agent.include_working_dir` 默认 `true`，仅在文件中显式写 `false` 才会关闭；
+   `agent.summary_in_system_prompt` 反之默认 `false`（摘要作为独立的 `[engine]` 消息紧跟系统提示词），显式写 `true` 才放进系统提示词。

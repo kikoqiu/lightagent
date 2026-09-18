@@ -272,6 +272,12 @@ type AgentConfig struct {
 	// loading starts from the defaults, so an explicit false is required to
 	// turn it off.
 	IncludeWorkingDir bool `json:"include_working_dir"`
+	// SummaryInSystemPrompt selects where a request carries the accumulated
+	// context summary: false (the default) sends it as the first user message,
+	// true appends it to the system prompt (the "CONVERSATION SUMMARY"
+	// section). The switch shapes the message list that is sent and nothing
+	// else.
+	SummaryInSystemPrompt bool `json:"summary_in_system_prompt"`
 }
 
 // Default returns the built-in configuration used when no file exists yet.
@@ -304,7 +310,7 @@ func Default() *Config {
 				UseBM25:          true,
 			},
 		},
-		Agent: AgentConfig{MaxToolIterations: 200, IncludeWorkingDir: true},
+		Agent: AgentConfig{MaxToolIterations: 200, IncludeWorkingDir: true, SummaryInSystemPrompt: false},
 		UI:    UIConfig{Markdown: true},
 	}
 }

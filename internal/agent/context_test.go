@@ -247,7 +247,83 @@ func TestEnsureUserMessage(t *testing.T) {
 	}
 }
 
-// TestCompactKeepsAUserMessageWhenEverythingIsCut covers the pass that cuts the
+// TestSummaryMessage pins the standalone summary message: its own user message,
+// always introduced by the [engine] tag, and nothing at all when the summary is
+// blank.
+func TestSummaryMessage(t *testing.T) {
+	if _, ok := summaryMessage("   "); ok {
+		t.Fatal("a blank summary must produce no message")
+	}
+	msg, ok := summaryMessage("  sum  ")
+	if !ok || msg.Role != "user" || msg.Content != summaryUserPrefix+"sum" {
+		t.Fatalf("summaryMessage = %+v ok=%v, want the [engine] block", msg, ok)
+	}
+}
+
+// TestHeadMessagesPlacement pins the two layouts a request head can have: the
+// default one sends the summary as its own message right after the system message
+// (in front of the history), the configured one leaves it to the (already
+// rendered) system prompt.
+func TestHeadMessagesPlacement(t *testing.T) {
+	rest := []llm.Message{{Role: "user", Content: "hi"}, {Role: "assistant", Content: "yo"}}
+
+	got := headMessages("sys", rest, "sum", false)
+	if len(got) != 4 {
+		t.Fatalf("default head = %+v, want system + summary + history", got)
+	}
+	if got[0].Role != "system" || got[0].Content != "sys" {
+		t.Fatalf("first message = %+v, want the system prompt", got[0])
+	}
+	if got[1].Role != "user" || got[1].Content != summaryUserPrefix+"sum" {
+		t.Fatalf("second message = %+v, want the [engine] summary message", got[1])
+	}
+	// The history rows follow the summary in their recorded order.
+	if got[2].Content != "hi" || got[3].Content != "yo" {
+		t.Fatalf("history rows = %+v, want them after the summary", got[2:])
+	}
+
+	// A blank summary adds no message.
+	if got := headMessages("sys", rest, "  ", false); len(got) != 3 || got[1].Content != "hi" {
+		t.Fatalf("blank summary head = %+v, want just the history behind the system prompt", got)
+	}
+
+	got = headMessages("sys", rest, "sum", true)
+	if len(got) != 3 || got[0].Content != "sys" || got[1].Content != "hi" {
+		t.Fatalf("system-prompt head = %+v, want the system prompt alone to carry it", got)
+	}
+	if rest[0].Content != "hi" {
+		t.Fatalf("the input messages were written into: %+v", rest)
+	}
+}
+
+// TestHeadMessagesSummaryLeadsTheHistory pins the default layout of a request
+// that carries a summary and several turns: the summary is the first user
+// message, followed by the history rows in their recorded order.
+func TestHeadMessagesSummaryLeadsTheHistory(t *testing.T) {
+	rest := []llm.Message{
+		{Role: "user", Content: "one"},
+		{Role: "assistant", Content: "two"},
+		{Role: "user", Content: contextContinueMessage},
+	}
+	got := headMessages("sys", rest, "sum", false)
+
+	users := 0
+	for _, m := range got {
+		if m.Role == "user" {
+			users++
+		}
+	}
+	if users != 3 {
+		t.Fatalf("request user messages = %d, want the two turns plus the summary message: %+v", users, got)
+	}
+	if got[1].Content != summaryUserPrefix+"sum" {
+		t.Fatalf("second message = %+v, want the [engine] summary message", got[1])
+	}
+	if got[2].Content != "one" || got[3].Content != "two" || got[4].Content != contextContinueMessage {
+		t.Fatalf("history rows = %+v, want the recorded rows after the summary", got[2:])
+	}
+}
+
 // whole tail: the tiny window leaves no room for even the newest turn, so
 // nothing but the engine marker may survive — also on the summarize-failure
 // fallback, which drops the batch and keeps that marker.
@@ -272,15 +348,63 @@ func TestCompactKeepsAUserMessageWhenEverythingIsCut(t *testing.T) {
 	}
 }
 
-func TestMergeSummaries(t *testing.T) {
-	if got := mergeSummaries("", "b"); got != "b" {
-		t.Fatalf("got %q", got)
+// TestSummarizeInstruction pins the wording rules of the summarizing instruction:
+// it always says the report becomes the only history context of the next
+// conversation, and the system-prompt layout — the case that needs spelling out —
+// adds the note that the report replaces that section's summary once one exists.
+func TestSummarizeInstruction(t *testing.T) {
+	const onlyHistory = "the only history context of the next conversation"
+
+	fresh := summarizeInstruction("", false)
+	if !strings.Contains(fresh, onlyHistory) {
+		t.Fatalf("instruction does not name the report's role:\n%s", fresh)
 	}
-	if got := mergeSummaries("a", ""); got != "a" {
-		t.Fatalf("got %q", got)
+	for _, absent := range []string{"[engine]", "CONVERSATION SUMMARY", "replaces"} {
+		if strings.Contains(fresh, absent) {
+			t.Fatalf("instruction without a summary mentions %q:\n%s", absent, fresh)
+		}
 	}
-	if got := mergeSummaries("a", "b"); got != "a\n\nb" {
-		t.Fatalf("got %q", got)
+
+	// Default layout: the report is the [engine] message the instruction already
+	// described, so there is no extra note.
+	userMsg := summarizeInstruction("earlier report", false)
+	if !strings.Contains(userMsg, onlyHistory) || strings.Contains(userMsg, "replaces") {
+		t.Fatalf("instruction for the user-message layout:\n%s", userMsg)
+	}
+
+	// System-prompt layout: with a summary in place, the instruction says the
+	// report replaces it; without one there is nothing to replace.
+	sysPrompt := summarizeInstruction("earlier report", true)
+	if !strings.Contains(sysPrompt, `The new report replaces the summary of the "# CONVERSATION SUMMARY" section of the system prompt.`) {
+		t.Fatalf("instruction for the system-prompt layout:\n%s", sysPrompt)
+	}
+	if strings.Contains(sysPrompt, "[engine]") {
+		t.Fatalf("instruction for the system-prompt layout:\n%s", sysPrompt)
+	}
+	cold := summarizeInstruction("", true)
+	if strings.Contains(cold, "replaces") {
+		t.Fatalf("instruction for an empty system-prompt summary:\n%s", cold)
+	}
+}
+
+// call cannot be made, so the previous summary stays and the messages are dropped.
+func TestCompactKeepsTheSummaryWhenSummarizingFails(t *testing.T) {
+	// A compactor without an LLM client fails the summarizing call.
+	c := &compactor{contextWindow: 100, maxTokens: 40960}
+	hist := []llm.Message{
+		{Role: "user", Content: strings.Repeat("q", 200)},
+		{Role: "assistant", Content: "answer"},
+		{Role: "user", Content: "next"},
+	}
+	_, summary, changed, err := c.compact(context.Background(), hist, livePrefix{}, "carried over", summarizeModeAuto)
+	if err == nil {
+		t.Fatal("expected the client-less compactor to report a summarizing failure")
+	}
+	if !changed {
+		t.Fatal("expected the oldest messages to be dropped")
+	}
+	if summary != "carried over" {
+		t.Fatalf("summary = %q, want the previous summary kept", summary)
 	}
 }
 

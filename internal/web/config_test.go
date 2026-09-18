@@ -287,7 +287,7 @@ func TestConfigEditorWiring(t *testing.T) {
 		"tools.discovery.enabled", "tools.discovery.mode", "tools.discovery.ttl",
 		"tools.discovery.max_search_results", "tools.discovery.min_match_rate", "tools.discovery.use_bm25",
 		"tools.mcp.enabled", "tools.mcp.servers",
-		"agent.max_tool_iterations", "agent.system_prompt", "agent.include_working_dir",
+		"agent.max_tool_iterations", "agent.system_prompt", "agent.include_working_dir", "agent.summary_in_system_prompt",
 		"ui.markdown",
 	} {
 		if !strings.Contains(configJS, "'"+path+"'") {

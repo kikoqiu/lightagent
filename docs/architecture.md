@@ -186,18 +186,41 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
    聊天模板要求请求里至少有一条 user 查询，否则接口直接返回 400。
 
 被压缩的部分（切点之前）按 append_instruction 模式交给模型总结：总结请求原样复用**实时请求的
-请求头** —— 系统提示（基础提示词 + 运行时行 + 目录清单 + unlock 规则 + MCP 全局信息，摘要段为
-当前摘要）与同一份 tools 声明都由 `Agent.livePrefixLocked()` 这一处渲染，只是把它放到被压缩消息
-之前、并在末尾追加压缩指令。因此模型总结时所处的环境与产生这些消息时一致（基础提示词以下的段落不会
-被丢掉），请求前缀与实时请求逐字节相同——服务端提示缓存仍可命中该前缀，不会被每次压缩重置。
-摘要与旧摘要合并（`旧 + "\n\n" + 新`）后写入系统提示的
-`# CONVERSATION SUMMARY` 段；摘要失败则退化为直接丢弃被压缩消息，回合继续。CLI `/compact`
-会以**手动模式**触发（更保守的保留窗口）。
+请求头** —— 系统提示（基础提示词 + 运行时行 + 目录清单 + unlock 规则 + MCP 全局信息）与同一份
+tools 声明都由 `Agent.livePrefixLocked()` 这一处渲染，摘要由 `headMessages()` 放到配置指定的位置，
+只是把它放到被压缩消息之前、并在末尾追加压缩指令。因此模型总结时所处的环境与产生这些消息时一致
+（基础提示词以下的段落不会被丢掉），请求前缀与实时请求逐字节相同——服务端提示缓存仍可命中该前缀，
+不会被每次压缩重置。压缩指令（`summarizeInstruction`，按本次请求的实际情况生成）告诉模型：它写出的报告
+是**下次对话唯一的历史上下文**，必须自足。摘要放进**系统提示词**（`agent.summary_in_system_prompt=true`）
+且已经有摘要时，再补一句**新摘要会替换 `# CONVERSATION SUMMARY` 段里的摘要**——系统提示词是特殊情形，
+需要点明；默认布局下报告本身就是那条 `[engine]` 摘要消息，无需额外说明。返回的报告即新的累积摘要，
+是全量更新（内容包含旧摘要）而非增量追加；摘要失败则保留原摘要并退化为直接丢弃被压缩消息，回合继续。
+CLI `/compact` 会以**手动模式**触发（更保守的保留窗口）。
 压缩完成后发布带 `summary` 的 `compacted` 事件，CLI 与 web 便在截断处显示它；恢复会话时
 摘要出现在历史消息之前（网页日志区的第一行），即「此前的对话只以摘要形式保留」。
 由于总结本身是一次模型调用（可能较慢），**压缩开始前**先发布一条 `info`
 （`compacting context: summarizing N of M messages`），两端因此马上能看到「正在压缩」，
 不会在等待期间毫无反馈；没有可压缩内容时不发任何事件，由命令调用方回复「无需压缩」。
+
+### 摘要的放置（`agent.summary_in_system_prompt`）
+
+该开关决定**发送时**累积摘要放在哪里，默认 `false`（第一条用户消息）：
+
+```
+system: <基础提示词 + 运行时行 + 目录清单 + ……>
+user:   [engine] CONVERSATION SUMMARY:
+        <累积摘要>
+user:   <历史里的第一条 user>
+...
+```
+
+* `false`：摘要作为**第一条用户消息**发给模型（`[engine]` 开头，和 `[engine] Context summarized,
+  continue.` 同一种标记，提示模型「这段是引擎侧信息」）。
+* `true`：摘要追加到系统提示词末尾的 `# CONVERSATION SUMMARY` 段。
+
+它只作用于发送前组装的消息列表（`headMessages` / `Agent.buildMessagesLocked`）；压缩的总结请求
+按同一布局携带摘要（见 `livePrefix.head`），因此与实时请求的前缀一致，压缩指令（`summarizeInstruction`）
+也只点名本次请求实际携带摘要的那一处。
 
 ### token 估算（`EstimateMessageTokens`）
 
@@ -213,7 +236,9 @@ name/arguments/id 等，即约 2.5 字符/token，另加每消息 12 字符的�
 
 基础提示词之后按顺序追加能力段落：① 运行时环境行（`agent.RuntimeInfo()`，每次运行生成，**不写进**
 `agent.md`）；② 当前目录清单（`agent.include_working_dir`，默认开启，`agent.DirectoryListing()`
-在 `agent.New` 时生成一次）；③ 存在锁定函数时的全局 unlock 规则；④ 每个已连接 MCP server 的 MCP 全局信息。
+在 `agent.New` 时生成一次）；③ 存在锁定函数时的全局 unlock 规则；④ 每个已连接 MCP server 的 MCP 全局信息；
+⑤ 累积的上下文摘要（**仅** `agent.summary_in_system_prompt = true`；默认摘要不在系统提示里，而是
+作为一条独立的 `[engine]` 消息紧跟其后，见 [上下文压缩](#摘要的放置agentsummary_in_system_prompt)）。
 
 ## MCP 工具发现 / unlock 控制面
 

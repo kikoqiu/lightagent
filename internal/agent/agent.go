@@ -39,8 +39,12 @@ type Agent struct {
 	// never lists the servers' functions.
 	mcpInfo []MCPServerInfo
 	summary string
-	history []llm.Message
-	busy    bool
+	// summaryInSystem says where a request carries the accumulated summary:
+	// true appends it to the system prompt, false (the default, from
+	// agent.summary_in_system_prompt) sends it as the first user message.
+	summaryInSystem bool
+	history         []llm.Message
+	busy            bool
 	// usage is the last provider-reported prompt-token count (the size of the
 	// context the API saw), 0 when unknown. usageAt is len(history) at the time
 	// it was reported, so messages appended afterwards can be estimated on top
@@ -113,6 +117,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		runtimeInfo:        RuntimeInfo(),
 		dirListing:         dirListing,
 		unlockRule:         unlockRule,
+		summaryInSystem:    cfg.Agent.SummaryInSystemPrompt,
 		maxIter:            maxIter,
 		autoSplitWrites:    cfg.Tools.WriteFile.AutoSplit,
 		contextWindow:      contextWindow,
@@ -172,21 +177,27 @@ func (a *Agent) systemPrompt() string {
 }
 
 // systemMessageLocked renders the system message every request carries: the
-// rendered system prompt with the current summary. It is the single place the
-// system message is built, so the ordinary calls and the summarizing one cannot
-// drift apart. The caller must hold a.mu.
+// rendered system prompt, with the accumulated summary appended while
+// agent.summary_in_system_prompt is on. The caller must hold a.mu.
 func (a *Agent) systemMessageLocked() llm.Message {
-	return llm.Message{Role: "system", Content: systemWithSummary(a.systemPrompt(), a.summary)}
+	content := a.systemPrompt()
+	if a.summaryInSystem {
+		content = systemWithSummary(content, a.summary)
+	}
+	return llm.Message{Role: "system", Content: content}
 }
 
 // livePrefixLocked renders the fixed head of every request the conversation
-// sends — the system message and the declared tool schemas — in one snapshot.
-// Compaction passes it to the summarizing call verbatim, which keeps that call's
-// prefix byte-identical to the live ones. The caller must hold a.mu.
+// sends — the system message, the declared tool schemas and the accumulated
+// summary with the place it occupies — in one snapshot. Compaction passes it to
+// the summarizing call verbatim, which keeps that call's prefix byte-identical to
+// the live ones. The caller must hold a.mu.
 func (a *Agent) livePrefixLocked() livePrefix {
 	return livePrefix{
-		systemPrompt: a.systemMessageLocked().Content,
-		tools:        a.reg.Definitions(),
+		systemPrompt:          a.systemMessageLocked().Content,
+		tools:                 a.reg.Definitions(),
+		summary:               a.summary,
+		summaryInSystemPrompt: a.summaryInSystem,
 	}
 }
 
@@ -277,7 +288,9 @@ func (a *Agent) contextTokensLocked() int {
 	if a.usage > 0 && a.usageAt >= 0 && a.usageAt <= len(a.history) {
 		return a.usage + EstimateMessagesTokens(a.history[a.usageAt:])
 	}
-	return EstimateMessagesTokens(a.history) + EstimateMessageTokens(a.systemMessageLocked())
+	// The request is estimated instead of the pieces: that counts the summary
+	// wherever agent.summary_in_system_prompt puts it.
+	return EstimateMessagesTokens(a.buildMessagesLocked())
 }
 
 // usageEvent builds a context-usage event. It is broadcast at every point the
@@ -694,13 +707,12 @@ func (a *Agent) appendMessage(m llm.Message) {
 	a.mu.Unlock()
 }
 
-// buildMessagesLocked renders the full request message list. The caller must
-// hold a.mu.
+// buildMessagesLocked renders the full request message list: the system message,
+// the accumulated summary (as the first user message, or in the system prompt
+// when agent.summary_in_system_prompt asks for it) and the history. The caller
+// must hold a.mu.
 func (a *Agent) buildMessagesLocked() []llm.Message {
-	msgs := make([]llm.Message, 0, len(a.history)+1)
-	msgs = append(msgs, a.systemMessageLocked())
-	msgs = append(msgs, a.history...)
-	return msgs
+	return headMessages(a.systemMessageLocked().Content, a.history, a.summary, a.summaryInSystem)
 }
 
 // drainSteering folds the queued steering messages into the history, announcing
@@ -828,9 +840,10 @@ func (a *Agent) doCompact(ctx context.Context, mode summarizeMode) bool {
 	hist := append([]llm.Message(nil), a.history...)
 	sum := a.summary
 	// The summarizing call reuses the live request prefix verbatim — the very
-	// system prompt and declared tools the ordinary calls send — so nothing
-	// below the base prompt is lost and the provider's cached prompt prefix
-	// stays valid across the pass.
+	// system prompt, accumulated summary (in the place the request carries it)
+	// and declared tools the ordinary calls send — so nothing below the base
+	// prompt is lost and the provider's cached prompt prefix stays valid across
+	// the pass.
 	prefix := a.livePrefixLocked()
 	a.mu.Unlock()
 

@@ -58,32 +58,99 @@ func ensureUserMessage(msgs []llm.Message) []llm.Message {
 	return append(out, llm.Message{Role: "user", Content: contextContinueMessage})
 }
 
-// summarizeAppendInstruction is the single instruction appended as the final
-// user message when compressing.
-// Summarize mode so the compression call reuses the live conversation layout.
-const summarizeAppendInstruction = `Context is full, summarize the conversation into a brief report with the following rules:
-- Think carefully and organize the key information (goals, decisions, steps taken, key points, results, next steps) so that work can be resumed and continued correctly.
-- After summarization, the conversation content before this point will be completely cleared from the context. The summary you provide here will replace the summary in the system prompt.
-- Repeated details, irrelevant content, and unimportant side discussions in the earlier parts that are not important should be omitted or condensed, but keep such content that is in the latest rounds.
-- System prompt except the original summary is fully preserved, so do NOT include it in the summary you generate.
-- Output the summary and do NOT add any explanatory meta-language.`
+// summarizeInstructionIntro opens the summarizing instruction and lets the tests
+// recognize the summarizing call.
+const summarizeInstructionIntro = "Context is full, summarize the conversation into a report with the following rules:"
+
+// summarizeInstruction renders the instruction appended as the final user message
+// when compressing. It tells the model what its report is for — the only history
+// context the next conversations see.
+//
+// The system prompt is the case that needs spelling out: when the summary lives
+// there and one already exists, the instruction says the new report replaces the
+// summary of that section. The default layout needs no such note — the report is
+// exactly the [engine] message the instruction just described as the only history
+// context (see headMessages).
+func summarizeInstruction(summary string, summaryInSystemPrompt bool) string {
+	lines := []string{
+		summarizeInstructionIntro,
+		"- Think carefully and organize the key information (goals, decisions, steps taken, key points, results, next steps) so that work can be resumed and continued correctly.",
+		"- The report you write here becomes the only history context of the next conversation, so it has to stand on its own.",
+	}
+	if summaryInSystemPrompt && strings.TrimSpace(summary) != "" {
+		lines = append(lines, `- The new report replaces the summary of the "# CONVERSATION SUMMARY" section of the system prompt.`)
+	}
+	return strings.Join(append(lines,
+		"- Repeated details, irrelevant content, and unimportant side discussions in the earlier parts that are not important should be omitted or condensed, but keep such content that is in the latest rounds.",
+		"- The system prompt itself stays as it is, so do NOT include it in the report you generate.",
+		"- Output the report and do NOT add any explanatory meta-language.",
+	), "\n")
+}
 
 // livePrefix is the fixed head of every request the running conversation sends:
-// the rendered system message and the declared tool schemas. The summarizing
-// call reuses it verbatim, so a compaction never changes what the provider sees
-// in front of the compressed messages — nothing below the base prompt is lost
-// and a provider-side prompt cache keeps its prefix.
+// the rendered system message and the declared tool schemas, plus the accumulated
+// summary and the place it occupies. The summarizing call reuses it verbatim (see
+// head and digest), so a compaction never changes what the provider sees in front
+// of the compressed messages — nothing below the base prompt is lost and a
+// provider-side prompt cache keeps its prefix.
 type livePrefix struct {
 	systemPrompt string
 	tools        []llm.ToolDef
+	// summary is the accumulated context summary, and summaryInSystemPrompt
+	// says whether a request carries it in the system prompt (true) or as its
+	// first user message (false, the default).
+	summary               string
+	summaryInSystemPrompt bool
+}
+
+// head renders the fixed head of a request followed by rest: the live system
+// prompt and rest's messages, with the accumulated summary in the place this
+// prefix came with. Both the live calls and the summarizing one build their
+// message list here, so the two cannot drift apart and the summarizing call's
+// prefix stays byte-identical to the live one.
+func (p livePrefix) head(rest []llm.Message) []llm.Message {
+	return headMessages(p.systemPrompt, rest, p.summary, p.summaryInSystemPrompt)
+}
+
+// headMessages renders the messages a request starts with: the system message,
+// then the accumulated summary where the configuration asks for it, then rest.
+// summaryInSystemPrompt keeps the summary in the system prompt (the caller then
+// passes a system message that already carries it); otherwise the summary goes
+// out as the first user message.
+func headMessages(system string, rest []llm.Message, summary string, summaryInSystemPrompt bool) []llm.Message {
+	msgs := make([]llm.Message, 0, len(rest)+2)
+	msgs = append(msgs, llm.Message{Role: "system", Content: system})
+	if !summaryInSystemPrompt {
+		if msg, ok := summaryMessage(summary); ok {
+			msgs = append(msgs, msg)
+		}
+	}
+	return append(msgs, rest...)
+}
+
+// summaryUserPrefix introduces the summary when it goes out as the first user
+// message. The [engine] tag marks engine-inserted text, like
+// contextContinueMessage above.
+const summaryUserPrefix = "[engine] CONVERSATION SUMMARY:\n"
+
+// summaryMessage builds the user message that carries the accumulated summary,
+// and reports false when there is nothing to send.
+func summaryMessage(summary string) (llm.Message, bool) {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return llm.Message{}, false
+	}
+	return llm.Message{Role: "user", Content: summaryUserPrefix + summary}, true
 }
 
 // compactor implements the single, global context-compression strategy:
-// summarize the older portion of the conversation and store the digest in the
-// system prompt, keeping the most recent messages intact.
+// summarize the older portion of the conversation and store the digest as the
+// accumulated summary, keeping the most recent messages intact. Where a request
+// carries that summary — in the system prompt or as its first user message — is
+// decided by the request builder (see livePrefix.head).
 //
 // The request prefix is deliberately not stored here: every pass receives the
-// one the live conversation renders (system prompt plus declared tools), so the
+// one the live conversation renders (system message plus declared tools), so the
 // summarizing call cannot drift away from the ordinary requests.
 type compactor struct {
 	client                *llm.Client
@@ -103,10 +170,16 @@ func (c *compactor) tokenLimit() int {
 
 // shouldCompact reports whether the conversation exceeds the trigger (a
 // percentage of the context window). The prefix is the one the next request will
-// carry, so the system prompt counts towards the trigger like any other context.
+// carry, so the system prompt and the accumulated summary count towards the
+// trigger like any other context.
 func (c *compactor) shouldCompact(history []llm.Message, prefix livePrefix, usageTokens int) bool {
 	estimate := EstimateMessagesTokens(history)
 	estimate += EstimateMessageTokens(llm.Message{Role: "system", Content: prefix.systemPrompt})
+	if !prefix.summaryInSystemPrompt {
+		if msg, ok := summaryMessage(prefix.summary); ok {
+			estimate += EstimateMessageTokens(msg)
+		}
+	}
 	if usageTokens > estimate {
 		estimate = usageTokens
 	}
@@ -247,11 +320,16 @@ func (c *compactor) cut(history []llm.Message, mode summarizeMode) (int, bool) {
 	return cut, true
 }
 
-// compact compresses history. prefix is the live request prefix (system prompt
-// with the existing summary plus the declared tools), which the digest call
-// reuses verbatim (see digest). It returns the new history, the new summary,
-// whether a change happened, and any error. On summarization failure it falls
-// back to dropping the oldest messages so the turn can continue.
+// compact compresses history. prefix is the live request prefix (system message
+// plus declared tools, with the accumulated summary in the place the
+// configuration asks for), which the digest call reuses verbatim (see digest). It
+// returns the new history, the new summary, whether a change happened, and any
+// error.
+//
+// The report the model writes is a full update of the summary: the digest call
+// carried the previous one and asked for the complete text, so the pass stores what
+// came back as the new accumulated summary. On summarization failure the previous
+// summary is kept and the oldest messages are dropped, so the turn can continue.
 func (c *compactor) compact(ctx context.Context, history []llm.Message, prefix livePrefix, summary string, mode summarizeMode) ([]llm.Message, string, bool, error) {
 	cut, ok := c.cut(history, mode)
 	if !ok {
@@ -271,26 +349,28 @@ func (c *compactor) compact(ctx context.Context, history []llm.Message, prefix l
 		}
 		return tail, summary, true, fmt.Errorf("summarize failed, dropped oldest messages: %w", err)
 	}
-	return tail, mergeSummaries(summary, digest), true, nil
+	return tail, digest, true, nil
 }
 
 // digest asks the model for a summary of batch. It reuses the live conversation
-// layout — the very request prefix the running conversation sends (system prompt
-// with the current summary, and the same declared tools) followed by the
-// messages being compressed — and appends the summarize instruction as the final
-// user message. Reusing that prefix verbatim matters twice over: the model
-// summarizing knows the same environment (runtime, working directory, unlock
-// rule, MCP servers) as it did while the messages were produced, and the call
-// shares its prefix with the live requests, so the provider can serve it from
-// its cached prompt prefix instead of re-processing a different one.
+// layout — the very request prefix the running conversation sends (system message
+// plus declared tools, with the accumulated summary where the configuration puts
+// it) followed by the messages being compressed — and appends the summarize
+// instruction as the final user message. Reusing that prefix verbatim matters
+// twice over: the model summarizing sees the same environment (runtime, working
+// directory, unlock rule, MCP servers) and the same accumulated summary as it did
+// while the messages were produced, and the call shares its prefix with the live
+// requests, so the provider can serve it from its cached prompt prefix instead of
+// re-processing a different one. The instruction matches that same layout, so it
+// only mentions the summary where the model can see it.
 func (c *compactor) digest(ctx context.Context, batch []llm.Message, prefix livePrefix) (string, error) {
 	if c.client == nil {
 		return "", fmt.Errorf("no llm client")
 	}
-	msgs := make([]llm.Message, 0, len(batch)+2)
-	msgs = append(msgs, llm.Message{Role: "system", Content: prefix.systemPrompt})
-	msgs = append(msgs, batch...)
-	msgs = append(msgs, llm.Message{Role: "user", Content: summarizeAppendInstruction})
+	// The accumulated summary is placed by the same helper the live requests use,
+	// so the prefix stays byte-identical even when it lives in a user message.
+	msgs := prefix.head(batch)
+	msgs = append(msgs, llm.Message{Role: "user", Content: summarizeInstruction(prefix.summary, prefix.summaryInSystemPrompt)})
 
 	resp, err := c.client.Chat(ctx, msgs, prefix.tools, nil, nil)
 	if err != nil {
@@ -299,20 +379,9 @@ func (c *compactor) digest(ctx context.Context, batch []llm.Message, prefix live
 	return strings.TrimSpace(resp.Content), nil
 }
 
-// mergeSummaries concatenates the previous summary with the new segment digest.
-func mergeSummaries(existing, digest string) string {
-	existing = strings.TrimSpace(existing)
-	digest = strings.TrimSpace(digest)
-	if existing == "" {
-		return digest
-	}
-	if digest == "" {
-		return existing
-	}
-	return existing + "\n\n" + digest
-}
-
-// systemWithSummary renders the system prompt with the optional summary.
+// systemWithSummary renders the system prompt with the optional summary, as the
+// agent.summary_in_system_prompt layout does; the default layout sends the summary
+// as the first user message instead (see headMessages).
 func systemWithSummary(base, summary string) string {
 	summary = strings.TrimSpace(summary)
 	if summary == "" {

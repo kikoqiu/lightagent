@@ -127,7 +127,8 @@
       fields: [
         { path: 'agent.max_tool_iterations', type: 'number', min: 1, help: 'tool rounds allowed inside one turn' },
         { path: 'agent.system_prompt', type: 'textarea', rows: 5, help: 'custom prompt; an agent.md next to config.json overrides it, and the runtime line is appended automatically' },
-        { path: 'agent.include_working_dir', type: 'bool', help: 'inject the working directory listing into the system prompt' }
+        { path: 'agent.include_working_dir', type: 'bool', help: 'inject the working directory listing into the system prompt' },
+        { path: 'agent.summary_in_system_prompt', type: 'bool', help: 'where a request carries the compressed context summary: off (default) = as the first user message, on = in the system prompt' }
       ]
     },
     {

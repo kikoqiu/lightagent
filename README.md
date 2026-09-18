@@ -169,7 +169,8 @@ source <(lightagent completion bash)       # bash 补全
   },
   "agent": {
     "max_tool_iterations": 200,
-    "system_prompt": ""                 // 留空使用内置默认系统提示词
+    "system_prompt": "",                // 留空使用内置默认系统提示词
+    "summary_in_system_prompt": false   // 发送时摘要的位置：默认第一条用户消息；true 则写进系统提示词
   },
   "ui": {
     "markdown": true                    // 助手输出按 Markdown 渲染（false 则原样输出）
@@ -398,8 +399,12 @@ token 预算 + 回合数上限：
   最多保留 3 个（自动）或 2 个（手动）Turn；从新到旧累加，谁先触顶谁停止。
 * 把更早的消息按原对话布局发给模型总结（末尾追加压缩指令）：总结请求**原样复用实时请求的请求头**
   （系统提示，含基础提示词以下的能力段落，以及同一份 tools 声明），因此模型总结时所处的环境与产生
-  这些消息时一致，且请求前缀与实时请求逐字节相同、服务端提示缓存不会失效；摘要合并进系统提示
-  （`# CONVERSATION SUMMARY`）；失败则退化为直接丢弃最旧消息。
+  这些消息时一致，且请求前缀与实时请求逐字节相同、服务端提示缓存不会失效；压缩指令告诉模型这份报告是
+  **下次对话唯一的历史上下文**（摘要放在系统提示词且已有摘要时，补一句新摘要会替换该段里的摘要），新摘要
+  因此是全量更新（内容包含旧摘要）而非增量追加；失败则退化为直接丢弃最旧消息。
+* 摘要的位置由 `agent.summary_in_system_prompt` 决定（默认 `false`）：发送时把累积摘要作为
+  **第一条用户消息**（`[engine] CONVERSATION SUMMARY:` 开头）放进消息列表；设为 `true` 则追加到
+  系统提示词的 `# CONVERSATION SUMMARY` 段。
 * 若压缩后一条消息都不剩（连触发本轮的 user 消息也被压掉），请求前会补一条
   `[engine] Context summarized, continue.` 的 user 消息：聊天模板要求请求里至少有一条
   user 查询，否则接口直接返回 400。
