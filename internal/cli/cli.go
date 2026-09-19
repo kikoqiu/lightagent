@@ -1601,14 +1601,19 @@ func (c *CLI) toggleToolResults(args []string) string {
 const summaryMarker = "older messages are condensed into the summary below"
 
 // writeSummaryLocked prints the summary block: the marker line and the summary
-// text indented under it. It is a no-op without a summary - nothing was
-// condensed, so there is nothing to mark. The caller must hold c.mu.
+// text indented under it. The summary is a model-written report, so it is
+// rendered like assistant prose (markdown when that is on, matching the page's
+// summary row) before it is indented. It is a no-op without a summary - nothing
+// was condensed, so there is nothing to mark. The caller must hold c.mu.
 func (c *CLI) writeSummaryLocked(summary string) {
 	summary = strings.TrimSpace(summary)
 	if summary == "" {
 		return
 	}
 	c.outLocked(termcolor.Cyan("[summary] ") + summaryMarker + "\n")
+	if c.md != nil && c.markdownOn {
+		summary = markdown.ANSI(summary)
+	}
 	c.outLocked("  " + indentAfterFirst(summary, "  ") + "\n")
 }
 

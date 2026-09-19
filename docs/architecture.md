@@ -103,7 +103,8 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 web 各自流式渲染（CLI 为 `[thinking]` 块，web 为 thinking 行），并和可见回答一样按
 `ui.markdown` 设置渲染 Markdown；定稿后的思考写入 assistant 消息（`reasoning_content`）并随后续请求回传，供 preserve thinking 模板使用。
 `compacted` 携带 `summary`（压缩后的累积摘要）：CLI 与 web 都据此在**截断处**显示摘要——
-CLI 打印 `[summary]` 块，网页追加一条 `summary` 行，两端的「详细消息到此为止」位置一致。
+CLI 打印 `[summary]` 块，网页追加一条 `summary` 行；两端都按 `ui.markdown` 渲染摘要
+Markdown，因此「详细消息到此为止」的位置一致。
 
 CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket 客户端。web 在启动时用当前
 会话（含恢复的历史）播种一份内存回放缓冲，并把之后每个事件追加进去（思考增量合并成一条

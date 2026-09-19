@@ -152,6 +152,44 @@ func TestCompactedEventPrintsTheSummary(t *testing.T) {
 	}
 }
 
+// TestSummaryBlockRendersMarkdown pins that the summary is rendered like any
+// other model prose: the compaction report usually carries headings, lists and
+// code, so its block must not show raw markdown markers. The page renders its
+// summary row the same way. With rendering off the summary stays literal.
+func TestSummaryBlockRendersMarkdown(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.lineStart = true
+
+	c.render(agent.Event{
+		Type:    agent.EventCompacted,
+		Text:    "context compressed: 9 -> 3 messages",
+		Summary: "## Goal\n- ship **it**",
+	})
+	got := buf.String()
+	if !strings.Contains(got, "[summary] "+summaryMarker+"\n  Goal\n  - ship it\n") {
+		t.Fatalf("the summary was not rendered as markdown: %q", got)
+	}
+	if strings.Contains(got, "##") || strings.Contains(got, "**") {
+		t.Fatalf("the markdown markers survived: %q", got)
+	}
+
+	// With markdown off the summary stays raw, matching raw replies.
+	c.markdownOn = false
+	c.md = nil
+	buf.Reset()
+	c.render(agent.Event{
+		Type:    agent.EventCompacted,
+		Text:    "context compressed: 3 -> 2 messages",
+		Summary: "## Goal",
+	})
+	if !strings.Contains(buf.String(), "\n  ## Goal\n") {
+		t.Fatalf("markdown off should keep the summary literal: %q", buf.String())
+	}
+}
+
 // TestCompactCommandReportsWhenIdle pins the /compact answer when there is
 // nothing to condense. A pass that does compress needs no line here: it reports
 // itself on the bus (the "compacting" info and the compacted event).
