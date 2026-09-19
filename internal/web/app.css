@@ -163,13 +163,19 @@
     transition:background .2s, box-shadow .2s;
   }
   header .dot.on { background:var(--green); box-shadow:0 0 0 3px rgba(63,185,80,.18); }
+  /* The context-usage badge (top right). It is hidden until the first usage
+     report arrives (.on is set by setUsage): an empty pill would read as "0%".
+     It warms up with the rail meter, and a phone keeps only the percentage half
+     (see the phone media query). */
   header .usage {
-    min-width:0; max-width:44vw;
+    display:none; min-width:0; max-width:44vw;
     color:var(--fg-muted); font-size:11.5px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
     background:var(--bg-elev); border:1px solid var(--border-soft); border-radius:999px; padding:3px 10px;
   }
-  header .usage:empty { display:none; }
+  header .usage.on { display:inline-block; }
+  header .usage.warm { color:var(--yellow); border-color:rgba(227,179,65,.4); }
+  header .usage.hot { color:var(--red); border-color:rgba(255,107,99,.45); }
   header .run {
     display:none; align-items:center; gap:6px;
     color:var(--yellow); font-size:11.5px; white-space:nowrap;
@@ -509,8 +515,15 @@
   .login-status { min-height:16px; font-size:11.5px; color:var(--fg-dim); }
   .login-status.bad { color:var(--red); }
   .login-form button[type=submit] { width:100%; }
-  /* A session exists and a password is configured: the header shows the way out. */
-  header #signOut { min-height:36px; font-size:12px; }
+  /* A session exists and a password is configured: the header shows the way out.
+     The word is for a wide header; the phone media query below swaps it for the
+     glyph, so the button matches the gear and the read-aloud button there. */
+  header button.signout { display:inline-flex; align-items:center; gap:6px; min-height:36px; font-size:12px; }
+  /* The [hidden] attribute is how auth.js hides the button while there is no
+     session; the display above would otherwise win over the UA rule. */
+  header button.signout[hidden] { display:none; }
+  header button.signout .signout-glyph { display:none; flex:0 0 auto; width:16px; height:16px; }
+  header button.signout .signout-glyph path { fill:none; stroke:currentColor; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
 
   /* ---- password row in the config form ---- */
   .secret-state { font-size:11.5px; color:var(--fg-dim); }
@@ -542,7 +555,19 @@
     footer {
       padding:8px max(12px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
     }
-    header .usage { font-size:11px; max-width:38vw; }
+    /* The phone header is the tightest spot: every affordance keeps its tap
+       target but drops its words. The usage badge keeps the bare percentage
+       (numbers only — the full tag stays in its title), and the way out becomes
+       the same glyph button as the read-aloud one and the gear. */
+    .head-right { gap:6px; }
+    /* When the header runs out of room the brand must not spill over the icon
+       buttons: it ellipsizes instead. */
+    header .brand b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    header .usage { font-size:11px; max-width:38vw; padding:3px 8px; }
+    header .usage .usage-label, header .usage .usage-tokens { display:none; }
+    header button.signout { min-width:36px; min-height:36px; padding:0; justify-content:center; }
+    header button.signout .signout-glyph { display:block; }
+    header button.signout .signout-label { display:none; }
     header .run { padding:3px 8px; }
     header .run #runText { display:none; }
     button { padding:0 14px; }

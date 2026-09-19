@@ -126,20 +126,38 @@
 
   // setUsage renders the context-usage badge in the header and mirrors the
   // numbers into the desktop side rail meter (which changes colour as the
-  // window fills up). Both targets are optional so the page keeps working.
+  // window fills up). The badge is split into the "ctx" word, the percentage and
+  // the token counts so each layout keeps what fits: a phone shows the
+  // percentage alone (the other two nodes are hidden, see app.css) while a wide
+  // header shows the full tag, and the title always carries the full numbers.
+  // The badge stays hidden (.on) until a report arrives, and every target is
+  // optional so the page keeps working without it.
   function setUsage(tokens, win) {
     var fill = document.getElementById('meterFill');
     var pctEl = document.getElementById('meterPct');
     var noteEl = document.getElementById('meterNote');
+    var pctSpan = document.getElementById('usagePct');
+    var tokSpan = document.getElementById('usageTokens');
     if (!win) {
-      usageEl.textContent = '';
+      usageEl.className = 'usage';
+      usageEl.title = '';
+      if (pctSpan) { pctSpan.textContent = ''; }
+      if (tokSpan) { tokSpan.textContent = ''; }
       if (fill) { fill.style.width = '0%'; fill.className = ''; }
       if (pctEl) { pctEl.textContent = '—'; }
       if (noteEl) { noteEl.textContent = 'waiting for usage…'; }
       return;
     }
     var pct = win > 0 ? (tokens * 100 / win) : 0;
-    usageEl.textContent = 'context ' + pct.toFixed(1) + '% (' + tokens + '/' + win + ' tokens)';
+    // The full tag mirrors the CLI prompt's [ctx 12.3%] label; the word sits in
+    // its own span so a phone can drop it.
+    var value = pct.toFixed(1) + '%';
+    var counts = ' (' + tokens + '/' + win + ' tokens)';
+    if (pctSpan) { pctSpan.textContent = value; }
+    if (tokSpan) { tokSpan.textContent = counts; }
+    if (!pctSpan) { usageEl.textContent = 'ctx ' + value + counts; }
+    usageEl.title = 'context ' + pct.toFixed(1) + '% (' + tokens + '/' + win + ' tokens)';
+    usageEl.className = 'usage on' + (pct >= 90 ? ' hot' : (pct >= 70 ? ' warm' : ''));
     var clamped = Math.max(0, Math.min(100, pct));
     if (fill) {
       fill.style.width = clamped + '%';
@@ -825,6 +843,23 @@
     input.style.height = 'auto';
     input.style.height = input.scrollHeight + 'px';
   }
+  // The composer's placeholder is short by nature of the box it sits in, but on
+  // a phone even the short form is the whole line: a touch keyboard has no
+  // Ctrl+Enter either, so the phone-width layout gets data-placeholder-short
+  // ("Message…") and the full hint stays in the textarea's title. The check
+  // follows the same breakpoint as the stylesheet (see the phone media query in
+  // app.css), so a rotation or a resize swaps the hint back and forth.
+  var PLACEHOLDER_LONG = input.placeholder;
+  var PLACEHOLDER_SHORT = input.getAttribute('data-placeholder-short') || PLACEHOLDER_LONG;
+  var phoneQuery = window.matchMedia ? window.matchMedia('(max-width: 480px)') : null;
+  function setComposerPlaceholder() {
+    input.placeholder = (phoneQuery && phoneQuery.matches) ? PLACEHOLDER_SHORT : PLACEHOLDER_LONG;
+  }
+  if (phoneQuery) {
+    if (phoneQuery.addEventListener) { phoneQuery.addEventListener('change', setComposerPlaceholder); }
+    else if (phoneQuery.addListener) { phoneQuery.addListener(setComposerPlaceholder); }
+  }
+  setComposerPlaceholder();
   sendEl.onclick = send;
   stopEl.onclick = function () {
     if (ws && ws.readyState === 1) { ws.send(JSON.stringify({ text: '/stop' })); }

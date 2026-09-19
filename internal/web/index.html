@@ -71,9 +71,24 @@
       <span class="brand"><b>lightagent</b><small id="status">connecting…</small></span>
       <span class="head-right">
         <span class="run" id="run"><span class="spin"></span><span id="runText">running</span><span id="elapsed"></span></span>
-        <span class="usage" id="usage"></span>
+        <!-- The context-usage badge. It is three nodes so each layout can keep
+             what fits: the "ctx" word, the percentage and the token counts. A
+             wide header shows all three; a phone keeps the percentage alone (see
+             .usage-label/.usage-tokens in app.css). The title keeps the full
+             numbers on every layout, and setUsage() fills the two empty ones. -->
+        <span class="usage" id="usage"><span class="usage-label">ctx </span><span id="usagePct"></span><span class="usage-tokens" id="usageTokens"></span></span>
         <span class="dot" id="dot" title="disconnected" aria-label="connection status"></span>
-        <button class="ghost" id="signOut" type="button" title="sign out" hidden>Sign out</button>
+        <!-- The way out of the session. It carries a glyph and a word: a wide
+             header shows "Sign out", a phone shows only the glyph (icon buttons
+             line up with the read-aloud one and the gear). -->
+        <button class="ghost signout" id="signOut" type="button" title="sign out" aria-label="sign out" hidden>
+          <svg class="signout-glyph" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
+            <path d="M6.4 2.4H3.9a1.6 1.6 0 0 0-1.6 1.6v8a1.6 1.6 0 0 0 1.6 1.6h2.5"/>
+            <path d="M9.5 5.2 12.3 8l-2.8 2.8"/>
+            <path d="M12 8H6.7"/>
+          </svg>
+          <span class="signout-label">Sign out</span>
+        </button>
         <button class="ghost tts-open" id="ttsOpen" type="button" data-tts-open title="read aloud (browser speech)" aria-label="read-aloud settings">🔊</button>
         <button class="ghost gear" type="button" data-config-open title="edit config.json" aria-label="edit config.json">⚙</button>
       </span>
@@ -81,7 +96,12 @@
     <div id="log" role="log" aria-live="polite"></div>
     <footer>
       <div class="composer">
-        <textarea id="input" rows="1" placeholder="Message lightagent…  (Ctrl+Enter = send)" aria-label="message"></textarea>
+        <!-- The wide layout keeps the full hint; a phone swaps in
+             data-placeholder-short (no Ctrl+Enter on a touch keyboard, and the
+             hint would be clipped there), see app.js. -->
+        <textarea id="input" rows="1" placeholder="Message lightagent…  (Ctrl+Enter = send)"
+                  data-placeholder-short="Message…"
+                  title="Enter = newline · Ctrl+Enter = send" aria-label="message"></textarea>
         <button id="stop" class="stop" title="interrupt the running turn" aria-label="stop" type="button">Stop</button>
         <button id="send" aria-label="send" type="button">Send</button>
       </div>

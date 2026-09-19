@@ -139,6 +139,32 @@ func TestMobileLayout(t *testing.T) {
 	}
 }
 
+// TestMobileChrome pins what the phone-sized layout drops, because the header
+// is the tightest spot on the page: the context badge keeps the bare percentage
+// (the "ctx" word and the token counts are hidden by CSS, the full tag stays in
+// its title) and the way out turns into the icon-only button the gear and the
+// read-aloud button already are. The composer asks for a message with a short
+// placeholder there too.
+func TestMobileChrome(t *testing.T) {
+	src := pageSource()
+	for _, want := range []string{
+		`class="usage-label"`, // the word a phone drops...
+		`id="usagePct"`,       // ...so only the percentage is left...
+		`id="usageTokens"`,    // ...and the counts go with it
+		".usage-label, header .usage .usage-tokens { display:none; }",
+		`class="signout-glyph"`, // the icon-only way out...
+		`class="signout-label"`, // ...that replaces the word
+		".signout .signout-glyph { display:block; }",
+		`data-placeholder-short`,           // the composer's short hint
+		"setComposerPlaceholder",           // it is swapped by app.js...
+		"matchMedia('(max-width: 480px)')", // ...at the stylesheet's phone breakpoint
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("phone layout is missing %q", want)
+		}
+	}
+}
+
 // TestResponsiveAffordances guards the polished mirror chrome: the connection
 // status label, the auto-growing composer, disabled-while-offline send button
 // and the mobile-safe padding/tap targets must all stay wired.
