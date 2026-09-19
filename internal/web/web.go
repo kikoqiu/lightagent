@@ -96,7 +96,7 @@ type Server struct {
 	configPendingRestart bool
 
 	mu       sync.Mutex
-	clients  map[int]*wsConn
+	clients  map[int]*client
 	nextID   int
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -130,7 +130,7 @@ func New(a *agent.Agent, host string, port int, markdownEnabled bool) (*Server, 
 		listener: ln,
 		markdown: markdownEnabled,
 		auth:     newAuth(),
-		clients:  make(map[int]*wsConn),
+		clients:  make(map[int]*client),
 		stop:     make(chan struct{}),
 	}
 	s.srv = &http.Server{Handler: s.routes()}
@@ -175,11 +175,15 @@ func (s *Server) Start() {
 func (s *Server) Close() error {
 	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
 	for id, c := range s.clients {
-		_ = c.Close()
+		clients = append(clients, c)
 		delete(s.clients, id)
 	}
 	s.mu.Unlock()
+	for _, c := range clients {
+		c.close()
+	}
 	return s.srv.Close()
 }
 
@@ -203,11 +207,12 @@ func (s *Server) subscribe() {
 	}()
 }
 
-// publish records an agent event in the scrollback and broadcasts it to every
-// client, dropping dead connections. Recording and broadcasting share one
-// critical section with the connection handshake (see addClient), so a client
-// connecting concurrently still receives each event exactly once: either inside
-// its history frame or live.
+// publish records an agent event in the scrollback and queues it for every
+// client, dropping the connections that cannot take it. Recording and queueing
+// share one critical section with the connection handshake (see addClient), so a
+// client connecting concurrently still receives each event exactly once: either
+// inside its history frames or live. Nothing here touches a socket, so holding
+// the lock costs nothing even when a browser is slow.
 func (s *Server) publish(ev agent.Event) {
 	data, err := json.Marshal(ev)
 	if err != nil {
@@ -219,41 +224,64 @@ func (s *Server) publish(ev agent.Event) {
 	s.broadcastLocked(data)
 }
 
-// broadcastLocked writes one payload to every connected client and drops the
-// connections that fail. The caller must hold s.mu.
+// broadcastLocked queues one payload for every connected client and closes the
+// ones that refuse it (a full backlog or a socket that is already gone). The
+// caller must hold s.mu. Queueing is a slice append on the client's own queue,
+// so a page that stopped reading can never block the mirror: its writer
+// goroutine paces the socket, and the read loop unregisters the client once the
+// close lands.
 func (s *Server) broadcastLocked(data []byte) {
-	for id, c := range s.clients {
-		if err := c.writeText(data); err != nil {
-			_ = c.Close()
-			delete(s.clients, id)
+	for _, c := range s.clients {
+		if !c.enqueue(data) {
+			c.close()
 		}
 	}
 }
 
-// addClient registers a connection, returns its id, and pushes the current
-// scrollback. Both steps happen under one lock hold so an event broadcast
-// concurrently is delivered exactly once (live or in the frame).
-func (s *Server) addClient(c *wsConn) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := s.nextID
-	s.nextID++
-	s.clients[id] = c
-	if payload := s.historyFrameLocked(); payload != nil {
-		_ = c.writeText(payload)
+// broadcastFramesLocked queues a whole sequence of frames (one history
+// snapshot) in order. The caller must hold s.mu, so no event can slip between
+// the frames of the snapshot.
+func (s *Server) broadcastFramesLocked(frames [][]byte) {
+	for _, frame := range frames {
+		s.broadcastLocked(frame)
 	}
-	return id
 }
 
-// removeClient unregisters and closes a connection.
-func (s *Server) removeClient(id int) {
+// addClient registers a connection and hands it the current scrollback: the
+// history frames are queued under the same lock hold that registers the client,
+// so an event published concurrently is delivered exactly once — either in the
+// snapshot or live after it (see client.replaying). Marshalling and the socket
+// writes happen outside the lock, on the client's own goroutine, so replaying a
+// long conversation never blocks the CLI, the other browsers or the page's own
+// requests.
+func (s *Server) addClient(conn *wsConn) *client {
 	s.mu.Lock()
-	c, ok := s.clients[id]
-	delete(s.clients, id)
+	s.nextID++
+	c := newClient(s.nextID, conn)
+	s.clients[c.id] = c
+	rows, header := s.historySnapshotLocked()
 	s.mu.Unlock()
-	if ok {
-		_ = c.Close()
+
+	go c.writeLoop()
+	for _, frame := range chunkHistory(rows, header) {
+		if !c.enqueueReplay(frame) {
+			break
+		}
 	}
+	c.finishReplay()
+	return c
+}
+
+// dropClient unregisters a connection and closes it. Both steps are idempotent,
+// so the read loop's teardown, the client's own writer and the backlog cap can
+// all call it for the same client.
+func (s *Server) dropClient(c *client) {
+	s.mu.Lock()
+	if current, ok := s.clients[c.id]; ok && current == c {
+		delete(s.clients, c.id)
+	}
+	s.mu.Unlock()
+	c.close()
 }
 
 // routes builds the HTTP handler tree.
@@ -313,15 +341,15 @@ func staticAsset(body, contentType string) http.HandlerFunc {
 
 // handleWS upgrades the request to a WebSocket and drives one client: it sends
 // the current conversation, then forwards inbound messages to the agent while
-// the publish loop pushes events back.
+// the client's own writer goroutine pushes events back.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgradeWebSocket(w, r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	id := s.addClient(conn)
-	defer s.removeClient(id)
+	c := s.addClient(conn)
+	defer s.dropClient(c)
 
 	for {
 		opcode, data, err := conn.readMessage()
@@ -468,36 +496,114 @@ func (s *Server) closeReasoningLocked() {
 	}
 }
 
-// historyFrame builds the payload sent to a newly connected client.
-func (s *Server) historyFrame() []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.historyFrameLocked()
+// A history snapshot travels as three kinds of frame, so a page can start
+// painting immediately and no single WebSocket message is huge. That matters
+// because a WebSocket message is atomic: the browser cannot render (or even
+// hand to the page) one huge frame in pieces, which is exactly what left a long
+// conversation stuck on the empty-log placeholder while the main thread ground
+// through the whole replay.
+//
+//	history_start   the header: usage numbers, the switches and the row count
+//	history_rows    one batch of rows, repeated until the scrollback is sent
+//	history_end     the terminator, after which live events follow
+const (
+	// historyBatchRows is how many rows one history_rows frame carries.
+	historyBatchRows = 200
+	// historyBatchBytes stops a batch early once its rows add up to this much
+	// text: rows vary wildly in size (a long tool result, a paragraph of
+	// thinking), so the row count alone does not keep a frame small.
+	historyBatchBytes = 256 << 10
+)
+
+// historyHeader is the payload of the first snapshot frame. Everything a page
+// needs besides the rows rides here, including the switch states, so a
+// reconnecting tab is back in sync.
+type historyHeader struct {
+	Type     string `json:"type"`
+	Tokens   int    `json:"tokens"`
+	Window   int    `json:"window"`
+	Busy     bool   `json:"busy"`
+	Markdown bool   `json:"markdown"`
+	Result   bool   `json:"result"`
+	Count    int    `json:"count"`
 }
 
-// historyFrameLocked serializes the scrollback plus the context-usage and busy
-// state the page needs. The rows carry everything the page draws - the summary
-// that marks where the context was cut included (see seedHistory and
-// recordLocked) - so a reload rebuilds exactly what the live view showed. The
-// busy flag lets a client connecting mid-turn show the running indicator. The
-// caller must hold s.mu.
-func (s *Server) historyFrameLocked() []byte {
+// historyRowsFrame is one batch of replayed rows.
+type historyRowsFrame struct {
+	Type     string           `json:"type"`
+	Messages []historyMessage `json:"messages"`
+}
+
+// historySnapshotLocked copies the scrollback and the state the header carries.
+// The copy shares the row strings (they are immutable) but owns its slice, so
+// the frames can be marshalled and queued outside the lock while the agent
+// keeps appending. The caller must hold s.mu.
+func (s *Server) historySnapshotLocked() ([]historyMessage, historyHeader) {
+	rows := make([]historyMessage, len(s.history))
+	copy(rows, s.history)
 	stats := s.agent.Stats()
-	payload, err := json.Marshal(map[string]any{
-		"type":     "history",
-		"messages": s.history,
-		"tokens":   stats.EstimatedTok,
-		"window":   stats.ContextWindow,
-		"busy":     stats.Busy,
-		// The page-only switches ride along, so a tab that reconnects after
-		// another one flipped them picks the new state up.
-		"markdown": s.markdown,
-		"result":   s.agent.ToolResultsVisible(),
-	})
-	if err != nil {
-		return nil
+	return rows, historyHeader{
+		Type:     "history_start",
+		Tokens:   stats.EstimatedTok,
+		Window:   stats.ContextWindow,
+		Busy:     stats.Busy,
+		Markdown: s.markdown,
+		Result:   s.agent.ToolResultsVisible(),
+		Count:    len(rows),
 	}
-	return payload
+}
+
+// historyFrames returns the frames a newly connected page receives, in order.
+// It is the path the tests read (the live path calls chunkHistory per client,
+// see addClient).
+func (s *Server) historyFrames() [][]byte {
+	s.mu.Lock()
+	rows, header := s.historySnapshotLocked()
+	s.mu.Unlock()
+	return chunkHistory(rows, header)
+}
+
+// chunkHistory turns a snapshot into the frames a page consumes: a header, one
+// frame per batch of rows and a terminator. Marshalling happens here, without
+// any lock held.
+func chunkHistory(rows []historyMessage, header historyHeader) [][]byte {
+	frames := make([][]byte, 0, len(rows)/historyBatchRows+2)
+	if data, err := json.Marshal(header); err == nil {
+		frames = append(frames, data)
+	}
+	batch := make([]historyMessage, 0, historyBatchRows)
+	size := 0
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if data, err := json.Marshal(historyRowsFrame{Type: "history_rows", Messages: batch}); err == nil {
+			frames = append(frames, data)
+		}
+		batch = batch[:0]
+		size = 0
+	}
+	for _, row := range rows {
+		rowBytes := historyRowBytes(row)
+		// A row that is bigger than the cap on its own travels alone: flush what
+		// is pending first, so it is never batched with its neighbours.
+		if rowBytes >= historyBatchBytes && len(batch) > 0 {
+			flush()
+		}
+		batch = append(batch, row)
+		size += rowBytes
+		if len(batch) >= historyBatchRows || size >= historyBatchBytes {
+			flush()
+		}
+	}
+	flush()
+	return append(frames, []byte(`{"type":"history_end"}`))
+}
+
+// historyRowBytes approximates the JSON size of one row. It only has to keep a
+// batch near historyBatchBytes, so counting the text is precise enough.
+func historyRowBytes(row historyMessage) int {
+	return len(row.Role) + len(row.Content) + len(row.Name) + len(row.Args) + 48
 }
 
 // handleClientMessage submits an inbound client message. Slash commands are
@@ -678,16 +784,17 @@ func (s *Server) localError(text string) {
 	s.localRow(historyMessage{Role: "error", Content: text}, agent.Event{Type: agent.EventError, Text: text})
 }
 
-// clearScrollback drops the mirror's rows and pushes the now empty listing, so
-// every open page forgets the conversation that was just discarded.
+// clearScrollback drops the mirror's rows and pushes the now empty snapshot, so
+// every open page forgets the conversation that was just discarded. The frames
+// are built under the lock: the snapshot is empty here, so it is cheap, and
+// nothing can slip between its frames.
 func (s *Server) clearScrollback() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.history = nil
 	s.reasoningOpen = false
-	if payload := s.historyFrameLocked(); payload != nil {
-		s.broadcastLocked(payload)
-	}
+	rows, header := s.historySnapshotLocked()
+	s.broadcastFramesLocked(chunkHistory(rows, header))
 }
 
 // markdownEnabled reports the page's markdown switch.

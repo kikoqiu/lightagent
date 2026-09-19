@@ -390,3 +390,34 @@ func TestConfigPutKeepsTheStoredPassword(t *testing.T) {
 		t.Fatalf("status = %d, want the password to keep working", status)
 	}
 }
+
+// TestSignInDialogLoadsBeforeTheMirrorScript pins the order the login gate needs:
+// auth.js defines window.AUTH and app.js reads it to decide whether to dial the
+// socket, so the dialog has to load first. The read itself happens at call time,
+// which is the other half of the contract: app.js must go through the accessor
+// instead of caching whatever window.AUTH was while it was parsing.
+func TestSignInDialogLoadsBeforeTheMirrorScript(t *testing.T) {
+	authAt := strings.Index(indexHTML, `src="auth.js"`)
+	appAt := strings.Index(indexHTML, `src="app.js"`)
+	if authAt < 0 || appAt < 0 {
+		t.Fatal("the page must load auth.js and app.js")
+	}
+	if authAt > appAt {
+		t.Error("auth.js must load before app.js, or the mirror dials before the session state is known")
+	}
+	for _, want := range []string{
+		"function AUTH() { return window.AUTH || NO_AUTH; }",
+		"function ensureSession() {",
+		"if (!AUTH().ok()) { return; }",
+		"ensureSession().then(function (ok) {",
+		"AUTH().onChange(function (ok) {",
+	} {
+		if !strings.Contains(appJS, want) {
+			t.Errorf("app.js should read the session state at call time (%q is missing)", want)
+		}
+	}
+	if strings.Contains(appJS, "var AUTH = window.AUTH") {
+		t.Error("app.js must not cache window.AUTH at parse time: auth.js may not have run yet")
+	}
+}
+

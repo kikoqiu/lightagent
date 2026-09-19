@@ -179,22 +179,23 @@ func TestRunningIndicator(t *testing.T) {
 	}
 
 	srv := newTestServer(t, "")
-	var frame struct {
-		Type string `json:"type"`
-		Busy bool   `json:"busy"`
+	frames := decodeHistoryFrames(t, srv)
+	if len(frames) < 2 {
+		t.Fatalf("history frames = %d, want a header and a terminator", len(frames))
 	}
-	if err := json.Unmarshal(srv.historyFrame(), &frame); err != nil {
-		t.Fatalf("historyFrame: %v", err)
+	first, last := frames[0], frames[len(frames)-1]
+	if first.Type != "history_start" {
+		t.Fatalf("frame type = %q, want history_start", first.Type)
 	}
-	if frame.Type != "history" {
-		t.Fatalf("frame type = %q, want history", frame.Type)
+	if last.Type != "history_end" {
+		t.Fatalf("last frame type = %q, want history_end", last.Type)
 	}
-	if frame.Busy {
+	if first.Busy {
 		t.Fatal("busy should be false while idle")
 	}
 }
 
-// historyRow is one row of the history frame as the page consumes it.
+// historyRow is one row of the history snapshot as the page consumes it.
 type historyRow struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -203,16 +204,45 @@ type historyRow struct {
 	IsError bool   `json:"is_error"`
 }
 
-// decodeHistory unmarshals the rows of the current history frame.
+// historyFrame is one frame of a history snapshot as the page consumes it: the
+// header (history_start), a batch of rows (history_rows) or the terminator
+// (history_end).
+type historyFrame struct {
+	Type     string       `json:"type"`
+	Messages []historyRow `json:"messages"`
+	Tokens   int          `json:"tokens"`
+	Window   int          `json:"window"`
+	Busy     bool         `json:"busy"`
+	Markdown bool         `json:"markdown"`
+	Result   bool         `json:"result"`
+	Count    int          `json:"count"`
+}
+
+// decodeHistoryFrames decodes the frames of the current snapshot, in order.
+func decodeHistoryFrames(t *testing.T, srv *Server) []historyFrame {
+	t.Helper()
+	var frames []historyFrame
+	for _, raw := range srv.historyFrames() {
+		var frame historyFrame
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			t.Fatalf("history frame: %v", err)
+		}
+		frames = append(frames, frame)
+	}
+	return frames
+}
+
+// decodeHistory collects the rows the chunked history frames carry, in order.
 func decodeHistory(t *testing.T, srv *Server) []historyRow {
 	t.Helper()
-	var frame struct {
-		Messages []historyRow `json:"messages"`
+	var rows []historyRow
+	for _, frame := range decodeHistoryFrames(t, srv) {
+		if frame.Type != "history_rows" {
+			continue
+		}
+		rows = append(rows, frame.Messages...)
 	}
-	if err := json.Unmarshal(srv.historyFrame(), &frame); err != nil {
-		t.Fatalf("historyFrame: %v", err)
-	}
-	return frame.Messages
+	return rows
 }
 
 // waitForHistory polls the history frame until want accepts it or the deadline
@@ -527,18 +557,24 @@ func TestWebSocketHandshakeAndPing(t *testing.T) {
 	srv := newTestServer(t, "")
 	conn, reader := dialWS(t, srv)
 
-	// The server pushes the current conversation first (a text frame) with the
-	// context-usage numbers the page needs for its header badge.
-	opcode, historyPayload, err := readServerFrame(reader)
+	// The server pushes the current conversation first: a header frame carrying
+	// the context-usage numbers the page needs for its badge, then the
+	// terminator (this conversation is empty, so there are no row batches).
+	opcode, header, err := readServerFrame(reader)
 	if err != nil {
-		t.Fatalf("read history frame: %v", err)
+		t.Fatalf("read history header: %v", err)
 	}
 	if opcode != opText {
 		t.Fatalf("first frame opcode = %d, want text", opcode)
 	}
-	if !strings.Contains(string(historyPayload), `"type":"history"`) ||
-		!strings.Contains(string(historyPayload), `"window"`) {
-		t.Fatalf("history frame = %s", string(historyPayload))
+	if !strings.Contains(string(header), `"type":"history_start"`) ||
+		!strings.Contains(string(header), `"window"`) {
+		t.Fatalf("history header = %s", string(header))
+	}
+	if _, end, err := readServerFrame(reader); err != nil {
+		t.Fatalf("read history terminator: %v", err)
+	} else if !strings.Contains(string(end), `"type":"history_end"`) {
+		t.Fatalf("history terminator = %s", string(end))
 	}
 
 	// A masked ping should be answered with a pong.
@@ -565,11 +601,20 @@ func TestSlashCommandOverWebSocket(t *testing.T) {
 	srv := newTestServer(t, "")
 	conn, reader := dialWS(t, srv)
 
-	// The handshake is followed by the history frame.
-	if _, payload, err := readServerFrame(reader); err != nil {
-		t.Fatalf("read history frame: %v", err)
-	} else if !strings.Contains(string(payload), `"type":"history"`) {
-		t.Fatalf("first frame = %s", payload)
+	// The handshake is followed by the history snapshot: a header and rows,
+	// terminated by history_end. The /help answer below must not be mistaken
+	// for one of those frames, so the read loop skips them.
+	for {
+		_, payload, err := readServerFrame(reader)
+		if err != nil {
+			t.Fatalf("read history snapshot: %v", err)
+		}
+		if !strings.Contains(string(payload), `"type":"history_`) {
+			t.Fatalf("frame = %s, want a history frame before the answer", payload)
+		}
+		if strings.Contains(string(payload), `"type":"history_end"`) {
+			break
+		}
 	}
 
 	if err := writeMaskedFrame(conn, opText, []byte(`{"text":"/help"}`)); err != nil {
@@ -581,6 +626,11 @@ func TestSlashCommandOverWebSocket(t *testing.T) {
 			t.Fatalf("read the answer to /help: %v", err)
 		}
 		if opcode != opText {
+			continue
+		}
+		if strings.Contains(string(payload), `"type":"history_`) {
+			// A late snapshot frame (the pump of the previous connection is
+			// gone here, but keep the loop honest).
 			continue
 		}
 		if !strings.Contains(string(payload), "/compact") {
@@ -956,21 +1006,19 @@ func TestExitCommandStaysPageLocal(t *testing.T) {
 }
 
 // TestHistoryFrameCarriesTheSwitches pins that a page reads the current switch
-// values from its history frame, so a tab reconnecting after another one (or the
-// CLI) flipped them is back in sync.
+// values from its history snapshot, so a tab reconnecting after another one (or
+// the CLI) flipped them is back in sync.
 func TestHistoryFrameCarriesTheSwitches(t *testing.T) {
 	srv := newTestServerWithMarkdown(t, "", false)
 	srv.agent.SetToolResultsVisible(false)
 
-	var frame struct {
-		Markdown bool `json:"markdown"`
-		Result   bool `json:"result"`
+	frames := decodeHistoryFrames(t, srv)
+	if len(frames) == 0 {
+		t.Fatal("no history frames")
 	}
-	if err := json.Unmarshal(srv.historyFrame(), &frame); err != nil {
-		t.Fatalf("historyFrame: %v", err)
-	}
-	if frame.Markdown || frame.Result {
-		t.Fatalf("frame = %+v, want both switches off", frame)
+	header := frames[0]
+	if header.Markdown || header.Result {
+		t.Fatalf("header = %+v, want both switches off", header)
 	}
 }
 

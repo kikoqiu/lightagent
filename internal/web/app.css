@@ -204,6 +204,11 @@
 
   .row { margin:0 0 15px; word-break:break-word; animation:rise .22s ease both; }
   @keyframes rise { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+  /* A replayed snapshot inserts its rows in batches; the entrance animation is
+     skipped while it runs, because starting hundreds of animations at once is
+     exactly the work the batching exists to avoid (the animation returns for
+     the live rows that arrive after the snapshot). */
+  #log.replaying .row { animation:none; }
   .role {
     display:block;
     font-size:10px; font-weight:700; letter-spacing:.9px; text-transform:uppercase;

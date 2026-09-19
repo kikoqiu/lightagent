@@ -22,9 +22,16 @@
   var reasoningRow = null;
   var reasoningText = '';
   var pendingReasoningRender = null;
-  // replaying suppresses live-only side effects while a history frame rebuilds
-  // the log (e.g. replayed user rows must not light up the running indicator).
+  // replaying is true while a snapshot rebuilds the log (history_start …
+  // history_end). It suppresses live-only side effects (a replayed user row must
+  // not light up the running indicator), holds the markdown work back to idle
+  // slices and makes row insertion batch, so a long conversation rebuilds
+  // without freezing the main thread.
   var replaying = false;
+  // replayBatch collects the rows of the snapshot while it is being replayed;
+  // it is inserted as a whole (see flushReplayBatch), which costs one reflow per
+  // batch instead of a layout read plus a scroll write per row.
+  var replayBatch = null;
   // The command rail's switches (/result, /markdown) are the only commands with
   // state: the rail shows it and sends the explicit opposite, so one click
   // always lands on the state the user asked for. The values arrive with the
@@ -164,10 +171,84 @@
     }
   }
 
-  function setSpan(span, text, renderMD) {
-    var html = renderMD ? mdToHTML(text) : null;
+  // MAX_MD_CHARS keeps one gigantic row (a huge tool result, a whole file in a
+  // reply) from stalling the idle upgrade below: past this size the replayed row
+  // stays plain text.
+  var MAX_MD_CHARS = 200000;
+  // Replaying a long conversation means parsing markdown for thousands of rows.
+  // That work is sliced into idle chunks instead of running as one long task:
+  // the main thread stays responsive, the transcript paints batch by batch, and
+  // each replayed row's plain text is upgraded in place. Rows that arrive live
+  // (a turn that is streaming) still render immediately.
+  var mdPending = new Map(); // span -> latest text waiting for its markdown pass
+  var mdFlushScheduled = false;
+  var MD_SLICE_MS = 8;
+
+  // applyMarkdown renders one row's text as markdown, falling back to plain
+  // text when rendering is off or the libraries are missing.
+  function applyMarkdown(span, text) {
+    var html = mdToHTML(text);
     if (html !== null) { span.className = 'text md'; span.innerHTML = html; }
     else { span.className = 'text'; span.textContent = text; }
+  }
+
+  function queueMarkdown(span, text) {
+    mdPending.set(span, text);
+    scheduleMarkdownFlush();
+  }
+
+  function scheduleMarkdownFlush() {
+    if (mdFlushScheduled || mdPending.size === 0) { return; }
+    mdFlushScheduled = true;
+    if (typeof window.requestIdleCallback === 'function') {
+      // The timeout guarantees progress even while the snapshot keeps arriving.
+      window.requestIdleCallback(flushMarkdown, { timeout: 250 });
+    } else {
+      window.setTimeout(function () { flushMarkdown(null); }, 16);
+    }
+  }
+
+  // flushMarkdown upgrades as many queued rows as fit in one idle slice. The
+  // Map keeps insertion order and the lowest text wins per row (a row that was
+  // re-streamed while waiting is parsed once, with its final text).
+  function flushMarkdown(deadline) {
+    mdFlushScheduled = false;
+    var started = Date.now();
+    var entries = mdPending.entries();
+    for (var next = entries.next(); !next.done; next = entries.next()) {
+      var span = next.value[0];
+      var text = next.value[1];
+      mdPending.delete(span);
+      // A row still sitting in the batch fragment counts too: only rows whose
+      // log was replaced (no parent left) are skipped. The size cap keeps one
+      // gigantic row from stalling the slice.
+      if ((span.isConnected || span.parentNode) && text.length <= MAX_MD_CHARS) {
+        applyMarkdown(span, text);
+      }
+      if (deadline && typeof deadline.timeRemaining === 'function') {
+        if (deadline.timeRemaining() <= 1) { break; }
+      } else if (Date.now() - started >= MD_SLICE_MS) {
+        break;
+      }
+    }
+    scheduleMarkdownFlush();
+  }
+
+  function setSpan(span, text, renderMD) {
+    // While a snapshot is being replayed the markdown pass is deferred: the row
+    // is drawn as plain text now and upgraded in an idle slice (see
+    // queueMarkdown). Parsing thousands of rows in one synchronous pass is what
+    // froze the tab (and hid the log behind "Waiting for messages…") on a long
+    // conversation.
+    if (renderMD && replaying) {
+      span.className = 'text';
+      span.textContent = text;
+      queueMarkdown(span, text);
+      return;
+    }
+    if (renderMD) { applyMarkdown(span, text); return; }
+    span.className = 'text';
+    span.textContent = text;
   }
 
   // scheduleRender re-renders the streaming row at most every 120ms.
@@ -217,8 +298,12 @@
 
   // placeRow adds a transcript row to the log: at the end, or before the pending
   // messages when some are waiting. The running reply's output is inserted before
-  // them, so it always stays above the message that interrupted it.
+  // them, so it always stays above the message that interrupted it. During a
+  // history replay the rows go into the batch fragment instead (see
+  // flushReplayBatch): no layout read, no scroll write, and the whole batch
+  // reaches the document in one insert.
   function placeRow(row) {
+    if (replayBatch) { replayBatch.appendChild(row); return; }
     var anchor = pendingRows.length ? pendingRows[0].el : null;
     // Follow the new row only if the reader was at the bottom (sampled first).
     var follow = atBottom();
@@ -269,6 +354,10 @@
 
   function setRow(el, text, renderMD) {
     if (!el) { return; }
+    // A replayed row sits in the batch fragment (not in the log yet) and the view
+    // is pinned once, when the snapshot ends: there is nothing to follow and no
+    // layout to read here.
+    if (replaying) { setSpan(el.lastChild, text, renderMD); return; }
     // A streamed re-render can grow the row, so the sample comes first too.
     var follow = atBottom();
     setSpan(el.lastChild, text, renderMD);
@@ -470,9 +559,31 @@
   var CFG = window.__LIGHTAGENT__ || {};
   var MARKDOWN = !!CFG.markdown;
   // Sessions live in a cookie, so the WebSocket handshake authenticates itself.
-  // The mirror only connects once AUTH says the browser is (or need not be)
-  // signed in, and drops the socket when a session ends.
-  var AUTH = window.AUTH || { ok: function () { return true; }, ensure: function () { return Promise.resolve(true); }, onChange: function () {}, unauthorized: function () {} };
+  // The mirror only connects once the sign-in dialog says the browser is (or
+  // need not be) signed in, and drops the socket when a session ends. The dialog
+  // (auth.js) loads before this script and defines window.AUTH; the lookup
+  // happens at call time, so a missing or failed auth.js degrades to "no login
+  // required" instead of leaving the page unable to connect at all.
+  var NO_AUTH = {
+    ok: function () { return true; },
+    ensure: function () { return Promise.resolve(true); },
+    onChange: function () {},
+    prompt: function () {},
+    unauthorized: function () {}
+  };
+  function AUTH() { return window.AUTH || NO_AUTH; }
+  // ensureSession asks the dialog for the session state, reporting "unknown" as
+  // signed in when the dialog itself is broken (a synchronous throw inside its
+  // check). The handshake is what the server enforces, so a page whose dialog
+  // failed to load still connects — it shows offline and waits for a sign-in
+  // instead of staying dead.
+  function ensureSession() {
+    try {
+      return Promise.resolve(AUTH().ensure());
+    } catch (err) {
+      return Promise.resolve(true);
+    }
+  }
   // Read-aloud (tts.js): every live event is handed to the voice panel, so it can
   // read the same rows the transcript draws. A missing script degrades to a
   // no-op, and a replayed history frame is skipped (see render).
@@ -550,25 +661,52 @@
     else if (kind === 'error') { addRow('error', '', '[error] ' + (ev.text || ''), false); }
   }
 
-  function renderHistory(ev) {
-    // A history frame always describes the full conversation, so replace the
-    // log instead of appending; otherwise reconnects duplicate every message.
-    // It is also a fresh snapshot, so re-pin the view before rebuilding: an empty
-    // log is at the bottom, which lets every replayed row follow naturally even
-    // if the reader had scrolled back before the reconnect.
+  // The snapshot's header carries whether a turn is already running; the
+  // indicator is applied when the replay ends (setRunning ignores calls while
+  // replaying, so a replayed user row cannot light it up early).
+  var historyBusy = false;
+
+  // flushReplayBatch moves the rows collected so far into the log: one insert,
+  // one reflow, and no layout read per row (the view is pinned once, when the
+  // snapshot ends).
+  function flushReplayBatch() {
+    if (!replayBatch) { return; }
+    if (replayBatch.childNodes.length > 0) { log.appendChild(replayBatch); }
+    replayBatch = document.createDocumentFragment();
+  }
+
+  // beginHistory replaces the log with an empty one and starts a replay. A
+  // snapshot always describes the full conversation, so it replaces the log
+  // instead of appending (otherwise reconnects duplicate every message).
+  function beginHistory(ev) {
     log.innerHTML = '';
-    pinBottom();
     current = null;
     currentText = '';
+    if (pendingRender) { clearTimeout(pendingRender); pendingRender = null; }
     // The rebuild replaces every row, so the open thinking row of a stream that
     // is gone with it is dropped too (the next chunk draws a fresh one). Pending
     // messages are gone as well: the agent draws their rows when it sends them.
     reasoningRow = null;
     reasoningText = '';
+    if (pendingReasoningRender) { clearTimeout(pendingReasoningRender); pendingReasoningRender = null; }
     pendingRows = [];
     // The rows the voice was reading are gone: drop its buffers and silence it.
     TTS.reset();
+    // Nothing queued points at a row in the document any more.
+    mdPending.clear();
     replaying = true;
+    log.classList.add('replaying');
+    replayBatch = document.createDocumentFragment();
+    historyBusy = !!ev.busy;
+    setUsage(ev.tokens || 0, ev.window || 0);
+    applySettings(ev);
+  }
+
+  // appendHistoryRows draws one batch of the snapshot and inserts it. Batches
+  // keep the browser responsive: each frame the page receives is small, and the
+  // rows reach the document in one insert.
+  function appendHistoryRows(ev) {
+    if (!replayBatch) { beginHistory(ev); }
     (ev.messages || []).forEach(function (m) {
       if (m.role === 'user') { render('user', { text: m.content }); }
       else if (m.role === 'assistant' && m.content) { render('assistant', { text: m.content }); }
@@ -580,16 +718,32 @@
       else if (m.role === 'error') { render('error', { text: m.content }); }
       else if (m.role === 'interrupted') { render('interrupted', { text: m.content }); }
     });
+    flushReplayBatch();
+  }
+
+  // endHistory closes the replay: the last batch is inserted, the view is pinned
+  // to the bottom (the way a refreshed page sits) and the running indicator picks
+  // up whatever the header reported.
+  function endHistory() {
+    if (!replaying) { return; }
+    flushReplayBatch();
+    replayBatch = null;
     replaying = false;
+    log.classList.remove('replaying');
     // The compressed-context summary is not appended here: it is one of the rows
-    // above, recorded exactly where the context was cut, so a reload rebuilds
-    // the truncation marker in the right place.
-    setUsage(ev.tokens || 0, ev.window || 0);
-    // The frames carry the current switches, so a reconnected tab agrees with
-    // whatever the other tabs (or the CLI) changed meanwhile.
-    applySettings(ev);
-    // A reconnect mid-turn must still show the indicator.
-    setRunning(!!ev.busy);
+    // replayed above, recorded exactly where the context was cut, so a reload
+    // rebuilds the truncation marker in the right place.
+    setRunning(historyBusy);
+    pinBottom();
+  }
+
+  // dropReplayState discards an unfinished replay: a socket that closed mid
+  // snapshot leaves a half-built log behind, and the next connection replaces it
+  // with a fresh snapshot anyway.
+  function dropReplayState() {
+    replayBatch = null;
+    replaying = false;
+    log.classList.remove('replaying');
   }
 
   function wsURL() {
@@ -601,7 +755,7 @@
   var reconnectTimer = null;
 
   function connect() {
-    if (!AUTH.ok()) { return; }
+    if (!AUTH().ok()) { return; }
     if (ws && (ws.readyState === 0 || ws.readyState === 1)) { return; }
     ws = new WebSocket(wsURL());
     ws.onopen = function () {
@@ -615,14 +769,18 @@
       dot.title = 'disconnected';
       statusEl.textContent = 'offline';
       sendEl.disabled = true;
+      // A socket that dropped in the middle of a snapshot leaves a half-built
+      // log: drop the replay state before clearing the indicator, so the
+      // indicator is not swallowed by the replay guard.
+      dropReplayState();
       setRunning(false);
-      if (!AUTH.ok()) { return; } // signed out: wait for a new session
+      if (!AUTH().ok()) { return; } // signed out: wait for a new session
       if (reconnectTimer) { return; }
       reconnectTimer = setTimeout(function () {
         reconnectTimer = null;
         // A session can expire between reconnects, so check before dialing.
-        AUTH.ensure().then(function (ok) {
-          if (ok) { connect(); } else { AUTH.prompt('Your session ended. Sign in again.'); }
+        ensureSession().then(function (ok) {
+          if (ok) { connect(); } else { AUTH().prompt('Your session ended. Sign in again.'); }
         }).catch(function () { connect(); });
       }, 1500);
     };
@@ -630,7 +788,12 @@
     ws.onmessage = function (e) {
       var ev;
       try { ev = JSON.parse(e.data); } catch (err) { return; }
-      if (ev.type === 'history') { renderHistory(ev); return; }
+      // The conversation snapshot arrives in three parts (see beginHistory):
+      // header, row batches, terminator, so a long conversation paints while it
+      // is still arriving instead of blocking on one giant frame.
+      if (ev.type === 'history_start') { beginHistory(ev); return; }
+      if (ev.type === 'history_rows') { appendHistoryRows(ev); return; }
+      if (ev.type === 'history_end') { endHistory(); return; }
       // The switches the rail mirrors: no row, just state.
       if (ev.type === 'settings') { applySettings(ev); return; }
       render(ev.type, ev);
@@ -677,12 +840,13 @@
   buildCommands();
   sendEl.disabled = true;
   // Wait for the session state before dialing: the handshake fails without a
-  // session, and AUTH may sign this browser in on its own with a stored digest.
-  AUTH.ensure().then(function (ok) {
+  // session, and the dialog may sign this browser in on its own with a stored
+  // digest.
+  ensureSession().then(function (ok) {
     if (ok) { connect(); }
   }).catch(function () { connect(); });
   // Signing in (or out) elsewhere on the page starts or stops the mirror.
-  AUTH.onChange(function (ok) {
+  AUTH().onChange(function (ok) {
     if (ok) { connect(); return; }
     if (ws) { try { ws.close(); } catch (err) { /* already closed */ } }
     ws = null;

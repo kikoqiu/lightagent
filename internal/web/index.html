@@ -186,10 +186,13 @@
   </div>
 </div>
 <!-- tts.js loads before app.js: the transcript feeds its events straight into
-     window.TTS. -->
+     window.TTS. auth.js loads before app.js too: it defines window.AUTH, which
+     app.js reads to decide whether to dial the mirror (a page whose session is
+     missing shows the sign-in dialog instead of opening a socket that would be
+     refused). -->
 <script src="tts.js"></script>
-<script src="app.js"></script>
 <script src="auth.js"></script>
+<script src="app.js"></script>
 <script src="config.js"></script>
 </body>
 </html>
