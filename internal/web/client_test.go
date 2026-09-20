@@ -286,6 +286,20 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 	if strings.Contains(pageSource(), "function renderHistory") {
 		t.Error("the single-frame renderHistory replay should be gone")
 	}
+	// A reconnect that has nothing to report keeps the log instead of rebuilding
+	// it: the page reports the transcript version its log was built from and the
+	// mirror answers history_same when its own version still matches.
+	for _, want := range []string{
+		"history_same",
+		"function sameHistory",
+		"function recordHistoryVersion",
+		"historyVersion",
+		"if (historyVersion > 0) { url += '?since=' + historyVersion; }",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
 }
 
 // attachQueuedClient registers a client whose frames the test reads straight from
@@ -408,6 +422,116 @@ func TestConnectingMidStreamDoesNotDuplicateChunks(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Content != "thinking hard" {
 		t.Fatalf("scrollback = %+v, want the whole streamed thinking", rows)
+	}
+}
+
+// readHistoryVersion returns the mirror's current transcript version: the value a
+// page reports back as ?since=.
+func readHistoryVersion(srv *Server) uint64 {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return srv.version
+}
+
+// versionedClient is a connection registered the way a reconnecting page does,
+// with the transcript version its log was built from.
+type versionedClient struct {
+	c      *client
+	reader *bufio.Reader
+}
+
+// dialVersionedClient registers a client for the given transcript version and
+// hands back a reader for the frames the mirror sends it.
+func dialVersionedClient(t *testing.T, srv *Server, since uint64) versionedClient {
+	t.Helper()
+	server, browser := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = browser.Close() })
+	c := srv.addClientSince(&wsConn{conn: server}, since)
+	t.Cleanup(c.close)
+	return versionedClient{c: c, reader: bufio.NewReader(browser)}
+}
+
+// TestReconnectSkipsAnUnchangedTranscript pins the "nothing new" reply and the
+// version that decides it: a page whose log already matches the mirror (it reports
+// ?since=) gets a single history_same frame — no header of rows, no batches, no
+// terminator — so a phone coming back from the background does not rebuild a long
+// conversation. Any change to the rows bumps the version instead, so a page
+// holding an older one is still replayed in full.
+func TestReconnectSkipsAnUnchangedTranscript(t *testing.T) {
+	srv := newTestServer(t, "")
+	srv.publish(agent.Event{Type: agent.EventAssistant, Text: "hello"})
+	version := readHistoryVersion(srv)
+	if version == 0 {
+		t.Fatal("a recorded row did not bump the transcript version")
+	}
+
+	// The page that reports the version it shows is not replayed...
+	upToDate := dialVersionedClient(t, srv, version)
+	if _, payload, err := readServerFrame(upToDate.reader); err != nil {
+		t.Fatalf("read the nothing-new frame: %v", err)
+	} else {
+		var same struct {
+			Type     string `json:"type"`
+			Version  uint64 `json:"version"`
+			Markdown bool   `json:"markdown"`
+		}
+		if err := json.Unmarshal(payload, &same); err != nil {
+			t.Fatalf("decode %s: %v", payload, err)
+		}
+		if same.Type != "history_same" {
+			t.Fatalf("frame = %s, want history_same", payload)
+		}
+		if same.Version != version {
+			t.Fatalf("reply version = %d, want %d", same.Version, version)
+		}
+		// The state that can change without the rows still travels.
+		if !same.Markdown {
+			t.Fatalf("the reply must carry the switches: %s", payload)
+		}
+	}
+	// Nothing follows it: the page keeps the log it has.
+	if frames := queuedFrames(upToDate.c); len(frames) != 0 {
+		t.Fatalf("frames queued after history_same = %d, want none", len(frames))
+	}
+	// It is a live client all the same.
+	srv.publish(agent.Event{Type: agent.EventInfo, Text: "still here"})
+	if _, next, err := readServerFrame(upToDate.reader); err != nil {
+		t.Fatalf("read the live frame: %v", err)
+	} else if !strings.Contains(string(next), `"type":"info"`) {
+		t.Fatalf("live frame = %s, want the info row", next)
+	}
+
+	// ...while a page holding an older version is.
+	srv.publish(agent.Event{Type: agent.EventAssistant, Text: "again"})
+	if now := readHistoryVersion(srv); now == version {
+		t.Fatal("a new row did not bump the transcript version")
+	}
+	stale := dialVersionedClient(t, srv, version)
+	if _, first, err := readServerFrame(stale.reader); err != nil {
+		t.Fatalf("read the snapshot header: %v", err)
+	} else if !strings.Contains(string(first), `"type":"history_start"`) {
+		t.Fatalf("stale page frame = %s, want a full snapshot", first)
+	}
+
+	// A thinking row that keeps growing changes the transcript without adding a
+	// row, and a cleared log replaces it: neither may pass as "nothing new".
+	srv.publish(agent.Event{Type: agent.EventReasoningDelta, Text: "think"})
+	thinking := readHistoryVersion(srv)
+	srv.publish(agent.Event{Type: agent.EventReasoningDelta, Text: "ing"})
+	if readHistoryVersion(srv) == thinking {
+		t.Fatal("a growing thinking row did not bump the transcript version")
+	}
+	srv.clearScrollback()
+	if readHistoryVersion(srv) == thinking {
+		t.Fatal("clearing the log did not bump the transcript version")
+	}
+
+	// A mirror-only row (the page's /help answer, say) joins the transcript too,
+	// although it never goes through the agent bus.
+	before := readHistoryVersion(srv)
+	srv.localInfo("page-only note")
+	if readHistoryVersion(srv) == before {
+		t.Fatal("a mirror-only row did not bump the transcript version")
 	}
 }
 

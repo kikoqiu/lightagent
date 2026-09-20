@@ -669,6 +669,10 @@
   }
 
   var ws = null;
+  // historyVersion is the transcript version the log on screen was built from. It
+  // rides back on the next connection (?since=), so a page that reconnects after
+  // nothing happened is answered with history_same and does not rebuild its log.
+  var historyVersion = 0;
   // Configuration injected by the server into the page head.
   var CFG = window.__LIGHTAGENT__ || {};
   var MARKDOWN = !!CFG.markdown;
@@ -803,6 +807,7 @@
   // snapshot always describes the full conversation, so it replaces the log
   // instead of appending (otherwise reconnects duplicate every message).
   function beginHistory(ev) {
+    recordHistoryVersion(ev);
     log.innerHTML = '';
     current = null;
     currentText = '';
@@ -826,6 +831,26 @@
     historyBusy = !!ev.busy;
     setUsage(ev.tokens || 0, ev.window || 0);
     applySettings(ev);
+  }
+
+  // recordHistoryVersion remembers which transcript the log was built from, so the
+  // next connection can report it as ?since=. A frame that does not carry one (a
+  // row batch arriving without its header) leaves the value alone.
+  function recordHistoryVersion(ev) {
+    if (typeof ev.version === 'number') { historyVersion = ev.version; }
+  }
+
+  // sameHistory applies the header of a "nothing new" reply: the mirror recorded
+  // nothing since the version this page reports, so the transcript on screen is
+  // still current. Only what can change without the rows changed — the usage
+  // numbers, the running flag and the switches — and the log itself is left
+  // exactly as it is. That is what keeps a phone coming back from the background
+  // from rebuilding (and repainting) a long conversation that did not change.
+  function sameHistory(ev) {
+    recordHistoryVersion(ev);
+    setUsage(ev.tokens || 0, ev.window || 0);
+    applySettings(ev);
+    setRunning(!!ev.busy);
   }
 
   // appendHistoryRows draws one batch of the snapshot and inserts it. Batches
@@ -874,8 +899,13 @@
 
   function wsURL() {
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    // The session cookie rides on the handshake, so there is no token to add.
-    return proto + location.host + '/ws';
+    // The session cookie rides on the handshake, so there is no token to add. The
+    // version the log on screen was built from travels as ?since=: when the
+    // mirror's own version still matches, it answers history_same instead of
+    // replaying the rows (and the page keeps its log).
+    var url = proto + location.host + '/ws';
+    if (historyVersion > 0) { url += '?since=' + historyVersion; }
+    return url;
   }
 
   var reconnectTimer = null;
@@ -942,6 +972,7 @@
       // header, row batches, terminator, so a long conversation paints while it
       // is still arriving instead of blocking on one giant frame.
       if (ev.type === 'history_start') { beginHistory(ev); return; }
+      if (ev.type === 'history_same') { sameHistory(ev); return; }
       if (ev.type === 'history_rows') { appendHistoryRows(ev); return; }
       if (ev.type === 'history_end') { endHistory(); return; }
       // The switches the rail mirrors: no row, just state.
@@ -972,10 +1003,10 @@
     document.documentElement.setAttribute('data-idle', '1');
     // The "running" state and its clock come back with the snapshot.
     stopTurnTimer();
-    // Rows waiting for their markdown pass belong to a log that is about to be
-    // replaced: upgrading them off-screen only costs battery.
-    mdPending.clear();
-    mdFlushScheduled = false;
+    // The pending markdown passes are kept: the log may well survive the trip (a
+    // reconnect with nothing to report is answered with history_same, which keeps
+    // it), and the log has to be complete when the page is looked at again. No
+    // timer of this page runs while it is hidden and stopped.
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) { try { ws.close(); } catch (err) { /* already closed */ } }
   }

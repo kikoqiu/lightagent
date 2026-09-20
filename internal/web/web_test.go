@@ -206,7 +206,6 @@ func TestHiddenPageSavesEnergy(t *testing.T) {
 		"hiddenStopTimer = setTimeout(goIdle, HIDDEN_GRACE_MS_PHONE);",
 		"if (stopped) { return; }", // a stopped page does not dial, a hidden one does
 		"stopTurnTimer();",         // the elapsed clock stops with the page
-		"mdPending.clear();",       // so do the idle markdown slices
 		"data-idle",                // the attribute the stylesheet hangs the pause on
 		"[data-idle] header .run .spin { animation-play-state:paused; }",
 		"turnTickMs", // whole seconds on a phone...
@@ -584,6 +583,13 @@ func TestInterruptAffordances(t *testing.T) {
 // would be, minus the cookie (the test servers run without a login).
 func dialWS(t *testing.T, srv *Server) (net.Conn, *bufio.Reader) {
 	t.Helper()
+	return dialWSQuery(t, srv, "")
+}
+
+// dialWSQuery is dialWS with a query string appended to /ws — the page's
+// ?since=<transcript version>.
+func dialWSQuery(t *testing.T, srv *Server, query string) (net.Conn, *bufio.Reader) {
+	t.Helper()
 	addr := "127.0.0.1:" + itoa(srv.Port())
 
 	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -594,7 +600,7 @@ func dialWS(t *testing.T, srv *Server) (net.Conn, *bufio.Reader) {
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
-	req := "GET /ws HTTP/1.1\r\n" +
+	req := "GET /ws" + query + " HTTP/1.1\r\n" +
 		"Host: " + addr + "\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
@@ -622,6 +628,44 @@ func dialWS(t *testing.T, srv *Server) (net.Conn, *bufio.Reader) {
 		}
 	}
 	return conn, reader
+}
+
+// TestDialWithSinceSkipsTheReplay drives the shortcut through the real handler and
+// the page's own dial: the version travels as ?since=, and a matching one means the
+// first (and only) frame is history_same instead of the rows.
+func TestDialWithSinceSkipsTheReplay(t *testing.T) {
+	srv := newTestServer(t, "")
+	srv.publish(agent.Event{Type: agent.EventAssistant, Text: "hello"})
+	version := readHistoryVersion(srv)
+
+	conn, reader := dialWSQuery(t, srv, fmt.Sprintf("?since=%d", version))
+	if _, payload, err := readServerFrame(reader); err != nil {
+		t.Fatalf("read the nothing-new frame: %v", err)
+	} else if !strings.Contains(string(payload), `"type":"history_same"`) {
+		t.Fatalf("frame = %s, want history_same", payload)
+	}
+	// The connection is a normal live client: a command still works on it.
+	if err := writeMaskedFrame(conn, opText, []byte(`{"text":"/help"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, payload, err := readServerFrame(reader)
+		if err != nil {
+			t.Fatalf("read the /help answer: %v", err)
+		}
+		if strings.Contains(string(payload), `"type":"info"`) {
+			break
+		}
+		t.Fatalf("frame = %s, want the /help answer", payload)
+	}
+
+	// An unparsable value counts as "no version": the page is replayed in full.
+	_, stale := dialWSQuery(t, srv, "?since=not-a-number")
+	if _, payload, err := readServerFrame(stale); err != nil {
+		t.Fatalf("read the snapshot header: %v", err)
+	} else if !strings.Contains(string(payload), `"type":"history_start"`) {
+		t.Fatalf("frame = %s, want a full snapshot", payload)
+	}
 }
 
 func TestWebSocketHandshakeAndPing(t *testing.T) {

@@ -109,6 +109,13 @@ type Server struct {
 	// reasoningOpen reports whether the newest row is a thinking row whose
 	// stream is still open; further reasoning_delta events append to it.
 	reasoningOpen bool
+	// version counts the changes of the visible transcript. A page reports the
+	// version its log was built from when it reconnects (?since=, see
+	// addClientSince); a match means nothing has to be replayed, which is what
+	// keeps a phone coming back from the background from rebuilding a long
+	// conversation. Every mutation of the rows bumps it, so a skipped replay can
+	// never hide a change.
+	version uint64
 	// pendingDelta/pendingText hold the merged streamed delta waiting for its
 	// coalescing window and pendingTimer flushes it once the window expires (see
 	// coalesceLocked). All three are guarded by mu.
@@ -348,14 +355,28 @@ func (s *Server) broadcastFramesLocked(frames [][]byte) {
 	}
 }
 
-// addClient registers a connection and hands it the current scrollback: the
+// addClient registers a connection and hands it the current scrollback; it is
+// addClientSince with an unknown transcript version, so the page always gets the
+// rows.
+func (s *Server) addClient(conn *wsConn) *client { return s.addClientSince(conn, 0) }
+
+// addClientSince registers a connection and hands it the current scrollback: the
 // history frames are queued under the same lock hold that registers the client,
 // so an event published concurrently is delivered exactly once — either in the
 // snapshot or live after it (see client.replaying). Marshalling and the socket
 // writes happen outside the lock, on the client's own goroutine, so replaying a
 // long conversation never blocks the CLI, the other browsers or the page's own
 // requests.
-func (s *Server) addClient(conn *wsConn) *client {
+//
+// since is the transcript version the page's log was built from (0 when it has
+// none) and is reported as ?since=. When it matches the mirror's own version,
+// nothing has been recorded since, and the reply is a single history_same frame
+// instead of the rows: the page keeps the log it shows rather than rebuilding it,
+// which is what a phone coming back from the background needs (it stops its
+// mirror after a while, see app.js). The comparison and the registration share one
+// critical section, so a live event is either already in the transcript (and the
+// version differs) or arrives as a live frame — never dropped by the shortcut.
+func (s *Server) addClientSince(conn *wsConn, since uint64) *client {
 	s.mu.Lock()
 	// A merged streamed delta goes out before this client is registered: the
 	// scrollback already holds those chunks (recordLocked runs at publish time),
@@ -365,10 +386,24 @@ func (s *Server) addClient(conn *wsConn) *client {
 	s.nextID++
 	c := newClient(s.nextID, conn)
 	s.clients[c.id] = c
-	rows, header := s.historySnapshotLocked()
+	upToDate := since != 0 && since == s.version
+	var rows []historyMessage
+	var header historyHeader
+	if upToDate {
+		header = s.historyHeaderLocked(len(s.history))
+	} else {
+		rows, header = s.historySnapshotLocked()
+	}
 	s.mu.Unlock()
 
 	go c.writeLoop()
+	if upToDate {
+		if frame := sameHistoryFrame(header); frame != nil {
+			c.enqueueReplay(frame)
+		}
+		c.finishReplay()
+		return c
+	}
 	for _, frame := range chunkHistory(rows, header) {
 		if !c.enqueueReplay(frame) {
 			break
@@ -454,7 +489,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	c := s.addClient(conn)
+	c := s.addClientSince(conn, transcriptVersion(r))
 	defer s.dropClient(c)
 
 	for {
@@ -467,6 +502,17 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		s.handleClientMessage(data)
 	}
+}
+
+// transcriptVersion reads the transcript version a reconnecting page reported as
+// the ?since= query of its WebSocket URL. An absent or unparsable value is 0,
+// which means "unknown" and always gets the full snapshot.
+func transcriptVersion(r *http.Request) uint64 {
+	v, err := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 // historyMessage is one conversation row sent to a browser. It mirrors the rows
@@ -497,6 +543,9 @@ func (s *Server) seedHistory() {
 	s.mu.Lock()
 	s.history = rows
 	s.reasoningOpen = false
+	// The seeded rows are this process's starting transcript: a page from an
+	// earlier process carries a version of its own, so it replays.
+	s.touchHistoryLocked()
 	s.mu.Unlock()
 }
 
@@ -552,13 +601,19 @@ func (s *Server) recordLocked(ev agent.Event) {
 	if ev.Type != agent.EventReasoningDelta {
 		s.closeReasoningLocked()
 	}
+	before := len(s.history)
 	switch ev.Type {
 	case agent.EventReasoningDelta:
 		if !s.reasoningOpen {
 			s.history = append(s.history, historyMessage{Role: "reasoning"})
 			s.reasoningOpen = true
 		}
-		s.history[len(s.history)-1].Content += ev.Text
+		if ev.Text != "" {
+			s.history[len(s.history)-1].Content += ev.Text
+			// The row grew although no row was added: the transcript changed, and
+			// a page holding the previous version has to replay it.
+			s.touchHistoryLocked()
+		}
 	case agent.EventUser:
 		s.history = append(s.history, historyMessage{Role: "user", Content: ev.Text})
 	case agent.EventAssistant:
@@ -588,7 +643,16 @@ func (s *Server) recordLocked(ev agent.Event) {
 	case agent.EventError:
 		s.history = append(s.history, historyMessage{Role: "error", Content: ev.Text})
 	}
+	// A row was added (or an empty thinking row was dropped above): the transcript
+	// a reconnecting page has to replay changed.
+	if len(s.history) != before {
+		s.touchHistoryLocked()
+	}
 }
+
+// touchHistoryLocked records that the visible transcript changed. The caller must
+// hold s.mu.
+func (s *Server) touchHistoryLocked() { s.version++ }
 
 // closeReasoningLocked finalizes the open thinking row, dropping it when it
 // ended up empty. The caller must hold s.mu.
@@ -599,6 +663,8 @@ func (s *Server) closeReasoningLocked() {
 	s.reasoningOpen = false
 	if last := len(s.history) - 1; strings.TrimSpace(s.history[last].Content) == "" {
 		s.history = s.history[:last]
+		// The row never reached a page, so the transcript changed.
+		s.touchHistoryLocked()
 	}
 }
 
@@ -625,7 +691,10 @@ const (
 // needs besides the rows rides here, including the switch states, so a
 // reconnecting tab is back in sync.
 type historyHeader struct {
-	Type     string `json:"type"`
+	Type string `json:"type"`
+	// Version identifies the transcript the rows belong to: a page sends it back
+	// as ?since= on its next connection (see addClientSince).
+	Version  uint64 `json:"version"`
 	Tokens   int    `json:"tokens"`
 	Window   int    `json:"window"`
 	Busy     bool   `json:"busy"`
@@ -640,6 +709,56 @@ type historyRowsFrame struct {
 	Messages []historyMessage `json:"messages"`
 }
 
+// historySameFrame is the reply to a page whose transcript is already current: it
+// carries the state that can change without the rows changing (usage numbers, the
+// running flag, the switches) and, by its type alone, says that no rows follow.
+// The page keeps the log it has, so a phone coming back from the background does
+// not rebuild (or even repaint) a long conversation that did not change.
+type historySameFrame struct {
+	Type     string `json:"type"`
+	Version  uint64 `json:"version"`
+	Tokens   int    `json:"tokens"`
+	Window   int    `json:"window"`
+	Busy     bool   `json:"busy"`
+	Markdown bool   `json:"markdown"`
+	Result   bool   `json:"result"`
+}
+
+// sameHistoryFrame renders the "nothing new" reply from the same header the
+// snapshot would have carried. It returns nil when the header cannot be
+// marshalled, and the caller then sends the full snapshot instead.
+func sameHistoryFrame(header historyHeader) []byte {
+	data, err := json.Marshal(historySameFrame{
+		Type:     "history_same",
+		Version:  header.Version,
+		Tokens:   header.Tokens,
+		Window:   header.Window,
+		Busy:     header.Busy,
+		Markdown: header.Markdown,
+		Result:   header.Result,
+	})
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// historyHeaderLocked builds the state the first snapshot frame carries. The
+// caller must hold s.mu.
+func (s *Server) historyHeaderLocked(rows int) historyHeader {
+	stats := s.agent.Stats()
+	return historyHeader{
+		Type:     "history_start",
+		Version:  s.version,
+		Tokens:   stats.EstimatedTok,
+		Window:   stats.ContextWindow,
+		Busy:     stats.Busy,
+		Markdown: s.markdown,
+		Result:   s.agent.ToolResultsVisible(),
+		Count:    rows,
+	}
+}
+
 // historySnapshotLocked copies the scrollback and the state the header carries.
 // The copy shares the row strings (they are immutable) but owns its slice, so
 // the frames can be marshalled and queued outside the lock while the agent
@@ -647,16 +766,7 @@ type historyRowsFrame struct {
 func (s *Server) historySnapshotLocked() ([]historyMessage, historyHeader) {
 	rows := make([]historyMessage, len(s.history))
 	copy(rows, s.history)
-	stats := s.agent.Stats()
-	return rows, historyHeader{
-		Type:     "history_start",
-		Tokens:   stats.EstimatedTok,
-		Window:   stats.ContextWindow,
-		Busy:     stats.Busy,
-		Markdown: s.markdown,
-		Result:   s.agent.ToolResultsVisible(),
-		Count:    len(rows),
-	}
+	return rows, s.historyHeaderLocked(len(s.history))
 }
 
 // historyFrames returns the frames a newly connected page receives, in order.
@@ -878,6 +988,9 @@ func (s *Server) localRow(row historyMessage, ev agent.Event) {
 	defer s.mu.Unlock()
 	s.closeReasoningLocked()
 	s.history = append(s.history, row)
+	// This path does not go through recordLocked, so it bumps the transcript version
+	// itself: a page holding the previous version has to replay this row.
+	s.touchHistoryLocked()
 	s.broadcastLocked(data)
 }
 
@@ -902,6 +1015,9 @@ func (s *Server) clearScrollback() {
 	s.dropDeltaLocked()
 	s.history = nil
 	s.reasoningOpen = false
+	// The log was replaced, so a page holding the old version has to replay this
+	// (empty) transcript instead of keeping what it shows.
+	s.touchHistoryLocked()
 	rows, header := s.historySnapshotLocked()
 	s.broadcastFramesLocked(chunkHistory(rows, header))
 }
