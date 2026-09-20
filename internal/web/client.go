@@ -162,15 +162,22 @@ func (c *client) close() {
 // writeLoop drains the queue on the client's own goroutine and pings the socket
 // while it is idle. A failed write closes the connection, which ends the read
 // loop of its handler and unregisters the client.
+//
+// The ping exists to notice a page that went away without a close frame, so it is
+// only sent once nothing has gone out for a whole interval: a connection that
+// just received frames is demonstrably alive, and on a phone one more frame on an
+// otherwise silent socket wakes the radio for nothing.
 func (c *client) writeLoop() {
 	ticker := time.NewTicker(clientPingInterval)
 	defer ticker.Stop()
+	var lastWrite time.Time
 	for {
 		if data, ok := c.take(); ok {
 			if err := c.conn.writeText(data); err != nil {
 				c.close()
 				return
 			}
+			lastWrite = time.Now()
 			continue
 		}
 		select {
@@ -178,6 +185,9 @@ func (c *client) writeLoop() {
 			return
 		case <-c.signal:
 		case <-ticker.C:
+			if time.Since(lastWrite) < clientPingInterval {
+				continue
+			}
 			if err := c.conn.writeFrame(opPing, nil); err != nil {
 				c.close()
 				return

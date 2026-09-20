@@ -288,3 +288,126 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 	}
 }
 
+// attachQueuedClient registers a client whose frames the test reads straight from
+// its queue instead of a socket: no writer goroutine runs, so the assertions are
+// deterministic. The connection is a pipe that is only ever closed.
+func attachQueuedClient(t *testing.T, srv *Server) *client {
+	t.Helper()
+	server, browser := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = browser.Close() })
+	srv.mu.Lock()
+	// The id comes from the server the way addClient allocates it, so a test that
+	// mixes both paths cannot collide with a registered client.
+	srv.nextID++
+	c := newClient(srv.nextID, &wsConn{conn: server})
+	// A client starts out replaying (its registration queues a snapshot); there is
+	// no snapshot here, so the phase ends right away and frames go to the queue.
+	c.finishReplay()
+	srv.clients[c.id] = c
+	srv.mu.Unlock()
+	t.Cleanup(c.close)
+	return c
+}
+
+// queuedFrames copies the frames waiting for a queued client, oldest first.
+func queuedFrames(c *client) [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([][]byte, len(c.queue))
+	copy(out, c.queue)
+	return out
+}
+
+// TestStreamedDeltasShareAFrame pins the coalescing of streamed chunks: a fast
+// model publishes dozens of reasoning/answer deltas per second and every frame
+// costs a socket write plus, on a phone, a radio wake-up, so consecutive chunks
+// of one stream travel as a single frame. The scrollback still records every
+// chunk exactly as published, so a page connecting later replays the same text.
+func TestStreamedDeltasShareAFrame(t *testing.T) {
+	srv := newTestServer(t, "")
+	c := attachQueuedClient(t, srv)
+
+	for _, chunk := range []string{"let me ", "think about ", "it"} {
+		srv.publish(agent.Event{Type: agent.EventReasoningDelta, Text: chunk})
+	}
+	// The window has not expired, so nothing has been queued yet.
+	if frames := queuedFrames(c); len(frames) != 0 {
+		t.Fatalf("the merge left the window early: %d frame(s) queued", len(frames))
+	}
+
+	// Any other event flushes it first, so the page draws the streamed row exactly
+	// where the scrollback recorded it.
+	srv.publish(agent.Event{Type: agent.EventAssistant, Text: "done"})
+	frames := queuedFrames(c)
+	if len(frames) != 2 {
+		t.Fatalf("frames = %d, want the merged delta and the answer", len(frames))
+	}
+	if !strings.Contains(string(frames[0]), `"type":"reasoning_delta"`) ||
+		!strings.Contains(string(frames[0]), "let me think about it") {
+		t.Fatalf("first frame = %s, want one merged reasoning_delta", frames[0])
+	}
+	if !strings.Contains(string(frames[1]), `"type":"assistant"`) {
+		t.Fatalf("second frame = %s, want the answer", frames[1])
+	}
+
+	// A stream that pauses mid-turn still reaches the page: the window closes on
+	// its own.
+	srv.publish(agent.Event{Type: agent.EventAssistantDelta, Text: "partial"})
+	deadline := time.Now().Add(2 * time.Second)
+	for len(queuedFrames(c)) < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	frames = queuedFrames(c)
+	if len(frames) != 3 {
+		t.Fatalf("frames = %d, want the chunk of the closed window as well", len(frames))
+	}
+	if last := string(frames[2]); !strings.Contains(last, `"type":"assistant_delta"`) ||
+		!strings.Contains(last, "partial") {
+		t.Fatalf("last frame = %s, want the streamed answer chunk", last)
+	}
+
+	// One row per stream, carrying every chunk.
+	srv.mu.Lock()
+	rows := append([]historyMessage(nil), srv.history...)
+	srv.mu.Unlock()
+	if len(rows) != 2 || rows[0].Role != "reasoning" || rows[0].Content != "let me think about it" ||
+		rows[1].Role != "assistant" || rows[1].Content != "done" {
+		t.Fatalf("scrollback = %+v, want the streamed thinking and the answer", rows)
+	}
+}
+
+// TestConnectingMidStreamDoesNotDuplicateChunks pins the hook that keeps a merged
+// frame out of a snapshot: the scrollback already carries the chunks (they are
+// recorded at publish time), so the snapshot alone describes the streamed row. A
+// page that connects in the middle of a stream must therefore not receive the
+// pending frame on top of it, or it would draw the same text twice.
+func TestConnectingMidStreamDoesNotDuplicateChunks(t *testing.T) {
+	srv := newTestServer(t, "")
+	c1 := attachQueuedClient(t, srv)
+
+	srv.publish(agent.Event{Type: agent.EventReasoningDelta, Text: "thinking "})
+	srv.publish(agent.Event{Type: agent.EventReasoningDelta, Text: "hard"})
+
+	server, browser := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = browser.Close() })
+	c2 := srv.addClient(&wsConn{conn: server})
+	t.Cleanup(c2.close)
+
+	// The client that was already connected gets the merged chunk...
+	frames := queuedFrames(c1)
+	if len(frames) != 1 || !strings.Contains(string(frames[0]), "thinking hard") {
+		t.Fatalf("connected client frames = %v, want one merged reasoning_delta", frames)
+	}
+	// ...and nothing of it is left waiting for the client that just connected.
+	srv.mu.Lock()
+	pending := srv.pendingDelta.Type
+	rows := append([]historyMessage(nil), srv.history...)
+	srv.mu.Unlock()
+	if pending != "" {
+		t.Fatalf("pending merge survived the handshake: %s", pending)
+	}
+	if len(rows) != 1 || rows[0].Content != "thinking hard" {
+		t.Fatalf("scrollback = %+v, want the whole streamed thinking", rows)
+	}
+}
+

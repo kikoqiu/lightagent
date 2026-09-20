@@ -7,7 +7,7 @@
 | [architecture.md](architecture.md) | 模块划分、Agent 回合循环、事件总线、steering、并发模型、持久化、上下文压缩流程 |
 | [configuration.md](configuration.md) | `config.json` 全字段说明、`agent.md` 覆盖、`extra_body`、配置优先级与示例 |
 | [tools.md](tools.md) | 五个内置工具的参数、语义、限制与示例 |
-| [web.md](web.md) | Web 镜像：启用、端口自增、登录与鉴权（加盐摘要 / 会话 cookie / 记住我）、WebSocket 协议与消息格式、`/api/config` 配置编辑（重启生效） |
+| [web.md](web.md) | Web 镜像：启用、端口自增、登录与鉴权（加盐摘要 / 会话 cookie / 记住我）、WebSocket 协议与消息格式、省电（移动端 / 隐藏页面、增量合帧）、`/api/config` 配置编辑（重启生效） |
 | [development.md](development.md) | 构建、运行、测试、目录结构、如何新增工具/配置项、编码约定 |
 
 ## 一分钟速览
@@ -26,7 +26,7 @@ lightagent/
     store/                 单会话持久化（CWD/.lightagent/session.json）
     markdown/              Markdown → ANSI 渲染（CLI，按行流式）
     cli/                   彩色 REPL + Markdown 渲染
-    web/                   WebSocket 实时镜像 + config 编辑接口（/api/config）
+    web/                   WebSocket 实时镜像（流式增量合帧）+ config 编辑接口（/api/config）
       assets/              内嵌的浏览器库（marked / DOMPurify）
 ```
 
@@ -44,5 +44,7 @@ lightagent/
 
 事件（`reasoning_delta` / `assistant_delta` / `assistant` / `tool_call` / `tool_result` / `info` /
 `error` / `compacted` / `usage` / `turn_done`）通过事件总线广播给 CLI 与所有 WebSocket 客户端；
+网页镜像会把同一流上连续的增量在 50ms 窗口内合并成一帧（减少手机上的网络唤醒，见
+[web.md](web.md#省电移动端与隐藏页面)），且回滚缓冲仍按原样记录每个增量。
 `user` 事件带 `source`（`cli`/`web`）以区分输入来源。`reasoning_delta` 是模型思考的流式增量；
 定稿后的思考写入 assistant 消息并随后续请求回传。

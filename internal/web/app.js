@@ -41,6 +41,24 @@
   var switchOn = { '/result': true, '/markdown': true };
   var switchEls = {};
 
+  // ---- device and page-state probes ----
+  // Both matchMedia queries are built once and shared by the layout wiring and
+  // the pacing below. A "phone" is the stylesheet's phone breakpoint (see the
+  // 480px media query in app.css) or a coarse pointer: a narrow window on a
+  // desktop counts too, and either way the answer means "redraw less".
+  var phoneQuery = window.matchMedia ? window.matchMedia('(max-width: 480px)') : null;
+  var coarseQuery = window.matchMedia ? window.matchMedia('(pointer: coarse)') : null;
+
+  function onPhone() {
+    return !!((phoneQuery && phoneQuery.matches) || (coarseQuery && coarseQuery.matches));
+  }
+
+  // visible reports whether the page is actually being looked at. A page nobody
+  // is looking at stops its clocks, its socket and its rendering work (see
+  // goIdle): the agent runs on the server, so nothing is lost by not watching
+  // it, and a fresh snapshot restores the transcript on the way back.
+  function visible() { return !document.hidden; }
+
   // The transcript follows new output exactly while the reader is already at the
   // bottom: dragging (or wheeling) up to read or copy history unpins the view, so
   // streamed output keeps growing below without yanking the reader back down.
@@ -59,8 +77,27 @@
   }
 
   // pinBottom shows the newest row regardless of where the reader was; on an
-  // empty (freshly rebuilt) log it also establishes "at the bottom".
-  function pinBottom() { log.scrollTop = log.scrollHeight; }
+  // empty (freshly rebuilt) log it also establishes "at the bottom". The write
+  // is coalesced into one animation frame: a streamed row can be re-drawn and
+  // several rows appended between two frames, and every scroll write forces a
+  // layout, so the frame ends with a single write to the true bottom. Whether to
+  // follow is still the caller's decision, taken by sampling atBottom() before
+  // it touched the DOM.
+  var pinQueued = false;
+
+  function pinBottom() {
+    if (pinQueued) { return; }
+    pinQueued = true;
+    var write = function () {
+      pinQueued = false;
+      log.scrollTop = log.scrollHeight;
+    };
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(write);
+    } else {
+      write();
+    }
+  }
 
   // The elapsed badge in the running pill times the current turn, mirroring the
   // CLI prompt (busyElapsedLocked): tenths of a second up to a minute, then
@@ -93,13 +130,38 @@
     if (elapsedEl) { elapsedEl.textContent = elapsedText(Date.now() - turnStart) + queuedText(); }
   }
 
+  // The clock's cadence: the terminal redraws its spinner every 100ms and a
+  // visible desktop mirrors that. A phone only needs whole seconds (tenths of a
+  // second are not worth a redraw on a small screen, nor a wake-up in a pocket),
+  // and a page in the background ticks once a second for as long as it keeps
+  // working (see the power section below).
+  var TURN_TICK_MS = 100;
+  var TURN_TICK_MS_PHONE = 1000;
+  var TURN_TICK_MS_HIDDEN = 1000;
+
   // A steering message joins the running turn, so an already-ticking clock is
-  // left alone (the CLI does the same). The tick mirrors its 100ms animation.
+  // left alone (the CLI does the same). The tick mirrors its 100ms animation, or
+  // a coarser one on a phone or in the background.
   function startTurnTimer() {
     if (turnTimer) { return; }
     turnStart = Date.now();
     tickTurn();
-    turnTimer = setInterval(tickTurn, 100);
+    turnTimer = setInterval(tickTurn, turnTickMs());
+  }
+
+  // turnTickMs is the clock's cadence: the terminal's 100ms on a visible desktop,
+  // whole seconds on a phone and while the page is in the background.
+  function turnTickMs() {
+    if (!visible()) { return TURN_TICK_MS_HIDDEN; }
+    return onPhone() ? TURN_TICK_MS_PHONE : TURN_TICK_MS;
+  }
+
+  // restartTurnTimer re-arms a running clock at the cadence the page's new state
+  // asks for; it does nothing when no turn is running.
+  function restartTurnTimer() {
+    if (!turnTimer) { return; }
+    clearInterval(turnTimer);
+    turnTimer = setInterval(tickTurn, turnTickMs());
   }
 
   function stopTurnTimer() {
@@ -269,33 +331,67 @@
     span.textContent = text;
   }
 
-  // scheduleRender re-renders the streaming row at most every 120ms.
+  // A streamed row is redrawn by parsing its whole text as markdown again, so it
+  // is redrawn at most once per interval — and that interval is about what the
+  // reader can see, not about saving work at their expense:
+  //   * a visible desktop redraws as the chunks arrive (an interval of 0, which
+  //     still coalesces the chunks of one burst into a single redraw),
+  //   * a visible phone caps it at RENDER_LIVE_PHONE_MS: re-parsing the whole row
+  //     costs much more there, and a tenth of a second is not visible in a stream,
+  //   * a page in the background (which keeps working unless it was stopped)
+  //     redraws once a second, since nobody is watching it.
+  // Both streams end with a full redraw (the final assistant event and
+  // finishReasoning), so a pending pass can never leave text unrendered.
+  var RENDER_LIVE_PHONE_MS = 100;
+  var RENDER_HIDDEN_MS = 1000;
+  // answerRenderedAt/reasoningRenderedAt remember when each streamed row was last
+  // drawn.
+  var answerRenderedAt = 0;
+  var reasoningRenderedAt = 0;
+
+  function renderIntervalMs() {
+    if (!visible()) { return RENDER_HIDDEN_MS; }
+    return onPhone() ? RENDER_LIVE_PHONE_MS : 0;
+  }
+
+  // streamDelay reports how long the next redraw of a streamed row waits, given
+  // how long ago its last pass was.
+  function streamDelay(sinceLast) {
+    var wait = renderIntervalMs() - sinceLast;
+    return wait > 0 ? wait : 0;
+  }
+
+  // scheduleRender re-renders the streaming row on that cadence.
   function scheduleRender() {
     if (pendingRender) { return; }
     pendingRender = setTimeout(function () {
       pendingRender = null;
+      answerRenderedAt = Date.now();
       setRow(current, currentText, MARKDOWN);
-    }, 120);
+    }, streamDelay(Date.now() - answerRenderedAt));
   }
 
-  // scheduleReasoningRender re-renders the thinking row at most every 120ms,
-  // through the same markdown path as the visible answer.
+  // scheduleReasoningRender paces the thinking row the same way, through the
+  // same markdown path as the visible answer.
   function scheduleReasoningRender() {
     if (pendingReasoningRender) { return; }
     pendingReasoningRender = setTimeout(function () {
       pendingReasoningRender = null;
+      reasoningRenderedAt = Date.now();
       setRow(reasoningRow, reasoningText, MARKDOWN);
-    }, 120);
+    }, streamDelay(Date.now() - reasoningRenderedAt));
   }
 
   // finishReasoning commits the streamed thinking row (if any) so the visible
-  // answer starts in its own row.
+  // answer starts in its own row. The commit is a full redraw, so the paced
+  // state of the row goes with it.
   function finishReasoning() {
     if (!reasoningRow) { return; }
     if (pendingReasoningRender) { clearTimeout(pendingReasoningRender); pendingReasoningRender = null; }
     setRow(reasoningRow, reasoningText, MARKDOWN);
     reasoningRow = null;
     reasoningText = '';
+    reasoningRenderedAt = 0;
   }
 
   // buildRow creates one transcript row.
@@ -636,13 +732,20 @@
     }
     if (kind === 'turn_done' || kind === 'interrupted') { setRunning(false); }
     if (kind === 'reasoning_delta') {
-      if (!reasoningRow) { reasoningRow = addRow('reasoning', 'thinking', '', MARKDOWN); }
+      if (!reasoningRow) {
+        reasoningRow = addRow('reasoning', 'thinking', '', MARKDOWN);
+        // A fresh row has nothing drawn yet, so its first pass is immediate.
+        reasoningRenderedAt = 0;
+      }
       reasoningText += ev.text || '';
       scheduleReasoningRender();
       return;
     }
     if (kind === 'assistant_delta') {
-      if (!current) { current = addRow('assistant', 'agent', '', false); }
+      if (!current) {
+        current = addRow('assistant', 'agent', '', false);
+        answerRenderedAt = 0;
+      }
       currentText += ev.text || '';
       if (MARKDOWN) { scheduleRender(); } else { setRow(current, currentText, false); }
       return;
@@ -651,6 +754,9 @@
     var streamedText = currentText;
     current = null;
     currentText = '';
+    // The streamed row is finished: a paced redraw still waiting would only redraw
+    // it with the text the branches below render in full.
+    if (pendingRender) { clearTimeout(pendingRender); pendingRender = null; }
     if (kind === 'turn_done') { return; }
     if (kind === 'user') { addRow('user', 'you', ev.text || '', false); }
     else if (kind === 'assistant') {
@@ -700,12 +806,14 @@
     log.innerHTML = '';
     current = null;
     currentText = '';
+    answerRenderedAt = 0;
     if (pendingRender) { clearTimeout(pendingRender); pendingRender = null; }
     // The rebuild replaces every row, so the open thinking row of a stream that
     // is gone with it is dropped too (the next chunk draws a fresh one). Pending
     // messages are gone as well: the agent draws their rows when it sends them.
     reasoningRow = null;
     reasoningText = '';
+    reasoningRenderedAt = 0;
     if (pendingReasoningRender) { clearTimeout(pendingReasoningRender); pendingReasoningRender = null; }
     pendingRows = [];
     // The rows the voice was reading are gone: drop its buffers and silence it.
@@ -771,12 +879,31 @@
   }
 
   var reconnectTimer = null;
+  // The reconnect backoff. It doubles per failed attempt up to RECONNECT_MAX_MS
+  // and a handshake that succeeds clears it, so a healthy page stays at the base
+  // delay while a phone that lost its network (or was asleep) does not wake its
+  // radio every 1.5s forever.
+  var reconnectDelay = 0;
+  var RECONNECT_MIN_MS = 1500;
+  var RECONNECT_MAX_MS = 60000;
+
+  // nextReconnectDelay advances the backoff and applies jitter, so pages that
+  // lost the same network do not retry in lockstep. The cap also bounds the
+  // jittered wait, so a sleeping phone never sees an attempt later than
+  // RECONNECT_MAX_MS.
+  function nextReconnectDelay() {
+    reconnectDelay = reconnectDelay ? Math.min(reconnectDelay * 2, RECONNECT_MAX_MS) : RECONNECT_MIN_MS;
+    return Math.min(Math.round(reconnectDelay * (0.75 + Math.random() * 0.5)), RECONNECT_MAX_MS);
+  }
 
   function connect() {
     if (!AUTH().ok()) { return; }
     if (ws && (ws.readyState === 0 || ws.readyState === 1)) { return; }
     ws = new WebSocket(wsURL());
     ws.onopen = function () {
+      // The connection is healthy again: the next drop starts from the base
+      // delay instead of continuing to back off.
+      reconnectDelay = 0;
       dot.classList.add('on');
       dot.title = 'connected';
       statusEl.textContent = 'online';
@@ -793,6 +920,11 @@
       dropReplayState();
       setRunning(false);
       if (!AUTH().ok()) { return; } // signed out: wait for a new session
+      // A stopped page does not dial: it has nothing to draw, the socket would be
+      // pinged awake for as long as the phone is asleep, and coming back reads a
+      // fresh snapshot anyway (see goActive). A page that is merely in the
+      // background keeps its mirror alive.
+      if (stopped) { return; }
       if (reconnectTimer) { return; }
       reconnectTimer = setTimeout(function () {
         reconnectTimer = null;
@@ -800,7 +932,7 @@
         ensureSession().then(function (ok) {
           if (ok) { connect(); } else { AUTH().prompt('Your session ended. Sign in again.'); }
         }).catch(function () { connect(); });
-      }, 1500);
+      }, nextReconnectDelay());
     };
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
     ws.onmessage = function (e) {
@@ -817,6 +949,70 @@
       render(ev.type, ev);
     };
   }
+
+  // ---- what a hidden page keeps doing ----
+  // The agent runs on the server, so a page nobody is looking at has nothing that
+  // has to stay current — how far that goes depends on the device. A desktop
+  // stays live (people switch tabs constantly and the machine is on mains), only
+  // easing its redraws to one per second (see renderIntervalMs/turnTickMs). A
+  // phone gets HIDDEN_GRACE_MS_PHONE of grace and is then stopped: its clock, its
+  // socket (the server pings an idle connection every 30s, and every ping wakes a
+  // radio), its idle markdown slices and its CSS animation all go. Coming back
+  // from a stopped page dials again and rebuilds the log from the snapshot, which
+  // is exactly how a reloaded page restores itself.
+  var HIDDEN_GRACE_MS_PHONE = 60000;
+  var hiddenStopTimer = null;
+  // stopped is true between goIdle and the next goActive: the page has no socket
+  // and does no work at all.
+  var stopped = false;
+
+  function goIdle() {
+    if (stopped) { return; }
+    stopped = true;
+    document.documentElement.setAttribute('data-idle', '1');
+    // The "running" state and its clock come back with the snapshot.
+    stopTurnTimer();
+    // Rows waiting for their markdown pass belong to a log that is about to be
+    // replaced: upgrading them off-screen only costs battery.
+    mdPending.clear();
+    mdFlushScheduled = false;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws) { try { ws.close(); } catch (err) { /* already closed */ } }
+  }
+
+  // goActive puts the page back to work: the animation resumes, a stopped page
+  // dials again (a fresh connection means a fresh snapshot), and the rhythm the
+  // foreground asks for is armed.
+  function goActive() {
+    var wasStopped = stopped;
+    stopped = false;
+    document.documentElement.removeAttribute('data-idle');
+    reconnectDelay = 0;
+    if (wasStopped && AUTH().ok()) { connect(); }
+    restartTurnTimer();
+  }
+
+  function onPageStateChange() {
+    if (hiddenStopTimer) { clearTimeout(hiddenStopTimer); hiddenStopTimer = null; }
+    if (visible()) { goActive(); return; }
+    // In the background the page keeps working — a desktop for good, a phone
+    // until its grace period is over — at the slow rhythm renderIntervalMs and
+    // turnTickMs pick up from visible(); only a running clock has to be re-armed
+    // here.
+    restartTurnTimer();
+    if (onPhone()) {
+      hiddenStopTimer = setTimeout(goIdle, HIDDEN_GRACE_MS_PHONE);
+    }
+  }
+
+  document.addEventListener('visibilitychange', onPageStateChange);
+  // Safari and Chrome's back-forward cache hand a page over without a
+  // visibilitychange, and a discarded tab is frozen before being dropped: those
+  // paths mean the page is going away whatever the device, so they stop it.
+  window.addEventListener('pagehide', goIdle);
+  window.addEventListener('pageshow', goActive);
+  window.addEventListener('freeze', goIdle);
+  window.addEventListener('resume', goActive);
 
   function send() {
     var text = input.value.trim();
@@ -846,12 +1042,11 @@
   // The composer's placeholder is short by nature of the box it sits in, but on
   // a phone even the short form is the whole line: a touch keyboard has no
   // Ctrl+Enter either, so the phone-width layout gets data-placeholder-short
-  // ("Message…") and the full hint stays in the textarea's title. The check
-  // follows the same breakpoint as the stylesheet (see the phone media query in
-  // app.css), so a rotation or a resize swaps the hint back and forth.
+  // ("Message…") and the full hint stays in the textarea's title. The shared
+  // phoneQuery above follows the stylesheet's breakpoint (see the phone media
+  // query in app.css), so a rotation or a resize swaps the hint back and forth.
   var PLACEHOLDER_LONG = input.placeholder;
   var PLACEHOLDER_SHORT = input.getAttribute('data-placeholder-short') || PLACEHOLDER_LONG;
-  var phoneQuery = window.matchMedia ? window.matchMedia('(max-width: 480px)') : null;
   function setComposerPlaceholder() {
     input.placeholder = (phoneQuery && phoneQuery.matches) ? PLACEHOLDER_SHORT : PLACEHOLDER_LONG;
   }

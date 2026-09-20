@@ -16,7 +16,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 | `internal/store` | 单会话持久化（`CWD/.lightagent/session.json`） |
 | `internal/cli` | 彩色 REPL、斜杠命令、Markdown 流式渲染（未完成行作为预览绘制在提示符上方，按终端宽度折行、最多 8 行，因此超出首行的文本也边收边显示）、提示区原地逐行重绘（不整块擦除，老式 Windows 控制台才不会闪屏）、`[thinking]` 思考流式块（同样应用 Markdown）、异步渲染事件 |
 | `internal/slash` | 斜杠命令表（名称 / 别名 / 参数 / 说明 / 网页是否常显）：CLI 的 `/help`、网页的 `/help` 与左侧命令栏都由此生成；同时提供命令解析（全角斜杠、别名归一）、on/off 参数解析与 `/history` 用量文案 |
-| `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown |
+| `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown；出站流式增量按 50ms 合帧（`web.go`），后台节流、手机隐藏超时后停表断连（`app.js`） |
 | `internal/markdown` | 无依赖的 Markdown → ANSI 渲染（CLI 用），按行流式输出并暴露未完成行（`Pending`）供预览 |
 | `internal/termcolor` | ANSI 彩色封装（检测到终端支持才着色） |
 
@@ -136,6 +136,8 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 * Web 的每个连接有独立的读协程，外加一条写协程（每条连接一个发送队列，见 `internal/web/client.go`）：
   注册连接与取快照在镜像的锁内完成（保证「快照 + 之后的事件」恰好一次），序列化与 socket 写入
   在锁外进行，因此慢/卡死的浏览器不会阻塞 Agent、CLI、其它页面或其它 HTTP 端点。
+  流式增量的合帧同样只在镜像的锁内做「记录 + 合并」，写出由各连接的写协程负责
+  （见 [web.md](web.md#省电移动端与隐藏页面)）。
 
 ## 持久化
 

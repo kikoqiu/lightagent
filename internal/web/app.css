@@ -191,6 +191,12 @@
      figures keep the badge from shifting as the tenths roll over. */
   header .run #elapsed { color:rgba(227,179,65,.8); font-variant-numeric:tabular-nums; }
   @keyframes spin { to { transform:rotate(360deg); } }
+  /* A hidden page stops its animations (app.js sets data-idle on <html>). The
+     busy spinner is the only thing that turns forever, and a compositor
+     animation waking a phone that shows another tab is pure battery; it starts
+     again with the page. The selector outranks the rule above so the pause is
+     not overridden by the running animation. */
+  [data-idle] header .run .spin { animation-play-state:paused; }
 
   /* ---- transcript ---- */
   #log {

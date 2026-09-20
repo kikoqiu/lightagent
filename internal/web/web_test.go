@@ -185,6 +185,51 @@ func TestResponsiveAffordances(t *testing.T) {
 	}
 }
 
+// TestHiddenPageSavesEnergy pins the power behaviour of the page: a desktop keeps
+// its mirror and its transcript while it is hidden (it only slows its redraws
+// down), a phone gets a grace period before it is stopped, a background page
+// redraws once a second, and a visible page is redrawn as soon as text arrives.
+// It also pins the reconnect backoff with jitter, so a sleeping phone does not
+// wake its radio every 1.5s.
+func TestHiddenPageSavesEnergy(t *testing.T) {
+	for _, want := range []string{
+		"function visible()", // "being looked at" is one predicate
+		"document.hidden",
+		"document.addEventListener('visibilitychange', onPageStateChange)",
+		"window.addEventListener('pagehide', goIdle)", // Safari/bfcache hand-over...
+		"window.addEventListener('pageshow', goActive)",
+		"window.addEventListener('freeze', goIdle)", // ...and a discarded tab
+		"window.addEventListener('resume', goActive)",
+		"function goIdle",
+		"function goActive",
+		"HIDDEN_GRACE_MS_PHONE", // a phone is stopped after a grace period...
+		"hiddenStopTimer = setTimeout(goIdle, HIDDEN_GRACE_MS_PHONE);",
+		"if (stopped) { return; }", // a stopped page does not dial, a hidden one does
+		"stopTurnTimer();",         // the elapsed clock stops with the page
+		"mdPending.clear();",       // so do the idle markdown slices
+		"data-idle",                // the attribute the stylesheet hangs the pause on
+		"[data-idle] header .run .spin { animation-play-state:paused; }",
+		"turnTickMs", // whole seconds on a phone...
+		"TURN_TICK_MS_PHONE",
+		"TURN_TICK_MS_HIDDEN",             // ...and once a second in the background
+		"matchMedia('(pointer: coarse)')", // a touch device counts as a phone
+		"restartTurnTimer",                // the clock follows the page's state
+		"RENDER_LIVE_PHONE_MS",            // a visible phone caps its redraws...
+		"RENDER_HIDDEN_MS",                // ...and a background page slows to one per second
+		"streamDelay",
+		"pinQueued", // one scroll write per animation frame
+		"requestAnimationFrame",
+		"nextReconnectDelay", // exponential backoff with jitter
+		"RECONNECT_MAX_MS",
+		"Math.random()",
+		"reconnectDelay = 0", // ...cleared by a handshake that succeeds
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+}
+
 // TestRunningIndicator guards the busy indicator: the page renders it and the
 // history frame reports whether a turn is already running. The pill also carries
 // the elapsed turn time, which is started with the spinner and cleared by the

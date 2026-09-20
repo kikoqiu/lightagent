@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"lightagent/internal/agent"
 	"lightagent/internal/llm"
@@ -108,6 +109,12 @@ type Server struct {
 	// reasoningOpen reports whether the newest row is a thinking row whose
 	// stream is still open; further reasoning_delta events append to it.
 	reasoningOpen bool
+	// pendingDelta/pendingText hold the merged streamed delta waiting for its
+	// coalescing window and pendingTimer flushes it once the window expires (see
+	// coalesceLocked). All three are guarded by mu.
+	pendingDelta agent.Event
+	pendingText  string
+	pendingTimer *time.Timer
 }
 
 // New binds the first available port at or after port (up to +maxPortTries).
@@ -175,6 +182,8 @@ func (s *Server) Start() {
 func (s *Server) Close() error {
 	s.stopOnce.Do(func() { close(s.stop) })
 	s.mu.Lock()
+	// Whatever was still waiting for its window goes away with the clients.
+	s.dropDeltaLocked()
 	clients := make([]*client, 0, len(s.clients))
 	for id, c := range s.clients {
 		clients = append(clients, c)
@@ -207,21 +216,113 @@ func (s *Server) subscribe() {
 	}()
 }
 
+// Streamed deltas are the mirror's only high-frequency traffic: a fast model
+// publishes dozens of reasoning/answer chunks per second, and every frame costs
+// a socket write plus, on a phone, a radio wake-up that outlives the bytes. Two
+// consecutive chunks of the same stream therefore travel as one frame (see
+// coalesceLocked). The scrollback is not affected: every chunk is recorded
+// exactly as published, so a page connecting later replays the same rows.
+const (
+	// deltaCoalesceWindow is how long a streamed delta waits for companions.
+	deltaCoalesceWindow = 50 * time.Millisecond
+	// deltaCoalesceMaxBytes bounds a merged frame: a very fast stream cannot grow
+	// one message without bound, and the page redraws per frame anyway.
+	deltaCoalesceMaxBytes = 64 << 10
+)
+
+// isStreamedDelta reports whether an event is a high-frequency stream chunk that
+// may be merged with its neighbours. Every other event flushes the merge first,
+// which is what keeps the order the scrollback recorded.
+func isStreamedDelta(t agent.EventType) bool {
+	return t == agent.EventReasoningDelta || t == agent.EventAssistantDelta
+}
+
 // publish records an agent event in the scrollback and queues it for every
 // client, dropping the connections that cannot take it. Recording and queueing
 // share one critical section with the connection handshake (see addClient), so a
 // client connecting concurrently still receives each event exactly once: either
 // inside its history frames or live. Nothing here touches a socket, so holding
 // the lock costs nothing even when a browser is slow.
+//
+// Streamed deltas take the detour through the coalescing window: they are
+// recorded right away (a snapshot has to describe them exactly as published) and
+// sent as one merged frame a moment later.
 func (s *Server) publish(ev agent.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordLocked(ev)
+	if isStreamedDelta(ev.Type) {
+		s.coalesceLocked(ev)
+		return
+	}
+	// Any other event ends or interrupts the streamed row: the merged chunks go
+	// out ahead of it, in the order the scrollback recorded them.
+	s.flushDeltaLocked()
 	data, err := json.Marshal(ev)
 	if err != nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.recordLocked(ev)
 	s.broadcastLocked(data)
+}
+
+// coalesceLocked merges one streamed delta into the pending frame. A chunk of
+// the other stream flushes first, so a page never draws text out of order. With
+// no client connected there is nothing to send it to — a page that connects
+// later replays the row from the scrollback — so the merge is dropped instead of
+// arming a timer. The caller must hold s.mu.
+func (s *Server) coalesceLocked(ev agent.Event) {
+	if len(s.clients) == 0 {
+		s.dropDeltaLocked()
+		return
+	}
+	if s.pendingDelta.Type != "" && s.pendingDelta.Type != ev.Type {
+		s.flushDeltaLocked()
+	}
+	s.pendingDelta = ev
+	s.pendingText += ev.Text
+	if len(s.pendingText) >= deltaCoalesceMaxBytes {
+		s.flushDeltaLocked()
+		return
+	}
+	if s.pendingTimer == nil {
+		s.pendingTimer = time.AfterFunc(deltaCoalesceWindow, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.flushDeltaLocked()
+		})
+	}
+}
+
+// flushDeltaLocked sends the merged streamed delta, if there is one. The caller
+// must hold s.mu.
+func (s *Server) flushDeltaLocked() {
+	if s.pendingTimer != nil {
+		s.pendingTimer.Stop()
+		s.pendingTimer = nil
+	}
+	if s.pendingDelta.Type == "" {
+		return
+	}
+	ev := s.pendingDelta
+	ev.Text = s.pendingText
+	s.pendingDelta = agent.Event{}
+	s.pendingText = ""
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	s.broadcastLocked(data)
+}
+
+// dropDeltaLocked discards the merged delta without sending it, for a log that is
+// about to be replaced. The caller must hold s.mu.
+func (s *Server) dropDeltaLocked() {
+	if s.pendingTimer != nil {
+		s.pendingTimer.Stop()
+		s.pendingTimer = nil
+	}
+	s.pendingDelta = agent.Event{}
+	s.pendingText = ""
 }
 
 // broadcastLocked queues one payload for every connected client and closes the
@@ -256,6 +357,11 @@ func (s *Server) broadcastFramesLocked(frames [][]byte) {
 // requests.
 func (s *Server) addClient(conn *wsConn) *client {
 	s.mu.Lock()
+	// A merged streamed delta goes out before this client is registered: the
+	// scrollback already holds those chunks (recordLocked runs at publish time),
+	// so they are part of the snapshot below, and sending the frame as well would
+	// draw the same text a second time on the new page.
+	s.flushDeltaLocked()
 	s.nextID++
 	c := newClient(s.nextID, conn)
 	s.clients[c.id] = c
@@ -791,6 +897,9 @@ func (s *Server) localError(text string) {
 func (s *Server) clearScrollback() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The cleared log has no rows: a merged chunk of the discarded conversation
+	// must not land in it after the empty snapshot below.
+	s.dropDeltaLocked()
 	s.history = nil
 	s.reasoningOpen = false
 	rows, header := s.historySnapshotLocked()
