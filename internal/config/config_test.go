@@ -398,40 +398,77 @@ func TestDiscoveryConfigPartialFileDefaults(t *testing.T) {
 }
 
 // TestWebFetchConfigDefaults verifies the built-in webfetch settings: the fetch
-// strategy is auto and the optional web settings start unset.
+// strategy is auto (a visible browser), the feedback is limited and the optional
+// web settings start unset.
 func TestWebFetchConfigDefaults(t *testing.T) {
 	w := Default().Tools.WebFetch
-	if !w.Enabled || w.TimeoutSeconds != 30 || !w.Compress || w.CompressRetries != 2 {
+	if !w.Enabled || w.TimeoutSeconds != 30 {
 		t.Fatalf("webfetch defaults = %+v", w)
+	}
+	if w.MaxLines != WebFetchMaxLinesDefault || WebFetchMaxLinesDefault != 200 {
+		t.Fatalf("max_lines = %d, want the built-in %d", w.MaxLines, WebFetchMaxLinesDefault)
 	}
 	if w.Mode != WebFetchModeAuto || w.EffectiveMode() != WebFetchModeAuto {
 		t.Fatalf("webfetch.mode = %q, want %q", w.Mode, WebFetchModeAuto)
 	}
-	if w.BrowserPath != "" || w.UserAgent != "" || w.MaxBytes != 0 {
+	if w.BrowserPath != "" || w.UserAgent != "" || w.MaxBytes != 0 || w.AttachAddress != "" {
 		t.Fatalf("the optional web settings must start unset: %+v", w)
+	}
+	if got := w.AttachEndpoint(); got != WebFetchAttachAddressDefault {
+		t.Fatalf("attach endpoint = %q, want the built-in %q", got, WebFetchAttachAddressDefault)
 	}
 }
 
 // TestWebFetchConfigModeValidation verifies the fetch strategy is one of the
-// three the fetcher implements, whatever the spelling of the value.
+// ones the fetcher implements, whatever the spelling of the value.
 func TestWebFetchConfigModeValidation(t *testing.T) {
 	cfg := Default()
 	cfg.OpenAI.APIKey = "sk-x"
-	for _, mode := range []string{WebFetchModeAuto, WebFetchModeBrowser, WebFetchModeHTTP, " HTTP "} {
+	modes := []string{
+		WebFetchModeAuto, WebFetchModeHeadful, WebFetchModeHeadless, WebFetchModeAttached, WebFetchModeHTTP,
+		" HTTP ",
+	}
+	for _, mode := range modes {
 		cfg.Tools.WebFetch.Mode = mode
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("tools.webfetch.mode %q should validate: %v", mode, err)
 		}
 	}
-	cfg.Tools.WebFetch.Mode = "chrome"
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("an unknown fetch strategy must fail validation")
+	// The strategies of older configurations and plain typos are both refused.
+	for _, mode := range []string{"chrome", "browser"} {
+		cfg.Tools.WebFetch.Mode = mode
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("tools.webfetch.mode %q must fail validation", mode)
+		}
+	}
+}
+
+// TestWebFetchConfigAttachEndpoint verifies the endpoint a chrome-attached fetch
+// reaches for: one configured address, or the built-in one. The address carries
+// host and port together, so the value is handed over as it is written (trimmed).
+func TestWebFetchConfigAttachEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  WebFetchToolConfig
+		want string
+	}{
+		{"port only", WebFetchToolConfig{AttachAddress: " 9333 "}, "9333"},
+		{"host and port", WebFetchToolConfig{AttachAddress: "192.168.0.5:9223"}, "192.168.0.5:9223"},
+		{"browser socket", WebFetchToolConfig{AttachAddress: " ws://127.0.0.1:9333/devtools/browser/x "},
+			"ws://127.0.0.1:9333/devtools/browser/x"},
+		{"empty falls back", WebFetchToolConfig{}, WebFetchAttachAddressDefault},
+	}
+	for _, tc := range cases {
+		if got := tc.cfg.AttachEndpoint(); got != tc.want {
+			t.Errorf("%s: AttachEndpoint() = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
 // TestWebFetchConfigPartialFileDefaults verifies a partial webfetch section
 // keeps the built-in settings when merged from a config file, that the section's
-// own values win, and that an unusable byte cap falls back to the built-in one.
+// own values win, and that an unusable byte cap or port falls back to the
+// built-in one.
 func TestWebFetchConfigPartialFileDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -449,23 +486,31 @@ func TestWebFetchConfigPartialFileDefaults(t *testing.T) {
 	if w.EffectiveMode() != WebFetchModeAuto {
 		t.Fatalf("mode = %q, want the default %q", w.EffectiveMode(), WebFetchModeAuto)
 	}
-	if w.TimeoutSeconds != 30 || !w.Compress || w.CompressRetries != 2 {
+	if w.TimeoutSeconds != 30 || w.MaxLines != WebFetchMaxLinesDefault {
 		t.Fatalf("merged webfetch config = %+v, want defaults preserved", w)
 	}
 	if w.UserAgent != "ua/1.0" {
 		t.Fatalf("user_agent = %q, want the stored value", w.UserAgent)
 	}
 
-	// A negative cap is unusable, so it falls back to the built-in one.
-	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"webfetch":{"max_bytes":-1}}}`), 0o600); err != nil {
+	// A negative cap is unusable, so it falls back to the built-in one; a
+	// negative line limit is the caller asking for no limit and is kept.
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"webfetch":{"max_bytes":-1,"max_lines":-1,"attach_address":"192.168.0.5:9223"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _, _, err = Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got := cfg.Tools.WebFetch.MaxBytes; got != Default().Tools.WebFetch.MaxBytes {
-		t.Fatalf("max_bytes = %d, want the default %d", got, Default().Tools.WebFetch.MaxBytes)
+	w = cfg.Tools.WebFetch
+	if w.MaxBytes != Default().Tools.WebFetch.MaxBytes {
+		t.Fatalf("max_bytes = %d, want the default %d", w.MaxBytes, Default().Tools.WebFetch.MaxBytes)
+	}
+	if w.MaxLines != -1 {
+		t.Fatalf("max_lines = %d, want the stored -1 (no limit)", w.MaxLines)
+	}
+	if got := w.AttachEndpoint(); got != "192.168.0.5:9223" {
+		t.Fatalf("attach endpoint = %q, want the stored address", got)
 	}
 }
 

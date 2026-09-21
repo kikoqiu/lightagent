@@ -36,7 +36,7 @@
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板） |
 | 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
-| 17 | 网页抓取 | `webfetch`：抓网页（`tools.webfetch.mode`：浏览器渲染 / HTTP 源码 / 自动）→ 转 Markdown；浏览器路径、User-Agent、源码字节上限均可配；结果默认先**自压缩**（模型压成核心内容后再替换 tool 消息，重试次数可配） |
+| 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；反馈默认**最多 200 行**（`max_lines`，可关），超长部分整页存到工作目录 `.lightagent/webfetch-<时间>.html` 并在反馈里给出路径 |
 
 ---
 
@@ -156,7 +156,7 @@ source <(lightagent completion bash)       # bash 补全
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
-    "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "compress": true, "compress_retries": 2 },
+    "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "max_lines": 200 },
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
       "enabled": false,
@@ -192,9 +192,11 @@ source <(lightagent completion bash)       # bash 补全
 * `tools.mcp`：内置纯标准库 MCP 客户端，按 `servers` 连接外部 MCP server（`stdio` / `http` / `sse`）。详见
   [configuration.md](docs/configuration.md#toolsmcpmcp-客户端)。
 * `tools.webfetch`：网页抓取工具（`url` + `timeout` 参数），页面经浏览器渲染或 HTTP 源码取得后转成
-  Markdown；取法由 web 侧配置决定（`mode`：`auto` / `browser` / `http`，另有 `browser_path`、
-  `user_agent`、`max_bytes`）；抓取结果默认先**自压缩**（`tools.webfetch.compress`，格式不对重试
-  `compress_retries` 次）再进上下文，长网页只占压缩后的长度。详见 [tools.md](docs/tools.md#webfetch)。
+  Markdown；取法由 web 侧配置决定（`mode`：`auto` / `chrome-headful` / `chrome-headless` /
+  `chrome-attached` / `http`，另有 `browser_path`、`user_agent`、`max_bytes`，`chrome-attached` 还有
+  `attach_address`）；只收网页与文本内容，二进制地址直接报错；
+  进入上下文的正文默认最多 `max_lines`（200）行，超长的整页存到 `.lightagent/` 并把路径写进反馈。
+  详见 [tools.md](docs/tools.md#webfetch)。
 * `tools.discovery`：MCP 工具发现 / unlock 机制（`tool_search_tool_bm25` → `unlock_tool` → `dynamic_call`）。
   MCP 工具恒为**锁定函数**，永不出现在 `tools` 声明里；系统提示词只注入 1 条全局机制规则 + 每 server 1 条 MCP 全局信息。详见
   [tools.md](docs/tools.md#mcp-工具发现--unlocktoolsdiscovery)。
@@ -394,20 +396,32 @@ CRLF 文件按 LF 匹配、写回时恢复 CRLF。
 
 ### `webfetch`
 抓取网页 → 转成 Markdown 交给模型。`url` 必填，`timeout`（秒）默认取
-`tools.webfetch.timeout_seconds`（30）。取法由 `tools.webfetch.mode` 决定：默认 `auto`
-（装了 Chromium 系浏览器就用无头浏览器渲染，否则回退 HTTP 源码），`browser` 要求必须渲染，
-`http` 只取源码；`browser_path` / `user_agent` / `max_bytes` 分别指定浏览器可执行文件、
-两条路径的 User-Agent 与 HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`，
-相对链接按**重定向后的**地址补全。
+`tools.webfetch.timeout_seconds`（30）。**只支持网页与文本内容**：地址返回二进制内容（PDF、图片、
+压缩包等）时直接返回错误，并提示改用 `exec_command` 下载/转换。
+
+取法由 `tools.webfetch.mode` 决定：
+
+* `auto`（默认）：用**可见窗口**的浏览器渲染（减少被反爬拦截的可能），没有可用浏览器时回退 HTTP 源码；
+* `chrome-headful`：必须用可见窗口的浏览器渲染；
+* `chrome-headless`：必须用无头浏览器渲染；
+* `chrome-attached`：挂到**已在运行**的浏览器上（DevTools 端点由 `attach_address` 给出，
+  可写端口 `"9222"`、`host:port`、`http://…` 或 `ws://…`，默认 `127.0.0.1:9222`），
+  用它自己的登录态与 Cookie；
+* `http`：只取 HTTP 源码，从不启动浏览器。
+
+`auto` / `chrome-headful` 启动的窗口用 agent **自己的 profile**（工作目录下
+`.lightagent/browser-profile`），不会打扰你正在使用的浏览器；要用你自己的登录态请选 `chrome-attached`。
+浏览器关闭时先请它自己退出（最多等 5 秒，之后才强杀进程树），启动前也清掉上次异常退出留下的
+残留（端口文件、崩溃标记），因此不会出现"每次打开都提示恢复上次会话、抓取一直超时"的情况。
+
+`browser_path` / `user_agent` / `max_bytes` 分别指定浏览器可执行文件、两条路径的 User-Agent 与
+HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`，相对链接按**重定向后的**地址补全。
 工具返回的正文（状态行 + `---` + Markdown）就和其他工具一样，按普通 tool 反馈记录，没有额外信封。
 
-结果默认先**自压缩**（`tools.webfetch.compress`）：本轮全部 tool 反馈记录完之后，引擎**按调用顺序**对其中的网页反馈
-**逐个**追加一条 `[engine]` user 提示（其余调用**跳过**、反馈原样保留），**指明压哪次调用的返回**
-（`webfetch {"url":"…"}` + `call id`，因为上下文里可能同时有好几条反馈、甚至好几个 `webfetch` 同时发过），
-让模型保留格式地把那条正文压成核心内容、去掉广告与无关内容，并用 `<compressed-content></compressed-content>`
-单独回一条消息；格式不对就再追加提示重试（每条 `tools.webfetch.compress_retries`，默认 2），超限即放弃那一条。
-**全部拿到后再统一收尾**：回滚追加的提示与中间回复，把对应 tool 消息重新记为压缩内容（位置不变），
-因此长网页在上下文里只占压缩后的长度。详见 [tools.md](docs/tools.md#webfetch)。
+**反馈长度**默认限制在 `tools.webfetch.max_lines`（200）行：超长的正文只保留前 N 行，整页（HTML）
+写进工作目录的 `.lightagent/webfetch-<时间>.html`，状态行说明"超长、总行数与总字节、文件路径"，
+需要全文时模型可用 `read_file_lines` 分页读取该文件。负数表示不限长度（此时不落盘）。
+详见 [tools.md](docs/tools.md#webfetch)。
 
 ---
 

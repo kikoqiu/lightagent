@@ -40,6 +40,9 @@ const (
 	// browserStopTimeout bounds the teardown of a browser (closing the pages
 	// and waiting for the process to be gone).
 	browserStopTimeout = 10 * time.Second
+	// browserQuitTimeout bounds waiting for a launched browser to end after it
+	// was asked to quit, before its process tree is killed.
+	browserQuitTimeout = 5 * time.Second
 )
 
 // BrowserOptions configures how a browser is launched or attached to. The zero
@@ -141,6 +144,9 @@ func LaunchBrowser(ctx context.Context, opts BrowserOptions) (*Browser, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A profile that outlives our browser carries the leftovers of the previous
+	// run, and they would spoil this launch (see prepareProfileDir).
+	prepareProfileDir(profileDir)
 	port, awaitPortFile := browserDebugPort(opts, profileDir)
 	cmd := exec.Command(execPath, browserLaunchArgs(profileDir, port, opts)...)
 	cmd.Stdout = io.Discard
@@ -307,8 +313,16 @@ func (b *Browser) call(ctx context.Context, session, method string, params any, 
 func (b *Browser) Options() BrowserOptions { return b.opts }
 
 // Close releases the browser: the pages this connection opened, the WebSocket
-// and — for a browser that was launched here — the whole process tree together
-// with the temporary profile. A browser that was attached to keeps running.
+// and — for a browser that was launched here — the browser itself.
+//
+// A launched browser is first asked to quit over the protocol and given a moment
+// to end on its own; only a browser that does not go away is killed with its
+// process tree. That matters beyond tidiness: a browser that ends by itself
+// leaves a clean profile behind — no "did not end cleanly" marker, no leftover
+// DevTools port file — so the next launch on the same profile starts straight
+// away instead of working around the leftovers of this one (see
+// prepareProfileDir, which cleans up after a browser that never got the chance).
+// A browser that was attached to keeps running; nothing of the user's is closed.
 func (b *Browser) Close() error {
 	b.mu.Lock()
 	if b.closed {
@@ -331,6 +345,18 @@ func (b *Browser) Close() error {
 			_ = conn.call(closeCtx, "", "Target.closeTarget", map[string]any{"targetId": targetID}, nil)
 		}
 		cancel()
+		if cmd != nil {
+			// An empty session addresses the browser itself, which is where
+			// Browser.close lives. The call fails once the browser goes away,
+			// which is the point of it.
+			quitCtx, cancel := context.WithTimeout(context.Background(), browserQuitTimeout)
+			_ = conn.call(quitCtx, "", "Browser.close", nil, nil)
+			cancel()
+			select {
+			case <-b.exited:
+			case <-time.After(browserQuitTimeout):
+			}
+		}
 		_ = conn.close()
 	}
 	if cmd != nil {

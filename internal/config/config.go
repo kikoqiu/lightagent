@@ -262,15 +262,33 @@ type WriteToolConfig struct {
 // names internal/utils reads, so the session wiring passes them through as they
 // are.
 const (
-	// WebFetchModeAuto renders with a browser when a Chromium-based one is
-	// installed and falls back to the HTTP source when it is not. This is the
-	// default.
+	// WebFetchModeAuto renders the page in a visible browser (the way
+	// WebFetchModeHeadful works) and falls back to the HTTP source when no
+	// browser can be started. A browser with a window is far less likely to be
+	// blocked than a headless one, which is why it is the default.
 	WebFetchModeAuto = "auto"
-	// WebFetchModeBrowser requires a browser: the HTTP source is never used, so
-	// a failure explains what rendering was missing.
-	WebFetchModeBrowser = "browser"
+	// WebFetchModeHeadful renders the page in a visible browser window started
+	// for the request.
+	WebFetchModeHeadful = "chrome-headful"
+	// WebFetchModeHeadless renders the page in a headless browser started for
+	// the request.
+	WebFetchModeHeadless = "chrome-headless"
+	// WebFetchModeAttached renders the page through a browser that is already
+	// running, reached over the DevTools endpoint of attach_address (the user's
+	// own browser, with their logins and cookies).
+	WebFetchModeAttached = "chrome-attached"
 	// WebFetchModeHTTP downloads the source and never starts a browser.
 	WebFetchModeHTTP = "http"
+)
+
+// Built-in webfetch limits and endpoints.
+const (
+	// WebFetchMaxLinesDefault is how many lines of markdown webfetch feeds back
+	// before a page is cut and saved to disk instead (tools.webfetch.max_lines).
+	WebFetchMaxLinesDefault = 200
+	// WebFetchAttachAddressDefault is the DevTools endpoint a chrome-attached
+	// fetch reaches for when attach_address is empty.
+	WebFetchAttachAddressDefault = "127.0.0.1:9222"
 )
 
 // WebFetchToolConfig configures webfetch.
@@ -281,13 +299,19 @@ type WebFetchToolConfig struct {
 	// TimeoutSeconds bounds one fetch (page load, rendering and conversion
 	// included) and is the default of the tool's own timeout argument.
 	TimeoutSeconds int `json:"timeout_seconds"`
-	// Mode selects how a page is obtained: WebFetchModeAuto (a browser when one
-	// is installed, else the HTTP source), WebFetchModeBrowser (a browser is
-	// required) or WebFetchModeHTTP (the source only). Any other value is
-	// rejected by Validate.
+	// Mode selects how a page is obtained: WebFetchModeAuto (a visible browser,
+	// else the HTTP source), WebFetchModeHeadful, WebFetchModeHeadless,
+	// WebFetchModeAttached or WebFetchModeHTTP. Any other value is rejected by
+	// Validate.
 	Mode string `json:"mode"`
+	// MaxLines caps the lines of markdown the tool feeds back. A page that does
+	// not fit is cut there and saved in full (as HTML) below the .lightagent
+	// directory of the working directory, with the path reported to the model.
+	// 0 keeps WebFetchMaxLinesDefault, a negative value asks for no limit.
+	MaxLines int `json:"max_lines"`
 	// BrowserPath pins the browser executable used to render a page (an empty
-	// value discovers an installed one). It is left out of the file when empty.
+	// value discovers an installed one). A mode that attaches never uses it. It
+	// is left out of the file when empty.
 	BrowserPath string `json:"browser_path,omitempty"`
 	// UserAgent overrides the user agent of both paths: the browser when one
 	// renders the page, the HTTP request otherwise. Empty keeps the default of
@@ -296,17 +320,12 @@ type WebFetchToolConfig struct {
 	// MaxBytes caps the body read over HTTP, in bytes. 0 keeps the built-in cap
 	// (8 MiB); the key is left out of the file when 0.
 	MaxBytes int64 `json:"max_bytes,omitempty"`
-	// Compress runs the self-compression pass: after a page was fetched and
-	// converted, the agent asks the model to condense the markdown before it
-	// becomes part of the context, so a long page costs a short tool result
-	// instead of its whole text. It defaults to true; loading starts from the
-	// defaults, so an explicit "compress": false is required to turn it off.
-	Compress bool `json:"compress"`
-	// CompressRetries is how many times the model may be asked again when its
-	// compression reply does not follow the requested format. Reaching the
-	// limit keeps the full page content. 0 disables retrying, a negative value
-	// falls back to the default.
-	CompressRetries int `json:"compress_retries"`
+	// AttachAddress is the DevTools endpoint of the browser to drive in
+	// WebFetchModeAttached. One string says all of it: "9222" (a port on
+	// 127.0.0.1), "192.168.0.5:9223", "127.0.0.1:9222", or an http:// / ws://
+	// URL. Empty means WebFetchAttachAddressDefault. It is left out of the file
+	// when empty.
+	AttachAddress string `json:"attach_address,omitempty"`
 }
 
 // EffectiveMode returns the fetch strategy, defaulting to auto. The value is
@@ -317,6 +336,16 @@ func (c WebFetchToolConfig) EffectiveMode() string {
 		return WebFetchModeAuto
 	}
 	return mode
+}
+
+// AttachEndpoint returns the DevTools endpoint a chrome-attached fetch reaches
+// for: the configured address, or the built-in one when nothing is configured.
+// It is what the tool hands to internal/utils as the browser to drive.
+func (c WebFetchToolConfig) AttachEndpoint() string {
+	if address := strings.TrimSpace(c.AttachAddress); address != "" {
+		return address
+	}
+	return WebFetchAttachAddressDefault
 }
 
 // ToggleToolConfig is a simple enabled/disabled switch.
@@ -362,7 +391,12 @@ func Default() *Config {
 			ReadFileLines: FsToolConfig{Enabled: true, MaxReadFileSize: 32000, MaxReadFileLines: 200},
 			WriteFile:     WriteToolConfig{Enabled: true, MaxLines: 200, AutoSplit: true},
 			EditFile:      ToggleToolConfig{Enabled: true},
-			WebFetch:      WebFetchToolConfig{Enabled: true, Mode: WebFetchModeAuto, TimeoutSeconds: 30, Compress: true, CompressRetries: 2},
+			WebFetch: WebFetchToolConfig{
+				Enabled:        true,
+				Mode:           WebFetchModeAuto,
+				TimeoutSeconds: 30,
+				MaxLines:       WebFetchMaxLinesDefault,
+			},
 			Discovery: ToolDiscoveryConfig{
 				Enabled:          false,
 				Mode:             ToolDiscoveryModeUnlock,
@@ -727,15 +761,15 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Tools.WebFetch.Mode) == "" {
 		c.Tools.WebFetch.Mode = def.Tools.WebFetch.Mode
 	}
+	// max_lines: 0 (unset) means the built-in limit; a negative value is kept as
+	// the caller asking for no limit at all.
+	if c.Tools.WebFetch.MaxLines == 0 {
+		c.Tools.WebFetch.MaxLines = def.Tools.WebFetch.MaxLines
+	}
 	// max_bytes is a cap: 0 (unset) means the built-in one, and a negative
 	// value falls back to it as well.
 	if c.Tools.WebFetch.MaxBytes < 0 {
 		c.Tools.WebFetch.MaxBytes = def.Tools.WebFetch.MaxBytes
-	}
-	// An explicit 0 means "no retry after a malformed compression reply", so
-	// only a negative value falls back to the default.
-	if c.Tools.WebFetch.CompressRetries < 0 {
-		c.Tools.WebFetch.CompressRetries = def.Tools.WebFetch.CompressRetries
 	}
 	if strings.TrimSpace(c.Tools.Discovery.Mode) == "" {
 		c.Tools.Discovery.Mode = def.Tools.Discovery.Mode
@@ -765,13 +799,14 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.OpenAI.APIKey) == "" {
 		return fmt.Errorf("openai.api_key is empty; edit the config file and try again")
 	}
-	// webfetch obtains a page in one of three ways, and only those three: a
-	// typo must be reported instead of silently falling back to the default.
+	// webfetch obtains a page in one of a few ways, and only those: a typo must
+	// be reported instead of silently falling back to the default.
 	switch c.Tools.WebFetch.EffectiveMode() {
-	case WebFetchModeAuto, WebFetchModeBrowser, WebFetchModeHTTP:
+	case WebFetchModeAuto, WebFetchModeHeadful, WebFetchModeHeadless, WebFetchModeAttached, WebFetchModeHTTP:
 	default:
-		return fmt.Errorf("tools.webfetch.mode %q is not supported (want %q, %q or %q)",
-			c.Tools.WebFetch.Mode, WebFetchModeAuto, WebFetchModeBrowser, WebFetchModeHTTP)
+		return fmt.Errorf("tools.webfetch.mode %q is not supported (want %q, %q, %q, %q or %q)",
+			c.Tools.WebFetch.Mode, WebFetchModeAuto, WebFetchModeHeadful, WebFetchModeHeadless,
+			WebFetchModeAttached, WebFetchModeHTTP)
 	}
 	// MCP tools always use the find/unlock mechanism, so enabling MCP also
 	// requires a valid discovery configuration.

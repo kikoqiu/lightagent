@@ -2,7 +2,10 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,13 +15,38 @@ import (
 // WebFetchToolName is the tool identifier of the page fetcher.
 const WebFetchToolName = "webfetch"
 
-// webFetchTimeoutDefault bounds a fetch when no timeout is configured.
-const webFetchTimeoutDefault = 30 * time.Second
-
-// bodySeparator divides the tool's own status line from the markdown it carries.
-// The answer is the tool's return value, recorded as an ordinary tool message
-// like every other tool's; nothing wraps it.
-const bodySeparator = "---"
+const (
+	// webFetchTimeoutDefault bounds a fetch when no timeout is configured.
+	webFetchTimeoutDefault = 30 * time.Second
+	// WebFetchMaxLinesDefault is how many lines of markdown the tool feeds back
+	// when nothing else is configured. A page that does not fit is cut there and
+	// saved to disk instead (see lightagentDir).
+	WebFetchMaxLinesDefault = 200
+	// bodySeparator divides the tool's own status line from the markdown it
+	// carries. The answer is the tool's return value, recorded as an ordinary
+	// tool message like every other tool's; nothing wraps it.
+	bodySeparator = "---"
+	// lightagentDir is the directory the agent keeps its state in, below the
+	// working directory: the pages of a fetch that was too long to feed back,
+	// and the browser profile of a launch of its own.
+	lightagentDir = ".lightagent"
+	// webFetchOverflowPrefix names the files a long page is saved in, followed by
+	// the timestamp of the fetch so a sequence of them stays readable in the
+	// directory.
+	webFetchOverflowPrefix = "webfetch-"
+	// webFetchOverflowTimeFormat is the timestamp layout of an overflow file.
+	webFetchOverflowTimeFormat = "20060102-150405"
+	// webFetchOverflowNameAttempts bounds the search for a free file name when
+	// several fetches land in the same second.
+	webFetchOverflowNameAttempts = 100
+	// browserProfileName is the browser profile a launch of our own uses, below
+	// lightagentDir.
+	browserProfileName = "browser-profile"
+	// nonPageHint tells the model what to do instead of fetching again when the
+	// address does not serve a page.
+	nonPageHint = "webfetch reads pages and text documents only; download or convert binary content " +
+		"(PDF, images, archives, ...) with exec_command instead."
+)
 
 // WebFetchConfig carries the webfetch settings.
 type WebFetchConfig struct {
@@ -26,19 +54,15 @@ type WebFetchConfig struct {
 	// It is the default of the tool's timeout argument. A non-positive value
 	// falls back to webFetchTimeoutDefault.
 	Timeout time.Duration
-	// Compress asks the agent to run a self-compression pass over the fetched
-	// markdown before it enters the context (tools.webfetch.compress).
-	Compress bool
-	// CompressRetries is how many times the agent may ask the model again after
-	// a compression reply that does not follow the requested format
-	// (tools.webfetch.compress_retries).
-	CompressRetries int
 	// Mode selects how the page is obtained. The empty value is the usual
-	// default (utils.FetchModeAuto: render with a browser when one is
-	// installed, else take the HTTP source).
+	// default (utils.FetchModeAuto: a visible browser, else the HTTP source).
 	Mode utils.FetchMode
+	// MaxLines caps how many lines of markdown the tool feeds back; a longer
+	// page is cut there and saved in full below the working directory. 0 keeps
+	// WebFetchMaxLinesDefault, a negative value asks for no limit at all.
+	MaxLines int
 	// BrowserPath pins the browser executable to render with; empty means
-	// auto-detection (utils.FindChrome). The HTTP path never uses it.
+	// auto-detection (utils.FindChrome). A mode that attaches never uses it.
 	BrowserPath string
 	// UserAgent overrides the user agent of both paths. Empty keeps the default
 	// of each one: the Go client's for the HTTP source, the browser's own for a
@@ -47,6 +71,10 @@ type WebFetchConfig struct {
 	// MaxBytes caps the body read over HTTP (0 keeps the cap of internal/utils,
 	// see utils.WebFetchMaxBytesDefault).
 	MaxBytes int64
+	// AttachEndpoint is the DevTools endpoint of the browser to drive in
+	// chrome-attached mode: "127.0.0.1:9222", "9222", an http:// or a ws://
+	// URL. It is only read in that mode.
+	AttachEndpoint string
 }
 
 // WebFetchTool fetches a page, converts it to markdown and returns the markdown
@@ -63,6 +91,9 @@ func NewWebFetchTool(cfg WebFetchConfig) *WebFetchTool {
 	if cfg.Mode == "" {
 		cfg.Mode = utils.FetchModeAuto
 	}
+	if cfg.MaxLines == 0 {
+		cfg.MaxLines = WebFetchMaxLinesDefault
+	}
 	return &WebFetchTool{cfg: cfg}
 }
 
@@ -72,7 +103,9 @@ func (t *WebFetchTool) Name() string { return WebFetchToolName }
 // Description implements Tool.
 func (t *WebFetchTool) Description() string {
 	return "Fetch a web page and read it as markdown. " + t.strategy() +
-		" The answer carries a status line (conversion result and any converter warning) and the markdown of the page. " +
+		" Only pages and other text documents are supported: an address that serves binary content " +
+		"(a PDF, an image, an archive, ...) is refused with an error, so use a command to get such content. " +
+		t.feedbackRule() +
 		"Use it to read documentation, articles or any address of the web instead of downloading " +
 		"the page with a command."
 }
@@ -81,13 +114,30 @@ func (t *WebFetchTool) Description() string {
 // never told about a browser it will not get.
 func (t *WebFetchTool) strategy() string {
 	switch t.cfg.Mode {
-	case utils.FetchModeBrowser:
-		return "The page is rendered with a browser, and the fetch fails when none is available."
 	case utils.FetchModeHTTP:
 		return "The page is downloaded over HTTP, without a browser."
+	case utils.FetchModeChromeHeadless:
+		return "The page is rendered in a headless browser."
+	case utils.FetchModeChromeAttached:
+		return "The page is rendered through a browser that is already running, " +
+			"reached over its DevTools endpoint."
+	case utils.FetchModeChromeHeadful:
+		return "The page is rendered in a visible browser window."
 	default:
-		return "The page is rendered with a browser when one is available and downloaded over HTTP otherwise."
+		return "The page is rendered in a visible browser window when a browser can be started " +
+			"and downloaded over HTTP otherwise."
 	}
+}
+
+// feedbackRule states what the answer carries: the model has to know that a long
+// page arrives cut, and that the whole page is on disk.
+func (t *WebFetchTool) feedbackRule() string {
+	if t.cfg.MaxLines < 0 {
+		return "The answer carries the whole markdown of the page. "
+	}
+	return fmt.Sprintf("The answer carries a status line and at most %d lines of markdown; a longer page is cut "+
+		"there and saved in full (as HTML) in the %s directory of the working directory, with the path "+
+		"reported in the answer. ", t.cfg.MaxLines, lightagentDir)
 }
 
 // Parameters implements Tool.
@@ -96,8 +146,9 @@ func (t *WebFetchTool) Parameters() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"url": map[string]any{
-				"type":        "string",
-				"description": "Address of the page (http or https; a missing scheme is read as https).",
+				"type": "string",
+				"description": "Address of a web page (http or https; a missing scheme is read as https). " +
+					"Addresses that serve other content are refused.",
 			},
 			"timeout": map[string]any{
 				"type": "integer",
@@ -129,7 +180,14 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) *Result
 
 	page, err := utils.WebFetch(ctx, rawURL, t.fetchOptions(timeout)...)
 	if err != nil {
-		return Fail(fmt.Sprintf("Fetch failed: %v", err))
+		return Fail(t.fetchFailure(err))
+	}
+	// A browser hands back whatever it rendered, including a PDF viewer or an
+	// image, so the type of the document is checked here as well: webfetch reads
+	// pages, and a caller that asked for something else has to learn that.
+	if !utils.IsPageContentType(page.ContentType) {
+		return Fail(fmt.Sprintf("Not a web page: %s serves %s. %s",
+			page.FinalURL, describeContentType(page.ContentType), nonPageHint))
 	}
 	converted, err := utils.Html2MdConvert(page.HTML, utils.WithBaseURL(page.FinalURL))
 	if err != nil {
@@ -146,32 +204,181 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) *Result
 	if len(converted.Warnings) > 0 {
 		warnings = strings.Join(converted.Warnings, "; ")
 	}
+	body, overflow, savedTo := t.limitFeedback(page, markdown)
+	status := fmt.Sprintf("Conversion succeeded. Converter warnings (if any): %s", warnings)
+	if overflow != "" {
+		status += "\n" + overflow
+	}
+
 	res := &Result{
 		// The tool returns its own text, which the agent records as the tool
 		// message of the call like any other tool's answer.
-		ForLLM: fmt.Sprintf("Conversion succeeded. Converter warnings (if any): %s\n%s\n\n%s",
-			warnings, bodySeparator, markdown),
-		ForUser: fmt.Sprintf("Fetched %s as markdown (%s, %d chars, %.1fs)",
-			page.FinalURL, page.Method, len(markdown), page.Elapsed.Seconds()),
+		ForLLM: status + "\n" + bodySeparator + "\n\n" + body,
+		ForUser: fmt.Sprintf("Fetched %s as markdown (%s, %d lines, %d chars, %.1fs)",
+			page.FinalURL, page.Method, countLines(markdown), len(markdown), page.Elapsed.Seconds()),
+	}
+	if overflow != "" {
+		res.ForUser += fmt.Sprintf("\nFeedback cut at %d lines", t.cfg.MaxLines)
+		if savedTo != "" {
+			res.ForUser += "; the whole page is in " + savedTo
+		}
 	}
 	if len(page.Notes) > 0 {
 		res.ForUser += "\n" + strings.Join(page.Notes, "; ")
 	}
-	res.Compress = t.cfg.Compress
-	res.CompressRetries = t.cfg.CompressRetries
 	return res
+}
+
+// fetchFailure renders a failed fetch for the model. A refusal of the content
+// itself is spelled out: the model has to learn that another tool is the way
+// forward instead of asking for the same address again.
+func (t *WebFetchTool) fetchFailure(err error) string {
+	if errors.Is(err, utils.ErrNotPage) {
+		return fmt.Sprintf("Fetch failed: %v. %s", err, nonPageHint)
+	}
+	return fmt.Sprintf("Fetch failed: %v", err)
+}
+
+// limitFeedback cuts the markdown to the configured number of lines. A page that
+// does not fit is written to an overflow file in full, and the returned note —
+// part of the status line the answer carries — reports how long the page is and
+// where it went, so the model can read it in pieces with read_file_lines instead
+// of losing it; savedTo is that path, for the display line of the caller. A page
+// that fits, or a tool that asks for no limit at all, is returned as it is, with
+// an empty note.
+func (t *WebFetchTool) limitFeedback(page utils.WebFetchResult, markdown string) (body, note, savedTo string) {
+	if t.cfg.MaxLines < 0 {
+		return markdown, "", ""
+	}
+	total := countLines(markdown)
+	if total <= t.cfg.MaxLines {
+		return markdown, "", ""
+	}
+	body = firstLines(markdown, t.cfg.MaxLines)
+	path, err := saveOverflowPage(page.HTML)
+	if err != nil {
+		return body, fmt.Sprintf("The page is longer than the %d line feedback limit: it holds %d lines / %d bytes "+
+			"in total, so only the first %d lines follow; saving the whole page failed: %v",
+			t.cfg.MaxLines, total, len(markdown), t.cfg.MaxLines, err), ""
+	}
+	return body, fmt.Sprintf("The page is longer than the %d line feedback limit: it holds %d lines / %d bytes "+
+		"in total, so only the first %d lines follow. The whole page (%d bytes of HTML) was saved to %s — "+
+		"read it with read_file_lines if the rest is needed.",
+		t.cfg.MaxLines, total, len(markdown), t.cfg.MaxLines, len(page.HTML), path), path
+}
+
+// saveOverflowPage writes the fetched page below the working directory and
+// returns the path of the file it created.
+func saveOverflowPage(html string) (string, error) {
+	dir := filepath.Join(workingDir(), lightagentDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create %s: %w", dir, err)
+	}
+	stamp := time.Now().Format(webFetchOverflowTimeFormat)
+	for attempt := 0; attempt < webFetchOverflowNameAttempts; attempt++ {
+		name := webFetchOverflowPrefix + stamp + ".html"
+		if attempt > 0 {
+			name = fmt.Sprintf("%s%s-%d.html", webFetchOverflowPrefix, stamp, attempt)
+		}
+		path := filepath.Join(dir, name)
+		// Exclusive creation: two fetches within the same second produce two
+		// files instead of one overwriting the other.
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return "", err
+		}
+		_, writeErr := file.WriteString(html)
+		closeErr := file.Close()
+		if writeErr != nil {
+			return "", writeErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("no free file name left in %s", dir)
+}
+
+// workingDir is the directory the process runs in. A failure falls back to the
+// relative path, which still lands in that directory.
+func workingDir() string {
+	if dir, err := os.Getwd(); err == nil {
+		return dir
+	}
+	return "."
+}
+
+// countLines counts the lines of a text: its newlines plus the last, possibly
+// unterminated one.
+func countLines(text string) int {
+	if text == "" {
+		return 0
+	}
+	return strings.Count(text, "\n") + 1
+}
+
+// firstLines returns the first n lines of a text (the whole text when it is
+// shorter than that).
+func firstLines(text string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	offset := 0
+	for i := 0; i < n; i++ {
+		next := strings.IndexByte(text[offset:], '\n')
+		if next < 0 {
+			return text
+		}
+		offset += next + 1
+	}
+	// The cut keeps whole lines: everything up to the terminator of the nth one.
+	return strings.TrimSuffix(text[:offset], "\n")
+}
+
+// describeContentType names a media type in a message (a response that carries
+// none is described instead of left blank).
+func describeContentType(contentType string) string {
+	if trimmed := strings.TrimSpace(contentType); trimmed != "" {
+		return trimmed
+	}
+	return "an unidentified content type"
+}
+
+// agentBrowserProfileDir returns the profile directory a launched browser uses.
+// It is a profile of our own, below the agent's directory in the working
+// directory, so the window the agent opens never interferes with the browser the
+// user is using (that one is reached by attaching, see chrome-attached), cookies
+// and logins of the agent's own profile survive between launches, and the state
+// belongs to the project rather than to the user's home.
+func agentBrowserProfileDir() string {
+	return filepath.Join(workingDir(), lightagentDir, browserProfileName)
 }
 
 // fetchOptions translates the configured web settings into the options of
 // internal/utils, leaving out what was not configured so the defaults of the
 // fetcher apply.
 func (t *WebFetchTool) fetchOptions(timeout time.Duration) []utils.WebFetchOptionFunc {
+	// The window of a headful browser is what makes a fetch look like a person
+	// reading a page, so auto and chrome-headful ask for one — on a profile of
+	// the agent's own, which is what keeps the user's browser out of it.
+	browser := utils.BrowserOptions{Headful: t.headfulWindow()}
+	if browser.Headful {
+		browser.UserDataDir = agentBrowserProfileDir()
+	}
 	opts := []utils.WebFetchOptionFunc{
 		utils.WithFetchMode(t.cfg.Mode),
 		utils.WithFetchTimeout(timeout),
+		utils.WithFetchBrowser(browser),
 	}
-	if t.cfg.BrowserPath != "" {
+	if t.launchesBrowser() && t.cfg.BrowserPath != "" {
 		opts = append(opts, utils.WithFetchChromePath(t.cfg.BrowserPath))
+	}
+	if t.cfg.Mode == utils.FetchModeChromeAttached && t.cfg.AttachEndpoint != "" {
+		opts = append(opts, utils.WithFetchBrowserAddress(t.cfg.AttachEndpoint))
 	}
 	if t.cfg.UserAgent != "" {
 		opts = append(opts, utils.WithFetchUserAgent(t.cfg.UserAgent))
@@ -180,5 +387,28 @@ func (t *WebFetchTool) fetchOptions(timeout time.Duration) []utils.WebFetchOptio
 		opts = append(opts, utils.WithFetchMaxBytes(t.cfg.MaxBytes))
 	}
 	return opts
+}
+
+// launchesBrowser reports whether the configured mode starts a browser of its
+// own (chrome-attached and http do not).
+func (t *WebFetchTool) launchesBrowser() bool {
+	switch t.cfg.Mode {
+	case utils.FetchModeHTTP, utils.FetchModeChromeAttached:
+		return false
+	default:
+		return true
+	}
+}
+
+// headfulWindow reports whether the configured mode drives a browser with a
+// visible window. Auto and chrome-headful do: a browser with a window is the
+// one that gets blocked the least, which is why it is the default.
+func (t *WebFetchTool) headfulWindow() bool {
+	switch t.cfg.Mode {
+	case utils.FetchModeHTTP, utils.FetchModeChromeHeadless, utils.FetchModeChromeAttached:
+		return false
+	default:
+		return true
+	}
 }
 

@@ -101,13 +101,13 @@ func runSession(o *options, stdout io.Writer) error {
 		// The configured mode names are the ones internal/utils reads, so the
 		// string travels as it is (tools.webfetch.mode).
 		reg.Register(tools.NewWebFetchTool(tools.WebFetchConfig{
-			Timeout:         time.Duration(cfg.Tools.WebFetch.TimeoutSeconds) * time.Second,
-			Mode:            utils.FetchMode(cfg.Tools.WebFetch.EffectiveMode()),
-			BrowserPath:     cfg.Tools.WebFetch.BrowserPath,
-			UserAgent:       cfg.Tools.WebFetch.UserAgent,
-			MaxBytes:        cfg.Tools.WebFetch.MaxBytes,
-			Compress:        cfg.Tools.WebFetch.Compress,
-			CompressRetries: cfg.Tools.WebFetch.CompressRetries,
+			Timeout:        time.Duration(cfg.Tools.WebFetch.TimeoutSeconds) * time.Second,
+			Mode:           utils.FetchMode(cfg.Tools.WebFetch.EffectiveMode()),
+			MaxLines:       cfg.Tools.WebFetch.MaxLines,
+			BrowserPath:    cfg.Tools.WebFetch.BrowserPath,
+			UserAgent:      cfg.Tools.WebFetch.UserAgent,
+			MaxBytes:       cfg.Tools.WebFetch.MaxBytes,
+			AttachEndpoint: cfg.Tools.WebFetch.AttachEndpoint(),
 		}))
 	}
 	// MCP servers: connect to every enabled server and register the tools it

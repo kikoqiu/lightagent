@@ -55,6 +55,10 @@ func newPageServer(t *testing.T) *httptest.Server {
 		case "/large":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			fmt.Fprint(w, strings.Repeat("a", 4096))
+		case "/binary":
+			// Not a page: the fetcher refuses it by its media type.
+			w.Header().Set("Content-Type", "application/pdf")
+			fmt.Fprint(w, "%PDF-1.7 not a page")
 		case "/echo":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			cookie, _ := r.Cookie("session")
@@ -126,11 +130,68 @@ func TestWebFetchFallsBackToSourceWithoutBrowser(t *testing.T) {
 		t.Errorf("notes = %v, want the reason the browser was skipped", result.Notes)
 	}
 
-	// Browser mode without a browser: an error, and no source.
+	// A mode that requires a browser without one: an error, and no source.
 	if _, err := WebFetch(context.Background(), server.URL+"/page",
-		WithFetchMode(FetchModeBrowser),
-		WithFetchBrowser(BrowserOptions{ExecPath: missing})); !errors.Is(err, ErrChromeNotFound) {
-		t.Errorf("browser mode error = %v, want ErrChromeNotFound", err)
+		WithFetchMode(FetchModeChromeHeadful),
+		WithFetchBrowser(BrowserOptions{ExecPath: missing, Headful: true})); !errors.Is(err, ErrChromeNotFound) {
+		t.Errorf("chrome-headful mode error = %v, want ErrChromeNotFound", err)
+	}
+}
+
+// TestWebFetchRefusesContentThatIsNotAPage pins the boundary of the fetcher: an
+// address that serves something binary is refused before its body is read, so a
+// download cannot flood the caller.
+func TestWebFetchRefusesContentThatIsNotAPage(t *testing.T) {
+	server := newPageServer(t)
+	_, err := WebFetch(context.Background(), server.URL+"/binary", WithFetchMode(FetchModeHTTP))
+	if !errors.Is(err, ErrNotPage) {
+		t.Fatalf("error = %v, want ErrNotPage", err)
+	}
+	if !strings.Contains(err.Error(), "application/pdf") {
+		t.Errorf("error = %v, want it to name the media type", err)
+	}
+	if !IsPageContentType("text/html; charset=utf-8") || !IsPageContentType("") || !IsPageContentType("TEXT/PLAIN") {
+		t.Error("an HTML or plain text response must count as a page")
+	}
+	if IsPageContentType("application/pdf") || IsPageContentType("image/png") ||
+		IsPageContentType("application/octet-stream") {
+		t.Error("binary content must not count as a page")
+	}
+}
+
+// TestWebFetchChromeAttachedNeedsAnEndpoint pins the one mode that cannot guess
+// what to attach to: it reports the missing endpoint instead of trying to
+// connect somewhere.
+func TestWebFetchChromeAttachedNeedsAnEndpoint(t *testing.T) {
+	server := newPageServer(t)
+	_, err := WebFetch(context.Background(), server.URL+"/page", WithFetchMode(FetchModeChromeAttached))
+	if err == nil || !strings.Contains(err.Error(), "chrome-attached") {
+		t.Fatalf("error = %v, want a refusal naming the mode", err)
+	}
+}
+
+// TestWebFetchBrowserModeDecidesTheWindow pins that an explicit browser mode
+// decides how the page is rendered, whatever the options say about the window:
+// chrome-headless renders headless all the same.
+func TestWebFetchBrowserModeDecidesTheWindow(t *testing.T) {
+	requireBrowser(t)
+	server := newPageServer(t)
+	t.Cleanup(func() { _ = CloseSharedBrowsers() })
+
+	result, err := WebFetch(testContext(t), server.URL+"/page",
+		WithFetchMode(FetchModeChromeHeadless),
+		// A caller asking for a window in the headless mode does not get one:
+		// the mode is the more specific statement.
+		WithFetchBrowser(BrowserOptions{Headful: true}),
+		WithFetchTimeout(45*time.Second), WithFetchSettle(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("WebFetch: %v", err)
+	}
+	if result.Method != FetchMethodHeadless {
+		t.Errorf("method = %q, want %q", result.Method, FetchMethodHeadless)
+	}
+	if !strings.Contains(result.HTML, "rendered-marker") {
+		t.Errorf("the DOM does not carry the script output: %.200q", result.HTML)
 	}
 }
 

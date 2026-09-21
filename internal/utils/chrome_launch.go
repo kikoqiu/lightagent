@@ -76,6 +76,13 @@ func browserLaunchArgs(profileDir string, port int, opts BrowserOptions) []strin
 		"--remote-debugging-port=" + strconv.Itoa(port),
 		"--no-first-run",
 		"--no-default-browser-check",
+		// A profile whose last session did not end cleanly (a browser that was
+		// killed, a machine that went down) makes Chrome offer to restore that
+		// session: the bubble has no place in an unattended run, and its pages
+		// would compete with the page being fetched.
+		"--hide-crash-restore-bubble",
+		"--disable-session-crashed-bubble",
+		"--noerrdialogs",
 		"--disable-background-networking",
 		"--disable-background-timer-throttling",
 		"--disable-breakpad",
@@ -113,25 +120,42 @@ func browserLaunchArgs(profileDir string, port int, opts BrowserOptions) []strin
 }
 
 // waitForDevTools waits for a launched browser to publish its DevTools
-// endpoint: read back from the port file when the browser picked the port
-// itself, probed over TCP otherwise. A browser that dies in the meantime ends
-// the wait right away, with its exit status as the reason.
+// endpoint: probed over TCP for a port that was chosen for the launch, read back
+// from the port file when the browser picked the port itself (a port of 0).
+//
+// A browser that was killed leaves its port file behind, naming a port nobody
+// listens on any more, so an address read from the file is only accepted once it
+// answers: the file keeps being read, and an address that did not answer is not
+// tried again while the file keeps naming it. Without that, a leftover file
+// would pin the wait on a dead port until the whole launch timed out — which is
+// exactly what a browser killed by a timeout or by the agent exiting leaves
+// behind. A browser that dies in the meantime ends the wait right away, with its
+// exit status as the reason.
 func (b *Browser) waitForDevTools(ctx context.Context, port int, awaitPortFile bool) (string, error) {
 	address := "127.0.0.1:" + strconv.Itoa(port)
+	// stale is the address a leftover port file named that did not answer.
+	stale := ""
 	var lastErr error
 	for {
 		if awaitPortFile {
-			discovered, err := readActivePort(b.profileDir)
-			if err == nil {
-				address = discovered
-				awaitPortFile = false
-				continue
+			address = ""
+			if found, err := readActivePort(b.profileDir); err == nil {
+				if found != stale {
+					address = found
+				}
+			} else {
+				lastErr = err
 			}
-			lastErr = err
-		} else if err := probePort(ctx, address); err == nil {
-			return address, nil
-		} else {
-			lastErr = err
+		}
+		if address != "" {
+			if err := probePort(ctx, address); err == nil {
+				return address, nil
+			} else {
+				lastErr = err
+				// Try the file again next round: the browser that is starting
+				// rewrites it as soon as it knows its own port.
+				stale = address
+			}
 		}
 		if channelClosed(b.exited) {
 			reason := "the browser exited"

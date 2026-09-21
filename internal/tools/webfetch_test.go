@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +30,33 @@ func webfetchPageServer(t *testing.T) *httptest.Server {
 	return server
 }
 
+// webfetchLongPageServer serves a page whose markdown is longer than the small
+// feedback limits the tests configure.
+func webfetchLongPageServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<!DOCTYPE html><html><body>")
+		for i := 1; i <= 60; i++ {
+			fmt.Fprintf(w, "<h2>Section %d</h2><p>Paragraph number %d of the page.</p>", i, i)
+		}
+		fmt.Fprint(w, "</body></html>")
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// webfetchBinaryServer serves content that is not a page.
+func webfetchBinaryServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/zip")
+		_, _ = w.Write([]byte("PK\x03\x04 archive bytes"))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
 // newMarkdownWebFetchTool builds the tool in HTTP mode, so a test never depends
 // on a browser being installed on the machine that runs it.
 func newMarkdownWebFetchTool(cfg WebFetchConfig) *WebFetchTool {
@@ -36,11 +65,10 @@ func newMarkdownWebFetchTool(cfg WebFetchConfig) *WebFetchTool {
 }
 
 // TestWebFetchToolConvertsPageToMarkdown pins the answer the tool returns: the
-// status line, the separator and the markdown the converter produced, plus the
-// compression request the agent honours.
+// status line, the separator and the markdown the converter produced.
 func TestWebFetchToolConvertsPageToMarkdown(t *testing.T) {
 	server := webfetchPageServer(t)
-	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second, Compress: true, CompressRetries: 2})
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
 
 	res := tool.Execute(context.Background(), map[string]any{"url": server.URL + "/docs"})
 	if res.IsError {
@@ -68,46 +96,32 @@ func TestWebFetchToolConvertsPageToMarkdown(t *testing.T) {
 	if !strings.Contains(res.ForUser, server.URL+"/docs") {
 		t.Errorf("ForUser = %q, want the fetched address", res.ForUser)
 	}
-	// The tool asks for the self-compression pass, with the configured retries
-	// and the timeout the caller gave it.
-	if !res.Compress || res.CompressRetries != 2 {
-		t.Errorf("compression request = %v/%d, want true/2", res.Compress, res.CompressRetries)
-	}
-}
-
-func TestWebFetchToolKeepsCompressionOffWhenDisabled(t *testing.T) {
-	server := webfetchPageServer(t)
-	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
-	res := tool.Execute(context.Background(), map[string]any{"url": server.URL})
-	if res.IsError {
-		t.Fatalf("Execute reported an error: %s", res.ForLLM)
-	}
-	if res.Compress {
-		t.Error("compression must stay off when the tool was built without it")
+	// A page that fits carries no overflow note at all.
+	if strings.Contains(res.ForLLM, "feedback limit") {
+		t.Errorf("a page within the limit must not be reported as cut:\n%s", res.ForLLM)
 	}
 }
 
 // TestWebFetchToolKeepsTheDefaultForANullTimeout pins that an explicit null is
-// read as "unset" (the configured default applies) rather than as an unusable
-// value.
+// read as "use the configured timeout" instead of as an invalid value.
 func TestWebFetchToolKeepsTheDefaultForANullTimeout(t *testing.T) {
 	server := webfetchPageServer(t)
 	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
 	res := tool.Execute(context.Background(), map[string]any{"url": server.URL, "timeout": nil})
 	if res.IsError {
-		t.Fatalf("a null timeout should keep the configured default: %s", res.ForLLM)
+		t.Fatalf("Execute reported an error: %s", res.ForLLM)
 	}
 }
 
-func TestWebFetchToolRejectsBadArguments(t *testing.T) {
-	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
+func TestWebFetchToolRejectsInvalidArguments(t *testing.T) {
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 5 * time.Second})
 	cases := []struct {
 		name string
 		args map[string]any
 	}{
 		{"missing url", map[string]any{}},
-		{"empty url", map[string]any{"url": "   "}},
 		{"non-string url", map[string]any{"url": 42}},
+		{"blank url", map[string]any{"url": "   "}},
 		{"zero timeout", map[string]any{"url": "https://example.com", "timeout": 0}},
 		{"negative timeout", map[string]any{"url": "https://example.com", "timeout": -1}},
 	}
@@ -129,21 +143,26 @@ func TestWebFetchToolDefaults(t *testing.T) {
 	if tool.cfg.Timeout != webFetchTimeoutDefault {
 		t.Errorf("timeout = %s, want %s", tool.cfg.Timeout, webFetchTimeoutDefault)
 	}
+	if tool.cfg.MaxLines != WebFetchMaxLinesDefault || WebFetchMaxLinesDefault != 200 {
+		t.Errorf("max lines = %d, want the built-in %d", tool.cfg.MaxLines, WebFetchMaxLinesDefault)
+	}
 }
 
 // TestWebFetchToolDescriptionFollowsTheMode pins that the model is told how the
-// pages are actually obtained: a tool pinned to the source must not advertise a
-// browser.
+// pages are actually obtained — a tool pinned to the source must not advertise a
+// browser — and what shape the answer has.
 func TestWebFetchToolDescriptionFollowsTheMode(t *testing.T) {
-	const automatic = "rendered with a browser when one is available and downloaded over HTTP otherwise"
+	const automatic = "rendered in a visible browser window when a browser can be started"
 	cases := []struct {
 		mode utils.FetchMode
 		want string
 	}{
 		{"", automatic},
 		{utils.FetchModeAuto, automatic},
-		{utils.FetchModeBrowser, "rendered with a browser, and the fetch fails when none is available"},
-		{utils.FetchModeHTTP, "downloaded over HTTP, without a browser"},
+		{utils.FetchModeChromeHeadful, "rendered in a visible browser window."},
+		{utils.FetchModeChromeHeadless, "rendered in a headless browser."},
+		{utils.FetchModeChromeAttached, "rendered through a browser that is already running"},
+		{utils.FetchModeHTTP, "downloaded over HTTP, without a browser."},
 	}
 	for _, tc := range cases {
 		tool := NewWebFetchTool(WebFetchConfig{Mode: tc.mode})
@@ -151,6 +170,15 @@ func TestWebFetchToolDescriptionFollowsTheMode(t *testing.T) {
 			t.Errorf("Description() for mode %q = %q, want it to contain %q",
 				tc.mode, tool.Description(), tc.want)
 		}
+	}
+	if !strings.Contains(NewWebFetchTool(WebFetchConfig{}).Description(), "binary content") {
+		t.Error("the description must state that binary content is refused")
+	}
+	if !strings.Contains(NewWebFetchTool(WebFetchConfig{MaxLines: 20}).Description(), "at most 20 lines") {
+		t.Error("the description must state the feedback limit")
+	}
+	if !strings.Contains(NewWebFetchTool(WebFetchConfig{MaxLines: -1}).Description(), "whole markdown") {
+		t.Error("a tool without a limit must say so instead of promising a cut")
 	}
 }
 
@@ -192,5 +220,154 @@ func TestWebFetchToolReportsFetchFailures(t *testing.T) {
 	res := tool.Execute(context.Background(), map[string]any{"url": "127.0.0.1:1/unreachable"})
 	if !res.IsError || !strings.Contains(res.ForLLM, "Fetch failed:") {
 		t.Fatalf("Execute = %+v, want a fetch failure", res)
+	}
+}
+
+// TestWebFetchToolRefusesContentThatIsNotAPage pins that an address serving
+// something binary is an error that names the content and points the model at a
+// command, instead of being converted into nonsense.
+func TestWebFetchToolRefusesContentThatIsNotAPage(t *testing.T) {
+	server := webfetchBinaryServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
+	res := tool.Execute(context.Background(), map[string]any{"url": server.URL + "/archive.zip"})
+	if !res.IsError {
+		t.Fatalf("Execute = %+v, want a refusal", res)
+	}
+	for _, want := range []string{"not a web page", "application/zip", "exec_command"} {
+		if !strings.Contains(res.ForLLM, want) {
+			t.Errorf("the refusal is missing %q:\n%s", want, res.ForLLM)
+		}
+	}
+}
+
+// TestWebFetchToolCutsLongFeedbackAndSavesThePage pins the feedback limit: the
+// markdown of a long page is cut, the whole page is written below .lightagent in
+// the working directory, and the answer reports the totals and the path.
+func TestWebFetchToolCutsLongFeedbackAndSavesThePage(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server := webfetchLongPageServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second, MaxLines: 5})
+
+	res := tool.Execute(context.Background(), map[string]any{"url": server.URL})
+	if res.IsError {
+		t.Fatalf("Execute reported an error: %s", res.ForLLM)
+	}
+	// The status line before the separator explains the cut; the body itself is
+	// the first five lines of the markdown.
+	status, body, found := strings.Cut(res.ForLLM, "\n---\n\n")
+	if !found {
+		t.Fatalf("the answer is missing the body separator:\n%s", res.ForLLM)
+	}
+	for _, want := range []string{"longer than the 5 line feedback limit", "lines /", "bytes"} {
+		if !strings.Contains(status, want) {
+			t.Errorf("the status line is missing %q:\n%s", want, status)
+		}
+	}
+	if got := countLines(body); got != 5 {
+		t.Errorf("the body holds %d lines, want the configured 5:\n%s", got, body)
+	}
+	if strings.Contains(body, "Section 60") {
+		t.Errorf("the body should hold the beginning of the page only:\n%s", body)
+	}
+	matches, err := filepath.Glob(filepath.Join(".lightagent", "webfetch-*.html"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("files under .lightagent = %v, want exactly one overflow file", matches)
+	}
+	if !strings.Contains(status, matches[0]) {
+		t.Errorf("the status line does not name the file %s:\n%s", matches[0], status)
+	}
+	if !strings.Contains(res.ForUser, matches[0]) {
+		t.Errorf("ForUser = %q, want the saved page named", res.ForUser)
+	}
+	saved, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read the overflow file: %v", err)
+	}
+	if !strings.Contains(string(saved), "<h2>Section 60</h2>") {
+		t.Error("the overflow file must hold the whole page")
+	}
+}
+
+// TestWebFetchToolKeepsTheWholePageWithoutALimit pins the escape hatch: a
+// negative max_lines feeds the whole markdown back and writes nothing.
+func TestWebFetchToolKeepsTheWholePageWithoutALimit(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server := webfetchLongPageServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second, MaxLines: -1})
+
+	res := tool.Execute(context.Background(), map[string]any{"url": server.URL})
+	if res.IsError {
+		t.Fatalf("Execute reported an error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "Section 60") {
+		t.Errorf("the whole page must reach the model:\n%s", res.ForLLM)
+	}
+	if _, err := os.Stat(".lightagent"); !os.IsNotExist(err) {
+		t.Errorf("no overflow file may be written without a limit (stat: %v)", err)
+	}
+}
+
+// TestWebFetchToolBrowserProfileIsLocal pins where a launched browser keeps its
+// profile: in the agent's directory below the working directory, next to the
+// pages a fetch saved, not in the user's home.
+func TestWebFetchToolBrowserProfileIsLocal(t *testing.T) {
+	t.Chdir(t.TempDir())
+	tool := NewWebFetchTool(WebFetchConfig{})
+
+	var opts utils.WebFetchOptions
+	for _, opt := range tool.fetchOptions(5 * time.Second) {
+		opt(&opts)
+	}
+	want := filepath.Join(".lightagent", "browser-profile")
+	if !strings.HasSuffix(opts.Browser.UserDataDir, want) {
+		t.Errorf("profile = %q, want it to end in %q", opts.Browser.UserDataDir, want)
+	}
+	if !filepath.IsAbs(opts.Browser.UserDataDir) {
+		t.Errorf("profile = %q, want an absolute path", opts.Browser.UserDataDir)
+	}
+	if cache, err := os.UserCacheDir(); err == nil && cache != "" &&
+		strings.HasPrefix(opts.Browser.UserDataDir, cache) {
+		t.Errorf("profile = %q, want it out of the user's cache directory", opts.Browser.UserDataDir)
+	}
+}
+
+// TestWebFetchToolWiresTheBrowserMode pins what each mode asks the fetcher for:
+// auto and chrome-headful drive a browser with a visible window on a profile of
+// the agent's own (never the user's default one, which is what chrome-attached
+// is for), chrome-headless one without, and chrome-attached the endpoint from
+// the configuration.
+func TestWebFetchToolWiresTheBrowserMode(t *testing.T) {
+	cases := []struct {
+		mode    utils.FetchMode
+		headful bool
+		address string
+	}{
+		{utils.FetchModeAuto, true, ""},
+		{utils.FetchModeChromeHeadful, true, ""},
+		{utils.FetchModeChromeHeadless, false, ""},
+		{utils.FetchModeChromeAttached, false, "127.0.0.1:9333"},
+		{utils.FetchModeHTTP, false, ""},
+	}
+	for _, tc := range cases {
+		tool := NewWebFetchTool(WebFetchConfig{Mode: tc.mode, AttachEndpoint: "127.0.0.1:9333"})
+		var opts utils.WebFetchOptions
+		for _, opt := range tool.fetchOptions(5 * time.Second) {
+			opt(&opts)
+		}
+		if opts.Mode != tc.mode {
+			t.Errorf("mode %q: fetcher mode = %q", tc.mode, opts.Mode)
+		}
+		if opts.Browser.Headful != tc.headful {
+			t.Errorf("mode %q: headful = %v, want %v", tc.mode, opts.Browser.Headful, tc.headful)
+		}
+		if opts.Browser.Address != tc.address {
+			t.Errorf("mode %q: attach address = %q, want %q", tc.mode, opts.Browser.Address, tc.address)
+		}
+		if got := opts.Browser.UserDataDir != ""; got != tc.headful {
+			t.Errorf("mode %q: own profile = %v, want %v", tc.mode, got, tc.headful)
+		}
 	}
 }

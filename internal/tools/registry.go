@@ -33,16 +33,6 @@ type Result struct {
 	IsError bool
 	// Silent suppresses user-facing rendering even when ForUser is set.
 	Silent bool
-	// Compress asks the agent to run a self-compression pass over this result
-	// before the turn continues: the model then receives a condensed version of
-	// the content instead of the full body (see agent.compressToolResults).
-	// webfetch is the only tool that sets it today (tools.webfetch.compress), but
-	// nothing in the pass is specific to it: any tool may ask.
-	Compress bool
-	// CompressRetries is how many times the model may be asked again after a
-	// compression reply that does not follow the requested format. It is only
-	// read when Compress is set.
-	CompressRetries int
 }
 
 // OK creates a successful result.

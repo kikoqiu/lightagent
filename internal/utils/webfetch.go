@@ -37,16 +37,33 @@ const (
 type FetchMode string
 
 const (
-	// FetchModeAuto renders with a browser when a Chromium-based one is
-	// installed and falls back to the HTTP source when it is not, or when the
-	// browser cannot render the page. This is the default.
+	// FetchModeAuto renders the page with the browser the options describe (see
+	// BrowserOptions.Headful) and falls back to the HTTP source when no browser
+	// can be used. This is the default. The webfetch tool pairs it with a
+	// visible window, since a browser with one is far less likely to be blocked
+	// than a headless one.
 	FetchModeAuto FetchMode = "auto"
-	// FetchModeBrowser requires a browser: the HTTP source is never returned,
-	// so a failure explains what the browser was missing.
-	FetchModeBrowser FetchMode = "browser"
+	// FetchModeChromeHeadful renders the page in a visible browser window,
+	// whatever the options say about the window: the fetch fails when no
+	// browser can be started.
+	FetchModeChromeHeadful FetchMode = "chrome-headful"
+	// FetchModeChromeHeadless renders the page in a headless browser, whatever
+	// the options say about the window.
+	FetchModeChromeHeadless FetchMode = "chrome-headless"
+	// FetchModeChromeAttached renders the page through a browser that is
+	// already running, reached over its DevTools endpoint
+	// (WebFetchOptions.Browser.Address): the user's own browser, with their
+	// logins and cookies.
+	FetchModeChromeAttached FetchMode = "chrome-attached"
 	// FetchModeHTTP downloads the source and never starts a browser.
 	FetchModeHTTP FetchMode = "http"
 )
+
+// ErrNotPage reports that the address does not serve a web page: a PDF, an
+// image, an archive or any other content WebFetch refuses. The fetcher reads
+// HTML documents only, so the caller can turn this into a message that points
+// the model at a command instead of another fetch.
+var ErrNotPage = errors.New("not a web page")
 
 // Defaults of WebFetchOptions.
 const (
@@ -63,7 +80,9 @@ const (
 // WebFetchOptions configures WebFetch. The zero value is the usual default:
 // render with a headless browser, fall back to the HTTP source, 30 seconds.
 type WebFetchOptions struct {
-	// Mode selects the fetching strategy (default FetchModeAuto).
+	// Mode selects the fetching strategy (default FetchModeAuto: a visible
+	// browser, else the HTTP source). Every other mode asks for exactly one way
+	// of obtaining the page and fails when that way is not available.
 	Mode FetchMode
 	// Timeout bounds the whole operation (default WebFetchTimeoutDefault).
 	Timeout time.Duration
@@ -74,8 +93,8 @@ type WebFetchOptions struct {
 	// Settle is a quiet period after the load event, for pages that render
 	// their content asynchronously (default: none).
 	Settle time.Duration
-	// UserAgent overrides the user agent of both paths. Without it the browser
-	// uses its own default, which identifies it as HeadlessChrome.
+	// UserAgent overrides the user agent of both paths. Without it the
+	// browser uses its own default, and the HTTP source sends none.
 	UserAgent string
 	// Headers are extra request headers; a browser applies them to every
 	// request the page makes.
@@ -198,11 +217,15 @@ type WebFetchResult struct {
 }
 
 // WebFetch returns the HTML of a page. A Chromium-based browser is detected
-// first: when one is found, a headless instance (or the browser the options
-// point at) loads the page, waits for it to finish loading — or for the timeout
-// to expire — and the resulting DOM tree is serialized back to HTML. Without a
-// browser the HTTP source is returned instead, and the result says so in
+// first: when one is found, an instance with a visible window (or a headless
+// one, or the browser the options point at — see FetchMode) loads the page,
+// waits for it to finish loading — or for the timeout to expire — and the
+// resulting DOM tree is serialized back to HTML. In FetchModeAuto without a
+// usable browser the HTTP source is returned instead, and the result says so in
 // Method and Notes.
+//
+// Only pages are read: an address that serves anything else is refused with an
+// error wrapping ErrNotPage.
 //
 // The browser stays alive between calls (see SharedBrowser) and is closed after
 // ten minutes without use or when the program ends, so the cookie state of a
@@ -211,6 +234,9 @@ func WebFetch(ctx context.Context, rawURL string, opts ...WebFetchOptionFunc) (W
 	cfg := defaultWebFetchOptions()
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = FetchModeAuto
 	}
 	target, err := normalizeFetchURL(rawURL)
 	if err != nil {
@@ -228,25 +254,77 @@ func WebFetch(ctx context.Context, rawURL string, opts ...WebFetchOptionFunc) (W
 		result.Elapsed = time.Since(started)
 		return result, err
 	}
+	// The mode selects how the page is rendered, so it wins over the window
+	// flag of the options: an explicit chrome-headful is a visible browser and
+	// an explicit chrome-headless is not, whatever the caller passed. Auto
+	// leaves the choice to the options, and chrome-attached uses the browser it
+	// was pointed at.
+	switch cfg.Mode {
+	case FetchModeChromeHeadful:
+		cfg.Browser.Headful = true
+	case FetchModeChromeHeadless, FetchModeChromeAttached:
+		cfg.Browser.Headful = false
+	}
+	// Attaching is the one mode that needs something the caller has to supply:
+	// there is no endpoint to guess, so a missing one is reported as such
+	// instead of ending up as a connection error.
+	if cfg.Mode == FetchModeChromeAttached && strings.TrimSpace(cfg.Browser.Address) == "" {
+		return WebFetchResult{}, errors.New("chrome-attached needs the DevTools address of the browser to drive " +
+			"(set it next to the mode; see WithFetchBrowserAddress)")
+	}
 
 	result, err := fetchRendered(ctx, target, cfg)
 	if err == nil {
 		result.Elapsed = time.Since(started)
 		return result, nil
 	}
-	if cfg.Mode == FetchModeBrowser {
+	if cfg.Mode != FetchModeAuto {
+		// Every other mode asks for one way and nothing else, so the error is
+		// the answer: it says what that way was missing.
 		return WebFetchResult{}, err
 	}
 
 	source, sourceErr := fetchSource(ctx, target, cfg)
 	if sourceErr != nil {
 		// Both ways failed: the browser error explains what rendering was
-		// missing, the source error what the request itself hit.
+		// missing, the source error what the request itself hit. The source
+		// error is the outer one, so a refusal of the content itself (a PDF,
+		// say) still reads as ErrNotPage.
 		return WebFetchResult{}, fmt.Errorf("%w (rendering failed as well: %v)", sourceErr, err)
 	}
 	source.Notes = append(source.Notes, "returned the HTTP source: "+err.Error())
 	source.Elapsed = time.Since(started)
 	return source, nil
+}
+
+// IsPageContentType reports whether a response media type is one WebFetch reads:
+// a document a browser shows as text — HTML for the sites, plain text for what
+// is served as a text file (a robot file, a markdown document). Binary content
+// (a PDF, an image, an archive) is not a page. A response that says nothing
+// about its type counts as a page too, so a server that keeps quiet is not
+// refused for it.
+func IsPageContentType(contentType string) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if mediaType == "" {
+		return true
+	}
+	if parsed, _, err := mime.ParseMediaType(contentType); err == nil {
+		mediaType = strings.ToLower(strings.TrimSpace(parsed))
+	}
+	if strings.HasPrefix(mediaType, "text/") {
+		return true
+	}
+	return mediaType == "application/xhtml+xml"
+}
+
+// notPageError turns a media type into the refusal of content that is not a
+// page.
+func notPageError(contentType string) error {
+	mediaType := strings.TrimSpace(contentType)
+	if mediaType == "" {
+		mediaType = "an unidentified type"
+	}
+	return fmt.Errorf("%w: the response is %s, not an HTML page", ErrNotPage, mediaType)
 }
 
 // WebFetchHTML is WebFetch for callers that only want the markup.
@@ -374,6 +452,14 @@ func fetchSource(ctx context.Context, target string, cfg WebFetchOptions) (WebFe
 	}
 	defer response.Body.Close()
 
+	// A page is an HTML document. Anything else — a PDF, an image, an archive —
+	// is refused here, before its body is read, so a download cannot flood the
+	// caller with bytes nobody asked for.
+	contentType := response.Header.Get("Content-Type")
+	if !IsPageContentType(contentType) {
+		return WebFetchResult{}, notPageError(contentType)
+	}
+
 	maxBytes := cfg.MaxBytes
 	if maxBytes <= 0 {
 		maxBytes = WebFetchMaxBytesDefault
@@ -388,7 +474,6 @@ func fetchSource(ctx context.Context, target string, cfg WebFetchOptions) (WebFe
 		body = body[:maxBytes]
 		notes = append(notes, fmt.Sprintf("the source was truncated at %d bytes", maxBytes))
 	}
-	contentType := response.Header.Get("Content-Type")
 	text, note, err := decodeBody(body, contentType)
 	if err != nil {
 		return WebFetchResult{}, err

@@ -109,16 +109,18 @@
       fields: [
         { path: 'tools.webfetch.enabled', type: 'bool', help: 'register webfetch' },
         { path: 'tools.webfetch.mode', type: 'select', options: [
-          { value: 'auto', label: 'auto — render with a browser when one is installed, else the HTTP source' },
-          { value: 'browser', label: 'browser — render or fail' },
+          { value: 'auto', label: 'auto — visible browser, else the HTTP source' },
+          { value: 'chrome-headful', label: 'chrome-headful — render in a visible browser window' },
+          { value: 'chrome-headless', label: 'chrome-headless — render in a headless browser' },
+          { value: 'chrome-attached', label: 'chrome-attached — render through the running browser' },
           { value: 'http', label: 'http — the source only, never a browser' }
         ], help: 'how a page is obtained' },
         { path: 'tools.webfetch.timeout_seconds', type: 'number', min: 1, help: 'seconds allowed for one fetch; the default of the tool timeout argument' },
+        { path: 'tools.webfetch.max_lines', type: 'number', help: 'lines of markdown fed back; a longer page is saved under .lightagent. 0 = built-in 200, negative = no limit' },
         { path: 'tools.webfetch.browser_path', type: 'text', placeholder: 'auto-detected', help: 'browser executable to render with; empty discovers an installed one' },
         { path: 'tools.webfetch.user_agent', type: 'text', placeholder: 'path default', help: 'user agent of both paths; empty keeps each path default' },
         { path: 'tools.webfetch.max_bytes', type: 'number', min: 0, help: 'body cap of the HTTP path in bytes; 0 = built-in 8 MiB' },
-        { path: 'tools.webfetch.compress', type: 'bool', help: 'condense the markdown with the model before it enters the context' },
-        { path: 'tools.webfetch.compress_retries', type: 'number', min: 0, help: 'retries after a malformed compression reply; 0 gives up at once' }
+        { path: 'tools.webfetch.attach_address', type: 'text', placeholder: '127.0.0.1:9222', help: 'chrome-attached: DevTools endpoint of the running browser — a port ("9222"), host:port, or an http:// / ws:// URL; empty = 127.0.0.1:9222' }
       ]
     },
     {

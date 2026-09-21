@@ -12,8 +12,7 @@ type Tool interface {
 ```
 
 `Result` 有三个关键字段：`ForLLM`（回填到对话的工具结果）、`ForUser`（CLI/网页展示）、
-`IsError`；另有 `Silent`（不渲染展示）与 `Compress` / `CompressRetries`（请求引擎对该结果做
-[自压缩](#自压缩toolswebfetchcompress)）。注册表 `tools.Registry` 负责按名分派并把 `arguments` 解析为 map。
+`IsError`；另有 `Silent`（不渲染展示）。注册表 `tools.Registry` 负责按名分派并把 `arguments` 解析为 map。
 
 `ForLLM` 是**工具函数的返回值**：agent 把它**原样**记成该调用的 tool 消息（`role=tool` + `tool_call_id`），
 不额外包装、不加信封 —— 工具反馈走的就是 OpenAI 那条正常的 tool 结果通路。
@@ -212,19 +211,48 @@ type Tool interface {
 
 ## `webfetch`
 
-抓取网页并把它简化成 Markdown 交给模型。
+抓取网页并把它简化成 Markdown 交给模型。**只吃网页与文本**：地址返回二进制内容（PDF、图片、
+压缩包等）时直接返回**错误结果**（说明是什么类型、并提示用 `exec_command` 下载或转换），
+HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在拿到渲染结果后同样检查。
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `url` | string | 必填 | 页面地址（`http`/`https`；缺 scheme 时按 `https` 处理） |
 | `timeout` | int | `webfetch.timeout_seconds` | 整次抓取的秒数上限（渲染、加载与转换都算在内） |
 
-* 取页面用 `internal/utils/webfetch.go`：机器上装了 Chromium 系浏览器时用无头浏览器渲染（DOM 序列化），
-  否则回退到 HTTP 源码；结果里的 `Method` / `Notes` 说明实际走了哪条路。
-* 取法由 `tools.webfetch` 的 web 侧配置决定（见 [configuration.md](configuration.md#tools)）：
-  `mode`（`auto` / `browser` / `http`）、`browser_path`（渲染用的浏览器可执行文件，空则自动探测）、
-  `user_agent`（两条路径共用的 UA，空则各用默认）、`max_bytes`（HTTP 源码的字节上限，`0` 用内置 8 MiB）。
-  工具描述会按 `mode` 如实陈述取法，`http` 时不会声称会渲染浏览器。
+* 取页面用 `internal/utils/webfetch.go`，取法由 `tools.webfetch.mode` 决定（见
+  [configuration.md](configuration.md#tools)）：
+
+  | `mode` | 取法 |
+  |--------|------|
+  | `auto`（默认） | 用**可见窗口**的浏览器渲染，没有可用浏览器时回退 HTTP 源码 |
+  | `chrome-headful` | 必须用可见窗口的浏览器渲染（失败即报错，不退回源码） |
+  | `chrome-headless` | 必须用无头浏览器渲染 |
+  | `chrome-attached` | 挂到**已在运行**的浏览器（DevTools 端点来自配置），用它自己的登录态与 Cookie |
+  | `http` | 只取 HTTP 源码，从不启动浏览器 |
+
+  可见窗口是默认取法的原因：无头浏览器更容易被反爬识别。`chrome-attached` 的端点由
+  `attach_address` 给出 —— 一个字符串说清全部：端口 `9222`（即 `127.0.0.1` 上的端口）、
+  `192.168.0.5:9223`、`127.0.0.1:9222`，或 `http://…` / `ws://…` 的浏览器地址；为空时用内置的
+  `127.0.0.1:9222`。要挂到自己日常用的浏览器上，用 `--remote-debugging-port=9222` 启动它即可
+  （端口自选时，可从其 profile 目录的 `DevToolsActivePort` 文件读到实际端口）。
+  结果里的 `Method` / `Notes` 说明实际走了哪条路，工具描述按 `mode` 如实陈述取法。
+* `auto` 与 `chrome-headful` 都是**启动一个带窗口的浏览器**：窗口用 **agent 自己的 profile**
+  （工作目录下的 `.lightagent/browser-profile`，因此其中有它自己的 Cookie 与登录态，也随项目走），
+  所以不会打扰你正在使用的浏览器 —— 要用你自己的浏览器（带着你的登录态）请选 `chrome-attached`。
+  启动的浏览器在共享池里存活（默认闲置 10 分钟后关闭，程序退出也会关掉它）。
+  没有可用浏览器时 `chrome-headful` 直接报错，`auto` 则回退到 HTTP 源码并在备注里说明原因。
+* **浏览器退出与 profile 卫生**（否则残留会让下次抓取一直超时）：
+  * 关闭时先通过协议请浏览器**自己退出**（`Browser.close`），最多等 5 秒；只有不退出的才连同进程树**强杀**。
+    这样 profile 会留下"正常结束"的状态，下次启动不会再问"是否恢复上次会话"。
+  * 启动前还会清掉上次异常退出（超时、被杀、机器断电）留下的残留：profile 里的 DevTools 端口文件
+    （指向一个已死的端口，留着会让新启动**一直等这个死端口**直到整次抓取超时）与"未正常结束"标记。
+  * 备用保险：读取端口文件时，**探测不通的端口不会被反复等待**，浏览器改写文件后立刻采用新端口。
+  * 该 profile 在所有 lightagent 实例之间共享：同时跑两个实例时，后启动的那个会因 profile 被占用而
+    起不来（`auto` 会退回 HTTP 源码并在备注里说明原因），这是 Chrome 的 profile 独占所致。
+
+* 其余配置：`browser_path`（渲染用的浏览器可执行文件，空则自动探测）、`user_agent`（两条路径共用的
+  UA，空则各用默认）、`max_bytes`（HTTP 源码的字节上限，`0` 用内置 8 MiB）。
 * 转换用 `internal/utils/html_converter.go`（`Html2MdConvert`，`BaseURL` 取**重定向后的** `FinalURL`，
   相对链接因此被补成绝对地址）。
 * 工具返回的就是它的返回值（下面这段文本），与其他工具一样作为普通 tool 反馈记录：
@@ -233,35 +261,24 @@ type Tool interface {
   Conversion succeeded. Converter warnings (if any): <html_converter 的告警，无则 none>
   ---
 
-  <Markdown 正文>
+  <Markdown 正文，最多 max_lines 行>
   ```
 
   * 告警来自转换器（未知标签、片段包裹等），拼在同一行里。
-  * 抓取失败、转换失败或页面没有可读内容时返回**错误结果**。
-  * CLI/网页的展示行是简短一行（地址、取法、Markdown 字符数、耗时、取页面时的备注），不打印整篇正文。
+  * 抓取失败、转换失败、内容不是网页/文本或页面没有可读内容时返回**错误结果**。
+  * CLI/网页的展示行是简短一行（地址、取法、行数、字符数、耗时、取页面时的备注），不打印整篇正文。
 
-### 自压缩（`tools.webfetch.compress`）
+### 反馈长度与落盘（`tools.webfetch.max_lines`）
 
-网页往往很长，直接进上下文很贵，因此抓取结果默认先过一遍**自压缩**。**目前只有 `webfetch` 请求自压缩**
-（开关就在 `tools.webfetch` 下），机制本身对任何工具开放：工具在 `Result.Compress` 里提出请求即可。
+正文默认最多 `max_lines`（`200`）行，避免一次抓取把上下文塞满：
 
-一轮里可能有好几个调用，其中只有一部分请求了压缩（比如 3 个调用里有 2 个 `webfetch`），处理方式是：
-
-1. 这一轮的**全部** tool 调用照常执行、结果照常记录（都是普通 tool 消息，就是各工具的返回值），前端也照常显示。
-2. 轮次结束后，引擎**按调用顺序**对其中"要求压缩"的那几条反馈**逐个**处理，每次都追加一条独立的 user 提示
-   （`[engine]` 前缀的英语提示词）；**没有请求压缩的调用直接跳过**，其反馈原样保留。
-   提示词**点明这次要压的是哪个调用的返回** —— `webfetch {"url":"…"}` 加上 `call id`
-   （参数压成一行、超长截断）—— 因为上下文里可能同时存在好几条 tool 反馈
-   （甚至好几个 `webfetch` 同时发过），不指明就分不清压哪一条。提示词要求模型保留格式地把那条内容压成核心信息、
-   去掉广告与无关内容，并把完整内容用 `<compressed-content></compressed-content>` 包起来单独回一条消息、不要任何解释。
-3. 每条回包都做格式检查：块存在且非空才算通过。不通过则再追加一条 `[engine]` 提示要求重发，
-   每条最多重试 `compress_retries` 次（默认 2）；某条超限即放弃那一条、保留它的完整正文（不影响其它条）。
-4. **全部拿到后统一收尾**：先回滚这次追加的所有提示与模型中间回复，再把每个被压缩的 tool 消息**重新记为压缩内容**
-   （位置不变，就是把那条 tool 消息的内容换成压缩后的文本），于是这一轮每个调用仍然只有一条反馈 ——
-   压缩过的就是压缩后的那条，没参与的还是原来的那条。
-
-自压缩期间引擎发 `info` 事件（开始压哪条、重试、成功时的字符数、放弃），失败发 `error`，因此等待不是静默的。
-这些提示词与中间回复都不算对话内容，前端不会为它们画消息行。
+* 不超过限制：正文原样进上下文，没有任何额外说明。
+* 超过限制：只回填**前 N 行**，状态行多一句"超长"说明 —— 该页共多少行、多少字节，
+  以及整页保存的**文件路径**；整页（HTML，即转换前的 DOM/源码）写到**工作目录**的
+  `.lightagent/webfetch-<时间戳>.html`（同秒多次抓取自动加序号，不覆盖）。
+  模型需要全文时用 `read_file_lines` 分页读该文件即可。
+* `max_lines` 为**负数**表示不限长度：整页正文照原样回填，也不落盘（`max_lines` 为 `0` 用内置 200）。
+* 落盘失败（目录不可写等）时仍然只回填前 N 行，并在状态行里报告失败原因 —— 抓取结果不会被丢掉。
 
 ---
 
