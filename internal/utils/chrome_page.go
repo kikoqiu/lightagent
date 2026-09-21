@@ -144,6 +144,13 @@ func (p *Page) usable() error {
 // and is called by every operation that needs them, so a caller that only
 // attaches to a tab (the user's own, for instance) does not have to know about
 // them.
+//
+// The Runtime domain is deliberately not among them: nothing here listens to its
+// events, and evaluating JavaScript (Runtime.evaluate) needs no enabling. That
+// matters beyond tidiness — a page can tell whether Runtime was enabled (an
+// anti-bot script reads an object it logs through a getter, which a browser with
+// the domain on looks at while a browser without it does not), so the domain
+// stays off.
 func (p *Page) prepare(ctx context.Context) error {
 	p.mu.Lock()
 	prepared := p.prepared
@@ -151,10 +158,13 @@ func (p *Page) prepare(ctx context.Context) error {
 	if prepared {
 		return nil
 	}
-	for _, domain := range []string{"Page", "DOM", "Network", "Runtime"} {
+	for _, domain := range []string{"Page", "DOM", "Network"} {
 		if err := p.call(ctx, domain+".enable", nil, nil); err != nil {
 			return err
 		}
+	}
+	if err := p.hideAutomation(ctx); err != nil {
+		return err
 	}
 	p.mu.Lock()
 	p.prepared = true
@@ -544,10 +554,64 @@ const (
 // were removed — not the source it was served from. Frames are serialized as
 // their <iframe> element: the content of a child frame belongs to its own
 // document, which is attached separately (browser.AttachPage on its target).
+//
+// A document that replaces itself while it is read — a site that answers with a
+// script challenge and then writes the real page, a page that reloads itself —
+// leaves the node ids of the reading behind. The reading is then simply taken
+// again (see staleDocumentAttempts): the caller cannot do that itself, and the
+// alternative is a fetch that reports an error although the page is right there.
 func (p *Page) HTML(ctx context.Context) (string, error) {
 	if err := p.prepare(ctx); err != nil {
 		return "", err
 	}
+	var (
+		html string
+		err  error
+	)
+	for attempt := 0; attempt < staleDocumentAttempts; attempt++ {
+		html, err = p.documentHTML(ctx)
+		if err == nil || !isStaleNodeError(err) {
+			break
+		}
+		if err := sleepContext(ctx, staleDocumentPause); err != nil {
+			return "", err
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	if !hasDoctypePrefix(html) {
+		// The serializer leaves the doctype out, so it is read from the
+		// document itself and put back in front.
+		if doctype, err := p.evaluateString(ctx, doctypeScript); err == nil && doctype != "" {
+			html = doctype + "\n" + html
+		}
+	}
+	return html, nil
+}
+
+const (
+	// staleDocumentAttempts is how often the document of a page is read before a
+	// page that keeps replacing it is reported as unreadable.
+	staleDocumentAttempts = 3
+	// staleDocumentPause is the moment between two readings of such a document.
+	staleDocumentPause = 50 * time.Millisecond
+)
+
+// isStaleNodeError reports whether a protocol error names a node that is gone,
+// which is what reading a document that replaced itself produces. The protocol
+// code is the generic one, so the message is what tells it apart.
+func isStaleNodeError(err error) bool {
+	var rpc *cdpRPCError
+	if !errors.As(err, &rpc) {
+		return false
+	}
+	return strings.Contains(rpc.Message, "Could not find node with given id") ||
+		strings.Contains(rpc.Message, "does not belong to the document")
+}
+
+// documentHTML reads the document of the page and serializes it.
+func (p *Page) documentHTML(ctx context.Context) (string, error) {
 	var document struct {
 		Root domNode `json:"root"`
 	}
@@ -574,13 +638,6 @@ func (p *Page) HTML(ctx context.Context) (string, error) {
 		html, err = p.outerHTML(ctx, element.NodeID)
 		if err != nil {
 			return "", err
-		}
-	}
-	if !hasDoctypePrefix(html) {
-		// The serializer leaves the doctype out, so it is read from the
-		// document itself and put back in front.
-		if doctype, err := p.evaluateString(ctx, doctypeScript); err == nil && doctype != "" {
-			html = doctype + "\n" + html
 		}
 	}
 	return html, nil

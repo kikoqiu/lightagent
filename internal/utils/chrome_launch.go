@@ -67,14 +67,57 @@ func freePort() (int, error) {
 	return addr.Port, nil
 }
 
-// browserLaunchArgs builds the command line of a launch. The trailing
-// about:blank gives a fresh browser a defined first tab instead of one that
-// restores history.
+// browserLaunchArgs builds the command line of a launch.
+//
+// A launch with a window has to pass for the browser the user starts
+// themselves: the page that is rendered in it is read by the site's own scripts
+// too, and the switches an automation setup carries — background networking and
+// extensions off, a muted and unsized window, phishing detection and component
+// updates off, and so on — are exactly what anti-bot code looks for. So a
+// headful launch takes nothing but the switches that only silence prompts (see
+// quietLaunchArgs). A headless launch is recognized as one whatever the command
+// line says, so it keeps the whole automation set (see headlessLaunchArgs),
+// which is what makes an unattended run quiet and light.
+//
+// One switch that such a command line usually carries is deliberately missing,
+// because Chrome answers it with a bar across the window — a visible sign of an
+// automation setup, and of a browser nobody started by hand: --disable-blink-features=AutomationControlled
+// would hide the automation flag natively, and Chrome shows its "unsupported
+// command-line flag" warning for it (checked on Chrome 153, where the bar took
+// 56px off the content area). The flag is turned off from inside the page
+// instead (see automationFlagScript).
+//
+// The trailing about:blank gives a fresh browser a defined first tab instead of
+// one that restores history.
 func browserLaunchArgs(profileDir string, port int, opts BrowserOptions) []string {
-	args := []string{
-		"--remote-debugging-port=" + strconv.Itoa(port),
-		"--no-first-run",
+	args := append([]string{"--remote-debugging-port=" + strconv.Itoa(port)}, quietLaunchArgs()...)
+	if !opts.Headful {
+		args = append(args, headlessLaunchArgs()...)
+	}
+	if profileDir != "" {
+		args = append(args, "--user-data-dir="+profileDir)
+	}
+	// The caller's arguments come last: for a switch that is passed once, like
+	// --window-size, Chrome reads the value of the last occurrence, so the
+	// caller overrules what we pass.
+	args = append(args, opts.ExtraArgs...)
+	return append(args, "about:blank")
+}
+
+// quietLaunchArgs are the switches that only keep the browser from asking
+// questions of somebody who is not there. No page can observe them — they
+// decide what the browser itself does about its profile and its dialogs, not
+// what it does as a web client — so both launch kinds carry them.
+func quietLaunchArgs() []string {
+	return []string{
 		"--no-default-browser-check",
+		// A profile that has never been used makes Chrome open its first-run
+		// flow, which ends in the sign-in dialog; the switch keeps that out of
+		// the way (without it the first launch of a fresh profile opens that
+		// dialog). It belongs to the quiet set rather than to the automation
+		// set: a page cannot observe it, and what the window shows instead is
+		// Chrome's own UI (a profile that is already in use shows neither).
+		"--no-first-run",
 		// A profile whose last session did not end cleanly (a browser that was
 		// killed, a machine that went down) makes Chrome offer to restore that
 		// session: the bubble has no place in an unattended run, and its pages
@@ -82,6 +125,30 @@ func browserLaunchArgs(profileDir string, port int, opts BrowserOptions) []strin
 		"--hide-crash-restore-bubble",
 		"--disable-session-crashed-bubble",
 		"--noerrdialogs",
+		// The profile keeps the cookies and logins of the previous runs, and the
+		// store they are encrypted with stays the one the profile was created
+		// with: a keyring that is locked would ask for a password nobody is
+		// there to type, and it would make those cookies unreadable besides.
+		"--password-store=basic",
+		"--use-mock-keychain",
+	}
+}
+
+// headlessLaunchArgs are the switches of a launch without a window: an invisible
+// browser is recognized as one whatever the command line says (its user agent
+// says "HeadlessChrome"), so looking like an ordinary browser gains nothing
+// there, while this set keeps an unattended run quiet and cheap — no background
+// traffic, no extensions, no updater, no crash reporting, no audio, and a window
+// size that is not the size of a screen it cannot see.
+func headlessLaunchArgs() []string {
+	return []string{
+		// "new" selects the current headless implementation; a browser that
+		// predates the value reads the switch all the same.
+		"--headless=new",
+		"--disable-gpu",
+		"--disable-dev-shm-usage",
+		"--hide-scrollbars",
+		"--window-size=1280,900",
 		"--disable-background-networking",
 		"--disable-background-timer-throttling",
 		"--disable-breakpad",
@@ -96,26 +163,7 @@ func browserLaunchArgs(profileDir string, port int, opts BrowserOptions) []strin
 		"--metrics-recording-only",
 		"--mute-audio",
 		"--no-service-autorun",
-		"--password-store=basic",
-		"--use-mock-keychain",
 	}
-	if !opts.Headful {
-		// "new" selects the current headless implementation; a browser that
-		// predates the value reads the switch all the same. The rest keeps an
-		// unattended run quiet and windowless.
-		args = append(args,
-			"--headless=new",
-			"--disable-gpu",
-			"--disable-dev-shm-usage",
-			"--hide-scrollbars",
-			"--window-size=1280,900",
-		)
-	}
-	if profileDir != "" {
-		args = append(args, "--user-data-dir="+profileDir)
-	}
-	args = append(args, opts.ExtraArgs...)
-	return append(args, "about:blank")
 }
 
 // waitForDevTools waits for a launched browser to publish its DevTools
