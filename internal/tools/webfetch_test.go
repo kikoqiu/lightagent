@@ -361,8 +361,8 @@ func TestWebFetchToolRefusesContentThatIsNotAPage(t *testing.T) {
 }
 
 // TestWebFetchToolCutsLongFeedbackAndSavesThePage pins the feedback limit: the
-// markdown of a long page is cut, the whole page is written below .lightagent in
-// the working directory, and the answer reports the totals and the path.
+// markdown of a long page is cut, the whole markdown is written below .lightagent
+// in the working directory, and the answer reports the totals and the path.
 func TestWebFetchToolCutsLongFeedbackAndSavesThePage(t *testing.T) {
 	t.Chdir(t.TempDir())
 	server := webfetchLongPageServer(t)
@@ -389,7 +389,7 @@ func TestWebFetchToolCutsLongFeedbackAndSavesThePage(t *testing.T) {
 	if strings.Contains(body, "Section 60") {
 		t.Errorf("the body should hold the beginning of the page only:\n%s", body)
 	}
-	matches, err := filepath.Glob(filepath.Join(".lightagent", "webfetch-*.html"))
+	matches, err := filepath.Glob(filepath.Join(".lightagent", "webfetch-*.md"))
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
@@ -406,8 +406,18 @@ func TestWebFetchToolCutsLongFeedbackAndSavesThePage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the overflow file: %v", err)
 	}
-	if !strings.Contains(string(saved), "<h2>Section 60</h2>") {
-		t.Error("the overflow file must hold the whole page")
+	// The file holds the markdown of the whole page, not the HTML it came from:
+	// the part the feedback cut away is there as markdown too.
+	if !strings.Contains(string(saved), "## Section 60") {
+		t.Error("the overflow file must hold the whole page as markdown")
+	}
+	if strings.Contains(string(saved), "<h2>") {
+		t.Error("the overflow file must not hold the HTML source")
+	}
+	// It is the same text as the feedback, so it continues exactly where the
+	// feedback was cut.
+	if !strings.HasPrefix(string(saved), body) {
+		t.Errorf("the overflow file must begin with the markdown that was fed back:\n%s", saved)
 	}
 }
 

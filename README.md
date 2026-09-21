@@ -36,7 +36,7 @@
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板） |
 | 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
-| 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；反馈默认**最多 200 行**（`max_lines`，可关），超长部分整页存到工作目录 `.lightagent/webfetch-<时间>.html` 并在反馈里给出路径 |
+| 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；反馈默认**最多 200 行**（`max_lines`，可关），超长部分整页存到工作目录 `.lightagent/webfetch-<时间>.md`（Markdown 正文）并在反馈里给出路径 |
 
 ---
 
@@ -430,8 +430,8 @@ CRLF 文件按 LF 匹配、写回时恢复 CRLF。
 HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`，相对链接按**重定向后的**地址补全。
 工具返回的正文（状态行 + `---` + Markdown）就和其他工具一样，按普通 tool 反馈记录，没有额外信封。
 
-**反馈长度**默认限制在 `tools.webfetch.max_lines`（200）行：超长的正文只保留前 N 行，整页（HTML）
-写进工作目录的 `.lightagent/webfetch-<时间>.html`，状态行说明"超长、总行数与总字节、文件路径"，
+**反馈长度**默认限制在 `tools.webfetch.max_lines`（200）行：超长的正文只保留前 N 行，整页（Markdown
+正文）写进工作目录的 `.lightagent/webfetch-<时间>.md`，状态行说明"超长、总行数与总字节、文件路径"，
 需要全文时模型可用 `read_file_lines` 分页读取该文件。负数表示不限长度（此时不落盘）。
 详见 [tools.md](docs/tools.md#webfetch)。
 

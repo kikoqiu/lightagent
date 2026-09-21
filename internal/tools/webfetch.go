@@ -35,8 +35,11 @@ const (
 	lightagentDir = ".lightagent"
 	// webFetchOverflowPrefix names the files a long page is saved in, followed by
 	// the timestamp of the fetch so a sequence of them stays readable in the
-	// directory.
+	// directory. The file holds the whole markdown of the page, under the .md
+	// suffix, so it can be read back with the file tools as it was fed back.
 	webFetchOverflowPrefix = "webfetch-"
+	// webFetchOverflowSuffix is the extension of an overflow file.
+	webFetchOverflowSuffix = ".md"
 	// webFetchOverflowTimeFormat is the timestamp layout of an overflow file.
 	webFetchOverflowTimeFormat = "20060102-150405"
 	// webFetchOverflowNameAttempts bounds the search for a free file name when
@@ -160,7 +163,7 @@ func (t *WebFetchTool) feedbackRule() string {
 		return "The answer carries the whole markdown of the page. "
 	}
 	return fmt.Sprintf("The answer carries a status line and at most %d lines of markdown; a longer page is cut "+
-		"there and saved in full (as HTML) in the %s directory of the working directory, with the path "+
+		"there and saved in full as markdown in the %s directory of the working directory, with the path "+
 		"reported in the answer. ", t.cfg.MaxLines, lightagentDir)
 }
 
@@ -239,7 +242,7 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) *Result
 	if len(converted.Warnings) > 0 {
 		warnings = strings.Join(converted.Warnings, "; ")
 	}
-	body, overflow, savedTo := t.limitFeedback(page, markdown)
+	body, overflow, savedTo := t.limitFeedback(markdown)
 	status := fmt.Sprintf("Conversion succeeded. Converter warnings (if any): %s", warnings)
 	if overflow != "" {
 		status += "\n" + overflow
@@ -281,7 +284,7 @@ func (t *WebFetchTool) fetchFailure(err error) string {
 // of losing it; savedTo is that path, for the display line of the caller. A page
 // that fits, or a tool that asks for no limit at all, is returned as it is, with
 // an empty note.
-func (t *WebFetchTool) limitFeedback(page utils.WebFetchResult, markdown string) (body, note, savedTo string) {
+func (t *WebFetchTool) limitFeedback(markdown string) (body, note, savedTo string) {
 	if t.cfg.MaxLines < 0 {
 		return markdown, "", ""
 	}
@@ -290,30 +293,33 @@ func (t *WebFetchTool) limitFeedback(page utils.WebFetchResult, markdown string)
 		return markdown, "", ""
 	}
 	body = firstLines(markdown, t.cfg.MaxLines)
-	path, err := saveOverflowPage(page.HTML)
+	// The whole markdown is saved, not the HTML it came from: the file continues
+	// exactly where the feedback was cut, so reading it back needs no second
+	// conversion and its size is the one the note reports.
+	path, err := saveOverflowMarkdown(markdown)
 	if err != nil {
 		return body, fmt.Sprintf("The page is longer than the %d line feedback limit: it holds %d lines / %d bytes "+
 			"in total, so only the first %d lines follow; saving the whole page failed: %v",
 			t.cfg.MaxLines, total, len(markdown), t.cfg.MaxLines, err), ""
 	}
 	return body, fmt.Sprintf("The page is longer than the %d line feedback limit: it holds %d lines / %d bytes "+
-		"in total, so only the first %d lines follow. The whole page (%d bytes of HTML) was saved to %s — "+
+		"in total, so only the first %d lines follow. The whole page was saved as markdown to %s — "+
 		"read it with read_file_lines if the rest is needed.",
-		t.cfg.MaxLines, total, len(markdown), t.cfg.MaxLines, len(page.HTML), path), path
+		t.cfg.MaxLines, total, len(markdown), t.cfg.MaxLines, path), path
 }
 
-// saveOverflowPage writes the fetched page below the working directory and
-// returns the path of the file it created.
-func saveOverflowPage(html string) (string, error) {
+// saveOverflowMarkdown writes the whole markdown of a fetched page below the
+// working directory and returns the path of the file it created.
+func saveOverflowMarkdown(markdown string) (string, error) {
 	dir := filepath.Join(workingDir(), lightagentDir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create %s: %w", dir, err)
 	}
 	stamp := time.Now().Format(webFetchOverflowTimeFormat)
 	for attempt := 0; attempt < webFetchOverflowNameAttempts; attempt++ {
-		name := webFetchOverflowPrefix + stamp + ".html"
+		name := webFetchOverflowPrefix + stamp + webFetchOverflowSuffix
 		if attempt > 0 {
-			name = fmt.Sprintf("%s%s-%d.html", webFetchOverflowPrefix, stamp, attempt)
+			name = fmt.Sprintf("%s%s-%d%s", webFetchOverflowPrefix, stamp, attempt, webFetchOverflowSuffix)
 		}
 		path := filepath.Join(dir, name)
 		// Exclusive creation: two fetches within the same second produce two
@@ -325,7 +331,7 @@ func saveOverflowPage(html string) (string, error) {
 			}
 			return "", err
 		}
-		_, writeErr := file.WriteString(html)
+		_, writeErr := file.WriteString(markdown)
 		closeErr := file.Close()
 		if writeErr != nil {
 			return "", writeErr

@@ -305,7 +305,7 @@ type WebFetchToolConfig struct {
 	// Validate.
 	Mode string `json:"mode"`
 	// MaxLines caps the lines of markdown the tool feeds back. A page that does
-	// not fit is cut there and saved in full (as HTML) below the .lightagent
+	// not fit is cut there and saved in full as markdown below the .lightagent
 	// directory of the working directory, with the path reported to the model.
 	// 0 keeps WebFetchMaxLinesDefault, a negative value asks for no limit.
 	MaxLines int `json:"max_lines"`
