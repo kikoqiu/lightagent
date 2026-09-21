@@ -2,12 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"lightagent/internal/utils"
 )
 
 func TestParseOptionsDefaults(t *testing.T) {
@@ -247,5 +254,49 @@ func TestShutdownHooksRunNewestFirst(t *testing.T) {
 	runShutdownHooks()
 	if len(order) != 2 || order[0] != 2 || order[1] != 1 {
 		t.Fatalf("hook order = %v, want [2 1]", order)
+	}
+}
+
+// TestRunMainClosesTheFetcherBrowser checks the cleanup of the exit path: the
+// browser the fetcher keeps in the background does not survive a run, which is
+// also what removes its temporary profile. It is skipped where no browser can be
+// started, exactly like the fetcher itself skipping the browser.
+func TestRunMainClosesTheFetcherBrowser(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode: no browser is started")
+	}
+	if !utils.ChromeAvailable("") {
+		t.Skip("no Chromium-based browser available")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<!DOCTYPE html><html><body>pooled</body></html>")
+	}))
+	defer server.Close()
+
+	// A fetch leaves its browser in the pool for the next one.
+	if _, err := utils.WebFetch(ctx, server.URL); err != nil {
+		t.Fatalf("WebFetch: %v", err)
+	}
+	browser := utils.SharedBrowserInstance()
+	if browser == nil || !browser.Alive() {
+		t.Skip("the fetch did not keep a browser, so there is nothing to release")
+	}
+
+	// The exit path of the program releases it.
+	if code := runMain([]string{"--version"}); code != 0 {
+		t.Errorf("runMain(--version) = %d, want 0", code)
+	}
+	if left := utils.SharedBrowserInstance(); left != nil {
+		t.Errorf("the pooled browser survived the exit path: %+v", left)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for browser.Alive() {
+		if time.Now().After(deadline) {
+			t.Fatalf("the browser is still alive after the exit path")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

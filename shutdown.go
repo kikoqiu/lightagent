@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"lightagent/internal/proc"
+	"lightagent/internal/utils"
 )
 
 // shutdownHooks are the callbacks a signal-triggered exit runs before leaving.
@@ -36,6 +37,10 @@ func onShutdown(fn func()) {
 // The interactive editor does not depend on it: it reads Ctrl+C as a key press,
 // so no signal is raised while it drives the console.
 func watchShutdown() {
+	// The browser the fetcher keeps in the background is released the same way
+	// on a signal exit: it is state the normal return path frees in a defer
+	// (see runMain), which a signal exit never reaches.
+	onShutdown(func() { _ = utils.CloseSharedBrowsers() })
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, watchedSignals...)
 	go func() {
