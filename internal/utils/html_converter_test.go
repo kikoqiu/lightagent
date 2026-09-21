@@ -55,6 +55,16 @@ func TestHtml2MdConvert_InlineEmphasis(t *testing.T) {
 	}
 }
 
+func TestHtml2MdConvert_ShortQuotation(t *testing.T) {
+	res := convert(t, `<p>He said <q>hello</q> once</p>`)
+	if !strings.Contains(res.Markdown, `"hello"`) {
+		t.Fatalf("expected plain double quotes around the quotation: %q", res.Markdown)
+	}
+	if strings.Contains(res.Markdown, "\u201c") || strings.Contains(res.Markdown, "\u201d") {
+		t.Fatalf("the curved quotation marks of a page must not be carried over: %q", res.Markdown)
+	}
+}
+
 func TestHtml2MdConvert_UnorderedList(t *testing.T) {
 	res := convert(t, "<ul><li>one</li><li>two</li><li>three</li></ul>")
 	for _, want := range []string{"- one", "- two", "- three"} {

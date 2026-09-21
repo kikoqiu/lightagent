@@ -16,20 +16,22 @@ import (
 const maxRecursionDepth = 256
 
 var (
-	// Tailwind & CSS 响应式多列检测正则
+	// Regular expressions that detect a responsive multi-column layout
+	// (Tailwind & CSS).
 	tailwindGridRegex = regexp.MustCompile(`(?:\b[a-z0-9]+:)?grid-cols-(\d+)\b`)
 	tailwindColsRegex = regexp.MustCompile(`(?:\b[a-z0-9]+:)?columns-(\d+)\b`)
 	cssGridRepRegex   = regexp.MustCompile(`grid-template-columns:\s*repeat\((\d+)`)
 	cssColCountRegex  = regexp.MustCompile(`column-count:\s*(\d+)`)
 
-	// 语言检测多格式支持（Prism, Highlight.js, Shiki, GitHub 等）
+	// Language detection across the formats pages use (Prism, Highlight.js,
+	// Shiki, GitHub, ...).
 	langRegex         = regexp.MustCompile(`(?:language|lang)-([a-zA-Z0-9_\-\+]+)`)
 	ghSourceLangRegex = regexp.MustCompile(`\bhighlight-source-([a-zA-Z0-9_\-\+]+)\b`)
 
-	// 标题锚点匹配
+	// Matches the anchor a heading links to itself with.
 	headingAnchorRegex = regexp.MustCompile(`(?i)\b(?:anchor|header-anchor|hash-link|permalink|section-link)\b`)
 
-	// XSS 与控制字符安全正则
+	// XSS and control character safety.
 	ctrlCharsRegex = regexp.MustCompile(`[\x00-\x1f\x7f]`)
 	safeSchemes    = map[string]bool{
 		"http":   true,
@@ -40,7 +42,7 @@ var (
 )
 
 // -------------------------------------------------------------
-// 缓冲管理模块
+// Buffer management
 // -------------------------------------------------------------
 
 type mdBuffer struct {
@@ -108,7 +110,7 @@ func (b *mdBuffer) String() string {
 }
 
 // -------------------------------------------------------------
-// 核心调度树遍历
+// Core dispatch: walking the tree
 // -------------------------------------------------------------
 
 func (c *Html2MdConverter) walk(n *nethtml.Node, buf *mdBuffer, ctx *walkContext) {
@@ -121,12 +123,13 @@ func (c *Html2MdConverter) walk(n *nethtml.Node, buf *mdBuffer, ctx *walkContext
 		return
 	}
 
-	// 1. 噪声过滤：隐藏元素、纯装饰性元素、复制代码按钮、KaTeX 纯视觉 DOM
+	// 1. Noise filtering: hidden elements, purely decorative ones, copy-code
+	// buttons, the visual-only DOM of KaTeX.
 	if isIgnoredNode(n, ctx) {
 		return
 	}
 
-	// 2. 标题内置跳转锚点净化
+	// 2. Drop the anchor a heading links to itself with.
 	if ctx.inHeading && isHeadingAnchor(n) {
 		return
 	}
@@ -142,46 +145,48 @@ func (c *Html2MdConverter) walk(n *nethtml.Node, buf *mdBuffer, ctx *walkContext
 		tag := strings.ToLower(n.Data)
 
 		// ---------------------------------------------------------
-		// 启发式搜索阶段 1：复杂语义与现代交互组件嗅探
+		// Heuristic phase 1: sniffing complex semantics and modern
+		// interactive widgets
 		// ---------------------------------------------------------
 
-		// 1.1 数学公式识别 (KaTeX / MathJax / MathML)
+		// 1.1 Math formulas (KaTeX / MathJax / MathML).
 		if c.handleMath(n, buf) {
 			return
 		}
 
-		// 1.2 无障碍伪表格支持：识别 role="table" 或 role="grid"
+		// 1.2 Accessible pseudo tables: role="table" or role="grid".
 		if role := strings.ToLower(getAttr(n, "role")); role == "table" || role == "grid" {
 			c.handleTable(n, buf, ctx)
 			c.warnings.addMsg(fmt.Sprintf("ARIA table <%s>", tag))
 			return
 		}
 
-		// 1.3 面包屑导航检测 (Breadcrumb)
+		// 1.3 Breadcrumb navigation.
 		if isBreadcrumbNav(n) {
 			c.handleBreadcrumb(n, buf, ctx)
 			return
 		}
 
-		// 1.4 现代 Callout / Alert / Admonition 提示框检测
+		// 1.4 Modern Callout / Alert / Admonition boxes.
 		if isCallout, calloutType := detectCallout(n); isCallout {
 			c.handleCallout(n, calloutType, buf, ctx)
 			return
 		}
 
-		// 1.5 现代无障碍模拟列表 (role="list")
+		// 1.5 Accessible simulated lists (role="list").
 		if role := strings.ToLower(getAttr(n, "role")); role == "list" && tag != "ul" && tag != "ol" {
 			c.handleAriaList(n, buf, ctx)
 			return
 		}
 
-		// 1.6 现代 Flex 双列键值对检测
+		// 1.6 Modern flex rows of key/value pairs.
 		if kNode, vNode, ok := isKeyValueFlexRow(n); ok {
 			c.handleKeyValueRow(kNode, vNode, buf, ctx)
 			return
 		}
 
-		// 1.7 现代多列布局探测（CSS Grid / Multi-column / Bootstrap / Tailwind 响应式）
+		// 1.7 Modern multi-column layouts (CSS Grid, multi-column, Bootstrap,
+		// Tailwind responsive).
 		if colCount := detectGridColumns(n); colCount >= 2 {
 			if isTabularGrid(n, colCount) {
 				c.handleTabularGrid(n, colCount, buf, ctx)
@@ -194,7 +199,8 @@ func (c *Html2MdConverter) walk(n *nethtml.Node, buf *mdBuffer, ctx *walkContext
 		}
 
 		// ---------------------------------------------------------
-		// 启发式搜索阶段 2：标准与语义 HTML 标签调度
+		// Heuristic phase 2: dispatching on standard and semantic HTML
+		// tags
 		// ---------------------------------------------------------
 		switch tag {
 		case "h1", "h2", "h3", "h4", "h5", "h6":
@@ -267,9 +273,12 @@ func (c *Html2MdConverter) walk(n *nethtml.Node, buf *mdBuffer, ctx *walkContext
 			}
 
 		case "q":
-			buf.WriteString("“")
+			// A short quotation is wrapped in plain double quotes, the English
+			// convention; the curved quotation marks of a page are not carried
+			// over.
+			buf.WriteString("\"")
 			c.walkChildren(n, buf, ctx)
-			buf.WriteString("”")
+			buf.WriteString("\"")
 
 		case "code":
 			if !ctx.inPre {
@@ -428,7 +437,7 @@ func (c *Html2MdConverter) walkChildren(n *nethtml.Node, buf *mdBuffer, ctx *wal
 }
 
 // -------------------------------------------------------------
-// 现代启发式处理器 1：数学公式处理（KaTeX / MathJax / MathML）
+// Modern heuristic handler 1: math formulas (KaTeX / MathJax / MathML)
 // -------------------------------------------------------------
 
 func (c *Html2MdConverter) handleMath(n *nethtml.Node, buf *mdBuffer) bool {
@@ -498,7 +507,7 @@ func (c *Html2MdConverter) handleMath(n *nethtml.Node, buf *mdBuffer) bool {
 }
 
 // -------------------------------------------------------------
-// 现代启发式处理器 2：Callout / Admonition / Alert 提示框
+// Modern heuristic handler 2: Callout / Admonition / Alert boxes
 // -------------------------------------------------------------
 
 func detectCallout(n *nethtml.Node) (bool, string) {
@@ -575,7 +584,7 @@ func (c *Html2MdConverter) handleCallout(n *nethtml.Node, calloutType string, bu
 }
 
 // -------------------------------------------------------------
-// 现代启发式处理器 3：面包屑导航 (Breadcrumbs)
+// Modern heuristic handler 3: breadcrumbs
 // -------------------------------------------------------------
 
 func isBreadcrumbNav(n *nethtml.Node) bool {
@@ -599,7 +608,10 @@ func (c *Html2MdConverter) handleBreadcrumb(n *nethtml.Node, buf *mdBuffer, ctx 
 				temp := newMdBuffer()
 				c.walkChildren(curr, temp, ctx)
 				txt := strings.TrimSpace(temp.String())
-				if txt != "" && txt != "/" && txt != ">" && txt != "›" {
+				// Separators a breadcrumb puts between its items: a slash, a
+				// greater-than sign, and the single right-pointing angle
+				// quotation mark (U+203A) many sites render.
+				if txt != "" && txt != "/" && txt != ">" && txt != "\u203a" {
 					items = append(items, txt)
 				}
 				if cTag == "li" {
@@ -625,7 +637,7 @@ func (c *Html2MdConverter) handleBreadcrumb(n *nethtml.Node, buf *mdBuffer, ctx 
 }
 
 // -------------------------------------------------------------
-// 现代启发式处理器 4：ARIA 模拟列表 (role="list")
+// Modern heuristic handler 4: accessible simulated lists (role="list")
 // -------------------------------------------------------------
 
 func (c *Html2MdConverter) handleAriaList(n *nethtml.Node, buf *mdBuffer, ctx *walkContext) {
@@ -656,7 +668,7 @@ func (c *Html2MdConverter) handleAriaList(n *nethtml.Node, buf *mdBuffer, ctx *w
 }
 
 // -------------------------------------------------------------
-// 现代启发式处理器 5：多列与响应式网格嗅探
+// Modern heuristic handler 5: multi-column and responsive grids
 // -------------------------------------------------------------
 
 func getCleanElementChildren(n *nethtml.Node) []*nethtml.Node {
@@ -933,7 +945,7 @@ func hasBlockElements(n *nethtml.Node) bool {
 }
 
 // -------------------------------------------------------------
-// 代码块提取与语言嗅探
+// Code block extraction and language sniffing
 // -------------------------------------------------------------
 
 func (c *Html2MdConverter) handlePreCodeBlock(n *nethtml.Node, buf *mdBuffer, ctx *walkContext) {
@@ -1050,7 +1062,7 @@ func extractLanguage(preNode, codeNode *nethtml.Node) string {
 }
 
 // -------------------------------------------------------------
-// 文本与标准行内格式化（含 XSS 防御）
+// Text and standard inline formatting (XSS defense included)
 // -------------------------------------------------------------
 
 func (c *Html2MdConverter) handleText(n *nethtml.Node, buf *mdBuffer, ctx *walkContext) {
@@ -1250,7 +1262,7 @@ func (c *Html2MdConverter) handleListItem(n *nethtml.Node, buf *mdBuffer, ctx *w
 }
 
 // -------------------------------------------------------------
-// 表格渲染系统
+// Table rendering
 // -------------------------------------------------------------
 
 type tableCell struct {
@@ -1429,7 +1441,7 @@ func (c *Html2MdConverter) collectTableRows(n *nethtml.Node, rows *[]tableRow, i
 }
 
 // -------------------------------------------------------------
-// 媒体与链接处理器（含安全清洗与协议校验）
+// Media and link handlers (sanitizing and scheme checking included)
 // -------------------------------------------------------------
 
 func (c *Html2MdConverter) handleMediaFallback(n *nethtml.Node, buf *mdBuffer, ctx *walkContext) {
@@ -1725,7 +1737,7 @@ func (c *Html2MdConverter) resolveURL(raw string) string {
 }
 
 // -------------------------------------------------------------
-// 节点清洗与属性工具辅助
+// Node filtering and attribute helpers
 // -------------------------------------------------------------
 
 func isIgnoredNode(n *nethtml.Node, ctx *walkContext) bool {
@@ -1773,6 +1785,10 @@ func isIgnoredNode(n *nethtml.Node, ctx *walkContext) bool {
 	return false
 }
 
+// isHeadingAnchor reports whether the node is the anchor a heading links to
+// itself with: it carries a class that names one, or its whole text is the glyph
+// such an anchor shows, a hash, the pilcrow (U+00B6) or the section sign
+// (U+00A7).
 func isHeadingAnchor(n *nethtml.Node) bool {
 	if n.Type != nethtml.ElementNode || strings.ToLower(n.Data) != "a" {
 		return false
@@ -1782,7 +1798,7 @@ func isHeadingAnchor(n *nethtml.Node) bool {
 		return true
 	}
 	txt := strings.TrimSpace(extractRawText(n))
-	return txt == "#" || txt == "¶" || txt == "§"
+	return txt == "#" || txt == "\u00b6" || txt == "\u00a7"
 }
 
 func isLeafOrShortText(n *nethtml.Node) bool {
@@ -1880,7 +1896,8 @@ func findCheckboxOrTask(n *nethtml.Node) (*nethtml.Node, bool, bool) {
 	return checkNode, hasCheck, isChecked
 }
 
-// wrapFragmentIfRequired 处理未闭合或孤立的 HTML 片段，保证 net/html 解析树规范
+// wrapFragmentIfRequired wraps an unclosed or orphaned HTML fragment so the
+// net/html parse tree stays well formed.
 func wrapFragmentIfRequired(raw string) (string, string) {
 	trimmed := strings.TrimSpace(raw)
 	lower := strings.ToLower(trimmed)

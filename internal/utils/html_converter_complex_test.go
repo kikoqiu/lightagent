@@ -195,6 +195,19 @@ func TestComplex_BreadcrumbNav(t *testing.T) {
 	}
 }
 
+func TestComplex_BreadcrumbSeparatorSkipped(t *testing.T) {
+	// The separator sites render between breadcrumb items is dropped, whichever
+	// form it takes: the ASCII sign and the angle quotation mark (U+203A) are
+	// both skipped, so only the items themselves are joined.
+	res := convert(t, `<nav class="breadcrumb"><a href="/">Home</a><a>&#8250;</a><a href="/docs">Docs</a></nav>`)
+	if !strings.Contains(res.Markdown, "Home > Docs") {
+		t.Fatalf("breadcrumb with an angle quotation mark separator not linearized: %q", res.Markdown)
+	}
+	if strings.Contains(res.Markdown, "\u203a") {
+		t.Fatalf("the separator must not stay an item: %q", res.Markdown)
+	}
+}
+
 func TestComplex_ARIAList(t *testing.T) {
 	res := convert(t, `<div role="list"><div role="listitem">alpha</div><div role="listitem">beta</div></div>`)
 	if !strings.Contains(res.Markdown, "- alpha") || !strings.Contains(res.Markdown, "- beta") {
@@ -515,11 +528,13 @@ func TestComplex_HeadingAnchorClassStripped(t *testing.T) {
 }
 
 func TestComplex_HeadingAnchorGlyphStripped(t *testing.T) {
-	res := convert(t, `<h2>Sec <a href="#sec">¶</a></h2>`)
+	// The glyph the anchor shows is the pilcrow (U+00B6), written as an HTML
+	// entity so the source stays ASCII.
+	res := convert(t, `<h2>Sec <a href="#sec">&#182;</a></h2>`)
 	if !strings.Contains(res.Markdown, "## Sec") {
 		t.Fatalf("heading lost: %q", res.Markdown)
 	}
-	if strings.Contains(res.Markdown, "¶") {
+	if strings.Contains(res.Markdown, "\u00b6") {
 		t.Fatalf("anchor glyph not stripped: %q", res.Markdown)
 	}
 }
