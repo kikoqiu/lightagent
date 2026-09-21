@@ -68,7 +68,7 @@ func (b *Browser) NewPage(ctx context.Context) (*Page, error) {
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
-	params := map[string]any{"url": "about:blank", "background": false}
+	params := map[string]any{"url": "about:blank", "background": true}
 	if err := b.call(ctx, "", "Target.createTarget", params, &created); err != nil {
 		return nil, err
 	}
