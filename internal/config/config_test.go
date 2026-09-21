@@ -397,6 +397,78 @@ func TestDiscoveryConfigPartialFileDefaults(t *testing.T) {
 	}
 }
 
+// TestWebFetchConfigDefaults verifies the built-in webfetch settings: the fetch
+// strategy is auto and the optional web settings start unset.
+func TestWebFetchConfigDefaults(t *testing.T) {
+	w := Default().Tools.WebFetch
+	if !w.Enabled || w.TimeoutSeconds != 30 || !w.Compress || w.CompressRetries != 2 {
+		t.Fatalf("webfetch defaults = %+v", w)
+	}
+	if w.Mode != WebFetchModeAuto || w.EffectiveMode() != WebFetchModeAuto {
+		t.Fatalf("webfetch.mode = %q, want %q", w.Mode, WebFetchModeAuto)
+	}
+	if w.BrowserPath != "" || w.UserAgent != "" || w.MaxBytes != 0 {
+		t.Fatalf("the optional web settings must start unset: %+v", w)
+	}
+}
+
+// TestWebFetchConfigModeValidation verifies the fetch strategy is one of the
+// three the fetcher implements, whatever the spelling of the value.
+func TestWebFetchConfigModeValidation(t *testing.T) {
+	cfg := Default()
+	cfg.OpenAI.APIKey = "sk-x"
+	for _, mode := range []string{WebFetchModeAuto, WebFetchModeBrowser, WebFetchModeHTTP, " HTTP "} {
+		cfg.Tools.WebFetch.Mode = mode
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("tools.webfetch.mode %q should validate: %v", mode, err)
+		}
+	}
+	cfg.Tools.WebFetch.Mode = "chrome"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an unknown fetch strategy must fail validation")
+	}
+}
+
+// TestWebFetchConfigPartialFileDefaults verifies a partial webfetch section
+// keeps the built-in settings when merged from a config file, that the section's
+// own values win, and that an unusable byte cap falls back to the built-in one.
+func TestWebFetchConfigPartialFileDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	blob := `{"openai":{"api_key":"sk-x"},"tools":{"webfetch":{"enabled":true,"user_agent":"ua/1.0"}}}`
+	if err := os.WriteFile(path, []byte(blob), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTAGENT_CONFIG", path)
+
+	cfg, _, _, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	w := cfg.Tools.WebFetch
+	if w.EffectiveMode() != WebFetchModeAuto {
+		t.Fatalf("mode = %q, want the default %q", w.EffectiveMode(), WebFetchModeAuto)
+	}
+	if w.TimeoutSeconds != 30 || !w.Compress || w.CompressRetries != 2 {
+		t.Fatalf("merged webfetch config = %+v, want defaults preserved", w)
+	}
+	if w.UserAgent != "ua/1.0" {
+		t.Fatalf("user_agent = %q, want the stored value", w.UserAgent)
+	}
+
+	// A negative cap is unusable, so it falls back to the built-in one.
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"webfetch":{"max_bytes":-1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Tools.WebFetch.MaxBytes; got != Default().Tools.WebFetch.MaxBytes {
+		t.Fatalf("max_bytes = %d, want the default %d", got, Default().Tools.WebFetch.MaxBytes)
+	}
+}
+
 // TestMCPServerConfigEffectiveType verifies transport resolution.
 func TestMCPServerConfigEffectiveType(t *testing.T) {
 	cases := []struct {

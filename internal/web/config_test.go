@@ -212,6 +212,57 @@ func TestConfigPutAcceptsARealKey(t *testing.T) {
 	}
 }
 
+// TestConfigPutSavesWebFetchSettings covers the webfetch card of the editor: the
+// web settings of the tool are ordinary document fields, so a save keeps them,
+// and a fetch strategy the fetcher cannot run is refused before the file is
+// touched (the mode is validated exactly like at startup).
+func TestConfigPutSavesWebFetchSettings(t *testing.T) {
+	srv := newTestServer(t, "")
+	seed := `{"openai":{"api_key":"sk-secret"}}`
+	path := seedConfigFile(t, srv, seed)
+
+	body := fmt.Sprintf(`{"openai":{"api_key":%q},"tools":{"webfetch":{
+		"enabled": true, "mode": "http", "timeout_seconds": 45,
+		"browser_path": "C:/chrome/chrome.exe", "user_agent": "lightagent/1.0", "max_bytes": 4096,
+		"compress": false, "compress_retries": 0}}}`, config.MaskedSecret)
+	status, reply := callConfig(t, srv, http.MethodPut, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", status, reply.Error)
+	}
+	if got := reply.Config.Tools.WebFetch.Mode; got != config.WebFetchModeHTTP {
+		t.Fatalf("reply mode = %q, want %q", got, config.WebFetchModeHTTP)
+	}
+
+	saved, err := config.Parse([]byte(readConfigString(t, path)))
+	if err != nil {
+		t.Fatalf("parse the saved config: %v", err)
+	}
+	w := saved.Tools.WebFetch
+	if w.Mode != config.WebFetchModeHTTP || !w.Enabled || w.TimeoutSeconds != 45 {
+		t.Fatalf("saved webfetch config = %+v", w)
+	}
+	if w.BrowserPath != "C:/chrome/chrome.exe" || w.UserAgent != "lightagent/1.0" || w.MaxBytes != 4096 {
+		t.Fatalf("the web settings of the tool were not saved: %+v", w)
+	}
+	if w.Compress || w.CompressRetries != 0 {
+		t.Fatalf("the compression switches were not saved: %+v", w)
+	}
+
+	// A strategy the fetcher does not implement is rejected and the file keeps
+	// the document that was there.
+	status, reply = callConfig(t, srv, http.MethodPut,
+		fmt.Sprintf(`{"openai":{"api_key":%q},"tools":{"webfetch":{"mode":"chrome"}}}`, config.MaskedSecret))
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an unknown fetch strategy (%s)", status, reply.Error)
+	}
+	if !strings.Contains(reply.Error, "tools.webfetch.mode") {
+		t.Fatalf("error = %q, want it to name the option", reply.Error)
+	}
+	if got := config.WebFetchModeHTTP; !strings.Contains(readConfigString(t, path), `"mode": "`+got+`"`) {
+		t.Fatalf("a rejected document changed the file:\n%s", readConfigString(t, path))
+	}
+}
+
 // TestConfigEndpointsWithoutAConfigFile checks a mirror started without a config
 // file reports that editing is unavailable instead of failing on a read, and
 // that only GET/PUT are accepted.
@@ -284,6 +335,9 @@ func TestConfigEditorWiring(t *testing.T) {
 		"tools.exec.enabled", "tools.exec.timeout_seconds", "tools.exec.wait_seconds", "tools.exec.use_utf8",
 		"tools.read_file_lines.enabled", "tools.read_file_lines.max_read_file_size", "tools.read_file_lines.max_read_file_lines",
 		"tools.write_file.enabled", "tools.write_file.max_lines", "tools.write_file.auto_split", "tools.edit_file.enabled",
+		"tools.webfetch.enabled", "tools.webfetch.mode", "tools.webfetch.timeout_seconds",
+		"tools.webfetch.browser_path", "tools.webfetch.user_agent", "tools.webfetch.max_bytes",
+		"tools.webfetch.compress", "tools.webfetch.compress_retries",
 		"tools.discovery.enabled", "tools.discovery.mode", "tools.discovery.ttl",
 		"tools.discovery.max_search_results", "tools.discovery.min_match_rate", "tools.discovery.use_bm25",
 		"tools.mcp.enabled", "tools.mcp.servers",

@@ -6,7 +6,7 @@
 |------|------|
 | [architecture.md](architecture.md) | 模块划分、Agent 回合循环、事件总线、steering、并发模型、持久化、上下文压缩流程 |
 | [configuration.md](configuration.md) | `config.json` 全字段说明、`agent.md` 覆盖、`extra_body`、配置优先级与示例 |
-| [tools.md](tools.md) | 五个内置工具的参数、语义、限制与示例 |
+| [tools.md](tools.md) | 六个内置工具的参数、语义、限制与示例 |
 | [web.md](web.md) | Web 镜像：启用、端口自增、登录与鉴权（加盐摘要 / 会话 cookie / 记住我）、WebSocket 协议与消息格式、省电（移动端 / 隐藏页面、增量合帧）、`/api/config` 配置编辑（重启生效） |
 | [development.md](development.md) | 构建、运行、测试、目录结构、如何新增工具/配置项、编码约定 |
 
@@ -22,7 +22,7 @@ lightagent/
     config/                config.json + agent.md
     llm/                   OpenAI 兼容客户端（流式 / 工具调用 / extra_body）
     agent/                 回合循环、steering、事件总线、上下文压缩
-    tools/                 exec_command / manage_session / read_file_lines / write_file / edit_file
+    tools/                 exec_command / manage_session / read_file_lines / write_file / edit_file / webfetch
     store/                 单会话持久化（CWD/.lightagent/session.json）
     markdown/              Markdown → ANSI 渲染（CLI，按行流式）
     cli/                   彩色 REPL + Markdown 渲染

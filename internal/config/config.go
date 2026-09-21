@@ -89,6 +89,7 @@ type ToolsConfig struct {
 	ReadFileLines FsToolConfig        `json:"read_file_lines"`
 	WriteFile     WriteToolConfig     `json:"write_file"`
 	EditFile      ToggleToolConfig    `json:"edit_file"`
+	WebFetch      WebFetchToolConfig  `json:"webfetch"`
 	Discovery     ToolDiscoveryConfig `json:"discovery"`
 	MCP           MCPConfig           `json:"mcp"`
 }
@@ -257,6 +258,67 @@ type WriteToolConfig struct {
 	AutoSplit bool `json:"auto_split"`
 }
 
+// WebFetch fetch strategies (tools.webfetch.mode). The values are the mode
+// names internal/utils reads, so the session wiring passes them through as they
+// are.
+const (
+	// WebFetchModeAuto renders with a browser when a Chromium-based one is
+	// installed and falls back to the HTTP source when it is not. This is the
+	// default.
+	WebFetchModeAuto = "auto"
+	// WebFetchModeBrowser requires a browser: the HTTP source is never used, so
+	// a failure explains what rendering was missing.
+	WebFetchModeBrowser = "browser"
+	// WebFetchModeHTTP downloads the source and never starts a browser.
+	WebFetchModeHTTP = "http"
+)
+
+// WebFetchToolConfig configures webfetch.
+type WebFetchToolConfig struct {
+	// Enabled registers the tool. It defaults to true; loading starts from the
+	// defaults, so an explicit "enabled": false is required to turn it off.
+	Enabled bool `json:"enabled"`
+	// TimeoutSeconds bounds one fetch (page load, rendering and conversion
+	// included) and is the default of the tool's own timeout argument.
+	TimeoutSeconds int `json:"timeout_seconds"`
+	// Mode selects how a page is obtained: WebFetchModeAuto (a browser when one
+	// is installed, else the HTTP source), WebFetchModeBrowser (a browser is
+	// required) or WebFetchModeHTTP (the source only). Any other value is
+	// rejected by Validate.
+	Mode string `json:"mode"`
+	// BrowserPath pins the browser executable used to render a page (an empty
+	// value discovers an installed one). It is left out of the file when empty.
+	BrowserPath string `json:"browser_path,omitempty"`
+	// UserAgent overrides the user agent of both paths: the browser when one
+	// renders the page, the HTTP request otherwise. Empty keeps the default of
+	// each path. It is left out of the file when empty.
+	UserAgent string `json:"user_agent,omitempty"`
+	// MaxBytes caps the body read over HTTP, in bytes. 0 keeps the built-in cap
+	// (8 MiB); the key is left out of the file when 0.
+	MaxBytes int64 `json:"max_bytes,omitempty"`
+	// Compress runs the self-compression pass: after a page was fetched and
+	// converted, the agent asks the model to condense the markdown before it
+	// becomes part of the context, so a long page costs a short tool result
+	// instead of its whole text. It defaults to true; loading starts from the
+	// defaults, so an explicit "compress": false is required to turn it off.
+	Compress bool `json:"compress"`
+	// CompressRetries is how many times the model may be asked again when its
+	// compression reply does not follow the requested format. Reaching the
+	// limit keeps the full page content. 0 disables retrying, a negative value
+	// falls back to the default.
+	CompressRetries int `json:"compress_retries"`
+}
+
+// EffectiveMode returns the fetch strategy, defaulting to auto. The value is
+// normalized (trimmed, lower-case) so a hand-written "HTTP" works too.
+func (c WebFetchToolConfig) EffectiveMode() string {
+	mode := strings.ToLower(strings.TrimSpace(c.Mode))
+	if mode == "" {
+		return WebFetchModeAuto
+	}
+	return mode
+}
+
 // ToggleToolConfig is a simple enabled/disabled switch.
 type ToggleToolConfig struct {
 	Enabled bool `json:"enabled"`
@@ -300,6 +362,7 @@ func Default() *Config {
 			ReadFileLines: FsToolConfig{Enabled: true, MaxReadFileSize: 32000, MaxReadFileLines: 200},
 			WriteFile:     WriteToolConfig{Enabled: true, MaxLines: 200, AutoSplit: true},
 			EditFile:      ToggleToolConfig{Enabled: true},
+			WebFetch:      WebFetchToolConfig{Enabled: true, Mode: WebFetchModeAuto, TimeoutSeconds: 30, Compress: true, CompressRetries: 2},
 			Discovery: ToolDiscoveryConfig{
 				Enabled:          false,
 				Mode:             ToolDiscoveryModeUnlock,
@@ -656,6 +719,24 @@ func (c *Config) applyDefaults() {
 	if c.Tools.WriteFile.MaxLines <= 0 {
 		c.Tools.WriteFile.MaxLines = def.Tools.WriteFile.MaxLines
 	}
+	if c.Tools.WebFetch.TimeoutSeconds <= 0 {
+		c.Tools.WebFetch.TimeoutSeconds = def.Tools.WebFetch.TimeoutSeconds
+	}
+	// An omitted mode keeps the built-in strategy; an unusable value is
+	// reported by Validate rather than silently replaced.
+	if strings.TrimSpace(c.Tools.WebFetch.Mode) == "" {
+		c.Tools.WebFetch.Mode = def.Tools.WebFetch.Mode
+	}
+	// max_bytes is a cap: 0 (unset) means the built-in one, and a negative
+	// value falls back to it as well.
+	if c.Tools.WebFetch.MaxBytes < 0 {
+		c.Tools.WebFetch.MaxBytes = def.Tools.WebFetch.MaxBytes
+	}
+	// An explicit 0 means "no retry after a malformed compression reply", so
+	// only a negative value falls back to the default.
+	if c.Tools.WebFetch.CompressRetries < 0 {
+		c.Tools.WebFetch.CompressRetries = def.Tools.WebFetch.CompressRetries
+	}
 	if strings.TrimSpace(c.Tools.Discovery.Mode) == "" {
 		c.Tools.Discovery.Mode = def.Tools.Discovery.Mode
 	}
@@ -683,6 +764,14 @@ func (c *Config) WebEnabled() bool { return c.Web.Port > 0 }
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.OpenAI.APIKey) == "" {
 		return fmt.Errorf("openai.api_key is empty; edit the config file and try again")
+	}
+	// webfetch obtains a page in one of three ways, and only those three: a
+	// typo must be reported instead of silently falling back to the default.
+	switch c.Tools.WebFetch.EffectiveMode() {
+	case WebFetchModeAuto, WebFetchModeBrowser, WebFetchModeHTTP:
+	default:
+		return fmt.Errorf("tools.webfetch.mode %q is not supported (want %q, %q or %q)",
+			c.Tools.WebFetch.Mode, WebFetchModeAuto, WebFetchModeBrowser, WebFetchModeHTTP)
 	}
 	// MCP tools always use the find/unlock mechanism, so enabling MCP also
 	// requires a valid discovery configuration.

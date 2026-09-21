@@ -9,8 +9,8 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 |----|------|
 | `internal/config` | 读取程序目录的 `config.json` 与可选 `agent.md`，提供默认值与校验 |
 | `internal/llm` | OpenAI 兼容的 `/chat/completions` 客户端：流式 SSE 与非流式解析（含 `reasoning_content` / `reasoning` 思考透出）、工具调用聚合、`extra_body` 合并、空闲超时看门狗 |
-| `internal/agent` | 回合循环（tool loop）、steering、事件总线、上下文压缩、系统提示词 |
-| `internal/tools` | 工具接口与注册表（含 MCP unlock 的 deferred/grant 控制面、BM25 发现搜索、`unlock_tool`、`dynamic_call`）、命令执行引擎与会话池、文件工具、字符集编解码 |
+| `internal/agent` | 回合循环（tool loop）、steering、事件总线、上下文压缩、工具结果自压缩（webfetch）、系统提示词 |
+| `internal/tools` | 工具接口与注册表（含 MCP unlock 的 deferred/grant 控制面、BM25 发现搜索、`unlock_tool`、`dynamic_call`）、命令执行引擎与会话池、文件工具、网页抓取（`webfetch`：utils 取页面 + 转 Markdown，取法/浏览器/UA/字节上限来自 `tools.webfetch`）、字符集编解码 |
 | `internal/mcp` | MCP 客户端（纯标准库）：JSON-RPC 2.0 over stdio / Streamable HTTP / HTTP+SSE；配置驱动的 `Manager` 与 `tools.Tool` 适配器 |
 | `internal/proc` | 子进程启动与停止：**树模式**（`Start`，Windows 用 Job Object「kill-on-close」、Unix 用独立进程组 `SIGTERM`→`SIGKILL`，exec 会话用）与**单进程模式**（`StartProcess`，只停止自己启动的那个进程，stdio MCP server 用）；`Shutdown` 在主进程退出或收到信号时按各自模式停止所有仍存活的进程 |
 | `internal/store` | 单会话持久化（`CWD/.lightagent/session.json`） |
@@ -54,12 +54,23 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
       ——将来若要「把解析错误回喂模型、让它重发调用」，就在该处按这个判定分支（策略未定，暂不启用）。
    6. 无 `tool_calls` 时：`finish_reason=length`（被 `max_tokens` 截断）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮（连续 3 次则停止）；否则回合结束——**但若此刻 `steerCh` 里还有消息**（流式过程中刚插入的），则本回合继续下一轮把它并入上下文，而不是结束回合。
    7. 逐个执行工具，发布 `tool_call` / `tool_result`，把结果作为 `tool` 消息追加；本轮结束后
-      广播 `usage`（工具结果同样占用上下文），回到 2。
+      广播 `usage`（工具结果同样占用上下文），回到 2。tool 消息的正文就是工具函数的返回值
+      （`res.ForLLM`），不加任何包装/信封；被中断的调用也在这条通路上记一条
+      `interrupted by user before the tool finished`。
       * **write_file 自动拆解**（`tools.write_file.auto_split`，默认开启）：若某次 `write_file` 的
         文本载荷超过 `write_file.max_lines`，该调用的参数在落库前先被改写成第一段（历史、前端展示与
         后续请求回传的都是实际执行的参数），其余分段在本轮工具结果之后追加为**独立的 assistant/tool
         往返**（每段一个 `tool_call` + `tool_result`，续写段 `mode='a'`），全部写完才回到 2 继续问
         模型；第一段失败则丢弃其余分段并发布 `info`。
+      * **webfetch 自压缩**（`tools.webfetch.compress`，默认开启；目前只有 `webfetch` 请求自压缩，
+        机制本身对所有工具开放）：一轮的**全部** tool 反馈记录完之后，
+        引擎**按调用顺序**对其中要求压缩的那几条**逐个**追加一条 `[engine]` user 提示（没请求的原样跳过），
+        **点明压的是哪个调用的返回**（`webfetch {"url":"…"}` + `call id`，因为上下文里可能同时有好几条 tool 反馈），
+        让模型把那条内容压成核心内容并用 `<compressed-content></compressed-content>` 单独回一条；
+        格式不对则再追加一条提示重试（每条 `compress_retries`，默认 2），某条超限即放弃那一条。
+        **全部拿到后统一收尾**：回滚这次追加的所有提示与中间回复，再把对应 tool 消息**重新记为压缩内容**
+        （位置不变），然后回到 2 继续问模型。压缩调用不带工具、也不发布流式增量，
+        进度以 `info` / `error` 事件呈现。
    8. 达到 `max_tool_iterations` 时发布 `info` 并结束。
 3. 结束时置 `busy=false`、保存会话、发布 `turn_done`；随后若 `steerCh` 仍非空（消息在最后一轮
    **之后**才到，已无轮次可并入），则由 `startSteeringTurn()` 立刻把它们作为**独立的新回合**继续

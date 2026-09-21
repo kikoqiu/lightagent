@@ -514,6 +514,10 @@ func (a *Agent) runTurn(ctx context.Context, userTexts []string) {
 		truncations = 0
 
 		var pendingSplits []llm.ToolCall
+		// Answers whose tool asked for the self-compression pass. They are
+		// collected here and condensed once the whole round is recorded, so a
+		// round that answers several calls is compressed call by call.
+		var compressions []compressRequest
 		for idx, tc := range resp.ToolCalls {
 			res, canceled := a.dispatchToolCall(ctx, tc)
 			if canceled {
@@ -523,6 +527,9 @@ func (a *Agent) runTurn(ctx context.Context, userTexts []string) {
 				a.reportInterruptedTools(resp.ToolCalls, idx)
 				a.finishInterrupt(turnStart, userCount)
 				return
+			}
+			if res.Compress {
+				compressions = append(compressions, compressRequest{call: tc, retries: res.CompressRetries})
 			}
 			rest, split := continuations[idx]
 			if !split {
@@ -559,6 +566,15 @@ func (a *Agent) runTurn(ctx context.Context, userTexts []string) {
 				a.finishInterrupt(turnStart, userCount)
 				return
 			}
+		}
+
+		// Every answer of the round is recorded, so the ones that asked for it
+		// are condensed here — one instruction at a time, each naming the call
+		// it is about — and the tool messages are recorded again with the
+		// condensed content once all of them came back.
+		if !a.compressToolResults(ctx, compressions) {
+			a.finishInterrupt(turnStart, userCount)
+			return
 		}
 	}
 

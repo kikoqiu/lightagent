@@ -105,6 +105,23 @@
       ]
     },
     {
+      title: 'Tools · web', note: 'webfetch: page → markdown',
+      fields: [
+        { path: 'tools.webfetch.enabled', type: 'bool', help: 'register webfetch' },
+        { path: 'tools.webfetch.mode', type: 'select', options: [
+          { value: 'auto', label: 'auto — render with a browser when one is installed, else the HTTP source' },
+          { value: 'browser', label: 'browser — render or fail' },
+          { value: 'http', label: 'http — the source only, never a browser' }
+        ], help: 'how a page is obtained' },
+        { path: 'tools.webfetch.timeout_seconds', type: 'number', min: 1, help: 'seconds allowed for one fetch; the default of the tool timeout argument' },
+        { path: 'tools.webfetch.browser_path', type: 'text', placeholder: 'auto-detected', help: 'browser executable to render with; empty discovers an installed one' },
+        { path: 'tools.webfetch.user_agent', type: 'text', placeholder: 'path default', help: 'user agent of both paths; empty keeps each path default' },
+        { path: 'tools.webfetch.max_bytes', type: 'number', min: 0, help: 'body cap of the HTTP path in bytes; 0 = built-in 8 MiB' },
+        { path: 'tools.webfetch.compress', type: 'bool', help: 'condense the markdown with the model before it enters the context' },
+        { path: 'tools.webfetch.compress_retries', type: 'number', min: 0, help: 'retries after a malformed compression reply; 0 gives up at once' }
+      ]
+    },
+    {
       title: 'Tools · discovery', note: 'locked tools: search, unlock, dynamic call',
       fields: [
         { path: 'tools.discovery.enabled', type: 'bool', help: 'register tool_search_tool_bm25, unlock_tool and dynamic_call' },

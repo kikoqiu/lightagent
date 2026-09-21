@@ -12,10 +12,14 @@ type Tool interface {
 ```
 
 `Result` 有三个关键字段：`ForLLM`（回填到对话的工具结果）、`ForUser`（CLI/网页展示）、
-`IsError`。注册表 `tools.Registry` 负责按名分派并把 `arguments` 解析为 map。
+`IsError`；另有 `Silent`（不渲染展示）与 `Compress` / `CompressRetries`（请求引擎对该结果做
+[自压缩](#自压缩toolswebfetchcompress)）。注册表 `tools.Registry` 负责按名分派并把 `arguments` 解析为 map。
+
+`ForLLM` 是**工具函数的返回值**：agent 把它**原样**记成该调用的 tool 消息（`role=tool` + `tool_call_id`），
+不额外包装、不加信封 —— 工具反馈走的就是 OpenAI 那条正常的 tool 结果通路。
 
 工具由配置开关控制（见 [configuration.md](configuration.md)）：可用的工具有
-`exec_command`、`manage_session`、`read_file_lines`、`write_file`、`edit_file`。
+`exec_command`、`manage_session`、`read_file_lines`、`write_file`、`edit_file`、`webfetch`。
 
 ---
 
@@ -206,6 +210,61 @@ type Tool interface {
 
 ---
 
+## `webfetch`
+
+抓取网页并把它简化成 Markdown 交给模型。
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `url` | string | 必填 | 页面地址（`http`/`https`；缺 scheme 时按 `https` 处理） |
+| `timeout` | int | `webfetch.timeout_seconds` | 整次抓取的秒数上限（渲染、加载与转换都算在内） |
+
+* 取页面用 `internal/utils/webfetch.go`：机器上装了 Chromium 系浏览器时用无头浏览器渲染（DOM 序列化），
+  否则回退到 HTTP 源码；结果里的 `Method` / `Notes` 说明实际走了哪条路。
+* 取法由 `tools.webfetch` 的 web 侧配置决定（见 [configuration.md](configuration.md#tools)）：
+  `mode`（`auto` / `browser` / `http`）、`browser_path`（渲染用的浏览器可执行文件，空则自动探测）、
+  `user_agent`（两条路径共用的 UA，空则各用默认）、`max_bytes`（HTTP 源码的字节上限，`0` 用内置 8 MiB）。
+  工具描述会按 `mode` 如实陈述取法，`http` 时不会声称会渲染浏览器。
+* 转换用 `internal/utils/html_converter.go`（`Html2MdConvert`，`BaseURL` 取**重定向后的** `FinalURL`，
+  相对链接因此被补成绝对地址）。
+* 工具返回的就是它的返回值（下面这段文本），与其他工具一样作为普通 tool 反馈记录：
+
+  ```
+  Conversion succeeded. Converter warnings (if any): <html_converter 的告警，无则 none>
+  ---
+
+  <Markdown 正文>
+  ```
+
+  * 告警来自转换器（未知标签、片段包裹等），拼在同一行里。
+  * 抓取失败、转换失败或页面没有可读内容时返回**错误结果**。
+  * CLI/网页的展示行是简短一行（地址、取法、Markdown 字符数、耗时、取页面时的备注），不打印整篇正文。
+
+### 自压缩（`tools.webfetch.compress`）
+
+网页往往很长，直接进上下文很贵，因此抓取结果默认先过一遍**自压缩**。**目前只有 `webfetch` 请求自压缩**
+（开关就在 `tools.webfetch` 下），机制本身对任何工具开放：工具在 `Result.Compress` 里提出请求即可。
+
+一轮里可能有好几个调用，其中只有一部分请求了压缩（比如 3 个调用里有 2 个 `webfetch`），处理方式是：
+
+1. 这一轮的**全部** tool 调用照常执行、结果照常记录（都是普通 tool 消息，就是各工具的返回值），前端也照常显示。
+2. 轮次结束后，引擎**按调用顺序**对其中"要求压缩"的那几条反馈**逐个**处理，每次都追加一条独立的 user 提示
+   （`[engine]` 前缀的英语提示词）；**没有请求压缩的调用直接跳过**，其反馈原样保留。
+   提示词**点明这次要压的是哪个调用的返回** —— `webfetch {"url":"…"}` 加上 `call id`
+   （参数压成一行、超长截断）—— 因为上下文里可能同时存在好几条 tool 反馈
+   （甚至好几个 `webfetch` 同时发过），不指明就分不清压哪一条。提示词要求模型保留格式地把那条内容压成核心信息、
+   去掉广告与无关内容，并把完整内容用 `<compressed-content></compressed-content>` 包起来单独回一条消息、不要任何解释。
+3. 每条回包都做格式检查：块存在且非空才算通过。不通过则再追加一条 `[engine]` 提示要求重发，
+   每条最多重试 `compress_retries` 次（默认 2）；某条超限即放弃那一条、保留它的完整正文（不影响其它条）。
+4. **全部拿到后统一收尾**：先回滚这次追加的所有提示与模型中间回复，再把每个被压缩的 tool 消息**重新记为压缩内容**
+   （位置不变，就是把那条 tool 消息的内容换成压缩后的文本），于是这一轮每个调用仍然只有一条反馈 ——
+   压缩过的就是压缩后的那条，没参与的还是原来的那条。
+
+自压缩期间引擎发 `info` 事件（开始压哪条、重试、成功时的字符数、放弃），失败发 `error`，因此等待不是静默的。
+这些提示词与中间回复都不算对话内容，前端不会为它们画消息行。
+
+---
+
 ## MCP 工具发现 / unlock（`tools.discovery`）
 
 MCP unlock 发现机制。**锁定函数**由宿主用 `Registry.RegisterDeferred` 注册：它们不进入模型声明的 `tools` 数组、也不出现在系统提示词里，只有拿到有效授权（grant）才允许执行。模型按 「搜索 → 解锁 → 间接调用」三步使用。开启 `tools.discovery.enabled` 后提供以下三个控制面工具，并在系统提示词追加 **Tool Discovery & Unlock** 规则（详见 [configuration.md](configuration.md#toolsdiscoverymcp-工具发现--unlock)）。
@@ -278,7 +337,7 @@ tool: <真实执行结果>
 每个 server 工具被包装为 `tools.Tool`，命名为 `mcp_<server>_<tool>`（小写、非法字符归一为 `_`）；描述与参数 schema 直接取自 server。
 
 * MCP 工具**始终**以 `RegisterDeferred` 作为**锁定函数**注册，进入搜索/解锁体系；**永不出现在模型的 `tools` 声明里**。
-* 内置工具（`exec_command` / `manage_session` / `read_file_*` / `write_file` / `edit_file`）不受此机制影响，始终作为核心工具暴露。
+* 内置工具（`exec_command` / `manage_session` / `read_file_*` / `write_file` / `edit_file` / `webfetch`）不受此机制影响，始终作为核心工具暴露。
 
 ### 系统提示词注入
 

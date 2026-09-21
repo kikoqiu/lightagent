@@ -104,8 +104,8 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 
 * **Form（表单）**：按段展开的控件表单，每项一行——左侧是配置键名 + 说明，右侧是控件：
   文本框、密码框、数字框、开关、滑杆（带实时数值）、下拉、多行文本。
-  段落为 OpenAI / Context / Web mirror / Tools · shell / Tools · files / Tools · discovery /
-  Tools · MCP / Agent / UI（`▸` 可折叠，OpenAI、Context、Web 默认展开）。
+  段落为 OpenAI / Context / Web mirror / Tools · shell / Tools · files / Tools · web /
+  Tools · discovery / Tools · MCP / Agent / UI（`▸` 可折叠，OpenAI、Context、Web 默认展开）。
   控件改动**立刻写进当前文档**，所以切到 JSON 看到的就是将要提交的内容。
   留空表示“用内置默认”（保存时该项直接从文件中移除）；`extra_body` 与 `tools.mcp.servers`
   是这两个 map 型字段的 JSON 文本框（标有 `json` 标签）。

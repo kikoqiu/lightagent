@@ -53,6 +53,7 @@
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
+    "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "browser_path": "", "user_agent": "", "max_bytes": 0, "compress": true, "compress_retries": 2 },
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
       "enabled": false,
@@ -134,12 +135,25 @@
 | `write_file.max_lines` | int | `200` | 单次写入行数上限（超出截断） |
 | `write_file.auto_split` | bool | `true` | 模型一次写出的文本超过 `max_lines` 时，由 agent 自动拆成多次写入（见 [tools.md](tools.md#write_file)）；关闭后恢复"截断 + 提示续写"的旧行为 |
 | `edit_file.enabled` | bool | `true` | 启用编辑工具 |
+| `webfetch.enabled` | bool | `true` | 启用 `webfetch`（抓网页 → Markdown） |
+| `webfetch.timeout_seconds` | int | `30` | 单次抓取的秒数上限（也是工具 `timeout` 参数的默认值） |
+| `webfetch.compress` | bool | `true` | 一轮 tool 反馈记录完后做[自压缩](tools.md#自压缩toolswebfetchcompress)：逐个追加指名该调用的提示让模型压成核心内容，全部拿到后把对应 tool 消息重新记为压缩内容。省略即开启，显式 `false` 关闭 |
+| `webfetch.compress_retries` | int | `2` | 压缩回包格式不对时的重试次数；用完即放弃压缩、保留完整正文。`0` 表示不重试，负数回退默认值 |
+| `webfetch.mode` | string | `"auto"` | 取页面的方式：`auto` 装了 Chromium 系浏览器就渲染、否则取 HTTP 源码；`browser` 必须渲染（没有可用浏览器就直接失败，不会退回源码）；`http` 只取源码、从不启动浏览器。其它取值校验失败 |
+| `webfetch.browser_path` | string | 空 | 渲染用的浏览器可执行文件；为空时自动探测已安装的浏览器。为空时不写入文件 |
+| `webfetch.user_agent` | string | 空 | 覆盖两条路径的 User-Agent（浏览器渲染时由浏览器发送、HTTP 源码是请求头）；为空时各用自带默认（Go 客户端 / 浏览器自身）。为空时不写入文件 |
+| `webfetch.max_bytes` | int | `0` | HTTP 源码正文的字节上限；`0` 用内置的 8 MiB。负数回退到 `0`；为 `0` 时不写入文件 |
 
 * `exec.use_utf8` 默认为 `true`：加载时先取默认值再合并文件，**省略该字段即保持开启**；
   需要旧的 ANSI 代码页转换时显式写 `"use_utf8": false`。它只是默认值——`exec_command` 的
   `use_utf8` 参数可由模型按次调用覆盖。该字段与参数**只在 Windows 生效**（非 Windows 无 ANSI
   代码页可回退，始终 UTF-8）。`exec_command` 的脚本语言由 `language` 参数选择（宿主引擎
   `ps`/`sh`，以及系统存在 Python 时的 `python`），细节见 [tools.md](tools.md#exec_command)。
+
+* `webfetch.mode` / `browser_path` / `user_agent` / `max_bytes` 只管**取页面**这一步：
+  转换（HTML → Markdown）、自压缩与结果格式都不受影响。工具描述按 `mode` 如实说明取法
+  （`http` 时不会声称会渲染浏览器，`browser` 时说明失败即表示没有可用浏览器），
+  实际走的那条路由抓取结果里的 `Method` / `Notes` 报告，CLI 与网页的展示行也会带上。
 
 #### `tools.discovery`（MCP 工具发现 / unlock）
 
