@@ -16,7 +16,10 @@ import (
 const WebFetchToolName = "webfetch"
 
 const (
-	// webFetchTimeoutDefault bounds a fetch when no timeout is configured.
+	// webFetchTimeoutDefault bounds a fetch when no timeout is configured, and
+	// is the floor of every fetch: the configured timeout and the timeout
+	// argument of a call are raised to it, because loading, rendering and
+	// converting a page cannot finish in less.
 	webFetchTimeoutDefault = 30 * time.Second
 	// WebFetchMaxLinesDefault is how many lines of markdown the tool feeds back
 	// when nothing else is configured. A page that does not fit is cut there and
@@ -52,7 +55,8 @@ const (
 type WebFetchConfig struct {
 	// Timeout bounds one fetch (page load, rendering and conversion included).
 	// It is the default of the tool's timeout argument. A non-positive value
-	// falls back to webFetchTimeoutDefault.
+	// falls back to webFetchTimeoutDefault, and a smaller one is raised to it:
+	// no fetch runs with less than that floor.
 	Timeout time.Duration
 	// Mode selects how the page is obtained. The empty value is the usual
 	// default (utils.FetchModeAuto: a visible browser, else the HTTP source).
@@ -85,9 +89,10 @@ type WebFetchTool struct {
 
 // NewWebFetchTool creates the page fetcher.
 func NewWebFetchTool(cfg WebFetchConfig) *WebFetchTool {
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = webFetchTimeoutDefault
-	}
+	// A missing or unusable value keeps the built-in default, and a value below
+	// the floor of every fetch is raised to it, so the configured timeout is
+	// always one the fetcher can honor.
+	cfg.Timeout = raiseWebFetchTimeout(cfg.Timeout)
 	if cfg.Mode == "" {
 		cfg.Mode = utils.FetchModeAuto
 	}
@@ -102,8 +107,8 @@ func (t *WebFetchTool) Name() string { return WebFetchToolName }
 
 // Description implements Tool.
 func (t *WebFetchTool) Description() string {
-	return "Fetch a web page and read it as markdown. " + t.strategy() +
-		" Only pages and other text documents are supported: an address that serves binary content " +
+	return "Fetch a web page and read it as markdown. " + t.strategy() + t.renderRule() +
+		"Only pages and other text documents are supported: an address that serves binary content " +
 		"(a PDF, an image, an archive, ...) is refused with an error, so use a command to get such content. " +
 		t.feedbackRule() +
 		"Use it to read documentation, articles or any address of the web instead of downloading " +
@@ -111,21 +116,40 @@ func (t *WebFetchTool) Description() string {
 }
 
 // strategy states how this tool is configured to obtain a page, so the model is
-// never told about a browser it will not get.
+// never told about a browser it will not get: the mode is fixed by the
+// configuration, and it is what decides whether Chrome is used at all. Every
+// sentence ends with a space, so it can be followed by renderRule.
 func (t *WebFetchTool) strategy() string {
 	switch t.cfg.Mode {
 	case utils.FetchModeHTTP:
-		return "The page is downloaded over HTTP, without a browser."
+		return "The page is downloaded over HTTP and never rendered: the source the server sends is what is read. "
 	case utils.FetchModeChromeHeadless:
-		return "The page is rendered in a headless browser."
+		return "The page is rendered by Chrome, in a headless instance with no window. "
 	case utils.FetchModeChromeAttached:
-		return "The page is rendered through a browser that is already running, " +
-			"reached over its DevTools endpoint."
+		return "The page is rendered by Chrome through the browser the user is using. "
 	case utils.FetchModeChromeHeadful:
-		return "The page is rendered in a visible browser window."
+		return "The page is rendered by Chrome, in a visible window. "
 	default:
-		return "The page is rendered in a visible browser window when a browser can be started " +
-			"and downloaded over HTTP otherwise."
+		return "The page is rendered by Chrome in a visible window when a browser can be started, " +
+			"and downloaded over HTTP otherwise. "
+	}
+}
+
+// renderRule states what rendering with Chrome is, since the model only reads
+// the markdown: a rendered fetch carries the DOM a real browser built — with the
+// content the page's JavaScript added — rather than the plain source. A tool
+// pinned to the source says nothing about Chrome, hence the empty answer.
+func (t *WebFetchTool) renderRule() string {
+	switch t.cfg.Mode {
+	case utils.FetchModeHTTP:
+		return ""
+	case utils.FetchModeChromeAttached:
+		return "Rendering means Chrome opens a tab in that browser, runs the JavaScript of the page and hands back " +
+			"the DOM it built, so the fetch carries the logins, cookies and sessions of that browser. "
+	default:
+		return "Rendering means a real Chrome loads the address, runs the JavaScript of the page and hands back " +
+			"the DOM it built, so content the page adds at run time is read as well; the browser uses a profile " +
+			"of the agent's own, not one of the user. "
 	}
 }
 
@@ -140,8 +164,13 @@ func (t *WebFetchTool) feedbackRule() string {
 		"reported in the answer. ", t.cfg.MaxLines, lightagentDir)
 }
 
-// Parameters implements Tool.
+// Parameters implements Tool. The timeout the model reads states the value the
+// system is configured with (tools.webfetch.timeout_seconds) as well as the
+// floor every fetch has, so an argument can never promise less than the fetch
+// will actually get.
 func (t *WebFetchTool) Parameters() map[string]any {
+	configured := webFetchSeconds(t.cfg.Timeout)
+	floor := webFetchSeconds(webFetchTimeoutDefault)
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -151,9 +180,12 @@ func (t *WebFetchTool) Parameters() map[string]any {
 					"Addresses that serve other content are refused.",
 			},
 			"timeout": map[string]any{
-				"type": "integer",
-				"description": "Time limit for the whole fetch in seconds " +
-					"(default: the configured tools.webfetch.timeout_seconds).",
+				"type":    "integer",
+				"default": configured,
+				"description": fmt.Sprintf("Time limit for the whole fetch in seconds (page load, rendering and "+
+					"conversion included). Default: %d, the configured tools.webfetch.timeout_seconds. "+
+					"The smallest value that is used is %d: a smaller number is raised to it.",
+					configured, floor),
 			},
 		},
 		"required": []string{"url"},
@@ -173,9 +205,12 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) *Result
 	if raw, present := args["timeout"]; present && raw != nil {
 		seconds := intArg(args, "timeout", 0)
 		if seconds <= 0 {
-			return Fail("Invalid 'timeout' argument. Must be a positive number of seconds.")
+			return Fail(fmt.Sprintf("Invalid 'timeout' argument. Must be a positive number of seconds "+
+				"(the smallest value used is %d).", webFetchSeconds(webFetchTimeoutDefault)))
 		}
-		timeout = time.Duration(seconds) * time.Second
+		// A shorter limit is not honored: the fetch takes the floor instead,
+		// which is what the schema promises the model.
+		timeout = raiseWebFetchTimeout(time.Duration(seconds) * time.Second)
 	}
 
 	page, err := utils.WebFetch(ctx, rawURL, t.fetchOptions(timeout)...)
@@ -348,25 +383,48 @@ func describeContentType(contentType string) string {
 	return "an unidentified content type"
 }
 
-// agentBrowserProfileDir returns the profile directory a launched browser uses.
-// It is a profile of our own, below the agent's directory in the working
-// directory, so the window the agent opens never interferes with the browser the
-// user is using (that one is reached by attaching, see chrome-attached), cookies
-// and logins of the agent's own profile survive between launches, and the state
-// belongs to the project rather than to the user's home.
+// agentBrowserProfileDir returns the profile directory a browser the tool starts
+// uses: a profile of our own, below the agent's directory in the working
+// directory. The browser path creates it when it is missing and nothing ever
+// deletes it, so the cookies and logins a fetch collects are there for the next
+// one, the state belongs to the project rather than to the user's home, and the
+// browser the user is using is never touched (chrome-attached reaches that one by
+// attaching to it, and names no profile of ours).
 func agentBrowserProfileDir() string {
 	return filepath.Join(workingDir(), lightagentDir, browserProfileName)
+}
+
+// webFetchSeconds reports a timeout as the whole number of seconds the tool
+// speaks in its schema and its messages.
+func webFetchSeconds(timeout time.Duration) int {
+	return int(timeout / time.Second)
+}
+
+// raiseWebFetchTimeout lifts a timeout to the floor of every fetch
+// (webFetchTimeoutDefault): loading, rendering and converting a page cannot
+// finish in less, so a shorter limit would only make a fetch fail early. The
+// configured timeout and the timeout argument of a call both go through it, and
+// the floor is the smallest value the schema offers the model.
+func raiseWebFetchTimeout(timeout time.Duration) time.Duration {
+	if timeout < webFetchTimeoutDefault {
+		return webFetchTimeoutDefault
+	}
+	return timeout
 }
 
 // fetchOptions translates the configured web settings into the options of
 // internal/utils, leaving out what was not configured so the defaults of the
 // fetcher apply.
 func (t *WebFetchTool) fetchOptions(timeout time.Duration) []utils.WebFetchOptionFunc {
-	// The window of a headful browser is what makes a fetch look like a person
-	// reading a page, so auto and chrome-headful ask for one — on a profile of
-	// the agent's own, which is what keeps the user's browser out of it.
+	// Every mode that starts a browser of its own renders on a profile of the
+	// agent's own — the headless one included: one directory below the agent's
+	// directory in the working directory, created when it is missing and never
+	// deleted, so the cookies and logins one fetch collects are there for the
+	// next one. A mode that starts no browser names no profile: http needs none,
+	// and chrome-attached drives the browser the user has open, whose profile is
+	// theirs and is not ours to point at.
 	browser := utils.BrowserOptions{Headful: t.headfulWindow()}
-	if browser.Headful {
+	if t.launchesBrowser() {
 		browser.UserDataDir = agentBrowserProfileDir()
 	}
 	opts := []utils.WebFetchOptionFunc{

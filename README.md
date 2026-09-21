@@ -396,23 +396,35 @@ CRLF 文件按 LF 匹配、写回时恢复 CRLF。
 
 ### `webfetch`
 抓取网页 → 转成 Markdown 交给模型。`url` 必填，`timeout`（秒）默认取
-`tools.webfetch.timeout_seconds`（30）。**只支持网页与文本内容**：地址返回二进制内容（PDF、图片、
+`tools.webfetch.timeout_seconds`（30）。工具 schema 里直接写出配置的秒数与下限：**实际超时不会小于 30 秒**，
+更小的配置值或参数值都会被抬到 30 秒。**只支持网页与文本内容**：地址返回二进制内容（PDF、图片、
 压缩包等）时直接返回错误，并提示改用 `exec_command` 下载/转换。
 
 取法由 `tools.webfetch.mode` 决定：
 
 * `auto`（默认）：用**可见窗口**的浏览器渲染（减少被反爬拦截的可能），没有可用浏览器时回退 HTTP 源码；
 * `chrome-headful`：必须用可见窗口的浏览器渲染；
-* `chrome-headless`：必须用无头浏览器渲染；
+* `chrome-headless`：必须用无头浏览器渲染（不开窗口，但 profile 与其它模式共用，见下）；
 * `chrome-attached`：挂到**已在运行**的浏览器上（DevTools 端点由 `attach_address` 给出，
   可写端口 `"9222"`、`host:port`、`http://…` 或 `ws://…`，默认 `127.0.0.1:9222`），
   用它自己的登录态与 Cookie；
 * `http`：只取 HTTP 源码，从不启动浏览器。
 
-`auto` / `chrome-headful` 启动的窗口用 agent **自己的 profile**（工作目录下
-`.lightagent/browser-profile`），不会打扰你正在使用的浏览器；要用你自己的登录态请选 `chrome-attached`。
-浏览器关闭时先请它自己退出（最多等 5 秒，之后才强杀进程树），启动前也清掉上次异常退出留下的
-残留（端口文件、崩溃标记），因此不会出现"每次打开都提示恢复上次会话、抓取一直超时"的情况。
+工具描述按 `mode` 如实陈述取法：渲染时点名 **Chrome**，并说明"渲染"= 真实浏览器加载地址、执行页面 JS、
+返回它构建出的 DOM（运行时生成的内容也能读到），`chrome-attached` 则讲**概念** —— 连接到了一个
+**你正在使用的浏览器**（带上它的登录态、Cookie 与会话），不提 DevTools 端点这类技术细节；
+`http` 模式的描述里不会出现浏览器。
+
+三种**会启动浏览器**的模式（`auto` / `chrome-headful` / `chrome-headless`）共用 agent **自己的 profile**
+（工作目录下 `.lightagent/browser-profile`）：**无头模式也用同一个 profile**，所以多次抓取之间 Cookie 与
+登录态是连贯的；需要浏览器时**缺失即创建、已存在则原样复用、永不删除**。不启动浏览器的 `chrome-attached`
+与 `http` **不设 profile**（前者用你正在运行的那个浏览器，它的 profile 是你自己的；后者根本不启浏览器），
+因此不会打扰你正在使用的浏览器 —— 要用你自己的登录态请选 `chrome-attached`。utils 里已**没有临时 profile**：
+`BrowserOptions` 不给目录的无头启动会被直接拒绝，只有带窗口的启动允许留空（此时用使用者的默认 profile）。
+浏览器关闭时先请它自己退出（最多等 5 秒，之后才强杀进程树），启动前也清掉上次异常退出留下的残留（端口文件、
+崩溃标记），因此不会出现"每次打开都提示恢复上次会话、抓取一直超时"的情况。Chrome 只把**持久化 Cookie**
+（带 `Expires`/`Max-Age`）写进 profile，纯会话 Cookie 随着浏览器进程一起消失 —— 只用会话 Cookie 的站点请用
+`chrome-attached`。
 
 `browser_path` / `user_agent` / `max_bytes` 分别指定浏览器可执行文件、两条路径的 User-Agent 与
 HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`，相对链接按**重定向后的**地址补全。

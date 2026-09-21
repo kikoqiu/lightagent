@@ -11,26 +11,25 @@ import (
 	"time"
 )
 
-// browserProfileDir decides which profile a launch uses. A headless launch
-// without an explicit directory gets a private temporary one (owned, removed
-// with the browser) so that concurrent runs never fight over a profile; a
-// headful launch falls back to the default profile of the user, which is what
-// makes their cookies and logins visible.
-func browserProfileDir(opts BrowserOptions) (dir string, owned bool, err error) {
+// browserProfileDir decides which profile a launch uses. The caller names it: an
+// explicit directory is created when it is missing and reused exactly as it
+// stands, which is what carries the cookies and logins of a project from one run
+// to the next. Only a launch with a window may leave it empty, which means the
+// default profile of the user — the one their own browser has open, and the only
+// way to their cookies. A headless launch without a directory is refused instead
+// of inventing one: an invisible browser has no business writing into a profile
+// nobody asked for.
+func browserProfileDir(opts BrowserOptions) (dir string, err error) {
 	if trimmed := strings.TrimSpace(opts.UserDataDir); trimmed != "" {
 		if err := os.MkdirAll(trimmed, 0o700); err != nil {
-			return "", false, fmt.Errorf("browser profile %s: %w", trimmed, err)
+			return "", fmt.Errorf("browser profile %s: %w", trimmed, err)
 		}
-		return trimmed, false, nil
+		return trimmed, nil
 	}
 	if opts.Headful {
-		return "", false, nil
+		return "", nil
 	}
-	dir, err = os.MkdirTemp("", "lightagent-browser-")
-	if err != nil {
-		return "", false, fmt.Errorf("cannot create a browser profile: %w", err)
-	}
-	return dir, true, nil
+	return "", errors.New("a headless browser needs a profile directory (BrowserOptions.UserDataDir)")
 }
 
 // browserDebugPort returns the DevTools port of a launch and whether the port

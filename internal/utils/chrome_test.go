@@ -33,6 +33,33 @@ func requireBrowser(t *testing.T) {
 	}
 }
 
+// testProfileDir returns the profile directory a test launch uses. A launch
+// names one, and a directory of the test's own keeps the browser of one test out
+// of the profile of another (and out of the one the machine's user browses in).
+func testProfileDir(t *testing.T) string {
+	t.Helper()
+	return cleanProfileAt(t, filepath.Join(t.TempDir(), "browser-profile"))
+}
+
+// cleanProfileAt registers the teardown of a profile directory: the browsers of
+// the test are closed first, and the directory is then removed while the process
+// that ran on it lets go of its files — a browser that was just closed can still
+// hold them for a moment, and the test framework removes what is left of the
+// test's directory afterwards, which is empty by then.
+func cleanProfileAt(t *testing.T, dir string) string {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = CloseSharedBrowsers()
+		for attempt := 0; attempt < 20; attempt++ {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+	return dir
+}
+
 // testContext bounds a browser test; launching a browser and loading a page
 // takes a moment, but never a minute.
 func testContext(t *testing.T) context.Context {
@@ -77,9 +104,11 @@ func TestFindChrome(t *testing.T) {
 func TestWebFetchRendersDOMWithBrowser(t *testing.T) {
 	requireBrowser(t)
 	server := newPageServer(t)
+	profile := testProfileDir(t)
 	t.Cleanup(func() { _ = CloseSharedBrowsers() })
 
 	result, err := WebFetch(testContext(t), server.URL+"/page",
+		WithFetchBrowser(BrowserOptions{UserDataDir: profile}),
 		WithFetchTimeout(45*time.Second), WithFetchSettle(200*time.Millisecond))
 	if err != nil {
 		t.Fatalf("WebFetch: %v", err)
@@ -116,9 +145,11 @@ func TestWebFetchRendersDOMWithBrowser(t *testing.T) {
 func TestWebFetchKeepsTheDOMWhenTheLoadTimesOut(t *testing.T) {
 	requireBrowser(t)
 	server := newHangingServer(t)
+	profile := testProfileDir(t)
 	t.Cleanup(func() { _ = CloseSharedBrowsers() })
 
 	result, err := WebFetch(testContext(t), server.URL+"/hanging",
+		WithFetchBrowser(BrowserOptions{UserDataDir: profile}),
 		WithFetchTimeout(45*time.Second), WithFetchLoadTimeout(700*time.Millisecond))
 	if err != nil {
 		t.Fatalf("WebFetch: %v", err)
@@ -165,7 +196,7 @@ func TestSharedBrowserReusesOneInstance(t *testing.T) {
 	requireBrowser(t)
 	ctx := testContext(t)
 	// A negative keep-alive keeps the browser until it is closed explicitly.
-	opts := BrowserOptions{KeepAlive: -1}
+	opts := BrowserOptions{UserDataDir: testProfileDir(t), KeepAlive: -1}
 	t.Cleanup(func() { _ = CloseSharedBrowsers() })
 
 	first, err := SharedBrowser(ctx, opts)
@@ -199,7 +230,7 @@ func TestSharedBrowserReusesOneInstance(t *testing.T) {
 func TestSharedBrowserClosesAfterIdle(t *testing.T) {
 	requireBrowser(t)
 	ctx := testContext(t)
-	browser, err := SharedBrowser(ctx, BrowserOptions{KeepAlive: 400 * time.Millisecond})
+	browser, err := SharedBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t), KeepAlive: 400 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("SharedBrowser: %v", err)
 	}
@@ -215,7 +246,7 @@ func TestSharedBrowserClosesAfterIdle(t *testing.T) {
 func TestBrowserCloseEndsTheProcess(t *testing.T) {
 	requireBrowser(t)
 	ctx := testContext(t)
-	options := BrowserOptions{LaunchTimeout: 20 * time.Second}
+	options := BrowserOptions{UserDataDir: testProfileDir(t), LaunchTimeout: 20 * time.Second}
 	browser, err := LaunchBrowser(ctx, options)
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
@@ -277,6 +308,7 @@ func TestBrowserLaunchReportsAnExecutableThatIsNotABrowser(t *testing.T) {
 	fake := notABrowserExecutable(t)
 	started := time.Now()
 	_, err := LaunchBrowser(context.Background(), BrowserOptions{
+		UserDataDir:   testProfileDir(t),
 		ExecPath:      fake,
 		LaunchTimeout: 15 * time.Second,
 	})
@@ -296,7 +328,7 @@ func TestBrowserLaunchReportsAnExecutableThatIsNotABrowser(t *testing.T) {
 func TestBrowserSharesCookiesWithAJar(t *testing.T) {
 	requireBrowser(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -394,7 +426,7 @@ func TestPageRendersAndReportsItsDocument(t *testing.T) {
 	requireBrowser(t)
 	server := newPageServer(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -444,7 +476,7 @@ func TestPageCookies(t *testing.T) {
 	requireBrowser(t)
 	server := newPageServer(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -479,7 +511,7 @@ func TestPageWaitForLoad(t *testing.T) {
 	server := newPageServer(t)
 	hanging := newHangingServer(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -525,7 +557,7 @@ func TestBrowserCrashIsReported(t *testing.T) {
 	requireBrowser(t)
 	hanging := newHangingServer(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -586,7 +618,7 @@ func killBrowserProcess(t *testing.T, pid int) {
 func TestPageDetachLeavesTheTabAlone(t *testing.T) {
 	requireBrowser(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -634,7 +666,7 @@ func TestEvaluateSurfacesErrorsAndValues(t *testing.T) {
 	requireBrowser(t)
 	server := newPageServer(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -677,7 +709,7 @@ func TestAttachToRunningBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("free port: %v", err)
 	}
-	launched, err := LaunchBrowser(ctx, BrowserOptions{DebugPort: port})
+	launched, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t), DebugPort: port})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -727,7 +759,7 @@ func TestAttachToExistingTabKeepsIt(t *testing.T) {
 	requireBrowser(t)
 	server := newPageServer(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -800,7 +832,7 @@ func TestWebFetchThroughAnAttachedBrowser(t *testing.T) {
 	}
 	// A browser that is already running: standing in for the user's own, which
 	// is reached through its DevTools port.
-	launched, err := LaunchBrowser(ctx, BrowserOptions{DebugPort: port, KeepAlive: -1})
+	launched, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t), DebugPort: port, KeepAlive: -1})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}
@@ -845,6 +877,7 @@ func TestWebFetchThroughAnAttachedBrowser(t *testing.T) {
 func TestWebFetchSharesCookiesWithTheBrowser(t *testing.T) {
 	requireBrowser(t)
 	server := newPageServer(t)
+	profile := testProfileDir(t)
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatalf("cookie jar: %v", err)
@@ -861,6 +894,7 @@ func TestWebFetchSharesCookiesWithTheBrowser(t *testing.T) {
 	// The page of the browser sees the cookie of the jar, the headers and the
 	// user agent the caller asked for.
 	result, err := WebFetch(testContext(t), server.URL+"/echo",
+		WithFetchBrowser(BrowserOptions{UserDataDir: profile}),
 		WithFetchJar(jar),
 		WithFetchHeaders(headers),
 		WithFetchUserAgent("lightagent-test/1.0"),
@@ -868,6 +902,9 @@ func TestWebFetchSharesCookiesWithTheBrowser(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("WebFetch: %v", err)
+	}
+	if result.Method == FetchMethodHTTP {
+		t.Error("the fetch fell back to the HTTP source, so nothing of the browser was exercised")
 	}
 	if !strings.Contains(result.HTML, "header-value|lightagent-test/1.0|true") {
 		t.Errorf("the page saw %.200q, want the header, the user agent and the cookie of the jar", result.HTML)
@@ -960,6 +997,7 @@ func TestWebFetchAgainstRawTCPServer(t *testing.T) {
 	requireBrowser(t)
 	address, requests := rawTCPServer(t)
 	ctx := testContext(t)
+	profile := testProfileDir(t)
 	t.Cleanup(func() { _ = CloseSharedBrowsers() })
 
 	// The source: the script is text, nothing has run yet, so neither the
@@ -984,6 +1022,7 @@ func TestWebFetchAgainstRawTCPServer(t *testing.T) {
 	// The rendered DOM: the browser runs the script and the DOM tree it built
 	// is serialized back to HTML — including the change the timer applied.
 	rendered, err := WebFetch(ctx, address,
+		WithFetchBrowser(BrowserOptions{UserDataDir: profile}),
 		WithFetchTimeout(45*time.Second), WithFetchSettle(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("rendered fetch: %v", err)
@@ -1008,7 +1047,7 @@ func TestWebFetchAgainstRawTCPServer(t *testing.T) {
 
 	// The results of the script are checked as values, not as markup: the page
 	// of the shared browser is asked what the script computed.
-	browser, err := SharedBrowser(ctx, BrowserOptions{})
+	browser, err := SharedBrowser(ctx, BrowserOptions{UserDataDir: profile})
 	if err != nil {
 		t.Fatalf("SharedBrowser: %v", err)
 	}

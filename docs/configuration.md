@@ -136,8 +136,8 @@
 | `write_file.auto_split` | bool | `true` | 模型一次写出的文本超过 `max_lines` 时，由 agent 自动拆成多次写入（见 [tools.md](tools.md#write_file)）；关闭后恢复"截断 + 提示续写"的旧行为 |
 | `edit_file.enabled` | bool | `true` | 启用编辑工具 |
 | `webfetch.enabled` | bool | `true` | 启用 `webfetch`（抓网页 → Markdown） |
-| `webfetch.timeout_seconds` | int | `30` | 单次抓取的秒数上限（也是工具 `timeout` 参数的默认值） |
-| `webfetch.mode` | string | `"auto"` | 取页面的方式：`auto`（默认）= 用**可见窗口**的浏览器渲染、没有可用浏览器时回退 HTTP 源码；`chrome-headful` 必须用可见窗口渲染；`chrome-headless` 必须用无头渲染；`chrome-attached` 挂到已在运行的浏览器；`http` 只取源码、从不启动浏览器。非以上取值校验失败（旧值 `browser` 也已被拒绝） |
+| `webfetch.timeout_seconds` | int | `30` | 单次抓取的秒数上限（也是工具 `timeout` 参数的默认值，会写进工具 schema）。低于 30 秒的值会被抬到 30 秒：实际超时不会小于内置下限（见 [tools.md](tools.md#webfetch)） |
+| `webfetch.mode` | string | `"auto"` | 取页面的方式：`auto`（默认）= 用**可见窗口**的浏览器渲染、没有可用浏览器时回退 HTTP 源码；`chrome-headful` 必须用可见窗口渲染；`chrome-headless` 必须用无头渲染；`chrome-attached` 挂到已在运行的浏览器；`http` 只取源码、从不启动浏览器。`auto`/`chrome-headful`/`chrome-headless` 都复用工作目录下 agent 自己的 profile（`.lightagent/browser-profile`，跨抓取保留 Cookie，见 [tools.md](tools.md#webfetch)）。非以上取值校验失败（旧值 `browser` 也已被拒绝） |
 | `webfetch.max_lines` | int | `200` | 反馈给模型的 Markdown 行数上限。超长的正文只回填前 N 行，整页（HTML）写到工作目录的 `.lightagent/webfetch-<时间>.html`，状态行报告总行数/总字节与文件路径（见 [tools.md](tools.md#反馈长度与落盘toolswebfetchmax_lines)）。`0` 用内置 200，负数 = 不限长度且不落盘 |
 | `webfetch.browser_path` | string | 空 | 渲染用的浏览器可执行文件；为空时自动探测已安装的浏览器。为空时不写入文件 |
 | `webfetch.user_agent` | string | 空 | 覆盖两条路径的 User-Agent（浏览器渲染时由浏览器发送、HTTP 源码是请求头）；为空时各用自带默认（Go 客户端 / 浏览器自身）。为空时不写入文件 |

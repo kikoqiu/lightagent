@@ -24,11 +24,12 @@ func main() {
 }
 
 // runMain runs one invocation and releases what must not outlive it: the
-// browser the fetcher keeps in the background (closing it also removes its
-// temporary profile) and then every remaining child process. The cleanup lives
-// in deferred calls here rather than in main, which has to end with os.Exit and
-// would skip them. Deferred calls run newest first, so the browser is closed
-// before the processes below it are reaped.
+// browser the fetcher keeps in the background (the profile it was started on
+// stays, so the next run picks up its cookies and logins) and then every
+// remaining child process. The cleanup lives in deferred calls here rather than
+// in main, which has to end with os.Exit and would skip them. Deferred calls run
+// newest first, so the browser is closed before the processes below it are
+// reaped.
 func runMain(args []string) int {
 	// Safety net for the normal return paths: nothing the agent started may
 	// outlive it, whichever way the session ended.

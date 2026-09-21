@@ -218,8 +218,11 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `url` | string | 必填 | 页面地址（`http`/`https`；缺 scheme 时按 `https` 处理） |
-| `timeout` | int | `webfetch.timeout_seconds` | 整次抓取的秒数上限（渲染、加载与转换都算在内） |
+| `timeout` | int | `webfetch.timeout_seconds` | 整次抓取的秒数上限（渲染、加载与转换都算在内）。实际取值不会小于 30 秒，详情见下 |
 
+* `timeout` 参数：工具 schema 的 `default` 就是配置的 `tools.webfetch.timeout_seconds`，描述里直接写出该秒数以及**下限**，
+  模型因此知道一次抓取实际能拿到多少时间。**实际超时不会小于 30 秒**（`webFetchTimeoutDefault`）：配置值或参数值更小时
+  一律抬到 30 秒；参数缺省或为 `null` 用配置值，`<= 0` 报参数错误。一次抓取的预算涵盖页面加载、渲染与转换。
 * 取页面用 `internal/utils/webfetch.go`，取法由 `tools.webfetch.mode` 决定（见
   [configuration.md](configuration.md#tools)）：
 
@@ -236,12 +239,30 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
   `192.168.0.5:9223`、`127.0.0.1:9222`，或 `http://…` / `ws://…` 的浏览器地址；为空时用内置的
   `127.0.0.1:9222`。要挂到自己日常用的浏览器上，用 `--remote-debugging-port=9222` 启动它即可
   （端口自选时，可从其 profile 目录的 `DevToolsActivePort` 文件读到实际端口）。
-  结果里的 `Method` / `Notes` 说明实际走了哪条路，工具描述按 `mode` 如实陈述取法。
-* `auto` 与 `chrome-headful` 都是**启动一个带窗口的浏览器**：窗口用 **agent 自己的 profile**
-  （工作目录下的 `.lightagent/browser-profile`，因此其中有它自己的 Cookie 与登录态，也随项目走），
-  所以不会打扰你正在使用的浏览器 —— 要用你自己的浏览器（带着你的登录态）请选 `chrome-attached`。
+  结果里的 `Method` / `Notes` 说明实际走了哪条路，工具描述按 `mode` 如实陈述取法：**渲染时点名 Chrome**
+  （Chromium 系浏览器），并说明"渲染"的含义 —— 真实浏览器加载地址、执行页面 JS、返回它构建出的 DOM
+  （因此运行时才生成的内容也能读到），且用的是 agent 自己的 profile；`chrome-attached` 讲的是**概念**：
+  连接到了一个**使用者正在使用的浏览器**（只说这一点，不提 DevTools 端点这类技术细节），所以带上它的登录态、
+  Cookie 与会话。只取源码的 `http` 模式描述里不会出现浏览器。
+* `auto`、`chrome-headful`、`chrome-headless` 三种**会自己启动浏览器**的模式一律使用 **agent 自己的 profile**
+  （工作目录下的 `.lightagent/browser-profile`：**无头模式同样**用它，所以多次抓取之间 Cookie 与登录态是连贯的）。
+  不启动浏览器的两种模式**不设 profile**（`BrowserOptions.UserDataDir` 为空）：`chrome-attached` 用的是
+  **你正在使用的浏览器**（它的 profile 是你自己的，不该由我们指定），`http` 根本不启动浏览器。
+  所以不会打扰你正在使用的浏览器 —— 要用你自己的登录态请选 `chrome-attached`。`auto` 与 `chrome-headful` 会开一个
+  **可见窗口**（`auto` 在没有可用浏览器时回退 HTTP 源码并在备注里说明原因；`chrome-headful` 直接报错），
+  `chrome-headless` 不开窗口，但用的是**同一个 profile**。
   启动的浏览器在共享池里存活（默认闲置 10 分钟后关闭，程序退出也会关掉它）。
-  没有可用浏览器时 `chrome-headful` 直接报错，`auto` 则回退到 HTTP 源码并在备注里说明原因。
+* **`.lightagent/browser-profile` 永不被删除，下次启动直接复用**：它是显式传给浏览器的 profile
+  （`BrowserOptions.UserDataDir`），`browserProfileDir` 只负责在缺失时创建、已存在时**原样复用**；utils 里
+  **不再存在临时 profile**（`os.MkdirTemp` 创建、随浏览器删除、`ownedProfile`/`removeProfileDir` 这些路径已全部移除）。
+  退出路径（`main.go` 的 `defer utils.CloseSharedBrowsers()` 与信号退出注册的 shutdown hook 各调一次）只关掉
+  **浏览器进程**，目录连同其中的 Cookie 与登录态原样留在工作目录里，下一次抓取沿用同一个 profile；启动前只清理
+  残留（端口文件与"未正常结束"标记，见下一条），**从不删目录**。
+  `BrowserOptions` 里**不给目录的无头启动会被直接拒绝**（不会偷偷建临时目录，也不会退回使用者默认 profile），
+  只有**带窗口**的启动允许留空目录（此时用使用者的默认 profile，也就是 `chrome-attached` 之外的另一种"用你登录态"的方式）。
+  注意：Chrome 只在磁盘 profile 里保留**持久化 Cookie**（带 `Expires`/`Max-Age`），纯**会话 Cookie** 只活在浏览器
+  进程的内存里，浏览器一关就没了 —— 所以跨抓取保留登录态的前提是站点发出的 Cookie 本身是持久的；只用会话 Cookie
+  的站点请用 `chrome-attached`（借你那个一直开着的浏览器）。
 * **浏览器退出与 profile 卫生**（否则残留会让下次抓取一直超时）：
   * 关闭时先通过协议请浏览器**自己退出**（`Browser.close`），最多等 5 秒；只有不退出的才连同进程树**强杀**。
     这样 profile 会留下"正常结束"的状态，下次启动不会再问"是否恢复上次会话"。

@@ -54,7 +54,7 @@ func TestNormalizeAddress(t *testing.T) {
 func TestCallReportsProtocolAndConnectionErrors(t *testing.T) {
 	requireBrowser(t)
 	ctx := testContext(t)
-	browser, err := LaunchBrowser(ctx, BrowserOptions{})
+	browser, err := LaunchBrowser(ctx, BrowserOptions{UserDataDir: testProfileDir(t)})
 	if err != nil {
 		t.Fatalf("LaunchBrowser: %v", err)
 	}

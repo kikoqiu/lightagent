@@ -160,7 +160,7 @@ func TestPrepareProfileKeepsThePortOfARunningBrowser(t *testing.T) {
 func TestWebFetchWorksAfterTheBrowserWasKilled(t *testing.T) {
 	requireBrowser(t)
 	server := newPageServer(t)
-	profile := filepath.Join(t.TempDir(), "profile")
+	profile := testProfileDir(t)
 	t.Cleanup(func() { _ = CloseSharedBrowsers() })
 
 	options := []WebFetchOptionFunc{
@@ -219,7 +219,7 @@ func TestWebFetchWorksAfterTheBrowserWasKilled(t *testing.T) {
 // directly on a profile that was left behind still comes up.
 func TestLaunchBrowserClearsTheLeftoversBeforeItStarts(t *testing.T) {
 	requireBrowser(t)
-	profile := filepath.Join(t.TempDir(), "profile")
+	profile := testProfileDir(t)
 	writePortFile(t, profile, deadPort(t))
 	markUncleanExit(t, profile)
 
@@ -238,6 +238,82 @@ func TestLaunchBrowserClearsTheLeftoversBeforeItStarts(t *testing.T) {
 	}
 	if !channelClosed(browser.exited) {
 		t.Error("the browser is still running after a graceful close")
+	}
+}
+
+// TestBrowserProfileDir pins which profile a launch uses: the caller names it,
+// it is created when it is missing and reused exactly as it stands (that is what
+// carries the cookies of one fetch to the next), and only a launch that asks for
+// a window may leave the directory empty. A headless launch without one is
+// refused: there is no profile of ours to fall back to, and an invisible browser
+// must not end up in the profile of the user.
+func TestBrowserProfileDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "profile")
+	got, err := browserProfileDir(BrowserOptions{UserDataDir: dir})
+	if err != nil {
+		t.Fatalf("browserProfileDir: %v", err)
+	}
+	if got != dir {
+		t.Errorf("profile = %q, want %q", got, dir)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("the profile directory was not created: %v", err)
+	}
+
+	// The same directory again: what is in it is left as it stands.
+	cookie := filepath.Join(dir, "Cookies")
+	if err := os.WriteFile(cookie, []byte("kept"), 0o600); err != nil {
+		t.Fatalf("write into the profile: %v", err)
+	}
+	if got, err := browserProfileDir(BrowserOptions{UserDataDir: dir, Headful: true}); err != nil || got != dir {
+		t.Errorf("browserProfileDir(headful, %q) = %q, %v, want the same directory", dir, got, err)
+	}
+	if _, err := os.Stat(cookie); err != nil {
+		t.Errorf("an existing profile was not left as it was: %v", err)
+	}
+
+	// A launch with a window may fall back to the default profile of the user.
+	if got, err := browserProfileDir(BrowserOptions{Headful: true}); err != nil || got != "" {
+		t.Errorf("browserProfileDir(headful, no directory) = %q, %v, want the user's default profile", got, err)
+	}
+	// A headless launch has nowhere else to go, so it must name one.
+	if got, err := browserProfileDir(BrowserOptions{}); err == nil || got != "" {
+		t.Errorf("browserProfileDir(headless, no directory) = %q, %v, want a refusal", got, err)
+	}
+}
+
+// TestExplicitProfileDirectorySurvivesAClose pins the profile the webfetch tool
+// uses (an explicit directory below the working directory): closing the browser
+// — on the idle timeout, when the program exits — ends the process but leaves the
+// directory and the state in it alone, which is what lets the next fetch reuse
+// the same profile (its cookies and logins included) instead of starting over.
+func TestExplicitProfileDirectorySurvivesAClose(t *testing.T) {
+	requireBrowser(t)
+	profile := testProfileDir(t)
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatalf("create the profile: %v", err)
+	}
+	// A file standing in for the state of a profile: cookies, logins, settings.
+	cookie := filepath.Join(profile, "Cookies")
+	if err := os.WriteFile(cookie, []byte("stays"), 0o600); err != nil {
+		t.Fatalf("write into the profile: %v", err)
+	}
+
+	browser, err := LaunchBrowser(testContext(t), BrowserOptions{UserDataDir: profile, KeepAlive: -1})
+	if err != nil {
+		t.Fatalf("LaunchBrowser: %v", err)
+	}
+	if browser.profileDir != profile {
+		t.Errorf("the browser runs on %q, want the profile it was given", browser.profileDir)
+	}
+	if err := browser.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(profile); err != nil {
+		t.Errorf("the profile directory is gone after a close: %v", err)
+	}
+	if _, err := os.Stat(cookie); err != nil {
+		t.Errorf("the state of the profile is gone after a close: %v", err)
 	}
 }
 

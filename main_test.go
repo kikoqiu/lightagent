@@ -257,10 +257,30 @@ func TestShutdownHooksRunNewestFirst(t *testing.T) {
 	}
 }
 
+// testProfileDir returns the profile directory the browser of this test runs on,
+// and takes it away once the browsers are gone: a launch always names a profile,
+// and a browser that was just closed can still hold its files for a moment, so
+// the removal is retried instead of being left to the test framework (which would
+// fail to remove the temporary directory it lives in).
+func testProfileDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "browser-profile")
+	t.Cleanup(func() {
+		_ = utils.CloseSharedBrowsers()
+		for attempt := 0; attempt < 20; attempt++ {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+	return dir
+}
+
 // TestRunMainClosesTheFetcherBrowser checks the cleanup of the exit path: the
-// browser the fetcher keeps in the background does not survive a run, which is
-// also what removes its temporary profile. It is skipped where no browser can be
-// started, exactly like the fetcher itself skipping the browser.
+// browser the fetcher keeps in the background does not survive a run. Its profile
+// does, which is what the next run picks up. It is skipped where no browser can
+// be started, exactly like the fetcher itself skipping the browser.
 func TestRunMainClosesTheFetcherBrowser(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short mode: no browser is started")
@@ -276,8 +296,10 @@ func TestRunMainClosesTheFetcherBrowser(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// A fetch leaves its browser in the pool for the next one.
-	if _, err := utils.WebFetch(ctx, server.URL); err != nil {
+	// A fetch leaves its browser in the pool for the next one, on a profile of
+	// its own (a launch always names one).
+	profile := testProfileDir(t)
+	if _, err := utils.WebFetch(ctx, server.URL, utils.WithFetchBrowser(utils.BrowserOptions{UserDataDir: profile})); err != nil {
 		t.Fatalf("WebFetch: %v", err)
 	}
 	browser := utils.SharedBrowserInstance()

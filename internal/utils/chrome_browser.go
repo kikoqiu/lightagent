@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -45,16 +44,19 @@ const (
 	browserQuitTimeout = 5 * time.Second
 )
 
-// BrowserOptions configures how a browser is launched or attached to. The zero
-// value is the small default: a headless browser with a temporary profile.
+// BrowserOptions configures how a browser is launched or attached to. A launch
+// names the profile to use (UserDataDir); only a launch that asks for a window
+// may leave it empty, which means the default profile of the user.
 type BrowserOptions struct {
 	// ExecPath is the browser executable; empty means auto-detection (see
 	// FindChrome).
 	ExecPath string
-	// UserDataDir is the profile directory. Empty means a fresh temporary
-	// profile for a headless launch (removed with the browser) or the browser's
-	// default profile for a headful launch, which is how the user's own
-	// cookies and logins become reachable.
+	// UserDataDir is the profile directory: it is created when it is missing and
+	// reused exactly as it stands, so the cookies and logins one fetch leaves in
+	// it are there for the next one. A headless launch needs it. A launch with a
+	// window may leave it empty, which means the browser's default profile —
+	// the one the user's own browser has open — which is how their cookies and
+	// logins become reachable.
 	UserDataDir string
 	// Headful launches a visible window instead of a headless instance.
 	Headful bool
@@ -110,10 +112,9 @@ type Browser struct {
 	endpoint cdpEndpoint
 	conn     *cdpConn
 
-	cmd          *exec.Cmd
-	exited       chan struct{} // closed once a launched process has been reaped
-	profileDir   string
-	ownedProfile bool
+	cmd        *exec.Cmd
+	exited     chan struct{} // closed once a launched process has been reaped
+	profileDir string
 
 	mu      sync.Mutex
 	closed  bool
@@ -130,17 +131,17 @@ func OpenBrowser(ctx context.Context, opts BrowserOptions) (*Browser, error) {
 	return LaunchBrowser(ctx, opts)
 }
 
-// LaunchBrowser starts a browser and connects to its DevTools endpoint. A
-// headless launch gets a temporary profile of its own unless UserDataDir is
-// set; a headful launch without UserDataDir uses the default profile of the
-// current user, which only works while no other browser uses that profile — a
-// running one has to be attached to instead.
+// LaunchBrowser starts a browser on the profile of the options and connects to
+// its DevTools endpoint. The profile is named by the caller (UserDataDir); a
+// headful launch without one uses the default profile of the current user, which
+// only works while no other browser uses that profile — a running one has to be
+// attached to instead. A headless launch without a profile is refused.
 func LaunchBrowser(ctx context.Context, opts BrowserOptions) (*Browser, error) {
 	execPath, err := FindChrome(opts.ExecPath)
 	if err != nil {
 		return nil, err
 	}
-	profileDir, ownedProfile, err := browserProfileDir(opts)
+	profileDir, err := browserProfileDir(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +160,6 @@ func LaunchBrowser(ctx context.Context, opts BrowserOptions) (*Browser, error) {
 	// terminated on shutdown even when the agent dies without running its
 	// cleanup.
 	if err := proc.Start(cmd); err != nil {
-		removeProfileDir(profileDir, ownedProfile)
 		return nil, fmt.Errorf("start %s: %w", execPath, err)
 	}
 
@@ -168,14 +168,13 @@ func LaunchBrowser(ctx context.Context, opts BrowserOptions) (*Browser, error) {
 		mode = BrowserHeadful
 	}
 	browser := &Browser{
-		mode:         mode,
-		opts:         opts,
-		execPath:     execPath,
-		cmd:          cmd,
-		exited:       make(chan struct{}),
-		profileDir:   profileDir,
-		ownedProfile: ownedProfile,
-		created:      make(map[string]struct{}),
+		mode:       mode,
+		opts:       opts,
+		execPath:   execPath,
+		cmd:        cmd,
+		exited:     make(chan struct{}),
+		profileDir: profileDir,
+		created:    make(map[string]struct{}),
 	}
 	go browser.waitProcess()
 
@@ -313,7 +312,9 @@ func (b *Browser) call(ctx context.Context, session, method string, params any, 
 func (b *Browser) Options() BrowserOptions { return b.opts }
 
 // Close releases the browser: the pages this connection opened, the WebSocket
-// and — for a browser that was launched here — the browser itself.
+// and — for a browser that was launched here — the browser itself. The profile
+// stays: it belongs to the caller, and its cookies and logins are what the next
+// launch picks up.
 //
 // A launched browser is first asked to quit over the protocol and given a moment
 // to end on its own; only a browser that does not go away is killed with its
@@ -336,7 +337,6 @@ func (b *Browser) Close() error {
 		created = append(created, targetID)
 	}
 	cmd := b.cmd
-	profileDir, owned := b.profileDir, b.ownedProfile
 	b.mu.Unlock()
 
 	if conn != nil {
@@ -366,7 +366,6 @@ func (b *Browser) Close() error {
 		case <-time.After(browserStopTimeout):
 		}
 	}
-	removeProfileDir(profileDir, owned)
 	return nil
 }
 
@@ -386,12 +385,4 @@ func (b *Browser) exitError() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.exitErr
-}
-
-// removeProfileDir deletes a temporary profile once its browser is gone.
-func removeProfileDir(dir string, owned bool) {
-	if !owned || dir == "" {
-		return
-	}
-	_ = os.RemoveAll(dir)
 }

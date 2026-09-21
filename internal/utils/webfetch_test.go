@@ -181,8 +181,9 @@ func TestWebFetchBrowserModeDecidesTheWindow(t *testing.T) {
 	result, err := WebFetch(testContext(t), server.URL+"/page",
 		WithFetchMode(FetchModeChromeHeadless),
 		// A caller asking for a window in the headless mode does not get one:
-		// the mode is the more specific statement.
-		WithFetchBrowser(BrowserOptions{Headful: true}),
+		// the mode is the more specific statement. The profile is still named:
+		// a launch never invents one.
+		WithFetchBrowser(BrowserOptions{UserDataDir: testProfileDir(t), Headful: true}),
 		WithFetchTimeout(45*time.Second), WithFetchSettle(200*time.Millisecond))
 	if err != nil {
 		t.Fatalf("WebFetch: %v", err)
