@@ -433,6 +433,9 @@
     border:1px solid var(--border); border-radius:var(--radius-sm);
     outline:none; transition:border-color .15s, box-shadow .15s;
   }
+  .field input[type=password] {
+    width:50%;
+  }
   .field input:focus, .field select:focus, .field textarea:focus {
     border-color:var(--accent); box-shadow:0 0 0 3px rgba(90,162,255,.16);
   }
