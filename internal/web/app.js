@@ -7,6 +7,9 @@
   var runEl = document.getElementById('run');
   var stopEl = document.getElementById('stop');
   var sendEl = document.getElementById('send');
+  var attachEl = document.getElementById('attach');
+  var attachFileEl = document.getElementById('attachFile');
+  var attachmentsEl = document.getElementById('attachments');
   var current = null;
   var currentText = '';
   // pendingRows holds the rows of messages this page submitted while the turn was
@@ -1045,9 +1048,179 @@
   window.addEventListener('freeze', goIdle);
   window.addEventListener('resume', goActive);
 
+  // ---- attachments ----
+  // An attached file is uploaded to the mirror as soon as it is picked (the
+  // server stores it under .lightagent/uploads and answers with an id) and then
+  // waits in the composer until a message carries it: the chip can be removed
+  // again before sending, which also drops the stored file. The next message
+  // travels with the ids of whatever is still attached, and the server hands
+  // those files to the model together with the text.
+  //
+  // The control only exists when the model declares the media types it accepts
+  // (openai.media_types); MEDIA carries what the server injected into the page.
+  var MEDIA = CFG.media || {};
+  var mediaEnabled = !!MEDIA.enabled;
+  var MAX_MEDIA_BYTES = MEDIA.max_bytes || 0;
+  // pendingFiles holds the chips in the order they were picked. An entry is
+  // {name, type, size, state, id, error}: state is 'uploading', 'ready' or
+  // 'error', and only a ready entry has an id to send.
+  var pendingFiles = [];
+
+  function formatSize(bytes) {
+    if (!bytes) { return '0 B'; }
+    var units = ['B', 'KiB', 'MiB', 'GiB'];
+    var value = bytes;
+    var i = 0;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+    return (i === 0 ? String(value) : value.toFixed(1)) + ' ' + units[i];
+  }
+
+  // renderAttachments redraws the chip row from pendingFiles.
+  function renderAttachments() {
+    if (!attachmentsEl) { return; }
+    attachmentsEl.innerHTML = '';
+    attachmentsEl.hidden = pendingFiles.length === 0;
+    pendingFiles.forEach(function (item) {
+      var li = document.createElement('li');
+      li.className = 'attachment'
+        + (item.state === 'uploading' ? ' busy' : '')
+        + (item.state === 'error' ? ' bad' : '');
+      var name = document.createElement('span');
+      name.className = 'attachment-name';
+      name.textContent = item.name;
+      li.appendChild(name);
+      var meta = document.createElement('span');
+      meta.className = 'attachment-meta';
+      if (item.state === 'uploading') { meta.textContent = 'uploading…'; }
+      else if (item.state === 'error') { meta.textContent = item.error; }
+      else { meta.textContent = (item.type ? item.type + ' · ' : '') + formatSize(item.size); }
+      meta.title = meta.textContent;
+      li.appendChild(meta);
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'attachment-x';
+      x.textContent = '✕';
+      x.title = 'remove this attachment';
+      x.setAttribute('aria-label', 'remove ' + item.name);
+      x.onclick = function () { cancelAttachment(item); };
+      li.appendChild(x);
+      attachmentsEl.appendChild(li);
+    });
+  }
+
+  // readyAttachmentIds lists the stored uploads the next message carries.
+  function readyAttachmentIds() {
+    var ids = [];
+    pendingFiles.forEach(function (item) {
+      if (item.state === 'ready' && item.id) { ids.push(item.id); }
+    });
+    return ids;
+  }
+
+  // cancelAttachment removes a chip before sending. A file that already reached
+  // the server is deleted there too, so a cancelled attachment does not pile up
+  // in the upload directory.
+  function cancelAttachment(item) {
+    var at = pendingFiles.indexOf(item);
+    if (at >= 0) { pendingFiles.splice(at, 1); }
+    renderAttachments();
+    if (item.id) { dropUpload(item.id); }
+  }
+
+  // dropUpload deletes one stored upload; a failure only costs a left-over file.
+  function dropUpload(id) {
+    fetch('/api/upload?id=' + encodeURIComponent(id), { method: 'DELETE', credentials: 'same-origin' })
+      .catch(function () {});
+  }
+
+  // clearAttachments drops the chips a message just consumed, keeping the ones
+  // that never made it (a failed upload is still worth showing).
+  function clearAttachments() {
+    pendingFiles = pendingFiles.filter(function (item) { return item.state !== 'ready'; });
+    renderAttachments();
+  }
+
+  // uploadJSON resolves an upload response, turning a non-2xx reply into an error
+  // carrying the server's own message (which is written for the user).
+  function uploadJSON(res) {
+    return res.json().catch(function () { return {}; }).then(function (body) {
+      if (!res.ok) { throw new Error(body.error || ('HTTP ' + res.status)); }
+      return body;
+    });
+  }
+
+
+  function attachFiles(files) {
+    for (var i = 0; i < files.length; i++) { uploadFile(files[i]); }
+  }
+
+  // uploadFile stores one picked file and turns its chip into a ready one.
+  function uploadFile(file) {
+    var item = { name: file.name, type: file.type || '', size: file.size, state: 'uploading', id: '', error: '' };
+    if (MAX_MEDIA_BYTES && file.size > MAX_MEDIA_BYTES) {
+      // The server would refuse it anyway; say so without the round trip.
+      item.state = 'error';
+      item.error = 'larger than ' + formatSize(MAX_MEDIA_BYTES);
+      pendingFiles.push(item);
+      renderAttachments();
+      return;
+    }
+    pendingFiles.push(item);
+    renderAttachments();
+    var body = new FormData();
+    body.append('file', file, file.name);
+    fetch('/api/upload', { method: 'POST', credentials: 'same-origin', body: body })
+      .then(uploadJSON)
+      .then(function (doc) {
+        if (pendingFiles.indexOf(item) < 0) {
+          // Cancelled while it was still uploading: the stored file goes too.
+          if (doc && doc.id) { dropUpload(doc.id); }
+          return;
+        }
+        item.id = doc.id || '';
+        if (doc.name) { item.name = doc.name; }
+        if (doc.type) { item.type = doc.type; }
+        if (typeof doc.size === 'number') { item.size = doc.size; }
+        item.state = 'ready';
+        renderAttachments();
+      })
+      .catch(function (err) {
+        if (pendingFiles.indexOf(item) < 0) { return; }
+        item.state = 'error';
+        item.error = (err && err.message) || 'upload failed';
+        renderAttachments();
+      });
+  }
+
+  // The attach control is wired only when the server says the capability is on.
+  // The picker offers exactly the accepted types (its accept attribute); the
+  // server refuses anything else anyway.
+  if (mediaEnabled && attachEl && attachFileEl) {
+    attachEl.hidden = false;
+    attachEl.title = 'attach a file'
+      + (MEDIA.types && MEDIA.types.length ? ' (' + MEDIA.types.join(', ') + ')' : '');
+    attachFileEl.accept = MEDIA.accept || '';
+    attachEl.onclick = function () { attachFileEl.click(); };
+    attachFileEl.addEventListener('change', function () {
+      var files = attachFileEl.files || [];
+      if (files.length) { attachFiles(files); }
+      // Clearing makes the same file pickable again after a removal.
+      attachFileEl.value = '';
+    });
+  }
+
+  // send submits the composer's content: its text plus the attachments still
+  // pending (their ids — the server reads the stored files and hands them to the
+  // model with this very message). A command line is a command, not a prompt, so
+  // it leaves the attachments where they are.
   function send() {
     var text = input.value.trim();
-    if (!text || !ws || ws.readyState !== 1) { return; }
+    if (!ws || ws.readyState !== 1) { return; }
+    var isCommand = text.charAt(0) === '/';
+    var ids = isCommand ? [] : readyAttachmentIds();
+    // An attachment alone is a message too (the server writes a placeholder line
+    // for the row); an empty command line is not.
+    if (!text && ids.length === 0) { return; }
     input.value = '';
     autoGrow();
     // Sending is an explicit "show me what comes next" action: re-pin the view
@@ -1062,7 +1235,11 @@
       queued++;
       tickTurn();
     }
-    ws.send(JSON.stringify({ text: text }));
+    var payload = { text: text };
+    if (ids.length > 0) { payload.attachments = ids; }
+    ws.send(JSON.stringify(payload));
+    // The files just sent belong to the conversation now: their chips go.
+    if (ids.length > 0) { clearAttachments(); }
   }
   // autoGrow keeps the composer one row tall until the message wraps, then it
   // grows up to the CSS max-height and scrolls.

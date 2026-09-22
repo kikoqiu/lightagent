@@ -46,6 +46,14 @@ type OpenAIConfig struct {
 	MaxTokens   int     `json:"max_tokens"`
 	TimeoutSec  int     `json:"timeout_seconds"`
 	Stream      bool    `json:"stream"`
+	// MediaTypes lists the multimedia types this model accepts as attachments,
+	// e.g. ["image/png", "image/jpeg", "image/*", "audio/wav",
+	// "application/pdf"]. Entries are lower cased; a bare family name means the
+	// whole family ("image" == "image/*"). The list is what turns the
+	// capability on: while it is empty neither upload_media (which also needs
+	// tools.upload_media.enabled) nor the web mirror's attach control exists.
+	// It is left out of the file when empty.
+	MediaTypes []string `json:"media_types,omitempty"`
 	// ExtraBody holds provider-specific request parameters. Its keys are merged
 	// into the top-level /chat/completions request body, so a value here
 	// overrides the corresponding built-in field (e.g. "temperature").
@@ -90,8 +98,23 @@ type ToolsConfig struct {
 	WriteFile     WriteToolConfig     `json:"write_file"`
 	EditFile      ToggleToolConfig    `json:"edit_file"`
 	WebFetch      WebFetchToolConfig  `json:"webfetch"`
+	UploadMedia   MediaToolConfig     `json:"upload_media"`
 	Discovery     ToolDiscoveryConfig `json:"discovery"`
 	MCP           MCPConfig           `json:"mcp"`
+}
+
+// MediaToolConfig configures the upload_media tool.
+//
+// The tool exists only when the model declares the media types it accepts
+// (openai.media_types) and this switch is on: the type list alone does not
+// register it, and the switch alone has nothing to accept. It defaults to false,
+// so both sides have to be set on purpose.
+type MediaToolConfig struct {
+	Enabled bool `json:"enabled"`
+	// MaxBytes caps one uploaded file, in bytes. 0 (or a negative value) keeps
+	// the built-in cap (tools.MediaMaxBytesDefault, 20 MiB); the key is left
+	// out of the file when 0.
+	MaxBytes int64 `json:"max_bytes,omitempty"`
 }
 
 // Tool discovery (unlock) mode constants. deferred tools stay locked until
@@ -397,6 +420,10 @@ func Default() *Config {
 				TimeoutSeconds: 30,
 				MaxLines:       WebFetchMaxLinesDefault,
 			},
+			// The upload tool is off until it is asked for: with the default
+			// it only becomes available once openai.media_types is configured
+			// AND this switch is turned on.
+			UploadMedia: MediaToolConfig{Enabled: false},
 			Discovery: ToolDiscoveryConfig{
 				Enabled:          false,
 				Mode:             ToolDiscoveryModeUnlock,
@@ -755,6 +782,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Tools.WebFetch.TimeoutSeconds <= 0 {
 		c.Tools.WebFetch.TimeoutSeconds = def.Tools.WebFetch.TimeoutSeconds
+	}
+	// upload_media.max_bytes is a cap: 0 (unset) keeps the built-in one and a
+	// negative value falls back to it as well.
+	if c.Tools.UploadMedia.MaxBytes < 0 {
+		c.Tools.UploadMedia.MaxBytes = def.Tools.UploadMedia.MaxBytes
 	}
 	// An omitted mode keeps the built-in strategy; an unusable value is
 	// reported by Validate rather than silently replaced.

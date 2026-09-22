@@ -417,3 +417,28 @@ func TestSystemWithSummary(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// TestEstimateMessageTokensCountsMedia verifies a message carrying media is
+// estimated above the same message without it, and that the estimate follows the
+// number of parts (the encoded bytes themselves are deliberately not counted:
+// they are not a token proxy).
+func TestEstimateMessageTokensCountsMedia(t *testing.T) {
+	plain := llm.Message{Role: "user", Content: "look at this"}
+	withMedia := plain
+	withMedia.Media = []llm.ContentPart{
+		{Type: llm.PartTypeImageURL, ImageURL: &llm.ImageURLPart{URL: "data:image/png;base64," + strings.Repeat("A", 4000)}},
+	}
+	plainTokens := EstimateMessageTokens(plain)
+	mediaTokens := EstimateMessageTokens(withMedia)
+	if mediaTokens <= plainTokens {
+		t.Fatalf("media estimate = %d, want more than %d", mediaTokens, plainTokens)
+	}
+	if mediaTokens != plainTokens+mediaPartTokens {
+		t.Fatalf("media estimate = %d, want %d (one part, whatever its size)", mediaTokens, plainTokens+mediaPartTokens)
+	}
+
+	withMedia.Media = append(withMedia.Media, llm.ContentPart{Type: llm.PartTypeFile, File: &llm.FilePart{Filename: "a.pdf"}})
+	if got := EstimateMessageTokens(withMedia); got != plainTokens+2*mediaPartTokens {
+		t.Fatalf("two parts estimate = %d, want %d", got, plainTokens+2*mediaPartTokens)
+	}
+}

@@ -857,3 +857,67 @@ func TestParseHandlesEchoedMask(t *testing.T) {
 		t.Fatalf("the masked password must be dropped, got %q", cfg.Web.Password)
 	}
 }
+
+// TestMediaConfigDefaults verifies the multimedia capability starts off: the
+// model accepts no attachment, and the upload tool is switched off, so both
+// sides have to be configured before it exists.
+func TestMediaConfigDefaults(t *testing.T) {
+	cfg := Default()
+	if len(cfg.OpenAI.MediaTypes) != 0 {
+		t.Fatalf("openai.media_types = %v, want unset", cfg.OpenAI.MediaTypes)
+	}
+	if cfg.Tools.UploadMedia.Enabled {
+		t.Fatal("tools.upload_media.enabled must default to false")
+	}
+	if cfg.Tools.UploadMedia.MaxBytes != 0 {
+		t.Fatalf("upload_media.max_bytes = %d, want 0 (the built-in cap)", cfg.Tools.UploadMedia.MaxBytes)
+	}
+	// Nothing about the capability is written into a default file: an unset
+	// type list and the built-in cap are both omitted.
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "media_types") {
+		t.Fatalf("an unset type list must be left out: %s", data)
+	}
+	if !strings.Contains(string(data), `"upload_media":{"enabled":false}`) {
+		t.Fatalf("the tool switch is written as false: %s", data)
+	}
+}
+
+// TestMediaConfigPartialFile verifies a config file carries the media settings
+// through, and that an unusable byte cap falls back to the built-in one.
+func TestMediaConfigPartialFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	blob := `{"openai":{"api_key":"sk-x","media_types":["image/png","IMAGE/JPG"]},` +
+		`"tools":{"upload_media":{"enabled":true,"max_bytes":4096}}}`
+	if err := os.WriteFile(path, []byte(blob), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTAGENT_CONFIG", path)
+
+	cfg, _, _, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(cfg.OpenAI.MediaTypes) != 2 || cfg.OpenAI.MediaTypes[0] != "image/png" {
+		t.Fatalf("media_types = %v, want the stored list (as written)", cfg.OpenAI.MediaTypes)
+	}
+	if !cfg.Tools.UploadMedia.Enabled || cfg.Tools.UploadMedia.MaxBytes != 4096 {
+		t.Fatalf("upload_media = %+v", cfg.Tools.UploadMedia)
+	}
+
+	// A negative cap is unusable and falls back to the built-in one.
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"upload_media":{"max_bytes":-1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if cfg.Tools.UploadMedia.MaxBytes != 0 {
+		t.Fatalf("max_bytes = %d, want the built-in cap (0)", cfg.Tools.UploadMedia.MaxBytes)
+	}
+}

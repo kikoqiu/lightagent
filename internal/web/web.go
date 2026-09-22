@@ -95,6 +95,12 @@ type Server struct {
 	// that a document saved through the editor is waiting for the next start.
 	configPath           string
 	configPendingRestart bool
+	// media is the multimedia capability the composer's attach control offers
+	// (the types the model accepts) and uploadsDir is where an upload is stored
+	// (.lightagent/uploads). The zero value (no types) disables attaching; both
+	// are set once by SetMedia before Start.
+	media      tools.MediaConfig
+	uploadsDir string
 
 	mu       sync.Mutex
 	clients  map[int]*client
@@ -452,6 +458,9 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/ws", s.requireSession(http.HandlerFunc(s.handleWS)))
 	mux.Handle("/api/config", s.requireSession(http.HandlerFunc(s.handleConfig)))
 	mux.Handle("/api/password", s.requireSession(http.HandlerFunc(s.handlePassword)))
+	// Attachments: the composer uploads a file here before sending, and drops
+	// it again when the user cancels it.
+	mux.Handle("/api/upload", s.requireSession(http.HandlerFunc(s.handleUpload)))
 	return mux
 }
 
@@ -826,22 +835,69 @@ func historyRowBytes(row historyMessage) int {
 // handled here, so the mirror offers the same command set as the terminal REPL;
 // every other line goes to the agent. Multiple clients may call this
 // concurrently; steering is handled by the agent.
+//
+// A message may carry attachments: the ids of files the page uploaded earlier
+// (see handleUpload). They are read from the upload directory and travel with
+// the text as the media of the user message, so the model receives them with
+// the prompt they belong to. An attachment that cannot be read is reported as
+// an error row and skipped; the message itself is still sent.
 func (s *Server) handleClientMessage(data []byte) {
 	var msg struct {
-		Text string `json:"text"`
+		Text        string   `json:"text"`
+		Attachments []string `json:"attachments"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return
 	}
 	text := strings.TrimSpace(msg.Text)
-	if text == "" {
-		return
-	}
 	if slash.IsCommandLine(text) {
+		// A command is not a prompt: its attachments stay with the page, which
+		// keeps the chips until a message actually carries them.
 		s.handleCommand(text)
 		return
 	}
-	s.agent.SubmitFrom("web", text)
+	media, names := s.readAttachments(msg.Attachments)
+	if text == "" && len(media) == 0 {
+		return
+	}
+	if text == "" {
+		text = "(attached " + strings.Join(names, ", ") + ")"
+	}
+	s.agent.SubmitMedia("web", text, media)
+}
+
+// readAttachments reads the uploaded files a message carries into content parts.
+// Every problem (an unknown id, a file that vanished, one the model no longer
+// accepts) is reported to the pages as an error row, so the user sees why an
+// attachment did not make it instead of quietly losing it.
+func (s *Server) readAttachments(ids []string) ([]llm.ContentPart, []string) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	media, dir := s.mediaLocked()
+	s.mu.Unlock()
+	if !media.Enabled() {
+		s.localError("attachments are not enabled in this run")
+		return nil, nil
+	}
+	parts := make([]llm.ContentPart, 0, len(ids))
+	names := make([]string, 0, len(ids))
+	for _, id := range ids {
+		path, err := uploadPath(dir, id)
+		if err != nil {
+			s.localError("attachment: " + err.Error())
+			continue
+		}
+		file, err := media.ReadMedia(path)
+		if err != nil {
+			s.localError("attachment " + id + ": " + err.Error())
+			continue
+		}
+		parts = append(parts, file.Parts...)
+		names = append(names, file.Name)
+	}
+	return parts, names
 }
 
 // handleCommand runs one slash command from a browser; the set is the terminal
@@ -1066,8 +1122,8 @@ func (s *Server) broadcastSettings() {
 
 // handleIndex serves the single-page UI. The page is public (it carries no data
 // and its sign-in dialog has to be reachable before there is a session); the
-// runtime switches and the command rail are injected, and every endpoint that
-// touches the agent asks for a session of its own.
+// runtime switches, the command rail and the media capability are injected, and
+// every endpoint that touches the agent asks for a session of its own.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -1081,7 +1137,29 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_MARKDOWN__", strconv.FormatBool(s.markdownEnabled()))
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_RESULT__", strconv.FormatBool(s.agent.ToolResultsVisible()))
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_COMMANDS__", commandsJSON())
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_MEDIA__", s.mediaJSON())
 	fmt.Fprint(w, body)
+}
+
+// mediaJSON is the media capability handed to the page: whether the composer
+// offers an attach control at all, which types it accepts (the file picker's
+// accept attribute) and how large one file may be (checked before uploading, so
+// an oversized pick is refused without a round trip).
+func (s *Server) mediaJSON() string {
+	s.mu.Lock()
+	media := s.media
+	s.mu.Unlock()
+	payload := map[string]any{
+		"enabled":   media.Enabled(),
+		"types":     media.Types,
+		"accept":    media.Accept(),
+		"max_bytes": media.Limit(),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return `{"enabled":false,"types":[],"accept":"","max_bytes":0}`
+	}
+	return string(data)
 }
 
 // commandsJSON is the command rail handed to the page. It is built from the

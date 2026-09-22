@@ -47,8 +47,9 @@
 
   // The schema: one descriptor per option of the Go struct (camelCase keys are
   // the JSON paths, dots nest). type is one of text, password, number, slider,
-  // bool, select, textarea, json. help is shown under the key; advanced marks
-  // free-form JSON that has no useful control shape (extra_body, servers).
+  // bool, select, textarea, json, list. help is shown under the key; advanced
+  // marks free-form JSON that has no useful control shape (extra_body, servers);
+  // a list is entered as a comma separated string and saved as a JSON array.
   var SCHEMA = [
     {
       title: 'OpenAI', note: 'endpoint, credentials, request shape', open: true,
@@ -60,6 +61,7 @@
         { path: 'openai.temperature', type: 'slider', min: 0, max: 2, step: 0.05, fallback: 0.0, help: 'sampling temperature; 0 falls back to the default (0.0)' },
         { path: 'openai.max_tokens', type: 'number', min: 1, help: 'cap per reply' },
         { path: 'openai.timeout_seconds', type: 'number', min: 0, help: 'idle timeout in seconds (waiting for headers or between stream chunks); 0 disables it' },
+        { path: 'openai.media_types', type: 'list', placeholder: 'image/png, image/jpeg, audio/wav', help: 'media types this model accepts as attachments (comma separated), e.g. image/png, image/*, audio/wav, application/pdf. A family name means the whole family ("image" = "image/*"). Configuring it enables attachments: the web composer can send files and, with tools.upload_media.enabled, the model gets the upload_media tool' },
         { path: 'openai.extra_body', type: 'json', advanced: true, rows: 5, help: 'provider-specific request fields, merged into the request body (overrides built-ins such as temperature)' }
       ]
     },
@@ -121,6 +123,13 @@
         { path: 'tools.webfetch.user_agent', type: 'text', placeholder: 'path default', help: 'user agent of both paths; empty keeps each path default' },
         { path: 'tools.webfetch.max_bytes', type: 'number', min: 0, help: 'body cap of the HTTP path in bytes; 0 = built-in 8 MiB' },
         { path: 'tools.webfetch.attach_address', type: 'text', placeholder: '127.0.0.1:9222', help: 'chrome-attached: DevTools endpoint of the running browser — a port ("9222"), host:port, or an http:// / ws:// URL; empty = 127.0.0.1:9222' }
+      ]
+    },
+    {
+      title: 'Tools · media', note: 'upload_media: hand a file to the model',
+      fields: [
+        { path: 'tools.upload_media.enabled', type: 'bool', help: 'register upload_media, which lets the model upload a local file of an accepted type as an attachment. Needs openai.media_types as well: both have to be set for the tool to exist' },
+        { path: 'tools.upload_media.max_bytes', type: 'number', min: 0, help: 'largest file one upload may carry, in bytes (the web composer enforces the same cap); 0 = built-in 20 MiB' }
       ]
     },
     {
@@ -260,6 +269,12 @@
       el.rows = def.rows || 4;
       el.spellcheck = false;
       el.className = def.type === 'json' ? 'json-box' : 'text-box';
+    } else if (def.type === 'list') {
+      // A list of strings is typed as one comma separated line; the document
+      // keeps a real JSON array (see listValue/splitList).
+      el = document.createElement('input');
+      el.type = 'text';
+      if (def.placeholder) { el.placeholder = def.placeholder; }
     } else if (def.type === 'slider') {
       el = document.createElement('input');
       el.type = 'range';
@@ -462,6 +477,24 @@
     return '';
   }
 
+  // listValue renders a stored list as the single line its control shows.
+  function listValue(value) {
+    if (isArray(value)) { return value.join(', '); }
+    return value === undefined || value === null ? '' : String(value);
+  }
+
+  // splitList turns the control's line back into the array the document stores:
+  // entries are trimmed, empties dropped and duplicates removed, and an empty
+  // line deletes the key so the built-in default applies again.
+  function splitList(text) {
+    var out = [];
+    String(text).split(',').forEach(function (entry) {
+      var item = entry.trim();
+      if (item && out.indexOf(item) < 0) { out.push(item); }
+    });
+    return out;
+  }
+
   // syncForm shows the document in the controls. It runs after a load and after a
   // successful save, never while the user is typing.
   function syncForm() {
@@ -484,6 +517,8 @@
         field.el.value = '';
       } else if (field.def.type === 'json') {
         field.el.value = empty ? '' : JSON.stringify(value, null, 2);
+      } else if (field.def.type === 'list') {
+        field.el.value = empty ? '' : listValue(value);
       } else if (field.def.type === 'select') {
         var want = empty ? '' : String(value);
         if (want && !hasOption(field.el, want)) { addOption(field.el, want); }
@@ -531,6 +566,14 @@
           : (Math.floor(n) !== n ? 'enter a whole number' : rangeError(def, n));
         if (problem) { setError(field, problem); } else { setPath(draft, def.path, n); clearError(field); }
       }
+    } else if (def.type === 'list') {
+      var items = splitList(field.el.value);
+      if (items.length === 0) {
+        deletePath(draft, def.path);
+      } else {
+        setPath(draft, def.path, items);
+      }
+      clearError(field);
     } else if (def.type === 'slider') {
       setPath(draft, def.path, Number(field.el.value));
       clearError(field);

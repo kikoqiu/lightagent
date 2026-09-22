@@ -7,13 +7,15 @@
 <title>lightagent</title>
 <script>
   // Runtime configuration injected by the server: whether replies are rendered
-  // as markdown in the browser, whether tool results are shown, and the command
-  // rail (the shared slash catalogue, so the page and the CLI agree). Sessions
-  // are cookie based, so no token is needed here (see auth.js).
+  // as markdown in the browser, whether tool results are shown, the command
+  // rail (the shared slash catalogue, so the page and the CLI agree) and the
+  // media capability (which types an attachment may have, and how large one may
+  // be). Sessions are cookie based, so no token is needed here (see auth.js).
   window.__LIGHTAGENT__ = {
     markdown: __LIGHTAGENT_MARKDOWN__,
     result: __LIGHTAGENT_RESULT__,
-    commands: __LIGHTAGENT_COMMANDS__
+    commands: __LIGHTAGENT_COMMANDS__,
+    media: __LIGHTAGENT_MEDIA__
   };
 </script>
 <link rel="stylesheet" href="app.css">
@@ -95,7 +97,18 @@
     </header>
     <div id="log" role="log" aria-live="polite"></div>
     <footer>
+      <!-- Attachments waiting to be sent. A chip is added when the browser
+           uploads a file (see app.js) and removed when the user cancels it; the
+           next message carries whatever is left. The row stays hidden while
+           nothing is attached. -->
+      <ul class="attachments" id="attachments" hidden aria-label="attachments"></ul>
       <div class="composer">
+        <!-- The attach control only exists when the model declares the media
+             types it accepts (openai.media_types); app.js unhides it and points
+             the picker at those types. -->
+        <input type="file" id="attachFile" multiple hidden>
+        <button id="attach" class="attach" type="button" hidden
+                title="attach a file" aria-label="attach a file">📎</button>
         <!-- The wide layout keeps the full hint; a phone swaps in
              data-placeholder-short (no Ctrl+Enter on a touch keyboard, and the
              hint would be clipped there), see app.js. -->

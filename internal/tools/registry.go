@@ -29,6 +29,11 @@ type Result struct {
 	ForLLM string
 	// ForUser, when non-empty, is a user-facing rendering (CLI/web display).
 	ForUser string
+	// Media, when non-empty, travels with the tool result: the parts are
+	// attached to the tool message as its content array (after ForLLM), which
+	// is how a tool hands an image, an audio clip or a file to the model. It is
+	// how upload_media delivers what it read.
+	Media []llm.ContentPart
 	// IsError marks the invocation as failed.
 	IsError bool
 	// Silent suppresses user-facing rendering even when ForUser is set.

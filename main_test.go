@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"lightagent/internal/config"
 	"lightagent/internal/utils"
 )
 
@@ -320,5 +321,48 @@ func TestRunMainClosesTheFetcherBrowser(t *testing.T) {
 			t.Fatalf("the browser is still alive after the exit path")
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestMediaCapabilityRequiresBothSettings pins the rule the multimedia
+// capability follows: configuring the model's accepted types turns the
+// capability (and so the web attach control) on, while the model only gets the
+// upload_media tool when the tool's own switch is on as well.
+func TestMediaCapabilityRequiresBothSettings(t *testing.T) {
+	cases := []struct {
+		name       string
+		types      []string
+		toolOn     bool
+		wantEnable bool
+		wantTool   bool
+	}{
+		{"neither", nil, false, false, false},
+		{"switch only", nil, true, false, false},
+		{"types only", []string{"image/png"}, false, true, false},
+		{"both", []string{"image/png"}, true, true, true},
+	}
+	for _, tc := range cases {
+		cfg := config.Default()
+		cfg.OpenAI.MediaTypes = tc.types
+		cfg.Tools.UploadMedia.Enabled = tc.toolOn
+		media, tool := mediaCapability(cfg)
+		if media.Enabled() != tc.wantEnable {
+			t.Errorf("%s: capability = %v, want %v", tc.name, media.Enabled(), tc.wantEnable)
+		}
+		if tool != tc.wantTool {
+			t.Errorf("%s: upload_media registered = %v, want %v", tc.name, tool, tc.wantTool)
+		}
+	}
+
+	// The byte cap travels from the tool's setting into the capability.
+	cfg := config.Default()
+	cfg.OpenAI.MediaTypes = []string{"image"}
+	cfg.Tools.UploadMedia.MaxBytes = 2048
+	media, _ := mediaCapability(cfg)
+	if media.Limit() != 2048 {
+		t.Fatalf("limit = %d, want the configured cap", media.Limit())
+	}
+	if got := media.List(); got != "image/*" {
+		t.Fatalf("types = %q, want the normalized family", got)
 	}
 }

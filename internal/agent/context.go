@@ -9,10 +9,20 @@ import (
 	"lightagent/internal/llm"
 )
 
+// mediaPartTokens is the flat token cost one media part contributes to the
+// estimate. The real cost is provider- and size-dependent (an image is billed by
+// its resolution, audio by its length), so a rough average is used instead of
+// the encoded size: counting the base64 characters would estimate a single
+// picture at hundreds of thousands of tokens and compact the context for it.
+// The provider's own prompt-token report (which counts the media it received)
+// corrects the estimate on the very next call.
+const mediaPartTokens = 1200
+
 // EstimateMessageTokens estimates the token cost of one message as it appears
 // in the request. The message's
 // character count (content, reasoning, tool call name/arguments/id) times 2/5 —
-// roughly 2.5 characters per token — plus a small per-message overhead.
+// roughly 2.5 characters per token — plus a small per-message overhead, plus a
+// flat cost per media part.
 func EstimateMessageTokens(m llm.Message) int {
 	chars := utf8.RuneCountInString(m.Content)
 	chars += utf8.RuneCountInString(m.ReasoningContent)
@@ -25,7 +35,7 @@ func EstimateMessageTokens(m llm.Message) int {
 		chars += len(m.ToolCallID)
 	}
 	chars += 12 // per-message JSON/role overhead
-	return chars * 2 / 5
+	return chars*2/5 + len(m.Media)*mediaPartTokens
 }
 
 // EstimateMessagesTokens sums EstimateMessageTokens over a message list.

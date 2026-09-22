@@ -37,6 +37,7 @@
 | 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
 | 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；反馈默认**最多 200 行**（`max_lines`，可关），超长部分整页存到工作目录 `.lightagent/webfetch-<时间>.md`（Markdown 正文）并在反馈里给出路径 |
+| 18 | 多媒体附件 | 模型侧 `openai.media_types` 声明**本模型可读的媒体类型**（如 `image/png`、`image/*`、`audio/wav`、`application/pdf`）。配置后：Web 输入框出现 **📎 附加按钮**，文件上传到工作目录 `.lightagent/uploads/`，**随下一条输入一起发给模型**（发送前点 ✕ 可取消并删掉已存文件）；若同时打开 `tools.upload_media.enabled`（两边都为真才启用），模型还拿到 `upload_media` 工具，可自行指定路径上传（类型不符 / 超限 / 空文件 / 目录都只报错，参数提示里列出可接收类型）。载荷：图片走 `image_url`（data URI）、音频走 `input_audio`（wav/mp3）、其余走 `file`（文件名 + data URI） |
 
 ---
 
@@ -140,6 +141,7 @@ source <(lightagent completion bash)       # bash 补全
     "max_tokens": 4096,
     "timeout_seconds": 120,               // 空闲超时：无数据超过该秒数才中断（0=关闭）
     "stream": true,
+    "media_types": [],                    // 本模型可读的媒体类型，如 ["image/png", "image/*"]；留空=不启用附件
     "extra_body": {}                     // 服务商额外请求参数，合并到请求体顶层
   },
   "context": {
@@ -157,6 +159,7 @@ source <(lightagent completion bash)       # bash 补全
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
     "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "max_lines": 200 },
+    "upload_media":    { "enabled": false, "max_bytes": 0 },  // 与 openai.media_types 同时为真才注册该工具
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
       "enabled": false,

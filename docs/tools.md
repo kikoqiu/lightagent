@@ -18,7 +18,9 @@ type Tool interface {
 不额外包装、不加信封 —— 工具反馈走的就是 OpenAI 那条正常的 tool 结果通路。
 
 工具由配置开关控制（见 [configuration.md](configuration.md)）：可用的工具有
-`exec_command`、`manage_session`、`read_file_lines`、`write_file`、`edit_file`、`webfetch`。
+`exec_command`、`manage_session`、`read_file_lines`、`write_file`、`edit_file`、`webfetch`，
+以及需要 `openai.media_types` 与 `tools.upload_media.enabled` **同时成立**时才会出现的
+`upload_media`。
 
 ---
 
@@ -216,6 +218,42 @@ type Tool interface {
 * 文本模式：先按字符集解码为 UTF-8 匹配，写回时再编码；CRLF 文件按 LF 匹配、写回恢复 CRLF。
 * 二进制模式（`hex`/`base64`）：`find`/`content` 为编码字节串，唯一匹配；`insert` 插到匹配字节之前。
 * JSON 转义生效：`\n` 是换行，`\\n` 是字面反斜杠加 n。
+
+---
+
+## `upload_media`
+
+把一个**本地多媒体文件**读进来并作为附件上传给模型，让模型直接拿到内容（图片、音频、文档本体），
+而不是去读它的字节。**只有当 `openai.media_types` 非空且 `tools.upload_media.enabled` 为 `true`
+时该工具才存在**（见 [configuration.md](configuration.md#openai-media_types--toolsupload_media多媒体附件)）。
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `path` | string | 必填 | 要上传的文件路径。参数的 `description` 里**直接列出生效的可接收类型**（来自 `openai.media_types`） |
+
+* **可接收类型**：由 `openai.media_types` 决定（小写；族名 = `类型/*`）。类型判定**先看扩展名、
+  再看文件头**，任一候选被接受即通过。
+* **不是可接收类型时报错**（不上传任何内容）：返回形如
+  `"x.zip" looks like application/zip, which this model does not accept; upload one of: image/png, application/pdf`，
+  模型可据此改走 `exec_command` 转换，或对纯文本改用 `read_file_lines`。
+* 其余拒绝情况：路径缺失/空、文件不存在、路径是目录、空文件、超过 `tools.upload_media.max_bytes`
+  （默认 20 MiB）——全部只返回错误，**错误结果不带任何附件**。
+* 成功时的工具结果分两部分：
+  * **文本**（正常 tool 正文）：`Uploaded image/png attachment "shot.png" (12.3 KiB); its content is attached to this tool result.`
+  * **附件**（该 tool 消息的 content 数组，紧跟文本之后）：
+
+| 类型 | 载荷 |
+|------|------|
+| `image/*` | `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}` |
+| `audio/wav` / `audio/mpeg` 等（可映射到 wav/mp3 的） | `{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"｜"mp3"}}` |
+| 其余（PDF、视频、其他音频等） | `{"type":"file","file":{"filename":"a.pdf","file_data":"data:application/pdf;base64,…"}}` |
+
+  因此该 tool 消息的 `content` 是**数组**（文本 part + 附件 part），这正是 OpenAI 兼容接口承载
+  多模态 tool 结果的方式；是否接受 `input_audio`/`file` 这类 part 取决于服务商。
+* 附件随消息一起进入历史，因此**后续每一轮请求都会带上**（模型可以反复查看同一张图片）；
+  保存会话时也一并落盘（含 base64 正文，会话文件会因此变大）。
+* 上下文用量估算对每个附件 part 记一个固定成本（不按 base64 长度估算），真实的
+  `usage.prompt_tokens` 会在下一次调用时覆盖估算值。
 
 ---
 

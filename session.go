@@ -97,6 +97,14 @@ func runSession(o *options, stdout io.Writer) error {
 	if cfg.Tools.EditFile.Enabled {
 		reg.Register(tools.NewEditFileTool())
 	}
+	// The multimedia capability is configured on the model side
+	// (openai.media_types) and switched on per tool
+	// (tools.upload_media.enabled): only the two together register the uploader,
+	// which is also the capability the web mirror's attach control offers.
+	mediaCfg, uploadTool := mediaCapability(cfg)
+	if uploadTool {
+		reg.Register(tools.NewUploadMediaTool(mediaCfg))
+	}
 	if cfg.Tools.WebFetch.Enabled {
 		// The configured mode names are the ones internal/utils reads, so the
 		// string travels as it is (tools.webfetch.mode).
@@ -235,6 +243,10 @@ func runSession(o *options, stdout io.Writer) error {
 		// The page's /save writes through the CLI, so the browser and the
 		// terminal persist exactly the same session.
 		srv.SetSessionSaver(c.SaveSession)
+		// Attachments: the accepted media types plus the directory the browser
+		// uploads land in (.lightagent/uploads beside the session file). They
+		// travel with the next user message.
+		srv.SetMedia(mediaCfg, filepath.Join(st.Dir(), web.UploadsDirName))
 		srv.Start()
 		defer srv.Close()
 		webPort = srv.Port()
@@ -245,6 +257,19 @@ func runSession(o *options, stdout io.Writer) error {
 		c.ShowHistory(resumed.Messages, resumed.Summary)
 	}
 	return c.Run(context.Background())
+}
+
+// mediaCapability decides the multimedia side of a run from the two settings
+// that together make it up: the types the model accepts (openai.media_types)
+// turn the capability on, and the tool's own switch (tools.upload_media.enabled)
+// decides whether the model gets upload_media as well.
+//
+// The returned config always carries the accepted types (the web mirror's attach
+// control is offered whenever any type is configured); the second value reports
+// whether the tool itself must be registered, which needs both sides.
+func mediaCapability(cfg *config.Config) (tools.MediaConfig, bool) {
+	media := tools.NewMediaConfig(cfg.OpenAI.MediaTypes, cfg.Tools.UploadMedia.MaxBytes)
+	return media, media.Enabled() && cfg.Tools.UploadMedia.Enabled
 }
 
 // resolveStore builds the session store, honouring --session.

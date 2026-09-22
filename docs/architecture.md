@@ -57,6 +57,10 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
       广播 `usage`（工具结果同样占用上下文），回到 2。tool 消息的正文就是工具函数的返回值
       （`res.ForLLM`），不加任何包装/信封；被中断的调用也在这条通路上记一条
       `interrupted by user before the tool finished`。
+      * **带附件的工具结果**（目前只有 `upload_media`）：`res.Media` 非空时该 tool 消息的
+        `content` 写成**数组** —— 文本 part（`ForLLM`）在前，附件 part 在后；不带附件时仍是普通
+        字符串，`llm.Message` 的编解码负责这个形态（会话文件里存的也是同一种形态）。
+        用户消息同理：Web 附带的文件作为该用户消息的 media 一起发送。
       * **write_file 自动拆解**（`tools.write_file.auto_split`，默认开启）：若某次 `write_file` 的
         文本载荷超过 `write_file.max_lines`，该调用的参数在落库前先被改写成第一段（历史、前端展示与
         后续请求回传的都是实际执行的参数），其余分段在本轮工具结果之后追加为**独立的 assistant/tool

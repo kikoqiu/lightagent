@@ -314,11 +314,20 @@ func (a *Agent) Submit(text string) { a.SubmitFrom("", text) }
 
 // SubmitFrom is Submit with an explicit origin ("cli", "web", ...). The origin
 // travels with the EventUser so frontends can avoid echoing their own input.
-func (a *Agent) SubmitFrom(source, text string) {
+func (a *Agent) SubmitFrom(source, text string) { a.submit(source, text, nil) }
+
+// SubmitMedia is SubmitFrom with media parts: files the message carries along
+// with its text (the web mirror's attachments). They are attached to the user
+// message, so the model receives them together with the text.
+func (a *Agent) SubmitMedia(source, text string, media []llm.ContentPart) {
+	a.submit(source, text, media)
+}
+
+func (a *Agent) submit(source, text string, media []llm.ContentPart) {
 	a.mu.Lock()
 	if a.busy {
 		a.mu.Unlock()
-		a.pushSteer(source, text)
+		a.pushSteer(source, text, media)
 		return
 	}
 	a.busy = true
@@ -327,7 +336,7 @@ func (a *Agent) SubmitFrom(source, text string) {
 	a.mu.Unlock()
 
 	a.bus.Publish(Event{Type: EventUser, Text: text, Source: source})
-	go a.runLoop(turnCtx, text)
+	go a.runLoop(turnCtx, userInput{text: text, media: media})
 }
 
 // Interrupt cancels the turn in flight (the model call or the tool it is
@@ -346,10 +355,12 @@ func (a *Agent) Interrupt() bool {
 
 // steerMessage is one queued steering message: its text plus the client it came
 // from, which rides along to the user event published when the message is folded
-// into the conversation.
+// into the conversation. media are the attachments the message carries (empty
+// for a plain message).
 type steerMessage struct {
 	source string
 	text   string
+	media  []llm.ContentPart
 }
 
 // pushSteer queues a steering message for the running turn. Nothing is announced
@@ -358,9 +369,9 @@ type steerMessage struct {
 // belongs at — after the reply it interrupted. Announcing it earlier would draw
 // it in the middle of that reply (and would replay in the wrong place too, since
 // the mirror records the rows the bus carries).
-func (a *Agent) pushSteer(source, text string) {
+func (a *Agent) pushSteer(source, text string, media []llm.ContentPart) {
 	select {
-	case a.steerCh <- steerMessage{source: source, text: text}:
+	case a.steerCh <- steerMessage{source: source, text: text, media: media}:
 	default:
 		a.bus.Publish(Event{Type: EventError, Text: "steering queue is full; message dropped"})
 	}
@@ -385,18 +396,25 @@ func (a *Agent) ToolResultsVisible() bool {
 // the provider cut a response off at max_tokens (finish_reason "length").
 const maxConsecutiveTruncations = 3
 
+// userInput is one user message of a turn: its text plus the media parts it
+// carries (the files the web mirror attached to it; empty for plain input).
+type userInput struct {
+	text  string
+	media []llm.ContentPart
+}
+
 // runLoop executes a full turn: LLM call → tool calls → repeat. The turn's
 // context is cancelled by Interrupt, which stops the in-flight step and ends the
 // turn (see finishInterrupt).
-func (a *Agent) runLoop(ctx context.Context, userText string) {
-	a.runTurn(ctx, []string{userText})
+func (a *Agent) runLoop(ctx context.Context, input userInput) {
+	a.runTurn(ctx, []userInput{input})
 }
 
 // runTurn is the body of a turn: it records the turn's user messages (which the
 // caller has announced on the bus already), runs the LLM/tool loop and tears the
 // turn down. A turn that picks up queued steering messages passes them all at
 // once.
-func (a *Agent) runTurn(ctx context.Context, userTexts []string) {
+func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 	defer func() {
 		a.mu.Lock()
 		a.busy = false
@@ -413,9 +431,9 @@ func (a *Agent) runTurn(ctx context.Context, userTexts []string) {
 	}()
 
 	turnStart := a.historyLen()
-	userCount := len(userTexts)
-	for _, text := range userTexts {
-		a.appendMessage(llm.Message{Role: "user", Content: text})
+	userCount := len(inputs)
+	for _, input := range inputs {
+		a.appendMessage(llm.Message{Role: "user", Content: input.text, Media: input.media})
 	}
 	// Report the context size right away so the frontends show the new user
 	// message while the model call is still in flight.
@@ -596,6 +614,7 @@ func (a *Agent) dispatchToolCall(ctx context.Context, tc llm.ToolCall) (*tools.R
 		ToolCallID: tc.ID,
 		Name:       tc.Function.Name,
 		Content:    res.ForLLM,
+		Media:      res.Media,
 	})
 	return res, false
 }
@@ -725,7 +744,7 @@ func (a *Agent) buildMessagesLocked() []llm.Message {
 func (a *Agent) drainSteering() {
 	for _, m := range a.takeSteering() {
 		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source})
-		a.appendMessage(llm.Message{Role: "user", Content: m.text})
+		a.appendMessage(llm.Message{Role: "user", Content: m.text, Media: m.media})
 	}
 }
 
@@ -782,12 +801,12 @@ func (a *Agent) startSteeringTurn() {
 	a.cancelTurn = cancel
 	a.mu.Unlock()
 
-	texts := make([]string, 0, len(msgs))
+	inputs := make([]userInput, 0, len(msgs))
 	for _, m := range msgs {
 		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source})
-		texts = append(texts, m.text)
+		inputs = append(inputs, userInput{text: m.text, media: m.media})
 	}
-	go a.runTurn(turnCtx, texts)
+	go a.runTurn(turnCtx, inputs)
 }
 
 // setUsage records the provider-reported token accounting for the request just

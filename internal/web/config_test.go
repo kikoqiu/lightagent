@@ -333,6 +333,7 @@ func TestConfigEditorWiring(t *testing.T) {
 	for _, path := range []string{
 		"openai.api_base", "openai.api_key", "openai.model", "openai.stream",
 		"openai.temperature", "openai.max_tokens", "openai.timeout_seconds", "openai.extra_body",
+		"openai.media_types",
 		"context.context_window", "context.summarize_token_percent",
 		"web.host", "web.port", "web.password",
 		"tools.exec.enabled", "tools.exec.timeout_seconds", "tools.exec.wait_seconds", "tools.exec.use_utf8",
@@ -341,6 +342,7 @@ func TestConfigEditorWiring(t *testing.T) {
 		"tools.webfetch.enabled", "tools.webfetch.mode", "tools.webfetch.timeout_seconds",
 		"tools.webfetch.max_lines", "tools.webfetch.browser_path", "tools.webfetch.user_agent",
 		"tools.webfetch.max_bytes", "tools.webfetch.attach_address",
+		"tools.upload_media.enabled", "tools.upload_media.max_bytes",
 		"tools.discovery.enabled", "tools.discovery.mode", "tools.discovery.ttl",
 		"tools.discovery.max_search_results", "tools.discovery.min_match_rate", "tools.discovery.use_bm25",
 		"tools.mcp.enabled", "tools.mcp.servers",

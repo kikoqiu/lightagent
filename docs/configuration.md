@@ -34,6 +34,7 @@
     "max_tokens": 40960,
     "timeout_seconds": 4800,               // 空闲超时：无数据超过该秒数才中断（0=关闭）
     "stream": true,
+    "media_types": ["image/png", "image/jpeg"],  // 模型可接收的多媒体类型（留空=不启用附件能力）
     "extra_body": {
       "reasoning_effort": "high",
       "top_p": 0.95
@@ -54,6 +55,7 @@
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
     "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "max_lines": 200 },
+    "upload_media":    { "enabled": false, "max_bytes": 0 },
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
       "enabled": false,
@@ -97,6 +99,7 @@
 | `max_tokens` | int | `40960` | 单次回复上限 |
 | `timeout_seconds` | int | `4800` | **空闲超时**（秒）：等待响应头、或流式过程中两个数据块之间的最大间隔；超过即中断并提示。不是整段请求的总时限，因此长回复不会被截断；`0` 关闭 |
 | `stream` | bool | `true` | 是否使用 SSE 流式输出 |
+| `media_types` | string[] | 空 | **本模型可接收的多媒体类型**（附件能力的总开关），如 `["image/png", "image/jpeg", "audio/wav", "application/pdf"]`。小写、可写族名（`"image"` = `"image/*"`）。留空 = 关闭附件能力：既不注册 `upload_media`，Web 输入框也没有附加按钮。非空时：Web 可附加文件，且若同时打开 `tools.upload_media.enabled` 则模型拿到上传工具（两边都为真才启用）。为空时不写入文件 |
 | `extra_body` | object | 无 | 见下节 |
 
 ### `context`
@@ -143,6 +146,8 @@
 | `webfetch.user_agent` | string | 空 | 覆盖两条路径的 User-Agent（浏览器渲染时由浏览器发送、HTTP 源码是请求头）；为空时各用自带默认（Go 客户端 / 浏览器自身）。为空时不写入文件 |
 | `webfetch.max_bytes` | int | `0` | HTTP 源码正文的字节上限；`0` 用内置的 8 MiB。负数回退到 `0`；为 `0` 时不写入文件 |
 | `webfetch.attach_address` | string | 空 | `chrome-attached` 挂载的 DevTools 端点，一个字符串即可：端口 `9222`（= `127.0.0.1:9222`）、`192.168.0.5:9223`、`http://…` 或 `ws://…`。为空时用内置的 `127.0.0.1:9222`；为空时不写入文件 |
+| `upload_media.enabled` | bool | `false` | 启用 `upload_media`（把本地多媒体文件上传成对话附件）。**必须与模型侧 `openai.media_types` 同时成立**：只配上类型而不打开该开关，或只打开开关而不配类型，都不会注册这个工具 |
+| `upload_media.max_bytes` | int | `0` | 单个附件文件的字节上限；`0` 用内置的 20 MiB。负数回退到 `0`；为 `0` 时不写入文件。**Web 附加按钮用同一个上限**（超限的文件在浏览器里就被拒，不发往服务端） |
 
 * `exec.use_utf8` 默认为 `true`：加载时先取默认值再合并文件，**省略该字段即保持开启**；
   需要旧的 ANSI 代码页转换时显式写 `"use_utf8": false`。它只是默认值——`exec_command` 的
@@ -159,6 +164,32 @@
 * 启动浏览器的模式（`auto` / `chrome-headful` / `chrome-headless`）用**工作目录下**
   `.lightagent/browser-profile` 作为 profile（agent 自己的 Cookie 与登录态，随项目走），
   不碰你自己的浏览器 profile；该目录已被 `.gitignore` 忽略。
+
+#### `openai.media_types` / `tools.upload_media`（多媒体附件）
+
+多媒体能力由**两个开关**共同决定，缺一不可：
+
+1. `openai.media_types`：**本模型能读的媒体类型**（能力总开关）。它是判断"这个文件能不能交给模型"的
+   唯一依据，也决定 Web 附加按钮是否存在、文件选择器只筛哪些类型。
+2. `tools.upload_media.enabled`：**是否把这个能力做成工具**给模型用（模型可以自己指定路径上传）。
+
+四条通路：
+
+| `media_types` | `upload_media.enabled` | 模型侧 `upload_media` 工具 | Web 附加文件 |
+|---------------|------------------------|---------------------------|--------------|
+| 空 | 任意 | 不注册 | 关闭（输入框没有附加按钮，`/api/upload` 直接 404） |
+| 非空 | `true` | **注册**（描述与 `path` 参数里都列出可接收类型） | 可用 |
+| 非空 | `false` | 不注册（模型无法自行上传） | 可用（用户附加的附件仍然照发） |
+
+* 类型的匹配：小写比较、忽略 `; charset=…` 之类的参数；族名（没有 `/` 的写法）等价于通配，
+  即 `"image"` = `"image/*"`；`"image/*"` 匹配任意 `image/…`。
+* 类型判定：**先看扩展名、再看文件头**（`mime.TypeByExtension` + `http.DetectContentType`），
+  两个候选里只要有一个被接受就用它，因此**没有扩展名的文件也能被认出来**；两个都不是可接收类型时报错，
+  错误信息里会列出可接收类型。扩展名与内容矛盾时（比如 `.txt` 里其实是 PNG）以扩展名优先。
+* 上限：`tools.upload_media.max_bytes`（默认 20 MiB）对**工具与 Web 两条路都一样**：
+  超限的文件不读、不存、不发。
+* 附件的载荷形态见 [tools.md](tools.md#upload_media)：图片走 `image_url`（data URI）、
+  音频走 `input_audio`（wav/mp3）、其余（PDF、视频等）走 `file`（文件名 + data URI）。
 
 #### `tools.discovery`（MCP 工具发现 / unlock）
 
