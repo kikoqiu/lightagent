@@ -1,9 +1,11 @@
 package store
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -261,5 +263,63 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 	if len(got.Messages) != 2 || got.Summary != "sum2" {
 		t.Fatalf("after overwrite = %+v", got)
+	}
+}
+
+// TestSaveStoresMediaAsPathsNotBytes verifies a saved conversation names the files
+// its messages carry instead of embedding them: the session file stays a readable
+// JSON document (no base64), and the payload is read back from the file when the
+// conversation is resumed (llm.ResolveMedia).
+func TestSaveStoresMediaAsPathsNotBytes(t *testing.T) {
+	dir := t.TempDir()
+	image := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(image, []byte("PNGDATA"), 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	payload := base64.StdEncoding.EncodeToString([]byte("PNGDATA"))
+
+	st, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	state := State{Messages: []llm.Message{{Role: "user", Content: "look", Media: []llm.ContentPart{{
+		Type:     llm.PartTypeImageURL,
+		ImageURL: &llm.ImageURLPart{URL: "data:image/png;base64," + payload},
+		Path:     image,
+		Mime:     "image/png",
+	}}}}}
+	if err := st.Save(state); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if !state.Messages[0].Media[0].HasPayload() {
+		t.Fatal("save must not strip the media of the state it was given")
+	}
+
+	raw, err := os.ReadFile(st.Path())
+	if err != nil {
+		t.Fatalf("read session: %v", err)
+	}
+	if strings.Contains(string(raw), payload) {
+		t.Fatalf("the session file embeds the payload:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "shot.png") {
+		t.Fatalf("the session file must name the file the payload came from:\n%s", raw)
+	}
+
+	got, err := st.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got == nil || len(got.Messages) != 1 || len(got.Messages[0].Media) != 1 {
+		t.Fatalf("loaded = %+v", got)
+	}
+	stored := got.Messages[0].Media[0]
+	if stored.Path != image || stored.Mime != "image/png" || stored.HasPayload() {
+		t.Fatalf("stored part = %+v, want the path and no payload", stored)
+	}
+
+	resolved := llm.ResolveMedia(got.Messages)
+	if url := resolved[0].Media[0].ImageURL.URL; url != "data:image/png;base64,"+payload {
+		t.Fatalf("resolved payload = %q", url)
 	}
 }

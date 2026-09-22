@@ -59,8 +59,10 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
       `interrupted by user before the tool finished`。
       * **带附件的工具结果**（目前只有 `upload_media`）：`res.Media` 非空时该 tool 消息的
         `content` 写成**数组** —— 文本 part（`ForLLM`）在前，附件 part 在后；不带附件时仍是普通
-        字符串，`llm.Message` 的编解码负责这个形态（会话文件里存的也是同一种形态）。
-        用户消息同理：Web 附带的文件作为该用户消息的 media 一起发送。
+        字符串，`llm.Message` 的编解码负责这个形态（会话文件里的 media part 同一形态，但**只写
+        `path`/`mime`，不写载荷**，见[持久化](#持久化)）。
+        用户消息同理：Web 附带的文件作为该用户消息的 media 一起发送，用户事件（`user`）另带一份
+        **附件描述**（`attachments`：名字 / 媒体类型 / 可取的 URL），前端据此在消息行里把图片画成图片。
       * **write_file 自动拆解**（`tools.write_file.auto_split`，默认开启）：若某次 `write_file` 的
         文本载荷超过 `write_file.max_lines`，该调用的参数在落库前先被改写成第一段（历史、前端展示与
         后续请求回传的都是实际执行的参数），其余分段在本轮工具结果之后追加为**独立的 assistant/tool
@@ -166,6 +168,12 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
   "messages": [ { "role": "user", "content": "..." } ]
 }
 ```
+
+* **带附件的消息存路径，不存内容**：媒体 part（图片 / 音频 / 文件）平时是内联载荷（data URI、base64），
+  写盘前由 `llm.ReferenceMedia` 换成「读自哪个文件 + 媒体类型」（`path` / `mime`，载荷留空），
+  会话文件因此不会因为一张图片膨胀成几 MB；恢复会话时 `llm.ResolveMedia` 按路径把内容读回来，
+  文件已被删除时该 part 保持「无载荷」，请求侧（`requestMessages`）用一句不可用文本 part 代替它。
+  `path`/`mime` 只存在于磁盘（与该 part 的内存结构）上，永不进入发给服务商的请求体。
 
 读写均为「写临时文件 + 原子重命名」。
 

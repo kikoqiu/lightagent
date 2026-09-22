@@ -83,7 +83,7 @@ func (c *Client) endpoint() string {
 func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, onDelta, onReasoning func(string)) (*Response, error) {
 	req := ChatRequest{
 		Model:       c.model,
-		Messages:    messages,
+		Messages:    requestMessages(messages),
 		Tools:       tools,
 		Temperature: c.temperature,
 		MaxTokens:   c.maxTokens,

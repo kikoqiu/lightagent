@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -231,6 +232,48 @@ func TestDrainSteering(t *testing.T) {
 		default:
 			t.Fatalf("no user event was announced for %q", want.text)
 		}
+	}
+}
+
+// TestUserEventCarriesTheMessageAttachments verifies the files a message carries
+// ride with its user event as descriptions — name, media type and the file they
+// came from, never the payload — so a front-end can draw what the message brought
+// along.
+func TestUserEventCarriesTheMessageAttachments(t *testing.T) {
+	a := newTestAgent(t)
+	events, cancel := a.Bus().Subscribe()
+	defer cancel()
+
+	image := &llm.ContentPart{
+		Type:     llm.PartTypeImageURL,
+		ImageURL: &llm.ImageURLPart{URL: "data:image/png;base64,AAAA"},
+		Path:     filepath.Join("state", "uploads", "shot.png"),
+		Mime:     "image/png",
+	}
+	a.steerCh <- steerMessage{source: "web", text: "look at this", media: []llm.ContentPart{*image}}
+
+	a.drainSteering()
+
+	select {
+	case ev := <-events:
+		if ev.Type != EventUser || ev.Text != "look at this" || ev.Source != "web" {
+			t.Fatalf("event = %+v", ev)
+		}
+		if len(ev.Attachments) != 1 {
+			t.Fatalf("attachments = %+v, want the file the message carried", ev.Attachments)
+		}
+		got := ev.Attachments[0]
+		if got.Name != "shot.png" || got.Type != "image/png" || got.Path == "" {
+			t.Errorf("attachment = %+v", got)
+		}
+	default:
+		t.Fatal("no user event was announced")
+	}
+
+	// The history keeps the media itself: the model receives the picture.
+	history := a.History()
+	if len(history) != 1 || len(history[0].Media) != 1 || !history[0].Media[0].HasPayload() {
+		t.Fatalf("history = %+v, want the message with its media", history)
 	}
 }
 

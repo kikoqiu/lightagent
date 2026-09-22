@@ -250,8 +250,13 @@ type Tool interface {
 
   因此该 tool 消息的 `content` 是**数组**（文本 part + 附件 part），这正是 OpenAI 兼容接口承载
   多模态 tool 结果的方式；是否接受 `input_audio`/`file` 这类 part 取决于服务商。
-* 附件随消息一起进入历史，因此**后续每一轮请求都会带上**（模型可以反复查看同一张图片）；
-  保存会话时也一并落盘（含 base64 正文，会话文件会因此变大）。
+* 附件随消息一起进入历史，因此**后续每一轮请求都会带上**（模型可以反复查看同一张图片）。
+* **保存会话只记文件路径，不落 base64**：每个附件 part 记住它读自哪个文件（`path`，绝对路径）和媒体类型
+  （`mime`），`store.Save` 用 `llm.ReferenceMedia` 把这两个字段写进会话文件、载荷留空；恢复会话时
+  `llm.ResolveMedia` 按该路径把内容读回来，对话因此原样继续。文件已被删除时该 part 仍是「一个带名字的附件」：
+  Web 端只显示文件名（图片取不回来），而发给模型的请求里用一句
+  `[attachment shot.png is no longer available: …]` 文本 part 代替它（`requestMessages`）。
+* `path`/`mime` 从不发给模型：请求里的 media part 只有载荷本身（`requestMessages` 会剥掉这两个字段）。
 * 上下文用量估算对每个附件 part 记一个固定成本（不按 base64 长度估算），真实的
   `usage.prompt_tokens` 会在下一次调用时覆盖估算值。
 

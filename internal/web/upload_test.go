@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -334,5 +335,157 @@ func TestUploadNamingKeepsTheFileName(t *testing.T) {
 	}
 	if len(id) > maxUploadNameBytes || !utf8.ValidString(id) {
 		t.Fatalf("trimmed id = %q (%d bytes), want a valid name of at most %d bytes", id, len(id), maxUploadNameBytes)
+	}
+}
+
+// TestUserRowShowsTheAttachmentsOfItsMessage verifies the page is told which files
+// a message brought along: the row names each of them and, for a file the mirror
+// stores itself, carries the URL its picture is drawn from.
+func TestUserRowShowsTheAttachmentsOfItsMessage(t *testing.T) {
+	srv, uploads := newMediaTestServer(t, []string{"image/png"}, 0)
+	_, payload := postUpload(t, baseURL(srv), "shot.png", pngBytes)
+	id := payload["id"].(string)
+
+	srv.handleClientMessage([]byte(`{"text":"what is this?","attachments":[` + quote(id) + `]}`))
+
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool {
+		return len(rows) > 0 && rows[0].Role == "user"
+	})
+	row := rows[0]
+	if row.Content != "what is this?" {
+		t.Fatalf("row = %+v, want the user message", row)
+	}
+	if len(row.Attachments) != 1 {
+		t.Fatalf("attachments = %+v, want the file the message carried", row.Attachments)
+	}
+	att := row.Attachments[0]
+	if att.Name != "shot.png" || att.Type != "image/png" {
+		t.Errorf("attachment = %+v, want the uploaded file", att)
+	}
+	if want := mediaPath + "?id=" + id; att.URL != want {
+		t.Errorf("url = %q, want %q", att.URL, want)
+	}
+	// The stored file is what the URL serves, so the page can draw the picture.
+	if _, err := os.Stat(filepath.Join(uploads, id)); err != nil {
+		t.Fatalf("the attachment is not where the URL points: %v", err)
+	}
+}
+
+// TestMediaEndpointServesStoredUploads verifies a row's picture can be fetched
+// back: the endpoint answers with the stored file itself, and refuses anything
+// that is not a file of the upload directory (or that is gone).
+func TestMediaEndpointServesStoredUploads(t *testing.T) {
+	srv, uploads := newMediaTestServer(t, []string{"image/png"}, 0)
+	base := baseURL(srv)
+	_, payload := postUpload(t, base, "shot.png", pngBytes)
+	id := payload["id"].(string)
+
+	resp, err := http.Get(base + mediaURL(id))
+	if err != nil {
+		t.Fatalf("GET %s: %v", mediaURL(id), err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, body)
+	}
+	if !bytes.Equal(body, pngBytes) {
+		t.Fatalf("body = %d bytes, want the stored file (%d)", len(body), len(pngBytes))
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/png") {
+		t.Fatalf("Content-Type = %q, want the file's own type", ct)
+	}
+
+	// A name the upload directory does not hold, a path, and an empty id.
+	cases := []struct {
+		id     string
+		status int
+	}{
+		{"nope.png", http.StatusNotFound},
+		{"../session.json", http.StatusBadRequest},
+		{"", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		endpoint := mediaPath + "?id=" + url.QueryEscape(tc.id)
+		resp, err := http.Get(base + endpoint)
+		if err != nil {
+			t.Fatalf("GET %s: %v", endpoint, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != tc.status {
+			t.Errorf("GET %s = %d, want %d", endpoint, resp.StatusCode, tc.status)
+		}
+	}
+
+	// A name that is a directory (a folder someone dropped in the upload
+	// directory by hand) is not a file to serve.
+	if err := os.Mkdir(filepath.Join(uploads, "folder"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	resp, err = http.Get(base + mediaPath + "?id=folder")
+	if err != nil {
+		t.Fatalf("GET %s?id=folder: %v", mediaPath, err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d for a directory, want 404", resp.StatusCode)
+	}
+
+	// A file that was dropped (the user cancelled the attachment) stops being
+	// served, which is what makes the page fall back to the file's name.
+	if err := os.Remove(filepath.Join(uploads, id)); err != nil {
+		t.Fatalf("remove upload: %v", err)
+	}
+	resp, err = http.Get(base + mediaURL(id))
+	if err != nil {
+		t.Fatalf("GET %s: %v", mediaURL(id), err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d after the file was dropped, want 404", resp.StatusCode)
+	}
+}
+
+// TestMediaEndpointNeedsTheCapability verifies the endpoint stays closed in a run
+// without attachments: no media types means no upload directory and nothing to
+// serve.
+func TestMediaEndpointNeedsTheCapability(t *testing.T) {
+	srv := newTestServer(t, "")
+	resp, err := http.Get(baseURL(srv) + mediaPath + "?id=shot.png")
+	if err != nil {
+		t.Fatalf("GET %s: %v", mediaPath, err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestPageDrawsTheFilesOfAMessage pins the page side of an attachment: a row that
+// carried files draws them under its text — the picture itself when the mirror
+// serves it, a chip with the file's name otherwise (a type the browser cannot
+// render, a file the mirror does not store, or a picture that cannot be loaded
+// any more).
+func TestPageDrawsTheFilesOfAMessage(t *testing.T) {
+	page := pageSource()
+	for _, want := range []string{
+		"function mediaList(attachments)",
+		"function mediaItem(item)",
+		"function mediaChip(item)",
+		"function isImageAttachment(item)",
+		// A picture the URL does not answer for falls back to naming the file.
+		"img.onerror = function ()",
+		// Both row paths carry the files: the replayed row and the live event.
+		"render('user', { text: m.content, attachments: m.attachments })",
+		"addRow('user', 'you', ev.text || '', false, ev.attachments)",
+		".row .attachments .media-image img",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing %q", want)
+		}
 	}
 }

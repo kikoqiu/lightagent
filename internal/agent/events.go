@@ -3,6 +3,8 @@ package agent
 import (
 	"sync"
 	"time"
+
+	"lightagent/internal/llm"
 )
 
 // EventType enumerates the observable agent events.
@@ -44,6 +46,10 @@ type Event struct {
 	// Source identifies who submitted a user message ("cli", "web"). It is
 	// empty for events that do not originate from user input.
 	Source string `json:"source,omitempty"`
+	// Attachments lists the files a user message carries (the web mirror's
+	// attachments). It holds names and paths only — never the payload — so a
+	// front-end can show what a message brought along.
+	Attachments []llm.Attachment `json:"attachments,omitempty"`
 	// Tokens and ContextWindow carry context-usage numbers for EventUsage.
 	Tokens        int       `json:"tokens,omitempty"`
 	ContextWindow int       `json:"context_window,omitempty"`

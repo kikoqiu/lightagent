@@ -31,6 +31,13 @@ type ContentPart struct {
 	ImageURL *ImageURLPart   `json:"image_url,omitempty"`
 	Audio    *InputAudioPart `json:"input_audio,omitempty"`
 	File     *FilePart       `json:"file,omitempty"`
+	// Path is the file this part's payload was read from, and Mime its media
+	// type. They are what a session file keeps instead of the payload itself,
+	// so a saved conversation names the pictures it carries instead of
+	// embedding them as base64 (see media.go). Neither ever reaches the
+	// provider: the request leaves them behind.
+	Path string `json:"path,omitempty"`
+	Mime string `json:"mime,omitempty"`
 }
 
 // ImageURLPart is the payload of an image_url content part.

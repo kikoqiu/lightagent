@@ -375,6 +375,20 @@
     font-weight:700; font-size:12px; box-shadow:none;
   }
   .attachment button.attachment-x:hover { background:rgba(161,61,61,.24); color:#f0b4b4; }
+  /* The same chips, drawn under a message that carried files rather than above the
+     composer. A picture is shown as itself there (framed, opening the file in its
+     own tab), everything else stays a chip; both line up with the message in a
+     user row, which is right-aligned. */
+  .row .attachments { width:auto; max-width:none; margin:8px 0 0; }
+  .user .attachments { justify-content:flex-end; }
+  .row .attachments .attachment { padding:4px 10px; }
+  .row .attachments .media-image { line-height:0; }
+  .row .attachments .media-image a { display:block; }
+  .row .attachments .media-image img {
+    display:block; max-width:min(420px, 100%); max-height:320px;
+    border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--bg-elev); box-shadow:var(--shadow);
+  }
 
   /* ---- config editor: control form + raw JSON mode ---- */
   /* The gear lives in the header (all layouts) and in the side rail card, so the

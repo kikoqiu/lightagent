@@ -72,11 +72,15 @@ func (s *Store) Dir() string { return s.dir }
 // Path returns the session file path.
 func (s *Store) Path() string { return filepath.Join(s.dir, s.file) }
 
-// Save writes the session atomically.
+// Save writes the session atomically. The media of the messages is stored as a
+// reference to the file it was read from, never as its bytes (see
+// llm.ReferenceMedia): a conversation holding pictures stays a readable JSON file
+// instead of megabytes of base64. The caller's state is left untouched.
 func (s *Store) Save(st State) error {
 	if st.Version == 0 {
 		st.Version = 1
 	}
+	st.Messages = llm.ReferenceMedia(st.Messages)
 	return s.writeJSON(s.Path(), st)
 }
 
@@ -92,7 +96,9 @@ func (s *Store) Load() (*State, error) {
 }
 
 // LoadPath reads an arbitrary session file. It returns (nil, nil) when the file
-// does not exist.
+// does not exist. The messages come back with the media parts still referring to
+// their files (see llm.ReferenceMedia): reading them back is up to the caller that
+// resumes the conversation (llm.ResolveMedia), so listing sessions stays cheap.
 func (s *Store) LoadPath(path string) (*State, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {

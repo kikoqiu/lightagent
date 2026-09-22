@@ -335,7 +335,7 @@ func (a *Agent) submit(source, text string, media []llm.ContentPart) {
 	a.cancelTurn = cancel
 	a.mu.Unlock()
 
-	a.bus.Publish(Event{Type: EventUser, Text: text, Source: source})
+	a.bus.Publish(Event{Type: EventUser, Text: text, Source: source, Attachments: llm.MediaAttachments(media)})
 	go a.runLoop(turnCtx, userInput{text: text, media: media})
 }
 
@@ -743,7 +743,7 @@ func (a *Agent) buildMessagesLocked() []llm.Message {
 // after the reply it interrupted, before the answer it steers.
 func (a *Agent) drainSteering() {
 	for _, m := range a.takeSteering() {
-		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source})
+		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source, Attachments: llm.MediaAttachments(m.media)})
 		a.appendMessage(llm.Message{Role: "user", Content: m.text, Media: m.media})
 	}
 }
@@ -803,7 +803,7 @@ func (a *Agent) startSteeringTurn() {
 
 	inputs := make([]userInput, 0, len(msgs))
 	for _, m := range msgs {
-		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source})
+		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source, Attachments: llm.MediaAttachments(m.media)})
 		inputs = append(inputs, userInput{text: m.text, media: m.media})
 	}
 	go a.runTurn(turnCtx, inputs)

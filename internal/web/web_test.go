@@ -267,11 +267,12 @@ func TestRunningIndicator(t *testing.T) {
 
 // historyRow is one row of the history snapshot as the page consumes it.
 type historyRow struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	Name    string `json:"name"`
-	Args    string `json:"args"`
-	IsError bool   `json:"is_error"`
+	Role        string           `json:"role"`
+	Content     string           `json:"content"`
+	Name        string           `json:"name"`
+	Args        string           `json:"args"`
+	IsError     bool             `json:"is_error"`
+	Attachments []llm.Attachment `json:"attachments"`
 }
 
 // historyFrame is one frame of a history snapshot as the page consumes it: the
@@ -482,9 +483,11 @@ func TestScrollbackSkipsEmptyToolResult(t *testing.T) {
 func TestSteeringRowOrder(t *testing.T) {
 	for _, want := range []string{
 		"function addPendingRow(text)",
-		"function settlePendingRow(text)",
+		"function settlePendingRow(text, attachments)",
 		"addPendingRow(text);",
-		"settlePendingRow(ev.text || '')",
+		"settlePendingRow(ev.text || '', ev.attachments)",
+		// The files the settled message carried join its row there.
+		"setRowMedia(row, attachments);",
 		// Transcript rows are inserted before the pending messages.
 		"if (anchor) { log.insertBefore(row, anchor); } else { log.appendChild(row); }",
 		"pendingRows = [];",

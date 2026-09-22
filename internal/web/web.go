@@ -263,6 +263,10 @@ func isStreamedDelta(t agent.EventType) bool {
 func (s *Server) publish(ev agent.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A message's attachments are described the way the page draws them — a URL
+	// where the mirror serves the file, no local path — for the recorded row and
+	// for the live frame alike, so a row looks the same however it arrived.
+	ev.Attachments = pageAttachments(s.uploadsDir, ev.Attachments)
 	s.recordLocked(ev)
 	if isStreamedDelta(ev.Type) {
 		s.coalesceLocked(ev)
@@ -459,8 +463,10 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/api/config", s.requireSession(http.HandlerFunc(s.handleConfig)))
 	mux.Handle("/api/password", s.requireSession(http.HandlerFunc(s.handlePassword)))
 	// Attachments: the composer uploads a file here before sending, and drops
-	// it again when the user cancels it.
+	// it again when the user cancels it; the pictures a message carried are
+	// fetched back from the same directory so a row can draw them (handleMedia).
 	mux.Handle("/api/upload", s.requireSession(http.HandlerFunc(s.handleUpload)))
+	mux.Handle(mediaPath, s.requireSession(http.HandlerFunc(s.handleMedia)))
 	return mux
 }
 
@@ -528,13 +534,15 @@ func transcriptVersion(r *http.Request) uint64 {
 // the live view draws: user/assistant/thinking text, info and error markers,
 // plus one entry per tool call and per user-visible tool result. The "summary"
 // role is the compressed-context summary: it marks the point where the older
-// messages were cut out of the model context.
+// messages were cut out of the model context. Attachments are the files a user
+// message carried, as the page draws them (see pageAttachments).
 type historyMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content,omitempty"`
-	Name    string `json:"name,omitempty"`
-	Args    string `json:"args,omitempty"`
-	IsError bool   `json:"is_error,omitempty"`
+	Role        string           `json:"role"`
+	Content     string           `json:"content,omitempty"`
+	Name        string           `json:"name,omitempty"`
+	Args        string           `json:"args,omitempty"`
+	IsError     bool             `json:"is_error,omitempty"`
+	Attachments []llm.Attachment `json:"attachments,omitempty"`
 }
 
 // seedHistory fills the in-memory scrollback from the agent's current
@@ -542,7 +550,12 @@ type historyMessage struct {
 // before the server was created) is replayed to the first browser that
 // connects, thinking included.
 func (s *Server) seedHistory() {
-	rows := messageRows(s.agent.History(), s.agent.ToolResultsVisible())
+	// The upload directory is read under the lock (SetMedia sets it before the
+	// mirror starts, but the field is guarded like every other one).
+	s.mu.Lock()
+	dir := s.uploadsDir
+	s.mu.Unlock()
+	rows := messageRows(s.agent.History(), s.agent.ToolResultsVisible(), dir)
 	// A resumed conversation carries the summary of everything that was
 	// compressed away before it, so it becomes the first row: the page then
 	// starts exactly where the agent's context does.
@@ -561,8 +574,9 @@ func (s *Server) seedHistory() {
 // messageRows converts stored conversation messages into the display rows the
 // page draws: user and assistant text, a thinking row for each assistant
 // message that carries reasoning, and one [tool] row per call plus its shown
-// result.
-func messageRows(msgs []llm.Message, showResults bool) []historyMessage {
+// result. dir is the upload directory the attachments of a user message are
+// served from (see pageAttachments).
+func messageRows(msgs []llm.Message, showResults bool, dir string) []historyMessage {
 	out := make([]historyMessage, 0, len(msgs))
 	for _, m := range msgs {
 		switch m.Role {
@@ -593,8 +607,12 @@ func messageRows(msgs []llm.Message, showResults bool) []historyMessage {
 			}
 			out = append(out, historyMessage{Role: "tool_result", Content: text, IsError: isErr})
 		default:
-			if strings.TrimSpace(m.Content) != "" {
-				out = append(out, historyMessage{Role: m.Role, Content: m.Content})
+			if strings.TrimSpace(m.Content) != "" || len(m.Media) > 0 {
+				out = append(out, historyMessage{
+					Role:        m.Role,
+					Content:     m.Content,
+					Attachments: pageAttachments(dir, m.Attachments()),
+				})
 			}
 		}
 	}
@@ -624,7 +642,11 @@ func (s *Server) recordLocked(ev agent.Event) {
 			s.touchHistoryLocked()
 		}
 	case agent.EventUser:
-		s.history = append(s.history, historyMessage{Role: "user", Content: ev.Text})
+		s.history = append(s.history, historyMessage{
+			Role:        "user",
+			Content:     ev.Text,
+			Attachments: ev.Attachments,
+		})
 	case agent.EventAssistant:
 		if strings.TrimSpace(ev.Text) != "" {
 			s.history = append(s.history, historyMessage{Role: "assistant", Content: ev.Text})

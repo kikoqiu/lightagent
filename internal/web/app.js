@@ -397,8 +397,9 @@
     reasoningRenderedAt = 0;
   }
 
-  // buildRow creates one transcript row.
-  function buildRow(cls, role, text, renderMD) {
+  // buildRow creates one transcript row. attachments are the files a message
+  // carried (the page draws them under the text; see mediaList).
+  function buildRow(cls, role, text, renderMD, attachments) {
     var row = document.createElement('div');
     row.className = 'row ' + cls;
     if (role) {
@@ -410,6 +411,8 @@
     var t = document.createElement('span');
     setSpan(t, text, renderMD);
     row.appendChild(t);
+    var media = mediaList(attachments);
+    if (media) { row.appendChild(media); }
     return row;
   }
 
@@ -428,8 +431,8 @@
     if (follow) { pinBottom(); }
   }
 
-  function addRow(cls, role, text, renderMD) {
-    var row = buildRow(cls, role, text, renderMD);
+  function addRow(cls, role, text, renderMD, attachments) {
+    var row = buildRow(cls, role, text, renderMD, attachments);
     placeRow(row);
     return row;
   }
@@ -447,8 +450,10 @@
 
   // settlePendingRow turns the pending row of a message the agent has just sent
   // into an ordinary one. It reports whether a row was converted; the row keeps
-  // its place, which is where the message entered the conversation.
-  function settlePendingRow(text) {
+  // its place, which is where the message entered the conversation. attachments
+  // are the files the agent reports for it: the row was drawn from the composer's
+  // text alone, so the files it carried are added here.
+  function settlePendingRow(text, attachments) {
     for (var i = 0; i < pendingRows.length; i++) {
       if (pendingRows[i].text !== text) { continue; }
       var row = pendingRows[i].el;
@@ -456,6 +461,7 @@
       // The pending mark rides on the class alone; the text is already the final
       // one, since it is the message the agent recorded.
       row.className = 'row user';
+      setRowMedia(row, attachments);
       return true;
     }
     return false;
@@ -469,15 +475,25 @@
     if (follow) { pinBottom(); }
   }
 
+  // rowText returns the row's own text span. It is not simply the last child: a
+  // row that carries files keeps them after its text (see mediaList).
+  function rowText(row) {
+    if (!row) { return null; }
+    for (var i = 0; i < row.children.length; i++) {
+      if (row.children[i].classList.contains('text')) { return row.children[i]; }
+    }
+    return row.lastChild;
+  }
+
   function setRow(el, text, renderMD) {
     if (!el) { return; }
     // A replayed row sits in the batch fragment (not in the log yet) and the view
     // is pinned once, when the snapshot ends: there is nothing to follow and no
     // layout to read here.
-    if (replaying) { setSpan(el.lastChild, text, renderMD); return; }
+    if (replaying) { setSpan(rowText(el), text, renderMD); return; }
     // A streamed re-render can grow the row, so the sample comes first too.
     var follow = atBottom();
-    setSpan(el.lastChild, text, renderMD);
+    setSpan(rowText(el), text, renderMD);
     if (follow) { pinBottom(); }
   }
 
@@ -731,8 +747,9 @@
       setRunning(true);
       // A message this page sent while the turn was running is being sent now:
       // its pending row becomes an ordinary one, in place (it already sits after
-      // everything the interrupted reply produced).
-      if (settlePendingRow(ev.text || '')) {
+      // everything the interrupted reply produced), picking up the files the
+      // message carried.
+      if (settlePendingRow(ev.text || '', ev.attachments)) {
         if (queued) { queued--; tickTurn(); }
         return;
       }
@@ -765,7 +782,7 @@
     // it with the text the branches below render in full.
     if (pendingRender) { clearTimeout(pendingRender); pendingRender = null; }
     if (kind === 'turn_done') { return; }
-    if (kind === 'user') { addRow('user', 'you', ev.text || '', false); }
+    if (kind === 'user') { addRow('user', 'you', ev.text || '', false, ev.attachments); }
     else if (kind === 'assistant') {
       var text = ev.text || streamedText;
       if (streamed) { setRow(streamed, text, true); }
@@ -862,7 +879,7 @@
   function appendHistoryRows(ev) {
     if (!replayBatch) { beginHistory(ev); }
     (ev.messages || []).forEach(function (m) {
-      if (m.role === 'user') { render('user', { text: m.content }); }
+      if (m.role === 'user') { render('user', { text: m.content, attachments: m.attachments }); }
       else if (m.role === 'assistant' && m.content) { render('assistant', { text: m.content }); }
       else if (m.role === 'reasoning') { render('reasoning_delta', { text: m.content }); }
       else if (m.role === 'tool_call') { render('tool_call', { name: m.name, args: m.args }); }
@@ -1106,6 +1123,95 @@
       li.appendChild(x);
       attachmentsEl.appendChild(li);
     });
+  }
+
+  // ---- the files a message carried ----
+  // A user message that brought files along is drawn with them: the picture
+  // itself when the mirror serves it (a file in its upload directory, see
+  // /api/media), a chip with the file's name otherwise — a file the mirror does
+  // not store (the model's own upload_media of a file elsewhere), a type the
+  // browser cannot render, or a picture whose file is gone (the <img> fails and
+  // the chip takes its place).
+
+  // mediaList builds the block of files for one row, or null when there are none.
+  function mediaList(attachments) {
+    if (!attachments || !attachments.length) { return null; }
+    var list = document.createElement('ul');
+    list.className = 'attachments';
+    attachments.forEach(function (item) { list.appendChild(mediaItem(item)); });
+    return list;
+  }
+
+  // mediaItem draws one attachment as a list item: a framed picture that opens
+  // the file in its own tab, or a chip when there is nothing to show.
+  function mediaItem(item) {
+    if (!isImageAttachment(item)) { return mediaChip(item); }
+    var li = document.createElement('li');
+    li.className = 'media-image';
+    var link = document.createElement('a');
+    link.href = item.url;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.title = 'open ' + attachmentName(item);
+    var img = document.createElement('img');
+    img.src = item.url;
+    img.alt = attachmentName(item);
+    link.appendChild(img);
+    li.appendChild(link);
+    // The file may be gone by now (it was deleted after the row was recorded):
+    // the page cannot show the picture, so the row falls back to naming it.
+    img.onerror = function () {
+      if (li.parentNode) { li.parentNode.replaceChild(mediaChip(item), li); }
+    };
+    return li;
+  }
+
+  // mediaChip names one attachment: its name, its type, and a link to the file
+  // when the mirror serves it.
+  function mediaChip(item) {
+    var li = document.createElement('li');
+    li.className = 'attachment';
+    var label = document.createElement('span');
+    label.className = 'attachment-name';
+    label.textContent = attachmentName(item);
+    if (item.url) {
+      var link = document.createElement('a');
+      link.href = item.url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.title = 'open ' + attachmentName(item);
+      link.appendChild(label);
+      li.appendChild(link);
+    } else {
+      li.appendChild(label);
+    }
+    if (item.type) {
+      var meta = document.createElement('span');
+      meta.className = 'attachment-meta';
+      meta.textContent = item.type;
+      li.appendChild(meta);
+    }
+    return li;
+  }
+
+  // isImageAttachment reports whether the page can draw the file as a picture:
+  // the mirror has to serve it and its type has to be an image.
+  function isImageAttachment(item) {
+    return !!item.url && (item.type || '').indexOf('image/') === 0;
+  }
+
+  function attachmentName(item) {
+    return item.name || 'attachment';
+  }
+
+  // setRowMedia adds the files a message carried to a row that is already drawn
+  // (a pending row the agent has just confirmed), and does nothing when the row
+  // carries them already.
+  function setRowMedia(row, attachments) {
+    if (!row || !attachments || !attachments.length) { return; }
+    if (row.querySelector('.attachments')) { return; }
+    var list = mediaList(attachments);
+    if (list) { row.appendChild(list); }
   }
 
   // readyAttachmentIds lists the stored uploads the next message carries.

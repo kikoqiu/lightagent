@@ -114,7 +114,7 @@ func (c MediaConfig) Supports(mediaType string) bool {
 
 // MediaFile is one local file an upload turns into content parts for the model.
 type MediaFile struct {
-	// Path is the file the caller asked for.
+	// Path is the file's absolute path.
 	Path string
 	// Name is its base name, which the file part carries.
 	Name string
@@ -133,6 +133,12 @@ func (c MediaConfig) ReadMedia(path string) (*MediaFile, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, fmt.Errorf("no file path given")
+	}
+	// Everything downstream works on the absolute path: it is what the part
+	// remembers (see below) and what an error reports, and a session file
+	// referring to it stays readable from any working directory.
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -167,12 +173,18 @@ func (c MediaConfig) ReadMedia(path string) (*MediaFile, error) {
 	if name == "" || name == "." {
 		name = "file"
 	}
+	part := mediaPart(mediaType, name, data)
+	// The part remembers the file it came from. That path is what a session file
+	// keeps instead of the payload (see llm.ReferenceMedia), and what lets a
+	// front-end name the attachment — or the web mirror serve its picture.
+	part.Path = path
+	part.Mime = mediaType
 	return &MediaFile{
 		Path:  path,
 		Name:  name,
 		Type:  mediaType,
 		Size:  info.Size(),
-		Parts: []llm.ContentPart{mediaPart(mediaType, name, data)},
+		Parts: []llm.ContentPart{part},
 	}, nil
 }
 

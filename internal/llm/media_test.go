@@ -1,7 +1,10 @@
 package llm
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -110,5 +113,136 @@ func TestMessageUnmarshalReadsPlainContent(t *testing.T) {
 	}
 	if msg.Role != "assistant" || msg.Content != "answer" || len(msg.Media) != 0 {
 		t.Fatalf("message = %+v", msg)
+	}
+}
+
+// TestMediaAttachmentsDescribeTheFiles pins what a front-end is told about the
+// files a message carries: what to call each of them, what it is, and where it
+// was read from — never the payload.
+func TestMediaAttachmentsDescribeTheFiles(t *testing.T) {
+	msg := Message{
+		Role: "user",
+		Media: []ContentPart{
+			{Type: PartTypeImageURL, ImageURL: &ImageURLPart{URL: "data:image/png;base64,AAAA"}, Path: filepath.Join("state", "uploads", "shot.png")},
+			{Type: PartTypeFile, File: &FilePart{Filename: "notes.pdf", FileData: "data:application/pdf;base64,BBBB"}},
+			{Type: PartTypeInputAudio, Audio: &InputAudioPart{Data: "CCCC", Format: "wav"}},
+		},
+	}
+	got := msg.Attachments()
+	if len(got) != 3 {
+		t.Fatalf("attachments = %+v, want one per media part", got)
+	}
+	if got[0].Name != "shot.png" || got[0].Type != "image/png" || got[0].Path == "" {
+		t.Errorf("image attachment = %+v", got[0])
+	}
+	if got[1].Name != "notes.pdf" || got[1].Type != "application/pdf" || got[1].Path != "" {
+		t.Errorf("file attachment = %+v", got[1])
+	}
+	if got[2].Type != "audio/wav" {
+		t.Errorf("audio attachment = %+v", got[2])
+	}
+}
+
+// TestReferenceMediaKeepsThePathNotTheBytes verifies the save direction: a media
+// part whose payload came from a file is stored as that path (and its media type)
+// with the payload dropped, the live message keeps its bytes, and a part with no
+// file behind it is left as it is.
+func TestReferenceMediaKeepsThePathNotTheBytes(t *testing.T) {
+	image := filepath.Join(t.TempDir(), "shot.png")
+	if err := os.WriteFile(image, []byte("PNGDATA"), 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	payload := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("PNGDATA"))
+	msgs := []Message{
+		{Role: "user", Content: "look", Media: []ContentPart{
+			{Type: PartTypeImageURL, ImageURL: &ImageURLPart{URL: payload}, Path: image},
+			{Type: PartTypeFile, File: &FilePart{Filename: "inline.pdf", FileData: "data:application/pdf;base64,BBBB"}},
+		}},
+		{Role: "assistant", Content: "answer"},
+	}
+
+	refs := ReferenceMedia(msgs)
+	if len(refs) != 2 || refs[0].Role != "user" || refs[0].Content != "look" {
+		t.Fatalf("referenced messages = %+v", refs)
+	}
+	part := refs[0].Media[0]
+	if part.Path != image || part.Mime != "image/png" {
+		t.Fatalf("referenced part = %+v, want the path and the media type", part)
+	}
+	if part.HasPayload() || part.ImageURL == nil || part.ImageURL.URL != "" {
+		t.Fatalf("referenced part still carries bytes: %+v", part)
+	}
+	// A part with no file behind it has nowhere else to keep its bytes.
+	if !refs[0].Media[1].HasPayload() {
+		t.Fatalf("a part with no path must keep its payload: %+v", refs[0].Media[1])
+	}
+	// The live message is untouched: the conversation keeps sending its media.
+	if msgs[0].Media[0].ImageURL.URL != payload {
+		t.Fatalf("the input message was modified: %+v", msgs[0].Media[0])
+	}
+
+	// The stored form is what a session file holds: paths, no base64.
+	data, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "PNGDATA") || strings.Contains(string(data), "base64,AA") {
+		t.Fatalf("the stored shape still carries the payload: %s", data)
+	}
+	if !strings.Contains(string(data), `"mime":"image/png"`) {
+		t.Fatalf("the stored shape must keep the media type: %s", data)
+	}
+}
+
+// TestResolveMediaReadsTheFilesBack verifies the resume direction: the payload of
+// a referenced part is read from its file again, a reference whose file is gone
+// stays a reference (and travels as a note instead of an invalid part), and a
+// part that already carries its bytes is left alone.
+func TestResolveMediaReadsTheFilesBack(t *testing.T) {
+	dir := t.TempDir()
+	image := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(image, []byte("PNGDATA"), 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	gone := filepath.Join(dir, "deleted.png")
+	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("PNGDATA"))
+	msgs := []Message{{Role: "user", Content: "look", Media: []ContentPart{
+		{Type: PartTypeImageURL, ImageURL: &ImageURLPart{}, Path: image, Mime: "image/png"},
+		{Type: PartTypeImageURL, ImageURL: &ImageURLPart{}, Path: gone, Mime: "image/png"},
+	}}}
+
+	resolved := ResolveMedia(msgs)
+	if got := resolved[0].Media[0].ImageURL.URL; got != want {
+		t.Fatalf("resolved payload = %q, want %q", got, want)
+	}
+	if resolved[0].Media[1].HasPayload() {
+		t.Fatalf("a file that is gone must stay a reference: %+v", resolved[0].Media[1])
+	}
+	if msgs[0].Media[0].HasPayload() {
+		t.Fatalf("the input message was modified: %+v", msgs[0].Media[0])
+	}
+
+	// The request cannot carry a part without a payload: it names the file
+	// instead, and the session bookkeeping stays behind.
+	wire := requestMessages(resolved)
+	if len(wire[0].Media) != 2 {
+		t.Fatalf("wire media = %+v", wire[0].Media)
+	}
+	if wire[0].Media[0].Path != "" || wire[0].Media[0].Mime != "" {
+		t.Fatalf("the wire part must not name a local file: %+v", wire[0].Media[0])
+	}
+	note := wire[0].Media[1]
+	if note.Type != PartTypeText || !strings.Contains(note.Text, "deleted.png") {
+		t.Fatalf("a missing attachment must travel as a note: %+v", note)
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), `"path"`) || strings.Contains(string(data), `"mime"`) {
+		t.Fatalf("the request must not carry the session bookkeeping: %s", data)
+	}
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("the request must carry the payload: %s", data)
 	}
 }

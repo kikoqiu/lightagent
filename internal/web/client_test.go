@@ -276,7 +276,7 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 		"queueMarkdown",
 		"MAX_MD_CHARS",
 		"if (renderMD && replaying)", // replayed rows render plain text first
-		"if (replaying) { setSpan(el.lastChild, text, renderMD); return; }",
+		"if (replaying) { setSpan(rowText(el), text, renderMD); return; }",
 		"#log.replaying .row { animation:none; }",
 	} {
 		if !strings.Contains(pageSource(), want) {

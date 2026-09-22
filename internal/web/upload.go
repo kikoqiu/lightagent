@@ -5,10 +5,12 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"lightagent/internal/llm"
 	"lightagent/internal/tools"
 )
 
@@ -18,6 +20,10 @@ const UploadsDirName = "uploads"
 
 // uploadFileField is the multipart field the page posts its file in.
 const uploadFileField = "file"
+
+// mediaPath is the endpoint the page fetches a stored upload from (what a row's
+// picture is drawn from).
+const mediaPath = "/api/media"
 
 const (
 	// maxUploadNameBytes bounds the original file name kept in an upload's
@@ -153,6 +159,87 @@ func (s *Server) dropUpload(w http.ResponseWriter, r *http.Request, dir string) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"removed": true})
+}
+
+// pageAttachments renders the files a message carries for the page: the name and
+// the media type of each, plus the URL that serves it when the mirror stores the
+// file itself — which is where the composer's attach control puts its uploads, so
+// an image is drawn as the picture it is. The path stays behind: a browser cannot
+// read a local path, and the mirror does not tell it where its files live. Any
+// other file (the model's own upload_media of, say, C:\pics\a.png) is only named.
+func pageAttachments(dir string, atts []llm.Attachment) []llm.Attachment {
+	if len(atts) == 0 {
+		return nil
+	}
+	out := make([]llm.Attachment, 0, len(atts))
+	for _, a := range atts {
+		page := llm.Attachment{Name: a.Name, Type: a.Type}
+		if id, ok := storedUpload(dir, a.Path); ok {
+			page.URL = mediaURL(id)
+		}
+		out = append(out, page)
+	}
+	return out
+}
+
+// storedUpload reports whether path is a file the mirror stores, answering with
+// the id /api/media serves it under. A path outside the upload directory (or one
+// whose file is gone) is not servable.
+func storedUpload(dir, path string) (string, bool) {
+	if dir == "" || path == "" {
+		return "", false
+	}
+	if filepath.Clean(filepath.Dir(path)) != filepath.Clean(dir) {
+		return "", false
+	}
+	id, err := uploadPath(dir, filepath.Base(path))
+	if err != nil {
+		return "", false
+	}
+	if _, err := os.Stat(id); err != nil {
+		return "", false
+	}
+	return filepath.Base(id), true
+}
+
+// mediaURL renders the URL one stored upload is fetched from.
+func mediaURL(id string) string {
+	return mediaPath + "?id=" + url.QueryEscape(id)
+}
+
+// handleMedia serves one stored upload back to the page: it is what a row draws a
+// message's picture from, so an attachment the user sent is shown as the picture
+// it is instead of as its name. Only files inside the upload directory are
+// served, by name, and only while the file is there: a row whose picture is gone
+// falls back to naming the file (see app.js).
+func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	s.mu.Lock()
+	media, dir := s.mediaLocked()
+	s.mu.Unlock()
+	if !media.Enabled() || dir == "" {
+		writeJSONError(w, http.StatusNotFound, "attachments are not enabled: set openai.media_types and restart")
+		return
+	}
+	path, err := uploadPath(dir, r.URL.Query().Get("id"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Only a regular file is served: an id naming a directory (a folder someone
+	// dropped in the upload directory by hand) must not turn into a listing.
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		writeJSONError(w, http.StatusNotFound, "no such attachment")
+		return
+	}
+	// ServeFile sets the content type from the file's own name and supports the
+	// range requests a browser makes for a large picture.
+	http.ServeFile(w, r, path)
 }
 
 // nextFilePart returns the first file of a multipart body and its client-supplied

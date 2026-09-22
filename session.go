@@ -179,6 +179,10 @@ func runSession(o *options, stdout io.Writer) error {
 			return fmt.Errorf("load session: %w", loadErr)
 		}
 		if cur != nil && len(cur.Messages) > 0 {
+			// A session file keeps where each attachment came from, not its
+			// bytes (see llm.ReferenceMedia), so the files are read back here:
+			// the conversation enters the loop exactly as it left it.
+			cur.Messages = llm.ResolveMedia(cur.Messages)
 			ag.Load(cur.Messages, cur.Summary)
 			resumed = cur
 			info("resumed %d messages from %s\n", len(cur.Messages), st.Path())
