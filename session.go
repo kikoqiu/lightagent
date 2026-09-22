@@ -247,6 +247,14 @@ func runSession(o *options, stdout io.Writer) error {
 		// The page's /save writes through the CLI, so the browser and the
 		// terminal persist exactly the same session.
 		srv.SetSessionSaver(c.SaveSession)
+		// The page's Restart button saves the session (the endpoint does that,
+		// so the conversation is on disk before anything is given up) and then
+		// hands the run over to a fresh process, which resumes it: the same
+		// conversation continues there, with the config.json that was just
+		// written put in effect. The mirror gives up its listening address on the
+		// way out, so the replacement binds it again and open pages reconnect to
+		// it on their own.
+		srv.SetRestarter(func() error { return restartProgram(srv.ReleaseListener) })
 		// Attachments: the accepted media types plus the directory the browser
 		// uploads land in (.lightagent/uploads beside the session file). They
 		// travel with the next user message.

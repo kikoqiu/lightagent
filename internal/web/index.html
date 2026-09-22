@@ -8,14 +8,17 @@
 <script>
   // Runtime configuration injected by the server: whether replies are rendered
   // as markdown in the browser, whether tool results are shown, the command
-  // rail (the shared slash catalogue, so the page and the CLI agree) and the
+  // rail (the shared slash catalogue, so the page and the CLI agree), the
   // media capability (which types an attachment may have, and how large one may
-  // be). Sessions are cookie based, so no token is needed here (see auth.js).
+  // be) and whether the mirror can restart the program at all (the config
+  // panel's Restart needs it). Sessions are cookie based, so no token is needed
+  // here (see auth.js).
   window.__LIGHTAGENT__ = {
     markdown: __LIGHTAGENT_MARKDOWN__,
     result: __LIGHTAGENT_RESULT__,
     commands: __LIGHTAGENT_COMMANDS__,
-    media: __LIGHTAGENT_MEDIA__
+    media: __LIGHTAGENT_MEDIA__,
+    restart: __LIGHTAGENT_RESTART__
   };
 </script>
 <link rel="stylesheet" href="app.css">
@@ -52,7 +55,7 @@
       <div class="actions">
         <button class="ghost" type="button" data-config-open>Edit config.json</button>
       </div>
-      <div class="card-note">Saved changes apply after a restart.</div>
+      <div class="card-note">Saved changes apply after a restart; the editor's Restart saves the session and loads it again.</div>
     </section>
     <section class="card">
       <div class="card-title"><span>Read aloud</span></div>
@@ -138,6 +141,12 @@
       <div class="modal-foot">
         <span class="modal-note" id="configStatus"></span>
         <span class="modal-actions">
+          <!-- The way to apply a saved document: the panel saves the session and
+               asks the mirror to start a fresh lightagent, which loads it again
+               (see the restart section of config.js). The server hides the
+               control when the mirror cannot restart the program. -->
+          <button class="ghost" id="configRestart" type="button"
+                  title="save the session, start a fresh lightagent and load the session again">Restart</button>
           <button class="ghost" id="configReload" type="button">Reload</button>
           <button id="configSave" type="button">Save</button>
         </span>

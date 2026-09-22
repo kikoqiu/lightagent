@@ -87,6 +87,11 @@ type Server struct {
 	// save writes the conversation to the session file and returns the path. It
 	// is registered by the program (SetSessionSaver) and backs /save.
 	save func() (string, error)
+	// restart starts a replacement of this program and hands the run over to it.
+	// It is registered by the program (SetRestarter) and backs the page's
+	// Restart button; the zero value means restarting is unavailable (see
+	// handleRestart).
+	restart func() error
 	// auth holds the login credential and the live sessions; the zero value (no
 	// password) means the mirror runs without a login.
 	auth *auth
@@ -439,8 +444,8 @@ func (s *Server) dropClient(c *client) {
 //
 // The page and its assets are public: they carry no data, and a browser has to
 // be able to load the sign-in dialog before it has a session. Everything that can
-// see or steer the agent — the WebSocket, the config editor, the password
-// control — sits behind requireSession, so a configured password actually
+// see or steer the agent — the WebSocket, the config editor, the restart, the
+// password control — sits behind requireSession, so a configured password actually
 // protects them.
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
@@ -461,6 +466,7 @@ func (s *Server) routes() http.Handler {
 	// The agent's own endpoints.
 	mux.Handle("/ws", s.requireSession(http.HandlerFunc(s.handleWS)))
 	mux.Handle("/api/config", s.requireSession(http.HandlerFunc(s.handleConfig)))
+	mux.Handle("/api/restart", s.requireSession(http.HandlerFunc(s.handleRestart)))
 	mux.Handle("/api/password", s.requireSession(http.HandlerFunc(s.handlePassword)))
 	// Attachments: the composer uploads a file here before sending, and drops
 	// it again when the user cancels it; the pictures a message carried are
@@ -1144,8 +1150,9 @@ func (s *Server) broadcastSettings() {
 
 // handleIndex serves the single-page UI. The page is public (it carries no data
 // and its sign-in dialog has to be reachable before there is a session); the
-// runtime switches, the command rail and the media capability are injected, and
-// every endpoint that touches the agent asks for a session of its own.
+// runtime switches, the command rail, the media capability and whether the mirror
+// can be told to restart are injected, and every endpoint that touches the agent
+// asks for a session of its own.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -1160,6 +1167,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_RESULT__", strconv.FormatBool(s.agent.ToolResultsVisible()))
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_COMMANDS__", commandsJSON())
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_MEDIA__", s.mediaJSON())
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_RESTART__", strconv.FormatBool(s.canRestart()))
 	fmt.Fprint(w, body)
 }
 

@@ -510,7 +510,10 @@
   .modal-note { flex:1 1 auto; min-width:0; color:var(--fg-dim); font-size:11.5px; }
   .modal-note.ok { color:var(--green); }
   .modal-note.bad { color:var(--red); }
-  .modal-actions { margin-left:auto; display:flex; gap:8px; }
+  .modal-note.warn { color:var(--yellow); }
+  /* Three actions (Restart / Reload / Save) have to be able to drop to a second
+     line on a phone-width panel; the note shrinks first. */
+  .modal-actions { margin-left:auto; display:flex; flex-wrap:wrap; gap:8px; }
 
   /* ---- read-aloud (TTS) panel ---- */
   /* The header button and the rail card both open the panel; both light up while

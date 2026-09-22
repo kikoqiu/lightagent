@@ -946,6 +946,31 @@
     return Math.min(Math.round(reconnectDelay * (0.75 + Math.random() * 0.5)), RECONNECT_MAX_MS);
   }
 
+  // A restart replaces the process behind the mirror: the config panel
+  // (config.js) reports an accepted one through window.MIRROR, so the header says
+  // what the silence is — the new process binds the same address, and this page
+  // reconnects to it — instead of "offline", which reads like a failure. The
+  // retries also start from the base delay again, so a page whose earlier
+  // attempts failed does not back off right when the mirror is coming back.
+  var restarting = false;
+  window.MIRROR = {
+    restarting: function () {
+      restarting = true;
+      reconnectDelay = 0;
+      statusEl.textContent = 'restarting…';
+    },
+    // onReconnect is installed by the panel that asked for the restart: it is
+    // called once the page is connected again (see notifyReconnected), so the
+    // control it disabled goes back into service without a reload.
+    onReconnect: null
+  };
+
+  // notifyReconnected tells that panel the mirror is back.
+  function notifyReconnected() {
+    var hook = window.MIRROR && window.MIRROR.onReconnect;
+    if (hook) { hook(); }
+  }
+
   function connect() {
     if (!AUTH().ok()) { return; }
     if (ws && (ws.readyState === 0 || ws.readyState === 1)) { return; }
@@ -954,15 +979,18 @@
       // The connection is healthy again: the next drop starts from the base
       // delay instead of continuing to back off.
       reconnectDelay = 0;
+      var cameBack = restarting;
+      restarting = false;
       dot.classList.add('on');
       dot.title = 'connected';
       statusEl.textContent = 'online';
       sendEl.disabled = false;
+      if (cameBack) { notifyReconnected(); }
     };
     ws.onclose = function () {
       dot.classList.remove('on');
       dot.title = 'disconnected';
-      statusEl.textContent = 'offline';
+      statusEl.textContent = restarting ? 'restarting…' : 'offline';
       sendEl.disabled = true;
       // A socket that dropped in the middle of a snapshot leaves a half-built
       // log: drop the replay state before clearing the indicator, so the

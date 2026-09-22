@@ -23,6 +23,7 @@
   var statusEl = document.getElementById('configStatus');
   var saveEl = document.getElementById('configSave');
   var reloadEl = document.getElementById('configReload');
+  var restartEl = document.getElementById('configRestart');
   var tabForm = document.getElementById('modeForm');
   var tabJSON = document.getElementById('modeJSON');
   if (!modal || !form || !json) { return; }
@@ -44,6 +45,12 @@
 
   var HINT = 'edits are saved to config.json and apply after a restart';
   var SAVED = 'saved — restart lightagent to apply it';
+
+  // The panel offers Restart only when the mirror can restart the program at all
+  // (the server injects that as window.__LIGHTAGENT__.restart); an embedder that
+  // runs the mirror inside its own process cannot, and then the button goes away
+  // instead of failing on every click.
+  var CAN_RESTART = !!((window.__LIGHTAGENT__ || {}).restart);
 
   // The schema: one descriptor per option of the Go struct (camelCase keys are
   // the JSON paths, dots nest). type is one of text, password, number, slider,
@@ -703,7 +710,76 @@
   }
 
   function close() {
+    // An unconfirmed restart lapses with the panel: a button that still says
+    // "Confirm restart" after a reopened panel would be a trap.
+    disarmRestart();
     if (!modal.hidden) { modal.hidden = true; }
+  }
+
+  // ---- restart ----
+  // Restart is the panel's other action, and the way a saved document takes
+  // effect: it asks the mirror to save the session and start a fresh lightagent,
+  // which loads that session again (POST /api/restart, see restart.go). This page
+  // loses its connection for a moment and reconnects to the new process on the
+  // same address, so the transcript comes back by itself; window.MIRROR (app.js)
+  // is told about it and says so in the header.
+  //
+  // The control asks once: the first click explains what a restart does and turns
+  // the button into the confirmation, which lapses after a moment so a click much
+  // later cannot end the run by accident.
+  var RESTART_LABEL = restartEl ? restartEl.textContent : 'Restart';
+  var RESTART_ASK_MS = 10000;
+  var restartArmed = false;
+  var restartAskTimer = null;
+  var restartPending = false;
+
+  function disarmRestart() {
+    restartArmed = false;
+    if (restartAskTimer) { clearTimeout(restartAskTimer); restartAskTimer = null; }
+    if (restartEl) { restartEl.textContent = RESTART_LABEL; }
+  }
+
+  function armRestart() {
+    restartArmed = true;
+    if (restartEl) { restartEl.textContent = 'Confirm restart'; }
+    setStatus('Restart lightagent? The session is saved first, then a fresh process starts and loads it again — click "Confirm restart" to go ahead.', 'warn');
+    if (restartAskTimer) { clearTimeout(restartAskTimer); }
+    restartAskTimer = setTimeout(function () {
+      disarmRestart();
+      setStatus(HINT);
+    }, RESTART_ASK_MS);
+  }
+
+  function restart() {
+    if (restartPending) { return; }
+    if (!restartArmed) { armRestart(); return; }
+    disarmRestart();
+    restartPending = true;
+    if (restartEl) { restartEl.disabled = true; }
+    setStatus('saving the session and restarting…');
+    fetch('/api/restart', { method: 'POST', credentials: 'same-origin' })
+      .then(readJSON)
+      .then(function (doc) {
+        // The accepted restart ends this process in a moment; the note stays so a
+        // user looking at the panel knows what the silence means.
+        if (window.MIRROR) { window.MIRROR.restarting(); }
+        setStatus('restarting — the session was saved to ' + (doc.saved || 'the session file') + '; this page reconnects by itself.', 'ok');
+      })
+      .catch(function (err) {
+        // A refused restart leaves the run — and this page — as it was.
+        restartPending = false;
+        if (restartEl) { restartEl.disabled = false; }
+        setStatus('restart failed: ' + friendly(err.message), 'bad');
+      });
+  }
+
+  // onRestarted puts the control back in service once the page is connected to the
+  // process this panel started (app.js calls it through window.MIRROR). Without it
+  // a second restart would need a page reload.
+  function onRestarted() {
+    restartPending = false;
+    if (restartEl) { restartEl.disabled = false; }
+    setStatus(HINT);
   }
 
   // ---- wiring ----
@@ -716,6 +792,14 @@
   tabJSON.onclick = function () { setMode('json'); };
   if (saveEl) { saveEl.onclick = save; }
   if (reloadEl) { reloadEl.onclick = load; }
+  if (restartEl && CAN_RESTART) {
+    restartEl.onclick = restart;
+    // The page reports the reconnect that follows a restart back to this panel
+    // (see onRestarted), so the button is usable again without a reload.
+    if (window.MIRROR) { window.MIRROR.onReconnect = onRestarted; }
+  } else if (restartEl) {
+    restartEl.hidden = true;
+  }
   json.addEventListener('input', function () {
     dirty = true;
     setStatus('unsaved changes — Save writes them to config.json');
