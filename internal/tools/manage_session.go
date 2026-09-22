@@ -47,12 +47,12 @@ func (t *ManageSessionTool) Parameters() map[string]any {
 			"wait_timeout": map[string]any{
 				"type":        "integer",
 				"default":     10,
-				"description": "For action='poll': max seconds to wait for new output or exit. Default: 10.",
+				"description": "For action='poll': max seconds to wait for the process to exit. Output arriving in the meantime does not end the wait. Default: 10.",
 			},
 			"max_lines": map[string]any{
 				"type":        "integer",
 				"default":     200,
-				"description": "Maximum incremental lines to return. Default: 200.",
+				"description": "Maximum incremental lines to return (head/tail folded). Default: 200.",
 			},
 			"max_chars": map[string]any{
 				"type":        "integer",
@@ -157,8 +157,11 @@ func (t *ManageSessionTool) executePoll(start time.Time, args map[string]any, wa
 		return failResult
 	}
 
+	// poll waits for the process to finish, up to wait_timeout: output written in
+	// the meantime does not end the wait (see WaitForExit), it comes back as one
+	// delta below.
 	if !session.IsDone() {
-		session.WaitForOutput(waitTimeout)
+		session.WaitForExit(waitTimeout)
 	}
 	raw, done := session.ReadAllPending()
 	shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)

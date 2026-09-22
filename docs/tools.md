@@ -49,13 +49,21 @@ type Tool interface {
     无法映射的符号）只能得到替换字符或乱码。
   * 非 Windows 主机**没有** `use_utf8` 参数（也没有可回退的 ANSI 代码页）：始终 UTF-8，
     仅额外注入 `PYTHONIOENCODING=utf-8`。
-* 同步等待最多 `wait_timeout` 秒（默认取 `exec.wait_seconds`，10s）。若在窗口内完成，
-  直接返回 `exit_code` 与输出；否则转入后台并返回 `session_id`。
+* 同步等待最多 `wait_timeout` 秒（默认取 `exec.wait_seconds`，10s）：等的是**进程退出**，窗口内写出的
+  内容不会提前结束等待（与 `manage_session` 的 `poll` 同一语义）。若在窗口内完成，直接返回 `exit_code`
+  与输出；否则转入后台并返回 `session_id`，期间累积的输出随该结果一起给出。
 * 硬超时 `run_timeout`（默认取 `exec.timeout_seconds`，3600s）到点强制结束进程；
   `run_timeout=0` 关闭硬超时。
 * 每次调用都是一个会话，会话的根进程（宿主 shell 或 Python 解释器）是它**自己进程树的根**：
   结束会话 / 硬超时 / lightagent 退出时整棵树一起结束（[进程树与退出](architecture.md#进程树与退出)）。
-* 输出经 ANSI 清理、CR 重放（进度条折叠）后按 `max_lines`/`max_chars` 做头尾折叠。
+* 输出在会话缓冲里按**终端规则**回放后再给模型：`\r` 只把光标移回第一列（**不擦除**），后续字符逐格
+  覆盖，因此更短的重写会留下原文本的尾巴（与终端所见一致，需要擦除就发 `CSI K`）；`\b` 光标左移一格；
+  行内 CSI 也照做——`CSI K`（`0`/`1`/`2`，擦除行内）与 `CSI <n> G`/`C`/`D`（列定位、左右移动），这正是
+  进度条与 `\r` 搭配的写法（`\r\x1b[K…`）；其余 CSI（颜色、上下移、私有模式等）一律吞掉，不会把转义
+  字节交给模型。`\n`（含 CRLF）结束一行，交付的行里不含 `\r`。
+* **被就地改写过的行会扣住不交付**，直到被 `\n` 定稿、或子进程退出（此时交出最后一版）——进度条刷新
+  多少次都只算一行、中间状态也不进上下文；从未被就地改写的未完成行（如不带换行的提示符）照常立即交付。
+  之后按 `max_lines`/`max_chars` 做头尾折叠。
 
 参数：
 
@@ -63,7 +71,7 @@ type Tool interface {
 |------|------|------|------|
 | `command` | string | 必填 | 脚本内容，由 `language` 解释 |
 | `language` | string | 宿主引擎（`ps` / `sh`，即宿主 shell） | 脚本语言；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`ps`/`sh`、以及存在时的 `python`）；参数自带的 `description` 是固定文案，各取值含义与 Python 版本在工具描述里 |
-| `wait_timeout` | int | `wait_seconds` | 同步等待秒数 |
+| `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
 | `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |
@@ -113,14 +121,16 @@ type Tool interface {
 | `action` | string | 必填 | `poll` / `input` / `kill` / `list` |
 | `session_id` | string | — | 目标会话（`list` 不需要） |
 | `data` | string | — | `input` 时写入 stdin 的内容 |
-| `wait_timeout` | int | `10` | `poll` 最长等待新输出/退出的秒数 |
+| `wait_timeout` | int | `10` | `poll` 最长等待**进程退出**的秒数（中间有输出也不提前返回） |
 | `max_lines` | int | `200` | 增量输出行数上限 |
 | `max_chars` | int | `30000` | 增量输出字符上限 |
 
 行为：
 
-* `poll`：先长轮询等待（有新输出或进程退出即返回），再返回**自上次消费以来的增量**。
-  仍在运行 → `status=running`；已退出 → `status=completed` 且带 `exit_code`。
+* `poll`：等待**进程退出**，最多 `wait_timeout` 秒（与 `exec_command` 的同步等待同一语义：
+  窗口内写出的内容不会提前结束等待，最后一次性返回**自上次消费以来的增量**）。仍在运行 →
+  `status=running`；已退出 → `status=completed` 且带 `exit_code`。被就地改写过的行进不去增量，
+  要等它定稿（`\n` 或进程退出）才作为一行出现，因此进度条不会逐次刷新地进入上下文。
 * `input`：写入 stdin。纯控制键会被翻译：`ctrl-c`、`ctrl-d`、`ctrl-z`、`enter`/`return`、
   `tab`、`esc`、`up`/`down`/`left`/`right`、`backspace`；其余文本原样写入（如需换行请写 `"\n"`）。
   stdio 编码在 `exec_command` 启动该会话时已确定（Windows 上的 `use_utf8`），`manage_session` 不再另行选择。

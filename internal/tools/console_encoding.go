@@ -104,9 +104,7 @@ func (w *consoleOutputWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	w.pending = append(w.pending, p...)
-	if !w.convert(false) && len(p) > 0 {
-		w.sink(nil) // an incomplete trailing character: still wake the reader
-	}
+	w.convert(false)
 	return len(p), nil
 }
 

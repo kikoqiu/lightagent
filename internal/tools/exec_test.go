@@ -36,6 +36,96 @@ func TestExecCommandCompletes(t *testing.T) {
 	}
 }
 
+// TestExecCommandCollapsesCRProgress covers the noise a refresh-driven program
+// makes: every write repaints the same terminal line with a leading CR, so only
+// that line's last version may reach the model — never one line per refresh.
+func TestExecCommandCollapsesCRProgress(t *testing.T) {
+	// Each update is its own write, the way a progress bar repaints a line: a CR
+	// back to column 0, an erase in line, then the new text.
+	command := "printf '\\r\\033[KDownloading 1%%'; sleep 0.05; " +
+		"printf '\\r\\033[KDownloading 2%%'; sleep 0.05; " +
+		"printf '\\r\\033[KDownloading 99%%'; printf '\\nAll done\\n'"
+	if runtime.GOOS == "windows" {
+		// [Console]::OpenStandardOutput() writes the bytes straight to the pipe,
+		// with no console encoding in between (see hostCodePageBytesCommand).
+		command = "$out = [Console]::OpenStandardOutput(); $esc = [char]27; " +
+			"foreach ($text in @(\"`r$esc[KDownloading 1%\", \"`r$esc[KDownloading 2%\", \"`r$esc[KDownloading 99%\", \"`nAll done`n\")) { " +
+			"$bytes = [Text.Encoding]::ASCII.GetBytes($text); " +
+			"$out.Write($bytes, 0, $bytes.Length); $out.Flush(); Start-Sleep -Milliseconds 50 }"
+	}
+
+	engine := NewExecEngine(60, 20, true)
+	defer engine.Close()
+	tool := NewExecCommandTool(engine)
+
+	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	// The line's last version, immediately followed by the line printed after
+	// it: the refreshes in between are gone.
+	if !strings.Contains(res.ForLLM, `Downloading 99%\nAll done`) {
+		t.Fatalf("the collapsed progress output is missing: %s", res.ForLLM)
+	}
+	for _, stale := range []string{"Downloading 1%", "Downloading 2%"} {
+		if strings.Contains(res.ForLLM, stale) {
+			t.Fatalf("a refreshed line reached the model: %s", res.ForLLM)
+		}
+	}
+	// The erase sequence is consumed by the buffer, not forwarded to the model.
+	for _, hidden := range []string{`\u001b`, "[K"} {
+		if strings.Contains(res.ForLLM, hidden) {
+			t.Fatalf("the erase sequence reached the model: %s", res.ForLLM)
+		}
+	}
+
+	// When the process was still running as the wait window closed, the rest of
+	// its output must not carry the refreshes either.
+	sessionID := sessionIDFromResult(t, res.ForLLM)
+	if sessionID == "" {
+		return
+	}
+	manageTool := NewManageSessionTool(engine)
+	for {
+		poll := manageTool.Execute(context.Background(), map[string]any{
+			"action": "poll", "session_id": sessionID, "wait_timeout": 5,
+		})
+		if poll.IsError {
+			t.Fatalf("poll error: %s", poll.ForLLM)
+		}
+		for _, stale := range []string{"Downloading 1%", "Downloading 2%"} {
+			if strings.Contains(poll.ForLLM, stale) {
+				t.Fatalf("a refreshed line reached the model: %s", poll.ForLLM)
+			}
+		}
+		if strings.Contains(poll.ForLLM, `"status":"completed"`) {
+			return
+		}
+	}
+}
+
+// TestExecCommandKeepsOverwrittenTail pins the terminal-accurate CR rule: a
+// rewrite shorter than the text it covers leaves that text's tail behind, the way
+// a terminal shows it (a CR moves the cursor, it does not erase).
+func TestExecCommandKeepsOverwrittenTail(t *testing.T) {
+	command := "printf 'abcdefgh\\rXY\\n'"
+	if runtime.GOOS == "windows" {
+		command = "[Console]::Out.Write(\"abcdefgh`rXY`n\"); [Console]::Out.Flush()"
+	}
+
+	engine := NewExecEngine(60, 20, true)
+	defer engine.Close()
+	tool := NewExecCommandTool(engine)
+
+	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "XYcdefgh") {
+		t.Fatalf("the overwritten line lost its tail: %s", res.ForLLM)
+	}
+}
+
 // TestExecCommandBackgroundThenManageSession verifies that a command exceeding
 // wait_timeout is backgrounded and can then be polled and killed.
 func TestExecCommandBackgroundThenManageSession(t *testing.T) {
@@ -94,6 +184,90 @@ func TestExecCommandBackgroundThenManageSession(t *testing.T) {
 	}
 	if !strings.Contains(kill.ForLLM, "terminated") {
 		t.Fatalf("unexpected kill output: %s", kill.ForLLM)
+	}
+}
+
+// TestManageSessionPollHidesRefreshedLines covers the poll side of the terminal
+// line model: while the child only repaints one line, neither call reports that
+// line's intermediate versions.
+func TestManageSessionPollHidesRefreshedLines(t *testing.T) {
+	// The child repaints one line for ~3s and prints a real line only afterwards,
+	// so both wait windows below land inside the repainting phase.
+	command := "i=0; while [ $i -lt 30 ]; do printf '\\rprogress %s' \"$i\"; i=$((i+1)); sleep 0.1; done; printf '\\ndone\\n'"
+	if runtime.GOOS == "windows" {
+		command = "$out = [Console]::OpenStandardOutput(); " +
+			"1..30 | ForEach-Object { $bytes = [Text.Encoding]::ASCII.GetBytes(\"`rprogress $_\"); " +
+			"$out.Write($bytes, 0, $bytes.Length); $out.Flush(); Start-Sleep -Milliseconds 100 }; " +
+			"$bytes = [Text.Encoding]::ASCII.GetBytes(\"`ndone`n\"); $out.Write($bytes, 0, $bytes.Length)"
+	}
+
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	execTool := NewExecCommandTool(engine)
+	manageTool := NewManageSessionTool(engine)
+
+	res := execTool.Execute(context.Background(), map[string]any{"command": command})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "progress") {
+		t.Fatalf("a refreshed line reached the model: %s", res.ForLLM)
+	}
+	sessionID := sessionIDFromResult(t, res.ForLLM)
+	if sessionID == "" {
+		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
+	}
+
+	poll := manageTool.Execute(context.Background(), map[string]any{
+		"action": "poll", "session_id": sessionID, "wait_timeout": 1,
+	})
+	if poll.IsError {
+		t.Fatalf("poll error: %s", poll.ForLLM)
+	}
+	if !strings.Contains(poll.ForLLM, `"status":"running"`) {
+		t.Fatalf("the session did not stay running: %s", poll.ForLLM)
+	}
+	if strings.Contains(poll.ForLLM, "progress") {
+		t.Fatalf("a refreshed line reached the model: %s", poll.ForLLM)
+	}
+}
+
+// TestManageSessionPollWaitsForExit pins the wait contract of poll: wait_timeout
+// is the window granted to the process to finish, so output written on the way
+// does not end the wait. An implementation that returned as soon as a line
+// arrived would report status=running with only that line.
+func TestManageSessionPollWaitsForExit(t *testing.T) {
+	// A line, a pause, a second line, another pause, then exit: the poll below
+	// starts during the first pause and the child is still alive after writing
+	// the second line, so only a wait for the exit reports completed.
+	command := "printf 'line one\\n'; sleep 1; printf 'line two\\n'; sleep 1"
+	if runtime.GOOS == "windows" {
+		command = "[Console]::Out.Write(\"line one`n\"); [Console]::Out.Flush(); Start-Sleep -Seconds 1; " +
+			"[Console]::Out.Write(\"line two`n\"); [Console]::Out.Flush(); Start-Sleep -Seconds 1"
+	}
+
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	execTool := NewExecCommandTool(engine)
+	manageTool := NewManageSessionTool(engine)
+
+	res := execTool.Execute(context.Background(), map[string]any{"command": command, "wait_timeout": 1})
+	sessionID := sessionIDFromResult(t, res.ForLLM)
+	if sessionID == "" {
+		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
+	}
+
+	poll := manageTool.Execute(context.Background(), map[string]any{
+		"action": "poll", "session_id": sessionID, "wait_timeout": 10,
+	})
+	if poll.IsError {
+		t.Fatalf("poll error: %s", poll.ForLLM)
+	}
+	if !strings.Contains(poll.ForLLM, `"status":"completed"`) {
+		t.Fatalf("the poll returned before the process exited: %s", poll.ForLLM)
+	}
+	if !strings.Contains(poll.ForLLM, `line two`) {
+		t.Fatalf("the delta does not hold what the child wrote: %s", poll.ForLLM)
 	}
 }
 

@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,12 +12,6 @@ import (
 
 	"lightagent/internal/proc"
 )
-
-// maxOutputBufferSize caps the per-session output buffer at 1MB.
-const maxOutputBufferSize = 1 << 20
-
-// outputTruncateMarker is appended once when the buffer cap is reached.
-const outputTruncateMarker = "\n... [output truncated, exceeded 1MB]\n"
 
 // Session lifecycle errors.
 var (
@@ -40,11 +33,8 @@ type ProcessSession struct {
 	proc  *exec.Cmd
 	stdin io.WriteCloser
 
-	outputBuffer    *bytes.Buffer
-	outputTruncated bool
-	readOffset      int
+	output sessionOutput // terminal-accurate, bounded child-output buffer
 
-	outputCh   chan struct{}
 	doneCh     chan struct{}
 	doneOnce   sync.Once
 	chInitOnce sync.Once
@@ -59,23 +49,14 @@ type SessionInfo struct {
 	StartedAt int64  `json:"started_at"`
 }
 
+// initChannels creates the done channel lazily, so a session assembled by hand
+// (as a test may do) still works.
 func (s *ProcessSession) initChannels() {
 	s.chInitOnce.Do(func() {
-		if s.outputCh == nil {
-			s.outputCh = make(chan struct{}, 1)
-		}
 		if s.doneCh == nil {
 			s.doneCh = make(chan struct{})
 		}
 	})
-}
-
-func (s *ProcessSession) signalOutput() {
-	s.initChannels()
-	select {
-	case s.outputCh <- struct{}{}:
-	default:
-	}
 }
 
 func (s *ProcessSession) signalDone() {
@@ -83,22 +64,21 @@ func (s *ProcessSession) signalDone() {
 	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
-// appendOutput appends raw bytes to the bounded buffer and wakes waiters.
+// appendOutput adds raw bytes to the line-aware, bounded buffer.
 func (s *ProcessSession) appendOutput(p []byte) {
 	s.mu.Lock()
-	if s.outputBuffer == nil {
-		s.outputBuffer = &bytes.Buffer{}
-	}
-	if s.outputBuffer.Len() >= maxOutputBufferSize {
-		if !s.outputTruncated {
-			s.outputBuffer.WriteString(outputTruncateMarker)
-			s.outputTruncated = true
-		}
-	} else {
-		s.outputBuffer.Write(p)
-	}
-	s.mu.Unlock()
-	s.signalOutput()
+	defer s.mu.Unlock()
+	s.output.append(p)
+}
+
+// flushOutput releases the line the buffer still held back because the child was
+// rewriting it in place. The output writers call it once the child is gone: no
+// byte can rewrite the line anymore, so what it holds is what the child left on
+// screen (see sessionOutput).
+func (s *ProcessSession) flushOutput() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.output.flush()
 }
 
 // startWatchdog force-terminates the process once timeout elapses.
@@ -140,34 +120,29 @@ func (s *ProcessSession) expireAfterTimeout() {
 	s.signalDone()
 }
 
-// WaitForOutput blocks until new unread output is available, the process has
-// exited, or the timeout elapses.
-func (s *ProcessSession) WaitForOutput(timeout time.Duration) (done bool, timedOut bool) {
-	done, timedOut, _ = s.WaitForOutputContext(context.Background(), timeout)
+// WaitForExit blocks until the process exits or the timeout elapses. Output does
+// not end the wait: wait_timeout is the window a caller grants the program to
+// finish, so everything it writes in the meantime accumulates and is reported in
+// one delta. A non-positive timeout only reports the current state.
+func (s *ProcessSession) WaitForExit(timeout time.Duration) (done bool, timedOut bool) {
+	done, timedOut, _ = s.WaitForExitContext(context.Background(), timeout)
 	return done, timedOut
 }
 
-// WaitForOutputContext is WaitForOutput with cancellation: it reports canceled
-// when ctx is done before any of the other conditions.
-func (s *ProcessSession) WaitForOutputContext(ctx context.Context, timeout time.Duration) (done bool, timedOut bool, canceled bool) {
+// WaitForExitContext is WaitForExit with cancellation: it reports canceled when
+// ctx is done before the process exits or the timeout elapses.
+func (s *ProcessSession) WaitForExitContext(ctx context.Context, timeout time.Duration) (done bool, timedOut bool, canceled bool) {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if timeout <= 0 {
-		timeout = 10 * time.Second
 	}
 	s.initChannels()
 	deadline := time.Now().Add(timeout)
 	for {
 		s.mu.Lock()
 		finished := s.Status == "done"
-		pending := s.outputBuffer != nil && s.outputBuffer.Len() > s.readOffset
 		s.mu.Unlock()
 		if finished {
 			return true, false, false
-		}
-		if pending {
-			return false, false, false
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -177,7 +152,6 @@ func (s *ProcessSession) WaitForOutputContext(ctx context.Context, timeout time.
 		case <-ctx.Done():
 			return false, false, true
 		case <-s.doneCh:
-		case <-s.outputCh:
 		case <-time.After(remaining):
 		}
 	}
@@ -208,12 +182,7 @@ func (s *ProcessSession) GetExitCode() int {
 func (s *ProcessSession) ReadIncremental() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.outputBuffer == nil || s.outputBuffer.Len() <= s.readOffset {
-		return ""
-	}
-	data := s.outputBuffer.Bytes()[s.readOffset:]
-	s.readOffset = s.outputBuffer.Len()
-	return string(data)
+	return s.output.read()
 }
 
 // ReadAllPending returns the pending delta plus whether the process exited.
@@ -221,12 +190,7 @@ func (s *ProcessSession) ReadAllPending() (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	done := s.Status == "done"
-	if s.outputBuffer == nil || s.outputBuffer.Len() <= s.readOffset {
-		return "", done
-	}
-	data := s.outputBuffer.Bytes()[s.readOffset:]
-	s.readOffset = s.outputBuffer.Len()
-	return string(data), done
+	return s.output.read(), done
 }
 
 // Write sends data to the process stdin.

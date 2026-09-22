@@ -14,8 +14,11 @@ func stripANSI(s string) string {
 	return ansiEscapePattern.ReplaceAllString(s, "")
 }
 
-// normalizeTerminalOutput sanitizes raw terminal bytes: CRLF→LF, strip ANSI,
-// then replay carriage-return/backspace rewrites so progress bars collapse.
+// normalizeTerminalOutput is the read-time safety net over a session's output:
+// CRLF→LF, strip a CSI escape that slipped through, then replay
+// carriage-return/backspace rewrites. The session buffer already applies the
+// terminal rules while the child writes (see sessionOutput), so this layer only
+// has to catch stray bytes.
 func normalizeTerminalOutput(raw string) string {
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	raw = stripANSI(raw)

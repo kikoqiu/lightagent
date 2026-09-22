@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -113,13 +112,12 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 
 	codec := childCodec(useUTF8)
 	session := &ProcessSession{
-		ID:           generateSessionID(),
-		Command:      command,
-		StartTime:    time.Now().Unix(),
-		Status:       "running",
-		stdin:        codec.wrapStdin(stdin),
-		proc:         cmd,
-		outputBuffer: &bytes.Buffer{},
+		ID:        generateSessionID(),
+		Command:   command,
+		StartTime: time.Now().Unix(),
+		Status:    "running",
+		stdin:     codec.wrapStdin(stdin),
+		proc:      cmd,
 	}
 	stdout := newConsoleOutputWriter(session.appendOutput, codec.charset)
 	stderr := newConsoleOutputWriter(session.appendOutput, codec.charset)
@@ -147,6 +145,9 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 		// a character split by the final pipe read is still emitted.
 		_ = stdout.Close()
 		_ = stderr.Close()
+		// The child is gone, so the line the buffer held back (a progress line
+		// a CR may still have rewritten) is final: release its last version.
+		session.flushOutput()
 
 		code := 0
 		switch {
@@ -400,20 +401,15 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 
 	session.startWatchdog(runTimeout)
 
-	// Adaptive wait: block up to wait_timeout. Whenever output arrives the loop
-	// re-evaluates the remaining window; once the deadline passes the process is
-	// left running in the background. A cancelled context (user interrupt) kills
-	// the process instead of leaving it behind.
+	// Wait up to wait_timeout for the process to exit. Output written on the way
+	// does not end the wait: it accumulates and is reported with the result (see
+	// sessionOutput). Once the window passes, the process is left running in the
+	// background. A cancelled context (user interrupt) kills it instead of
+	// leaving it behind.
 	deadline := start.Add(waitTimeout)
-	for {
-		done, timedOut, canceled := session.WaitForOutputContext(ctx, time.Until(deadline))
-		if canceled {
-			_ = session.Kill()
-			return fail("interrupted by user")
-		}
-		if done || timedOut || !time.Now().Before(deadline) {
-			break
-		}
+	if _, _, canceled := session.WaitForExitContext(ctx, time.Until(deadline)); canceled {
+		_ = session.Kill()
+		return fail("interrupted by user")
 	}
 
 	raw := session.ReadIncremental()
