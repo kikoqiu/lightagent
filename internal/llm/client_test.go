@@ -247,6 +247,69 @@ func TestIncompleteResponsesAreClassified(t *testing.T) {
 	}
 }
 
+// TestContextLengthErrorsAreClassified pins the condition the agent recovers from
+// (see Agent.recoverContextOverflow): the provider refusing a request because it
+// did not fit the model's context window — under the error codes and wording the
+// common vendors use, because the local estimate can say a request fits while the
+// provider says it does not (media parts and oversized tool feedback are counted
+// roughly). Unrelated API failures must not be classified, or a turn would roll
+// its context back and recompress it for a bad key or a rate limit.
+func TestContextLengthErrorsAreClassified(t *testing.T) {
+	over := []string{
+		`{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 131072 tokens. Please reduce the length of the messages.","code":"context_length_exceeded"}}`,
+		`{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}`,
+		`{"error":{"code":400,"message":"The input token count (210000) exceeds the maximum number of tokens allowed (200000)","status":"INVALID_ARGUMENT"}}`,
+		`{"error":{"message":"Request too large: too many tokens in the conversation"}}`,
+		`{"error":{"message":"This request exceeds the context window of the model"}}`,
+	}
+	for _, body := range over {
+		if err := (&APIError{StatusCode: 400, Body: body}); !IsContextLengthError(err) {
+			t.Errorf("IsContextLengthError(%s) = false, want true", body)
+		}
+	}
+
+	other := []error{
+		nil,
+		&APIError{StatusCode: 401, Body: `{"error":{"message":"Incorrect API key provided"}}`},
+		&APIError{StatusCode: 429, Body: `{"error":{"message":"Rate limit reached for gpt-4 in organization org-x"}}`},
+		&APIError{StatusCode: 502, Body: `<html><head><title>502 Bad Gateway</title></head></html>`},
+		fmt.Errorf("request failed: dial tcp 127.0.0.1:1: connectex: connection refused"),
+	}
+	for _, err := range other {
+		if IsContextLengthError(err) {
+			t.Errorf("IsContextLengthError(%v) = true, want false", err)
+		}
+	}
+
+	// The rendered message keeps the wording the front-ends have always shown.
+	if got := (&APIError{StatusCode: 400, Body: "  too many tokens  "}).Error(); got != "api error 400: too many tokens" {
+		t.Fatalf("APIError.Error() = %q, want the historical wording", got)
+	}
+}
+
+// TestChatClassifiesProviderContextLengthRejection pins the wiring of the
+// classification: a non-2xx answer travels as an APIError carrying the status and
+// the body, so the agent can recognise the rejection without parsing the message.
+func TestChatClassifiesProviderContextLengthRejection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	client := NewClient(cfg.OpenAI)
+	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, nil)
+	if !IsContextLengthError(err) {
+		t.Fatalf("Chat error = %v, want a context-length rejection", err)
+	}
+	if !strings.Contains(err.Error(), "api error 400: ") {
+		t.Fatalf("Chat error = %q, want the historical api-error wording", err)
+	}
+}
+
 // TestReadStreamIncompleteToolCallFails covers a provider that ends the stream
 // with a normal-looking finish_reason after delivering only half of a tool
 // call: the accumulated arguments are not valid JSON, so the call never fully

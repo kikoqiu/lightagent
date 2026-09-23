@@ -196,8 +196,10 @@ func (c *compactor) shouldCompact(history []llm.Message, prefix livePrefix, usag
 	return estimate >= c.tokenLimit()
 }
 
-// summarizeMode distinguishes who requested a pass; automatic compaction keeps
-// a larger recent window than an explicit manual request。
+// summarizeMode distinguishes who requested a pass: automatic compaction keeps
+// a larger recent window than an explicit manual request, and the overflow
+// recovery (the pass that follows a request the provider rejected for its size)
+// keeps nothing raw at all.
 type summarizeMode int
 
 const (
@@ -205,6 +207,10 @@ const (
 	summarizeModeAuto summarizeMode = iota
 	// summarizeModeManual is used by the /compact command.
 	summarizeModeManual
+	// summarizeModeOverflow is used by the recovery pass that follows a request
+	// the provider rejected for context length (see
+	// Agent.recoverContextOverflow).
+	summarizeModeOverflow
 )
 
 // parseTurnBoundaries returns the starting index of each Turn. A Turn begins at
@@ -223,18 +229,29 @@ func parseTurnBoundaries(history []llm.Message) []int {
 
 // summarizeMaxKeptTurns caps how many of the newest user messages (complete
 // turns) a pass may retain regardless of the token budget: automatic keeps at
-// most 3, manual at most 2.
+// most 3, manual at most 2, and the overflow recovery none — its budget is zero
+// anyway, so the count is moot (and summarizeTailCut lifts it to its minimum of
+// one, never the budget).
 func summarizeMaxKeptTurns(m summarizeMode) int {
-	if m == summarizeModeManual {
+	switch m {
+	case summarizeModeManual:
 		return 2
+	case summarizeModeOverflow:
+		return 0
 	}
 	return 3
 }
 
 // retentionBudget returns how many tokens of the newest messages a pass may
 // keep visible: a fraction (1/10 auto, 1/20 manual) of the available input
-// budget (ContextWindow minus the MaxTokens output reserve).
+// budget (ContextWindow minus the MaxTokens output reserve). The overflow
+// recovery keeps nothing: the provider has just proven the estimate too small,
+// so only the summary may survive the retry (see
+// Agent.recoverContextOverflow).
 func (c *compactor) retentionBudget(m summarizeMode) int {
+	if m == summarizeModeOverflow {
+		return 0
+	}
 	available := c.contextWindow - c.maxTokens
 	if available <= 0 {
 		available = c.contextWindow
@@ -328,6 +345,34 @@ func (c *compactor) cut(history []llm.Message, mode summarizeMode) (int, bool) {
 		return 0, false
 	}
 	return cut, true
+}
+
+// wouldCut reports whether a pass in this mode would condense anything of
+// history. The overflow recovery asks before it touches the context: a retry is
+// only worth issuing when the pass (or the rollback) really frees room.
+func (c *compactor) wouldCut(history []llm.Message, mode summarizeMode) bool {
+	_, ok := c.cut(history, mode)
+	return ok
+}
+
+// overflowRollbackCut returns the index the newest messages of a rejected request
+// start at: the assistant/tool rows this turn appended after its user message,
+// and every user message no answer followed (the turn's own messages plus the
+// steering messages folded in before the failing call). The recovery replays
+// those user messages on top of the summary, while the assistant/tool rows are
+// dropped for good — the model produced them, but the request carrying their
+// results never reached it (see Agent.recoverContextOverflow).
+//
+// It returns len(history) when there is nothing to roll back.
+func overflowRollbackCut(history []llm.Message) int {
+	cut := len(history)
+	for cut > 0 && history[cut-1].Role != "user" {
+		cut--
+	}
+	for cut > 0 && history[cut-1].Role == "user" {
+		cut--
+	}
+	return cut
 }
 
 // compact compresses history. prefix is the live request prefix (system message

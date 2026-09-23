@@ -113,6 +113,9 @@
 > `(context_window - openai.max_tokens)` 除以 10（自动压缩）或 20（手动 `/compact`），
 > 且最多保留 3 个（自动）或 2 个（手动）完整 Turn。详见
 > [architecture.md](architecture.md#保留summarizetailcut)。
+> 服务商直接以「上下文超限」拒绝请求时还会走一次**溢出恢复**（回退本轮消息 → 以
+> **不保留任何原始消息**的方式压缩 → 重发被退回的消息），它同样没有配置项；详见
+> [architecture.md](architecture.md#溢出恢复provider-拒绝后回退--摘要--重发)。
 
 ### `web`
 

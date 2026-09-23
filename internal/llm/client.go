@@ -120,7 +120,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, 
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("api error %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(snippet))}
 	}
 
 	// Abort the transfer when no data arrives for the configured idle timeout.
@@ -278,6 +278,60 @@ func (c *Client) readJSON(r io.Reader, onReasoning func(string)) (*Response, err
 		return nil, err
 	}
 	return resp, nil
+}
+
+// APIError is a non-2xx answer from the provider. The status code and the body
+// are kept apart so a caller can classify the rejection (see
+// IsContextLengthError) instead of parsing the rendered message.
+type APIError struct {
+	// StatusCode is the HTTP status of the response.
+	StatusCode int
+	// Body is the response body, trimmed and capped at a few KiB.
+	Body string
+}
+
+// Error implements error.
+func (e *APIError) Error() string {
+	return fmt.Sprintf("api error %d: %s", e.StatusCode, strings.TrimSpace(e.Body))
+}
+
+// contextLengthMarkers are the phrases providers use when a request did not fit
+// the model's context window. Both the wording and the error code differ per
+// vendor (OpenAI's context_length_exceeded, Anthropic's "prompt is too long",
+// Google's "exceeds the maximum number of tokens", ...), so the lower-cased body
+// is matched against all of them.
+var contextLengthMarkers = []string{
+	"context_length_exceeded",
+	"context length",
+	"context window",
+	"maximum number of tokens",
+	"too many tokens",
+	"reduce the length of the messages",
+	"prompt is too long",
+	"input is too long",
+	"token limit",
+}
+
+// IsContextLengthError reports whether err is the provider refusing a request
+// because it did not fit the model's context window. It is the condition the
+// agent recovers from by rolling the newest messages back out of the context,
+// compressing what is left and replaying them (see
+// Agent.recoverContextOverflow): the local token estimate counts oversized tool
+// feedback and media parts (see agent.mediaPartTokens) roughly, so a request can
+// be over the window while the estimate says it fits — the provider's rejection
+// is the only signal that says so.
+func IsContextLengthError(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	body := strings.ToLower(apiErr.Body)
+	for _, marker := range contextLengthMarkers {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // IncompleteResponseError reports a completion the client refused to accept

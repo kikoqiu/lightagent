@@ -36,6 +36,9 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
    4. `callLLM()`：构造 `[system, ...history]`，附带工具定义，流式调用；模型可见回答的增量
       文本发布为 `assistant_delta`；若服务商返回思考内容（`reasoning_content` / `reasoning`），
       其增量先发布为 `reasoning_delta`。
+      * **调用失败**：被用户中断的走下面的「中断」分支；**服务商以「上下文超限」拒绝**
+        （`llm.IsContextLengthError`，见[溢出恢复](#溢出恢复provider-拒绝后回退--摘要--重发)）时
+        回退本轮消息、摘要后重发同一条消息（次数有上限）；其余错误仍以 `error` 结束回合。
    5. 追加 assistant 消息（含组装后的思考 `reasoning_content`，会随后续请求回传）并广播
       `usage`。模型答复在返回前会做**完整性校验**（`llm.validateResponse`），不合格的响应直接
       报错并结束本回合，不会写入历史：
@@ -186,7 +189,9 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 ### 触发
 
 估算 token（或接口返回的 `usage.prompt_tokens`）≥ `context_window * summarize_token_percent%`
-即压缩。
+即压缩。**服务商直接拒绝（上下文超限）时不受该阈值约束**——估算对媒体 part 与超大 tool 反馈
+只是粗略计数，被拒后由引擎主动做一次溢出恢复（见
+[溢出恢复](#溢出恢复provider-拒绝后回退--摘要--重发)）。
 
 ### 保留（`summarizeTailCut`）
 
@@ -194,8 +199,9 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
    `user`。保留窗口**总是从某条 user 消息开始**，因此 assistant `tool_calls` 与 `tool`
    结果永远不会被切开，窗口也不会悬挂在孤立的 tool 结果上。
 2. **token 预算**：`available = context_window - openai.max_tokens`（≤0 时回退
-   `context_window`）；预算 = `available / 10`（自动）或 `available / 20`（手动 `/compact`）。
-3. **回合数上限**：自动最多保留 3 条 user 消息（3 个 Turn），手动最多 2 条。
+   `context_window`）；预算 = `available / 10`（自动）或 `available / 20`（手动 `/compact`）；
+   溢出恢复（`summarizeModeOverflow`）的预算为 **0**，即不保留任何原始消息。
+3. **回合数上限**：自动最多保留 3 条 user 消息（3 个 Turn），手动最多 2 条，溢出恢复不保留。
 4. **自新到旧累加**：从最新的 Turn 开始向前保留，只要加入下一个更旧的 Turn 后仍
    **严格小于**预算且未超过回合数上限；两者谁先触顶谁停止。
 5. **无「至少保留最新一轮」回退**：当连最新一个 Turn 都达到/超过预算时不保留任何原始
@@ -246,7 +252,47 @@ user:   <历史里的第一条 user>
 
 与主项目 tokenizer 一致：`(字符数 + 12) * 2/5`，其中字符数包含 content、tool call 的
 name/arguments/id 等，即约 2.5 字符/token，另加每消息 12 字符的固定开销。触发判断时
-优先采用接口返回的 `usage.prompt_tokens`（若更大）。
+优先采用接口返回的 `usage.prompt_tokens`（若更大）。媒体 part 按**个数**粗算
+（`mediaPartTokens`，每 part 固定值），不按 base64 字节数：否则一张图片就会被算成几十万
+token。正因如此，估算可能小于真实占用，被服务商拒绝时走下面的溢出恢复。
+
+### 溢出恢复（provider 拒绝后回退 + 摘要 + 重发）
+
+估算对媒体 part 与超大 tool 反馈只是粗略计数，所以请求可能**已经超出窗口而估算仍说「放得下」**：
+tool 循环里一条超长的反馈（整份文件、读回的图片）、带图片的用户消息，都是常见的触发者。这时
+服务商返回的错误才是唯一可靠信号：`llm.IsContextLengthError` 按状态码 + 各家文案/错误码判定
+（`context_length_exceeded`、`maximum context length`、`prompt is too long`、
+`maximum number of tokens` 等，见 `llm.contextLengthMarkers`）。被判定的失败不再直接结束回合，
+而是做一次**溢出恢复**（`Agent.recoverContextOverflow`），也就是「回退这条消息 → 自动摘要 →
+重发被退回的消息」：
+
+1. **回退**（`overflowRollbackCut`）：把这条被拒请求带来的最新消息从上下文里拿出去 —— 本轮产生
+   的 assistant/tool 行（超长的工具反馈就在这里），以及**没有得到回答的 user 消息**（本轮自己的
+   消息，以及失败调用前刚并入的 steering 消息）。更早的、已被回答过的历史**保持不动**，接着交给
+   压缩；这些被回退的 user 消息随后会原样重放。
+2. **摘要**：以 `summarizeModeOverflow` 跑一次压缩，**保留预算为 0**——估算刚被证明偏小，只有
+   摘要才能保证重发的请求装得下，因此整段幸存历史都被换成累积摘要（`compacted` 事件的
+   `context compressed: N -> 1 messages`）。被回退的 user 消息**刻意不进入这次总结的批次**：
+   它们带的附件（大图片、大文件）很可能正是超限的原因，若一起发给模型，总结调用自己也会被拒。
+3. **重发**：把被回退的 user 消息重新放回摘要之上（`replayMessages`），随后 `continue` 重新调用
+   模型——「同一条消息，在压缩后的上下文里再发一次」。重放**不重发 `user` 事件**：这些行在进入
+   对话时就已广播，再播一次会让两端多画一行；若压缩后只剩下 `[engine]` 标记，则标记被摘掉
+   （重放的消息本身就是请求需要的 user 查询；若一条 user 消息都没有，标记会补上）。
+
+细节：
+
+* 恢复过程在总线上自报：先一条 `info`（`context length exceeded: rolled back N message(s),
+  compressing the context and retrying`），随后是常规的 `compacting context: …` 与带 `summary` 的
+  `compacted`，因此两端都能解释这段额外等待；被回退的旧行仍留在终端/网页日志里（与压缩一致，
+  只在切点插入摘要行）。
+* **什么都没有释放时不重发**：若回退只拿掉了 user 消息、而幸存历史又无可压缩的内容（整条消息
+  本身就超出窗口，例如一张过大的图片），重发等于把刚被拒的请求原样再发一遍——此时直接按服务商
+  的错误结束回合，且**历史保持原样**（消息仍在对话里，用户可自行处理）。
+* 恢复后紧接的一轮**跳过主动压缩**（`skipCompact`）：那次压缩只会把刚重放的消息吃掉。
+* 单个回合最多恢复 `maxContextOverflowRecoveries`（2）次，之后按服务商的错误结束回合，避免在
+  「模型又产出一条超长反馈」的循环里打转。
+* 总结调用本身也可能被同一原因拒（要压缩的历史就是超限的那份）：按既有失败路径处理——保留原
+  摘要、丢弃被压缩的消息，恢复照常继续（此时上下文反而更小）。
 
 ## 系统提示词优先级
 

@@ -443,17 +443,45 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 	// max_tokens (finish_reason "length") and the loop auto-continued. A
 	// response that finishes normally resets it.
 	truncations := 0
+	// overflowRecoveries counts how many times this turn recovered from a
+	// request the provider rejected for its size (see recoverContextOverflow).
+	overflowRecoveries := 0
+	// skipCompact suppresses the proactive pass on the iteration right after
+	// such a recovery: the recovery has just compressed everything it could,
+	// and a pass here could only condense the user messages it replayed — the
+	// very input being sent again.
+	skipCompact := false
 
 	for i := 0; i < a.maxIter; i++ {
 		a.drainSteering()
 
-		a.compactIfNeeded(ctx)
+		if skipCompact {
+			skipCompact = false
+		} else {
+			a.compactIfNeeded(ctx)
+		}
 
 		resp, err := a.callLLM(ctx)
 		if err != nil {
 			if turnInterrupted(ctx, err) {
 				a.finishInterrupt(turnStart, userCount)
 				return
+			}
+			// A request the provider rejected for its size is recovered
+			// instead of failed: the newest messages are rolled back out of
+			// the context, what is left is compressed into the summary and
+			// those user messages are replayed on top of it, so the retry
+			// sends them in front of a context that fits (see
+			// recoverContextOverflow). Oversized tool feedback and the media
+			// the local estimate undercounts are the usual causes, which is
+			// why the provider's own rejection is the only reliable signal
+			// (llm.IsContextLengthError).
+			if llm.IsContextLengthError(err) && overflowRecoveries < maxContextOverflowRecoveries &&
+				a.recoverContextOverflow(ctx) {
+				overflowRecoveries++
+				skipCompact = true
+				a.bus.Publish(a.usageEvent())
+				continue
 			}
 			// Reserved recovery hook. llm.IsIncompleteResponse(err) is
 			// true when the provider delivered a half-built reply (a
@@ -906,6 +934,93 @@ func (a *Agent) doCompact(ctx context.Context, mode summarizeMode) bool {
 	})
 	a.save()
 	return true
+}
+
+// maxContextOverflowRecoveries bounds how many times one turn recovers from the
+// provider rejecting a request for its size (roll back, compress, replay).
+const maxContextOverflowRecoveries = 2
+
+// recoverContextOverflow reacts to a request the provider rejected because it did
+// not fit the model's context window. That rejection is the estimate's failure,
+// not the request's: oversized tool feedback and media parts (an attachment the
+// user sent, an image a tool read back) can cost far more than
+// EstimateMessageTokens counts, so a request can be over the window while the
+// estimate still says it fits. The recovery therefore
+//
+//  1. rolls the newest messages back out of the context — the assistant/tool rows
+//     this turn appended and the user messages no answer followed, i.e. exactly
+//     the content that made the request too large (see overflowRollbackCut),
+//  2. compresses everything that is left with the overflow mode, whose zero
+//     retention budget keeps nothing raw: the surviving history is replaced by
+//     the accumulated summary. Those rolled-back user messages are deliberately
+//     not part of that batch, so an oversized attachment among them cannot make
+//     the summarizing call overflow too,
+//  3. replays them on top of the summary, so the model is asked again with the
+//     same user input in front of a context that is now as small as it gets.
+//
+// The pass reports itself on the bus (an info naming the rollback, then the usual
+// compacting info and the compacted event) so both front-ends explain the extra
+// wait. It reports whether the context really became smaller, i.e. whether a
+// retry can behave differently: when neither the rollback nor the pass frees
+// anything, the caller reports the provider's error instead of sending the very
+// request that was just rejected.
+func (a *Agent) recoverContextOverflow(ctx context.Context) bool {
+	a.mu.Lock()
+	cut := overflowRollbackCut(a.history)
+	var (
+		replay []llm.Message
+		other  int
+	)
+	for _, m := range a.history[cut:] {
+		switch {
+		case m.Role != "user":
+			// The assistant/tool rows go away for good.
+			other++
+		case m.Content == contextContinueMessage && len(m.Media) == 0:
+			// The engine marker is not a user message: it only keeps a request
+			// legal, which the replayed messages do themselves.
+		default:
+			replay = append(replay, m)
+		}
+	}
+	// The overflow pass keeps nothing raw, so it frees room exactly when the
+	// surviving history still holds something to condense.
+	frees := a.compactor != nil && a.compactor.wouldCut(a.history[:cut], summarizeModeOverflow)
+	if !frees && other == 0 {
+		a.mu.Unlock()
+		return false
+	}
+	dropped := len(a.history) - cut
+	a.history = a.history[:cut]
+	a.mu.Unlock()
+
+	a.bus.Publish(Event{Type: EventInfo, Text: fmt.Sprintf(
+		"context length exceeded: rolled back %d message(s), compressing the context and retrying", dropped)})
+	a.doCompact(ctx, summarizeModeOverflow)
+	a.replayMessages(replay)
+	return true
+}
+
+// replayMessages puts the user messages an overflow recovery rolled back on top
+// of the context again and keeps the request legal afterwards. Nothing is
+// published: those rows were announced when they entered the conversation (turn
+// start or drainSteering), so announcing them again would draw them twice.
+func (a *Agent) replayMessages(msgs []llm.Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// A pass that compressed everything leaves its continue marker behind; the
+	// replayed messages are the request's user query again, so the marker is
+	// dropped exactly as it is not added to a history that already holds one.
+	if len(msgs) > 0 {
+		if n := len(a.history); n > 0 && a.history[n-1].Role == "user" && a.history[n-1].Content == contextContinueMessage {
+			a.history = a.history[:n-1]
+		}
+		a.history = append(a.history, msgs...)
+	}
+	// The rollback can take every user message with it (they were the very
+	// messages making the request too large) and chat templates reject a request
+	// without a user query, so the marker takes their place when none is left.
+	a.history = ensureUserMessage(a.history)
 }
 
 // save persists the current state through the registered hook.

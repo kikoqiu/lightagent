@@ -1470,3 +1470,433 @@ func TestIncompleteStreamedToolCallEndsTheTurnWithAnError(t *testing.T) {
 		t.Fatal("the agent is still busy after the failure")
 	}
 }
+
+// TestOverflowRejectionRollsBackTheToolRoundAndRetries covers the usual cause of a
+// provider rejecting a request for its size: tool feedback far larger than the
+// local estimate counted for it (a whole file, an image read back). The turn rolls
+// that round back out of the context and asks the model again with the same user
+// message in front of a context that now fits, instead of failing.
+func TestOverflowRejectionRollsBackTheToolRoundAndRetries(t *testing.T) {
+	const userText = "read the log"
+	var (
+		mu     sync.Mutex
+		calls  int
+		bodies [][]capturedMessage
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []capturedMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		calls++
+		n := calls
+		bodies = append(bodies, req.Messages)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+		case 2:
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 12000 tokens. Please reduce the length of the messages.","code":"context_length_exceeded"}}`)
+		default:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "echo", desc: "echoes"})
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Submit(userText)
+	got := drainEvents(t, events)
+
+	if calls != 3 {
+		t.Fatalf("model calls = %d, want the first call, the rejected one and the retry", calls)
+	}
+	if hasEvent(got, EventError, "") {
+		t.Fatalf("the turn failed instead of recovering: %+v", got)
+	}
+	const rollback = "context length exceeded: rolled back 3 message(s), compressing the context and retrying"
+	if !hasEvent(got, EventInfo, rollback) {
+		t.Fatalf("no rollback info was published: %+v", got)
+	}
+	if !hasEvent(got, EventAssistant, "done") {
+		t.Fatalf("the retry's reply was not published: %+v", got)
+	}
+
+	// The retry is the same user message in front of the history that is left:
+	// the rejected tool round is gone (nothing else had to be compressed).
+	mu.Lock()
+	retry := bodies[len(bodies)-1]
+	mu.Unlock()
+	if len(retry) != 2 || retry[0].Role != "system" || retry[1].Role != "user" || retry[1].Content != userText {
+		t.Fatalf("retry request = %+v, want system + the user message alone", retry)
+	}
+	hist := a.History()
+	if len(hist) != 2 || hist[0].Role != "user" || hist[1].Content != "done" {
+		t.Fatalf("history = %+v, want the user message and the retry's reply", hist)
+	}
+}
+
+// TestOverflowRejectionSummarizesTheContextAndReplaysTheMessage covers the other
+// half of the recovery: when the surviving history has something to condense, all
+// of it is compressed into the summary (nothing is left raw) and the turn's user
+// message is replayed on top, so the retry carries the summary plus that very
+// message instead of the history the provider rejected. The replayed message is
+// deliberately not part of the summarizing batch: an oversized attachment in it
+// would otherwise make that call overflow too.
+func TestOverflowRejectionSummarizesTheContextAndReplaysTheMessage(t *testing.T) {
+	const userText = "and now?"
+	var (
+		mu       sync.Mutex
+		bodies   [][]capturedMessage
+		digests  [][]capturedMessage
+		liveCall int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []capturedMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		last := ""
+		if len(req.Messages) > 0 {
+			last = req.Messages[len(req.Messages)-1].Content
+		}
+		isDigest := strings.HasPrefix(last, summarizeInstructionIntro)
+
+		mu.Lock()
+		bodies = append(bodies, req.Messages)
+		if isDigest {
+			digests = append(digests, req.Messages)
+		} else {
+			liveCall++
+		}
+		n := liveCall
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case isDigest:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"REPORT"},"finish_reason":"stop"}]}`)
+		case n == 1:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+		case n == 2:
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 12000 tokens. Please reduce the length of the messages.","code":"context_length_exceeded"}}`)
+		default:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "echo", desc: "echoes"})
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Load([]llm.Message{
+		{Role: "user", Content: "first question"},
+		{Role: "assistant", Content: "first answer"},
+		{Role: "user", Content: "second question"},
+		{Role: "assistant", Content: "second answer"},
+	}, "")
+	a.Submit(userText)
+	got := drainEvents(t, events)
+
+	if liveCall != 3 {
+		t.Fatalf("live calls = %d, want the first call, the rejected one and the retry", liveCall)
+	}
+	if hasEvent(got, EventError, "") {
+		t.Fatalf("the turn failed instead of recovering: %+v", got)
+	}
+	if !hasEvent(got, EventInfo, "context length exceeded: rolled back 3 message(s), compressing the context and retrying") {
+		t.Fatalf("no rollback info was published: %+v", got)
+	}
+	if !hasEvent(got, EventCompacted, "context compressed: 4 -> 1 messages") {
+		t.Fatalf("the surviving history was not compressed: %+v", got)
+	}
+	if a.Summary() != "REPORT" {
+		t.Fatalf("summary = %q, want the report the model wrote", a.Summary())
+	}
+	if !hasEvent(got, EventAssistant, "done") {
+		t.Fatalf("the retry's reply was not published: %+v", got)
+	}
+
+	// The summarizing call condensed the surviving history — and only that: the
+	// rolled-back message is what gets replayed afterwards, not summarized (its
+	// attachment could be the very thing that overflowed the window).
+	mu.Lock()
+	defer mu.Unlock()
+	if len(digests) != 1 {
+		t.Fatalf("summarizing calls = %d, want 1", len(digests))
+	}
+	digest := digests[0]
+	if digest[1].Role != "user" || digest[1].Content != "first question" {
+		t.Fatalf("the summarizing batch starts with %+v, want the first recorded turn", digest[1])
+	}
+	for _, m := range digest {
+		if strings.Contains(m.Content, userText) {
+			t.Fatalf("the summarizing call carried the rolled-back message: %+v", digest)
+		}
+	}
+
+	// The retry carries the summary as the first user message and the replayed
+	// message right behind it: that is the request the provider accepts.
+	retry := bodies[len(bodies)-1]
+	if len(retry) != 3 || retry[0].Role != "system" {
+		t.Fatalf("retry request = %+v, want system + summary + the replayed message", retry)
+	}
+	if want := summaryUserPrefix + "REPORT"; retry[1].Content != want {
+		t.Fatalf("retry summary message = %q, want %q", retry[1].Content, want)
+	}
+	if retry[2].Content != userText {
+		t.Fatalf("retry message = %q, want the rolled-back %q", retry[2].Content, userText)
+	}
+
+	hist := a.History()
+	if len(hist) != 2 || hist[0].Content != userText || hist[1].Content != "done" {
+		t.Fatalf("history = %+v, want the replayed message and the retry's reply", hist)
+	}
+}
+
+// TestOverflowRejectionWithoutAnythingToFreeFailsTheTurn covers what the recovery
+// cannot help with: the user message alone is over the window (an oversized
+// attachment, say), so rolling it back and replaying it would send the very request
+// the provider just rejected. The turn reports the provider's error, retries
+// nothing, and leaves the history untouched.
+func TestOverflowRejectionWithoutAnythingToFreeFailsTheTurn(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens.","code":"context_length_exceeded"}}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("look at this picture")
+	got := drainEvents(t, events)
+
+	if calls != 1 {
+		t.Fatalf("model calls = %d, want 1 (nothing could be freed, so no retry)", calls)
+	}
+	if !hasEvent(got, EventError, "context length") {
+		t.Fatalf("the provider's error was not reported: %+v", got)
+	}
+	if hasEvent(got, EventInfo, "context length exceeded:") {
+		t.Fatalf("a rollback was announced although nothing could be freed: %+v", got)
+	}
+	hist := a.History()
+	if len(hist) != 1 || hist[0].Role != "user" || hist[0].Content != "look at this picture" {
+		t.Fatalf("history = %+v, want the user message left as it was", hist)
+	}
+}
+
+// TestOverflowRecoveryGivesUpAfterTwoAttempts covers a request that keeps coming
+// back too large: the turn recovers at most maxContextOverflowRecoveries times
+// (each attempt rolls back, compresses and replays) and then reports the provider's
+// error instead of looping.
+func TestOverflowRecoveryGivesUpAfterTwoAttempts(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		live   int
+		digest int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []capturedMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		last := ""
+		hasToolRow := false
+		for i, m := range req.Messages {
+			if i == len(req.Messages)-1 {
+				last = m.Content
+			}
+			if m.Role == "tool" {
+				hasToolRow = true
+			}
+		}
+		isDigest := strings.HasPrefix(last, summarizeInstructionIntro)
+
+		mu.Lock()
+		if isDigest {
+			digest++
+		} else {
+			live++
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		// The summarizing call is rejected too (the history it condenses is the
+		// oversized one), which the pass survives by dropping that batch.
+		if isDigest || hasToolRow {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "echo", desc: "echoes"})
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Load([]llm.Message{
+		{Role: "user", Content: "first question"},
+		{Role: "assistant", Content: "first answer"},
+		{Role: "user", Content: "second question"},
+		{Role: "assistant", Content: "second answer"},
+	}, "")
+	a.Submit("keep going")
+	got := drainEvents(t, events)
+
+	rollbacks := 0
+	for _, ev := range got {
+		if ev.Type == EventInfo && strings.HasPrefix(ev.Text, "context length exceeded:") {
+			rollbacks++
+		}
+	}
+	if rollbacks != maxContextOverflowRecoveries {
+		t.Fatalf("rollbacks = %d, want %d", rollbacks, maxContextOverflowRecoveries)
+	}
+	if !hasEvent(got, EventError, "context length") {
+		t.Fatalf("the provider's error was not reported after the attempts: %+v", got)
+	}
+	if live != 6 {
+		t.Fatalf("live calls = %d, want the two recoveries and their retries", live)
+	}
+	if digest != 1 {
+		t.Fatalf("summarizing calls = %d, want the one the first recovery issued", digest)
+	}
+	if a.Busy() {
+		t.Fatal("the agent is still busy after the failure")
+	}
+}
+
+// TestOverflowRejectionOnTheFirstCallResendsTheMessage covers the other common
+// trigger named in the same breath as tool feedback: a user message the provider
+// rejects as too large for the window (an attachment, for instance) when the very
+// first call of the turn is made. The message is rolled back, the history before it
+// is compressed into the summary, and the message is replayed on top of that
+// summary — the same input, sent again with everything else compressed.
+func TestOverflowRejectionOnTheFirstCallResendsTheMessage(t *testing.T) {
+	const userText = "what do you make of this?"
+	var (
+		mu     sync.Mutex
+		bodies [][]capturedMessage
+		live   int
+		digest int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []capturedMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		last := ""
+		if len(req.Messages) > 0 {
+			last = req.Messages[len(req.Messages)-1].Content
+		}
+		isDigest := strings.HasPrefix(last, summarizeInstructionIntro)
+
+		mu.Lock()
+		bodies = append(bodies, req.Messages)
+		if isDigest {
+			digest++
+		} else {
+			live++
+		}
+		n := live
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case isDigest:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"REPORT"},"finish_reason":"stop"}]}`)
+		case n == 1:
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 20000 tokens.","code":"context_length_exceeded"}}`)
+		default:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Load([]llm.Message{
+		{Role: "user", Content: "first question"},
+		{Role: "assistant", Content: "first answer"},
+		{Role: "user", Content: "second question"},
+		{Role: "assistant", Content: "second answer"},
+	}, "")
+	a.Submit(userText)
+	got := drainEvents(t, events)
+
+	if live != 2 || digest != 1 {
+		t.Fatalf("live/digest calls = %d/%d, want the rejected call, one summarizing call and the retry", live, digest)
+	}
+	if hasEvent(got, EventError, "") {
+		t.Fatalf("the turn failed instead of recovering: %+v", got)
+	}
+	if !hasEvent(got, EventInfo, "context length exceeded: rolled back 1 message(s), compressing the context and retrying") {
+		t.Fatalf("no rollback info was published: %+v", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	retry := bodies[len(bodies)-1]
+	if len(retry) != 3 || retry[0].Role != "system" {
+		t.Fatalf("retry request = %+v, want system + summary + the message", retry)
+	}
+	if want := summaryUserPrefix + "REPORT"; retry[1].Content != want {
+		t.Fatalf("retry summary message = %q, want %q", retry[1].Content, want)
+	}
+	if retry[2].Content != userText {
+		t.Fatalf("retry message = %q, want the resubmitted user message", retry[2].Content)
+	}
+}

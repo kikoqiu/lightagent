@@ -267,6 +267,10 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   总结要调用模型（可能较慢），因此压缩**开始前**会先广播一条 `info`：
   `compacting context: summarizing N of M messages`，两端立刻显示「正在压缩」；没有可压缩
   内容时不广播任何事件（`/compact` 由命令处理方回复 `nothing to compress yet`）。
+  服务商以「上下文超限」拒绝请求时的溢出恢复（回退本轮消息 → 摘要 → 重发）也在这条通路上：
+  先一条 `info`（`context length exceeded: rolled back N message(s), compressing the context
+  and retrying`），随后是同样的 `compacting context: …` 与 `summary` 行；被回退的行**不会**从
+  日志与回放缓冲里删除，页面看到的就是「回退提示 + 摘要行」。
 
 * `settings` 是**瞬时帧**（不进日志区）：服务端在网页侧开关（`/result`、`/markdown`）变化时广播，
   页面的命令栏据此刷新 on / off 状态；新页面从注入的配置、重连页面从 `history_start` 表头拿到同样的值。

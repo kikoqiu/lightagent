@@ -87,10 +87,102 @@ func TestRetentionBudget(t *testing.T) {
 	if got := c.retentionBudget(summarizeModeManual); got != 450 {
 		t.Fatalf("manual budget = %d, want 450", got)
 	}
+	// The overflow recovery keeps nothing raw: the provider has just proven the
+	// estimate too small, so only the summary may survive the retry.
+	if got := c.retentionBudget(summarizeModeOverflow); got != 0 {
+		t.Fatalf("overflow budget = %d, want 0", got)
+	}
+	if got := summarizeMaxKeptTurns(summarizeModeOverflow); got != 0 {
+		t.Fatalf("overflow turn cap = %d, want 0", got)
+	}
 	// maxTokens >= contextWindow falls back to the full context window.
 	c2 := &compactor{contextWindow: 1000, maxTokens: 5000}
 	if got := c2.retentionBudget(summarizeModeAuto); got != 100 {
 		t.Fatalf("fallback budget = %d, want 100", got)
+	}
+}
+
+// TestOverflowPassCutsTheWholeHistory pins the point of the overflow mode: a pass
+// that follows a rejected request condenses the entire surviving history — the
+// same history the auto mode leaves alone for being far below the window.
+func TestOverflowPassCutsTheWholeHistory(t *testing.T) {
+	c := &compactor{contextWindow: 100000, maxTokens: 1000}
+	// Three turns: the auto mode's retention budget and its three-turn cap both
+	// hold them, so it has nothing to condense.
+	msgs := budgetMessages(3, 40)
+	if _, ok := c.cut(msgs, summarizeModeAuto); ok {
+		t.Fatal("the auto mode condensed a history that fits its retention budget")
+	}
+	cut, ok := c.cut(msgs, summarizeModeOverflow)
+	if !ok {
+		t.Fatal("the overflow mode must condense everything")
+	}
+	if cut != len(msgs) {
+		t.Fatalf("overflow cut = %d, want %d (whole history)", cut, len(msgs))
+	}
+}
+
+// TestOverflowRollbackCut pins how much of a rejected request's tail the recovery
+// rolls back: the assistant/tool rows this turn produced and the user messages no
+// answer followed (the turn's own messages plus a steering message folded in before
+// the failing call). Everything before them — the answered history the pass is
+// about to compress — stays, and the rolled-back user messages are what the replay
+// puts back on top of the summary.
+func TestOverflowRollbackCut(t *testing.T) {
+	toolRow := llm.Message{Role: "tool", ToolCallID: "c1", Content: strings.Repeat("x", 5000)}
+	cases := []struct {
+		name    string
+		history []llm.Message
+		want    int
+	}{
+		{
+			name: "tool feedback of the running turn",
+			history: []llm.Message{
+				{Role: "user", Content: "one"},
+				{Role: "assistant", Content: "answer"},
+				{Role: "user", Content: "read the log"},
+				{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1"}}},
+				toolRow,
+			},
+			want: 2,
+		},
+		{
+			name: "steering message folded in before the failing call",
+			history: []llm.Message{
+				{Role: "user", Content: "read the log"},
+				{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1"}}},
+				toolRow,
+				{Role: "user", Content: "also check the tail"},
+			},
+			want: 3,
+		},
+		{
+			name: "whole start batch of the turn",
+			history: []llm.Message{
+				{Role: "user", Content: "one"},
+				{Role: "user", Content: "two"},
+				{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "c1"}}},
+				toolRow,
+			},
+			want: 0,
+		},
+		{
+			name:    "the turn's user message alone",
+			history: []llm.Message{{Role: "user", Content: "hello"}},
+			want:    0,
+		},
+		{
+			name:    "nothing to roll back",
+			history: nil,
+			want:    0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := overflowRollbackCut(tc.history); got != tc.want {
+				t.Fatalf("overflowRollbackCut = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
