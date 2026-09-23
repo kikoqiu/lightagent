@@ -44,8 +44,8 @@ echo ============================================================
 set "FAILED="
 
 call :build windows amd64 "" .exe
-call :build linux   amd64 "" ""
-call :build linux   arm64 "" ""
+rem call :build linux   amd64 "" ""
+rem call :build linux   arm64 "" ""
 
 echo.
 if defined FAILED (
