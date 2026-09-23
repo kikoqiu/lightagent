@@ -30,7 +30,7 @@
 | 8 | 文件操作 | `read_file_lines` / `write_file` / `edit_file`（含 GBK 等字符集转换） |
 | 9 | 上下文压缩 | 全局唯一压缩模式：超阈值时把旧消息总结成一条摘要；`/history` 查看用量，CLI 提示行与网页徽标实时显示 |
 | 10 | 彩色 CLI | 角色区分颜色；仅在确认终端支持 ANSI 时才着色（非 TTY、`NO_COLOR`、`TERM=dumb`、旧版 Windows 控制台自动关闭） |
-| 11 | Markdown 渲染 | 助手回答与模型思考均渲染为 Markdown：CLI 转 ANSI，Web 用浏览器端 marked（GFM，含表格）+ DOMPurify；`ui.markdown` 默认开启 |
+| 11 | Markdown 渲染 | 助手回答与模型思考均渲染为 Markdown：CLI 转 ANSI，Web 用浏览器端 marked（GFM，含表格）+ DOMPurify，公式（`$…$` / `$$…$$`）由内嵌的 **math.js** 渲染为 MathML（浏览器原生排版，无字体文件、无第三方公式库）；`ui.markdown` 默认开启 |
 | 12 | 多行输入 | CLI 与 Web 均为 **Enter 换行**；CLI 发送用 **Ctrl+J**（Windows 本地也可 Ctrl+Enter；Linux/SSH 下终端支持 kitty 键盘协议时也可 Ctrl+Enter，另有 Alt+Enter），Web 用 **Ctrl+Enter** |
 | 13 | MCP 客户端 + 工具发现 / unlock | 纯标准库 MCP 客户端（stdio / Streamable HTTP / HTTP+SSE），server 在 `tools.mcp` 中配置；MCP 工具**恒为锁定函数**（永不进 `tools` 声明）：`tool_search_tool_bm25` 发现 → `unlock_tool` 下发 schema 并授权（TTL）→ `dynamic_call` 间接调用；系统提示词只注入 1 条全局 unlock 规则 + 每 server 1 条 MCP 全局信息（含 server 返回的 `serverInfo`/`instructions`） |
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板） |
@@ -319,6 +319,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 * 回合运行中顶部显示转圈指示，输入框右侧出现 **Stop** 按钮（点击即中断，同 `/stop`）。
 * 助手回复在浏览器里用内嵌的 **marked**（GFM，含表格）+ **DOMPurify** 渲染（`ui.markdown=false`
   时退回纯文本）；两条库文件已随二进制内嵌，无需联网。
+* 公式（`$…$` 行内、`$$…$$` 独立成行）由页面自带的 **math.js** 渲染为 **MathML**：浏览器原生排版，
+  不需要字体文件；括号的指数落在整组上（`(x_i-\mu)^2`、`\left(\frac{n}{e}\right)^n`），`\\` 与 `&`
+  以及 `aligned` / `cases` / `matrix` 等环境排成表格，也不会误判价格（`$5`）或代码块里的 `$`。
 * 若设置了 `web.password`，页面会弹出**登录对话框**：浏览器用服务端公布的盐算 `sha256(盐+密码)`
   并只发送该摘要，成功后在 HttpOnly 会话 cookie 上保持登录（勾选 “Stay signed in” 可长期保持，
   并把这枚**加盐摘要**存进浏览器，下次自动静默登录）；页头 **Sign out** 退出。

@@ -77,6 +77,7 @@ CLI 与网页（可同时多个）都能输入；Agent 的事件通过 **WebSock
 | GET | `/auth.js` | 登录对话框脚本（内嵌），公开 |
 | GET | `/config.js` | 配置编辑器脚本（内嵌），公开 |
 | GET | `/tts.js` | 朗读（TTS）脚本（内嵌），公开 |
+| GET | `/math.js` | 公式渲染脚本（内嵌）：把回复里的 `$…$` / `$$…$$` 渲染成 MathML，公开 |
 | GET | `/assets/marked.min.js` | 内嵌的 Markdown 渲染库（marked，MIT） |
 | GET | `/assets/dompurify.min.js` | 内嵌的 HTML 净化库（DOMPurify，Apache-2.0/MPL-2.0） |
 
@@ -92,9 +93,11 @@ CLI 与网页（可同时多个）都能输入；Agent 的事件通过 **WebSock
 | `auth.js` | 登录对话框：取盐、算加盐摘要（自带 SHA-256，明文 HTTP 下没有 WebCrypto）、保存摘要、连接门控 |
 | `config.js` | 配置编辑器（表单 / JSON 两种模式，访问 `/api/config`、`/api/password`）与面板里的**重启**按钮（`/api/restart`） |
 | `tts.js` | 朗读面板：语言/语音选择、朗读内容选择（写 `localStorage`，不经服务端），并把对话事件读出来 |
+| `math.js` | 公式渲染：把回复里的 `$…$` / `$$…$$` 渲染为 MathML（浏览器自带排版，无 webfont、也无第三方公式库），见[公式（MathML）](#公式mathml) |
 | `assets/` | 第三方库（marked / DOMPurify），见该目录的 `README.md` |
 
-`app.css`、`app.js`、`auth.js`、`config.js`、`tts.js` 由 `/app.css`、`/app.js`、`/auth.js`、`/config.js`、`/tts.js` 提供，
+`app.css`、`app.js`、`auth.js`、`config.js`、`tts.js`、`math.js` 由 `/app.css`、`/app.js`、`/auth.js`、
+`/config.js`、`/tts.js`、`/math.js` 提供，
 和页面、`/assets/` 一样**公开**（不含数据）；受保护的只有 `/ws` 与 `/api/*` 中的数据端点，它们靠会话 cookie，
 因此子请求不再需要 `?token=`。
 
@@ -301,6 +304,10 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 > 收到最终 `assistant` 时用完整文本定稿（同一行覆盖，不会重复出现两条回复）；
 > `ui.markdown=false` 时不再调用库，直接用 `textContent` 显示纯文本。
 >
+> **公式走同一条管线**：`math.js` 先把 `$…$` / `$$…$$` 抽出来渲染成 MathML，marked 处理剩下的正文，
+> 再把这些 MathML 放回 HTML、和正文一起过 DOMPurify（见[公式（MathML）](#公式mathml)）。因此
+> `ui.markdown` 开着时公式才有排版，关掉时和别的 Markdown 一样按原文显示。
+>
 > **回放时 Markdown 走空闲切片**：重建快照的行数可能成千上万，逐行同步解析会把主线程占满
 > （页面卡死、日志区停在 `Waiting for messages…`）。所以回放期间每行先画**纯文本**，再按
 > 插入顺序在 `requestIdleCallback` 的空闲切片（每片约 8ms；不支持该 API 时退化为 16ms 的
@@ -428,6 +435,49 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   **不读布局、不跑入场动画**（`#log.replaying .row` 关掉动画），结束（`history_end`）时贴底一次
   ——等同刷新页面的最终状态。因此重建一段很长的对话只会产生「每批一次重排」，而不是
   「每行一次强制布局 + 一次滚动写入」。
+
+## 公式（MathML）
+
+回复里的 LaTeX 公式（`$…$` 行内、`$$…$$` 独立成行）渲染为 **MathML**，由浏览器自带的数学排版引擎绘制：
+
+* **不引入 KaTeX / MathJax**：前者要额外内嵌约 1 MB 字体，后者更大；而 MathML 的根式、分数、上下标、
+  大算符都是引擎能力，**零新增资源**、随页面缩放、文字可选中、读屏软件也能读，引擎不支持时还会
+  退化成公式内容的文字（公式不会消失）。`math.js` 约 1150 行 / 53 KB、无依赖，随二进制内嵌、无构建步骤。
+* **覆盖的子集**（约 350 个命令）：希腊字母与常用关系 / 运算 / 箭头符（`\leq` `\geq` `\leg` `\greq`
+  `\nleq` `\prec` `\sqsubseteq` `\asymp` `\vDash` …）、集合与二元运算（`\cup` `\cap` `\uplus` `\circ`
+  `\oplus` `\otimes` `\triangle` …）、箭头（`\to` `\mapsto` `\hookrightarrow` `\Longrightarrow` …）、
+  `\frac` / `\cfrac` / `\binom` / `\sqrt[n]` / `^` `_`、重音与上下括号（`\overline` `\hat` `\vec`
+  `\overbrace` `\underbrace` `\overrightarrow` …）、`\text{}`（内容原样直立）、`\quad` `\,` `\;` 等空白、
+  `\left(\right)` 与 `\big` 系列定界符、`\sum` / `\prod` / `\int` / `\iiiint` / `\oint` 等大算符
+  （**行间公式**把上下限放在符号上下、行内与积分始终放在右侧，与 TeX 一致）、`\Box` / `\dagger` /
+  `\pmod{n}` 这类常用写法，以及 `\mathbf` / `\mathbb` / `\textbf` 等字体命令。
+* **排版开关不显示**：`\displaystyle` / `\textstyle` / `\limits` / `\nolimits` / `\mathstrut` /
+  `\phantom` / `\notag` 这些只说“怎么排”的命令直接丢弃（不会把名字打进公式），而 `\sum\limits_{i=1}^{n}`
+  这类写法仍然把上下限接在算符上。
+* **括号带着上下标**：`(x_i-\mu)^2`、`\left(\frac{n}{e}\right)^n` 里的指数落在**整个括号组**上——成对
+  的定界符合成一个 MathML 组，两侧因此同时被拉到内容高度。否则 MathML 只按同级内容定高，开括号会被
+  指数撑高、闭括号还是原大小，看起来就像上下标挂错了地方。
+* **多行公式排成表格**：`\\` 分行、`&` 分列，`aligned` / `align` / `gather` / `split` / `cases` /
+  `matrix` / `pmatrix` / `bmatrix` / `Bmatrix` / `vmatrix` / `Vmatrix` / `array` 都排成 `<mtable>`
+  （`aligned` 按 TeX 规则在 `&` 处右 / 左交替对齐，`cases` 左侧带 `{`，`array` 按自己的列格式 `lcr`
+  对齐）；没有环境的裸 `\\`（如 `$$a \\ c$$`）排成单列表格。
+* **字体**：`\mathbf` / `\mathbb` 等命令同时写 `mathvariant` 属性与页面样式类——MathML Core 已把
+  `mathvariant` 换成 CSS，Chromium 因此读类（`\mathbf` 真的加粗、`\mathbb{R}` 直接换成 ℝ 这类双线
+  字符），仍实现该属性的引擎则读属性。
+* **公式不会被 Markdown 吃掉**：抽取时跳过围栏代码与行内代码（那里的 `$` 保持为代码），`\$` 是
+  转义美元符，而 `_` `*` `\%` `\{` `\;` 不再触发强调或转义——`x_i^2` 得到的是 x 的上下标。
+* **不会被误判**：单独的 `$`、价格（`$5 and $6`、`US$7`、紧贴单词的 `US$7 cheap`、纯数字的 `x$5$`）都
+  保持原文——行内公式要求 `$` 与内容之间没有空格、内容里没有第二个孤立的 `$`，含空格的正文还必须带
+  反斜杠或运算符这类数学记号；反过来，紧贴单词的公式（`Cauchy$|x|\le 1$`）现在也能识别，而未闭合的
+  `$` 不会再吞掉下一行的文字（闭合符优先在**同一行**里找）。
+* **流式期间**：`$$` 的闭合还没到时不渲染（按原文显示），最终一次重绘时才转成 MathML，与表格、
+  代码块的流式表现一致。
+* **不支持的写法**退化而不是报错：不认识的环境（`\begin{foo}…\end{foo}`）只丢掉命令本身、内容照常
+  排出；未知命令按直立文字显示其名字（`\foo` → `foo`）；`{…}` 仍是分组（不显示花括号，和 TeX 一致，
+  要显示花括号请写 `\{…\}`）；矩阵环境里的 `\hline` 与列分隔线不画。
+* 渲染结果与正文一起过 DOMPurify（MathML 的标签与属性都在它的默认允许清单内），页面既不放行别的
+  标记，也不需要额外白名单；只有表格的 `columnalign` 要显式加回——DOMPurify 的 MathML 属性表把它
+  拼成了 `columnsalign`，所以 `app.js` 的净化调用传 `ADD_ATTR: ['columnalign']`。
 
 ## 复制消息
 

@@ -68,6 +68,15 @@ var authJS string
 //go:embed tts.js
 var ttsJS string
 
+// math.js is the page's formula renderer: it turns the LaTeX subset a reply
+// carries into MathML, which the browser lays out itself (no webfont and no
+// third-party math library — see docs/web.md). It is embedded like the other
+// page files and loaded before app.js, which uses it inside the markdown
+// pipeline.
+//
+//go:embed math.js
+var mathJS string
+
 // maxPortTries is how many ports to attempt when the configured one is busy.
 const maxPortTries = 50
 
@@ -455,6 +464,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/config.js", staticAsset(configJS, "application/javascript; charset=utf-8"))
 	mux.HandleFunc("/auth.js", staticAsset(authJS, "application/javascript; charset=utf-8"))
 	mux.HandleFunc("/tts.js", staticAsset(ttsJS, "application/javascript; charset=utf-8"))
+	mux.HandleFunc("/math.js", staticAsset(mathJS, "application/javascript; charset=utf-8"))
 	if sub, err := fs.Sub(assetsFS, "assets"); err == nil {
 		mux.Handle("/assets/", noCache(http.StripPrefix("/assets/", http.FileServer(http.FS(sub)))))
 	}

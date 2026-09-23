@@ -99,7 +99,7 @@ func signedInClient(t *testing.T, srv *Server, password string) *http.Client {
 // not need to know which file carries a given marker now that the HTML, CSS and
 // JS live in separate embedded files.
 func pageSource() string {
-	return indexHTML + "\n" + appCSS + "\n" + appJS + "\n" + configJS + "\n" + authJS + "\n" + ttsJS
+	return indexHTML + "\n" + appCSS + "\n" + appJS + "\n" + configJS + "\n" + authJS + "\n" + ttsJS + "\n" + mathJS
 }
 
 // TestPageIsPublic checks the shell is served without a session: the sign-in
@@ -785,6 +785,7 @@ func TestIndexAndAssets(t *testing.T) {
 	for _, want := range []string{
 		"assets/marked.min.js",
 		"assets/dompurify.min.js",
+		"math.js",
 		"app.css",
 		"app.js",
 		"auth.js",
@@ -811,6 +812,12 @@ func TestIndexAndAssets(t *testing.T) {
 		if strings.Contains(page, ph) {
 			t.Fatalf("page still carries the unresolved placeholder %s: %s", ph, page)
 		}
+	}
+	// math.js has to load before app.js: the markdown pipeline app.js installs
+	// calls into it (math_test.go checks what it renders).
+	mathAt, appAt := strings.Index(page, `src="math.js"`), strings.Index(page, `src="app.js"`)
+	if mathAt == -1 || appAt == -1 || mathAt > appAt {
+		t.Fatalf("the page must load math.js before app.js: %s", page)
 	}
 
 	// The page's own stylesheet and script are embedded and served with the
@@ -850,6 +857,18 @@ func TestIndexAndAssets(t *testing.T) {
 			t.Errorf("app.js does not build the command rail (%q is missing)", want)
 		}
 	}
+	// The markdown pipeline lifts formulas out through math.js and puts the
+	// rendered MathML back before the result is sanitized.
+	for _, want := range []string{"markdownToHTML", "MathTex.protect", "MathTex.inject"} {
+		if !strings.Contains(string(scriptBody), want) {
+			t.Errorf("app.js does not run the markdown pipeline through math.js (%q is missing)", want)
+		}
+	}
+	// The alignment a formula table asks for has to be added back by hand:
+	// DOMPurify's MathML attribute list spells columnalign "columnsalign".
+	if !strings.Contains(string(scriptBody), "ADD_ATTR: ['columnalign']") {
+		t.Error("app.js does not add columnalign back to the sanitizer")
+	}
 
 	asset, err := http.Get(base + "/assets/marked.min.js")
 	if err != nil {
@@ -862,6 +881,31 @@ func TestIndexAndAssets(t *testing.T) {
 	}
 	if !strings.Contains(string(js), "marked") {
 		t.Fatalf("asset body does not look like marked: %q", string(js)[:80])
+	}
+
+	// The formula renderer is a page script of its own (hand written, not a
+	// vendored library), served like the rest of the UI.
+	mathResp, err := http.Get(base + "/math.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mathBody, _ := io.ReadAll(mathResp.Body)
+	_ = mathResp.Body.Close()
+	if mathResp.StatusCode != http.StatusOK {
+		t.Fatalf("/math.js status = %d, want 200 (the UI is public)", mathResp.StatusCode)
+	}
+	if ct := mathResp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/javascript") {
+		t.Fatalf("/math.js content type = %q", ct)
+	}
+	for _, want := range []string{"window.MathTex", "protect", "inject", "<math>"} {
+		if !strings.Contains(string(mathBody), want) {
+			t.Errorf("math.js does not carry %q", want)
+		}
+	}
+	// A display formula is centred and scrolls sideways instead of overflowing
+	// the row (see the formulas section of app.css).
+	if !strings.Contains(appCSS, ".mtex-block { display:block;") {
+		t.Error("app.css does not lay out a display formula")
 	}
 }
 

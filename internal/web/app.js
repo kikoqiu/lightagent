@@ -246,10 +246,26 @@
   // result with DOMPurify. It returns null when rendering is disabled or the
   // libraries failed to load, so the caller falls back to plain text.
   function mdToHTML(text) {
-    if (!MARKDOWN || typeof marked === 'undefined') { return null; }
+    if (!MARKDOWN) { return null; }
+    return markdownToHTML(text);
+  }
+
+  // markdownToHTML is the one markdown pipeline: the formulas are lifted out of
+  // the text first (marked would read _x_y_ as emphasis and eat the backslash of
+  // \%, \{ and \;), the rest goes through marked, the MathML is put back where
+  // the placeholders are and the whole result is sanitized. math.js owns both
+  // ends of that (protect/inject).
+  function markdownToHTML(text) {
+    if (typeof marked === 'undefined') { return null; }
     try {
-      var html = marked.parse(text, { gfm: true, breaks: true });
-      if (typeof DOMPurify !== 'undefined') { html = DOMPurify.sanitize(html); }
+      var lifted = (typeof MathTex !== 'undefined') ? MathTex.protect(text) : null;
+      var html = marked.parse(lifted ? lifted.text : text, { gfm: true, breaks: true });
+      if (lifted) { html = MathTex.inject(html, lifted.items); }
+      if (typeof DOMPurify !== 'undefined') {
+        // DOMPurify's MathML attribute list spells columnalign "columnsalign", so
+        // the alignment a formula table asks for is added back explicitly.
+        html = DOMPurify.sanitize(html, { ADD_ATTR: ['columnalign'] });
+      }
       return html;
     } catch (e) {
       return null;
@@ -855,13 +871,8 @@
   // last resort — so the entry is never empty.
   function rowHTML(span, source) {
     if (span.classList.contains('md')) { return span.innerHTML; }
-    if (typeof marked !== 'undefined') {
-      try {
-        var html = marked.parse(source, { gfm: true, breaks: true });
-        if (typeof DOMPurify !== 'undefined') { html = DOMPurify.sanitize(html); }
-        return html;
-      } catch (e) { /* not markdown after all: fall through to the escaped text */ }
-    }
+    var html = markdownToHTML(source);
+    if (html !== null) { return html; }
     return escapeHTML(source).replace(/\n/g, '<br>');
   }
 

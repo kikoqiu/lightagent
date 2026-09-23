@@ -313,6 +313,27 @@
   .text.md th, .text.md td { border:1px solid var(--border); padding:6px 11px; text-align:left; }
   .text.md th { background:var(--bg-elev); }
   .text.md tbody tr:nth-child(even) { background:rgba(16,22,31,.7); }
+
+  /* ---- formulas (MathML) ---- */
+  /* math.js turns the formulas in a reply into MathML, which the browser lays out
+     itself (see docs/web.md). No font family is set: the engine's own math font
+     is the right one, and the fallback when a formula is not recognised is the
+     text it was written from. A display formula is centred, and a wide one
+     scrolls sideways on a phone instead of overflowing the row. */
+  .mtex { font-size:1.06em; }
+  .mtex-block { display:block; margin:9px 0; text-align:center; overflow-x:auto; overflow-y:hidden; }
+  .mtex-block math { white-space:nowrap; }
+  /* MathML Core replaced mathvariant with CSS: math.js writes both, so Firefox
+     and MathJax read the attribute while Chromium reads these classes. \mathbb
+     needs none of them — it is the real double-struck character by then. */
+  .mtex .mv-normal { font-style:normal; }
+  .mtex .mv-italic { font-style:italic; }
+  .mtex .mv-bold { font-weight:700; }
+  .mtex .mv-bolditalic { font-weight:700; font-style:italic; }
+  .mtex .mv-sans { font-family:ui-sans-serif, Arial, sans-serif; }
+  .mtex .mv-mono { font-family:ui-monospace, Consolas, monospace; }
+  .mtex .mv-script { font-family:"Apple Chancery", "Segoe Script", "URW Chancery L", cursive; }
+  .mtex .mv-fraktur { font-family:"Old English Text MT", "UnifrakturMaguntia", fantasy; }
   /* ---- composer ---- */
   footer {
     flex:0 0 auto;

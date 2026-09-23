@@ -24,6 +24,9 @@
 <link rel="stylesheet" href="app.css">
 <script src="assets/marked.min.js"></script>
 <script src="assets/dompurify.min.js"></script>
+<!-- math.js renders the $…$ and $$…$$ formulas in a reply as MathML. app.js uses
+     it inside the markdown pipeline, so it has to load first. -->
+<script src="math.js"></script>
 </head>
 <body>
 <div class="app">
