@@ -390,6 +390,91 @@
     background:var(--bg-elev); box-shadow:var(--shadow);
   }
 
+  /* ---- copy control on a message row ---- */
+  /* The icon rides in the role line, right next to the label it belongs to: to
+     the right of "agent", to the left of "you" (a user message hugs the right
+     edge of the log, so its icon is mirrored to stay on the message's side). The
+     item the button sits in has no size of its own and the button floats out of
+     it, so the line keeps its exact height and width — nothing moves whether the
+     icon is on screen or not, and an invisible icon cannot swallow a click. A
+     desktop asks for the icon with a hover (or with the keyboard focus), a touch
+     screen — which has no hover — with a long press on the row (see app.js). */
+  .role.with-actions { display:flex; align-items:center; }
+  .user .role.with-actions { justify-content:flex-end; }
+  .row-actions {
+    position:relative; flex:0 0 auto; width:0; height:0;
+    opacity:0; pointer-events:none;
+    transition:opacity .15s linear;
+  }
+  .user .role .row-actions { order:-1; }
+  .row:hover .row-actions,
+  .row:focus-within .row-actions,
+  .row.show-actions .row-actions { opacity:1; pointer-events:auto; }
+  /* The button itself: transparent, centred on the role line and 6px away from
+     the label, so it never reaches the message text below (the line's band plus
+     the gap above it is all it uses). */
+  .row-actions button.copy {
+    position:absolute; top:0; left:6px; width:24px; height:24px;
+    min-height:0; padding:0; border:0; border-radius:7px;
+    display:flex; align-items:center; justify-content:center;
+    background:transparent; color:var(--fg-dim); box-shadow:none;
+    transform:translateY(-50%);
+  }
+  .user .role .row-actions button.copy { left:auto; right:6px; }
+  .row-actions button.copy svg { width:13px; height:13px; display:block; }
+  .row-actions button.copy svg path { fill:none; stroke:currentColor; stroke-width:1.4; stroke-linecap:round; stroke-linejoin:round; }
+  .row:hover .row-actions button.copy,
+  .row.show-actions .row-actions button.copy { color:var(--fg-muted); }
+  .row-actions button.copy:hover,
+  .row-actions button.copy:focus-visible { color:var(--fg); background:rgba(90,162,255,.16); }
+  /* The menu: a compact segmented panel that names the three flavours, hanging
+     under the icon. It is translucent — the transcript stays faintly visible
+     through it — and rises into place with one short animation (a reader who
+     asked for less motion gets it without the movement). */
+  .copy-pop {
+    position:absolute; left:0; top:0; z-index:40;
+    display:flex; flex-wrap:wrap; align-items:center; gap:2px;
+    max-width:calc(100% - 16px); padding:3px;
+    background:rgba(16,23,34,.72);
+    -webkit-backdrop-filter:blur(12px) saturate(150%);
+    backdrop-filter:blur(12px) saturate(150%);
+    border:1px solid rgba(122,152,192,.26); border-radius:11px;
+    box-shadow:0 20px 44px -24px rgba(0,0,0,.95), inset 0 1px 0 rgba(255,255,255,.05);
+    transform-origin:top center;
+    animation:copy-down .16s linear both;
+  }
+  .copy-pop[hidden] { display:none; }
+  /* Opened upwards (there was no room below): the same rise, from the floor. */
+  .copy-pop.flip { transform-origin:bottom center; animation-name:copy-up; }
+  @keyframes copy-down { from { opacity:0; transform:translateY(-5px) scale(.94); } }
+  @keyframes copy-up { from { opacity:0; transform:translateY(5px) scale(.94); } }
+  .copy-pop button {
+    width:30px; height:28px; min-height:0; padding:0; border:0; border-radius:8px;
+    display:flex; align-items:center; justify-content:center;
+    background:transparent; color:var(--fg-muted); box-shadow:none;
+  }
+  .copy-pop button svg { width:14px; height:14px; display:block; }
+  .copy-pop button svg path { fill:none; stroke:currentColor; stroke-width:1.35; stroke-linecap:round; stroke-linejoin:round; }
+  .copy-pop button:hover { background:rgba(90,162,255,.20); color:var(--fg); filter:none; }
+  /* The flavour that was just copied: green for as long as its menu is up (the
+     mark is cleared when the menu closes, see clearCopyMarks in app.js). */
+  .copy-pop button.done { color:var(--green); }
+  /* The outcome line ("copied"): a small pill floating under the panel. It is
+     positioned out of the panel's own flow on purpose — as a flex item of a
+     shrink-to-fit container its text would set the menu's width, so a longer
+     message would blow the menu up the moment a copy finished. */
+  .copy-note {
+    position:absolute; left:0; top:100%; margin-top:6px;
+    width:max-content; max-width:min(240px, 70vw);
+    padding:3px 9px 4px; border-radius:8px;
+    background:rgba(16,23,34,.86); color:var(--fg-muted); font-size:10.5px;
+    box-shadow:0 12px 26px -18px rgba(0,0,0,.9);
+    pointer-events:none;
+  }
+  .copy-note:empty { display:none; }
+  /* Opened upwards (no room below): the pill hangs the other way, over the panel. */
+  .copy-pop.flip .copy-note { top:auto; bottom:100%; margin:0 0 6px; }
+
   /* ---- config editor: control form + raw JSON mode ---- */
   /* The gear lives in the header (all layouts) and in the side rail card, so the
      editor is reachable on phones too. */
@@ -620,14 +705,22 @@
     header button.signout .signout-label { display:none; }
     header .run { padding:3px 8px; }
     header .run #runText { display:none; }
+    /* The copy icon is a real tap target on a touch screen. The box grows, the
+       glyph barely does, and the box stays centred on the role line: nothing
+       reaches the message text below. The menu's entries grow with it. */
+    .row-actions button.copy { width:32px; height:32px; }
+    .row-actions button.copy svg { width:15px; height:15px; }
+    .copy-pop button { width:36px; height:32px; }
+    .copy-pop button svg { width:15px; height:15px; }
     button { padding:0 14px; }
   }
   @media (max-height: 460px) {
     header .brand small { display:none; }
   }
-  /* The reduced-motion preference stills the transcript's entrance animation;
-     the busy spinner deliberately keeps turning. It is the only cue that the
-     agent is working, and a frozen ring reads as a hung UI. */
+  /* The reduced-motion preference stills the transcript's entrance animation and
+     the copy menu's rise; the busy spinner deliberately keeps turning. It is the
+     only cue that the agent is working, and a frozen ring reads as a hung UI. */
   @media (prefers-reduced-motion: reduce) {
     .row { animation:none; }
+    .copy-pop { animation:none; }
   }

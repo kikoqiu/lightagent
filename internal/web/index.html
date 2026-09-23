@@ -202,6 +202,40 @@
       </div>
     </div>
   </div>
+  <!-- The copy menu of a transcript row: one shared popup that app.js moves to
+       the Copy button of the row it acts on (a row carries its own text; see the
+       copy section of app.js). Three flavours leave one message on the
+       clipboard: the markdown source as written, the rendered HTML block (for a
+       rich editor) and the plain text the row reads as. It lives inside .app,
+       the page's positioning context, because the layout never uses fixed
+       positioning — a phone's dynamic viewport would drag such an overlay
+       around. -->
+  <div class="copy-pop" id="copyPop" role="menu" aria-label="copy this message" hidden>
+    <!-- Icon-only entries: the glyph says which flavour, the tooltip and the
+         note that follows a copy name it in words. -->
+    <button type="button" role="menuitem" data-copy="markdown"
+            title="copy as markdown (the message as it was written)" aria-label="copy as markdown">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path d="M2.1 11.1V5.3l2.6 3 2.6-3v5.8"/>
+        <path d="M11.5 5.3v5.8m-1.7-1.9 1.7 1.9 1.7-1.9"/>
+      </svg>
+    </button>
+    <button type="button" role="menuitem" data-copy="html"
+            title="copy as HTML (the rendered message, for a rich editor)" aria-label="copy as HTML">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path d="M5.3 4.4 2.1 8l3.2 3.6"/>
+        <path d="M10.7 4.4 13.9 8l-3.2 3.6"/>
+        <path d="M9.2 3.5 6.8 12.5"/>
+      </svg>
+    </button>
+    <button type="button" role="menuitem" data-copy="text"
+            title="copy as plain text (what the row reads as)" aria-label="copy as plain text">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path d="M2.6 4.6h10.8M2.6 8h10.8M2.6 11.4h6.2"/>
+      </svg>
+    </button>
+    <span class="copy-note" id="copyNote" role="status" aria-live="polite"></span>
+  </div>
   <div class="modal login" id="loginModal" hidden>
     <div class="modal-backdrop"></div>
     <div class="modal-panel login-panel" role="dialog" aria-modal="true" aria-labelledby="loginTitle">

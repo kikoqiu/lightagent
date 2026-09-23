@@ -10,6 +10,8 @@
   var attachEl = document.getElementById('attach');
   var attachFileEl = document.getElementById('attachFile');
   var attachmentsEl = document.getElementById('attachments');
+  var copyPop = document.getElementById('copyPop');
+  var copyNote = document.getElementById('copyNote');
   var current = null;
   var currentText = '';
   // pendingRows holds the rows of messages this page submitted while the turn was
@@ -267,6 +269,13 @@
   var mdFlushScheduled = false;
   var MD_SLICE_MS = 8;
 
+  // rowSource remembers the text a row was drawn from, keyed by that row's text
+  // span: the copy control hands a row back exactly as it was written, whatever
+  // the /markdown switch is rendering on screen. Every update goes through
+  // setSpan — the live stream and a replayed snapshot alike — so a row restored
+  // by a reconnect copies like a fresh one.
+  var rowSource = new WeakMap();
+
   // applyMarkdown renders one row's text as markdown, falling back to plain
   // text when rendering is off or the libraries are missing.
   function applyMarkdown(span, text) {
@@ -318,6 +327,9 @@
   }
 
   function setSpan(span, text, renderMD) {
+    // The source text is kept aside before anything is drawn: the copy control
+    // needs it in every branch below.
+    if (span) { rowSource.set(span, text); }
     // While a snapshot is being replayed the markdown pass is deferred: the row
     // is drawn as plain text now and upgraded in an idle slice (see
     // queueMarkdown). Parsing thousands of rows in one synchronous pass is what
@@ -402,17 +414,26 @@
   function buildRow(cls, role, text, renderMD, attachments) {
     var row = document.createElement('div');
     row.className = 'row ' + cls;
+    var label = null;
     if (role) {
-      var r = document.createElement('span');
-      r.className = 'role';
-      r.textContent = role;
-      row.appendChild(r);
+      label = document.createElement('span');
+      label.className = 'role';
+      label.textContent = role;
+      row.appendChild(label);
     }
     var t = document.createElement('span');
     setSpan(t, text, renderMD);
     row.appendChild(t);
     var media = mediaList(attachments);
     if (media) { row.appendChild(media); }
+    // The messages the user wrote and the replies the agent produced can be
+    // copied away: their control rides in the role line, next to the label it
+    // belongs to (app.css keeps it out of the flow, so the line is untouched
+    // until the icon is asked for).
+    if (copyableRow(cls)) {
+      if (label) { label.classList.add('with-actions'); }
+      (label || row).appendChild(copyControl(row));
+    }
     return row;
   }
 
@@ -574,6 +595,394 @@
     // messages too.
     placeRow(row);
     return row;
+  }
+
+  // ---- copy ----
+  // Every user message and every agent reply can leave the page on the clipboard
+  // in three flavours: markdown (the message as it was written), HTML (the
+  // rendered block, so a rich editor keeps the formatting) and text (what the row
+  // reads as on screen). The control is a transparent icon tucked into the row's
+  // role line, next to the label it belongs to, and it stays out of sight until
+  // the reader asks for it — a desktop asks with a hover (app.css), a touch
+  // screen, which has no hover, with a long press (see the long press section).
+  // COPY_DONE_MS is how long the "copied" note (and the open menu) stays.
+  var COPY_DONE_MS = 900;
+  // copyTarget is the row the open menu acts on, copyButton the control it was
+  // opened from and copyTimer the note's own clock.
+  var copyTarget = null;
+  var copyButton = null;
+  var copyTimer = null;
+
+  // copyableRow reports whether a row carries a copy control: the messages the
+  // user wrote (a pending one too — its text is the message) and the replies the
+  // agent produced.
+  function copyableRow(cls) {
+    return cls === 'user' || cls === 'user pending' || cls === 'assistant';
+  }
+
+  // copyGlyph draws the control's icon: two overlapping sheets, stroked with the
+  // page's own colour (currentColor), so it reads as a transcript affordance and
+  // not as a button with a label of its own.
+  function copyGlyph() {
+    var NS = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    var back = document.createElementNS(NS, 'path');
+    back.setAttribute('d', 'M10.4 5.9V4.1a1.6 1.6 0 0 0-1.6-1.6H4.1a1.6 1.6 0 0 0-1.6 1.6v4.7a1.6 1.6 0 0 0 1.6 1.6h1.8');
+    var front = document.createElementNS(NS, 'path');
+    front.setAttribute('d', 'M7.6 5.9h4.3a1.6 1.6 0 0 1 1.6 1.6v4.4a1.6 1.6 0 0 1-1.6 1.6H7.6A1.6 1.6 0 0 1 6 11.9V7.5a1.6 1.6 0 0 1 1.6-1.6z');
+    svg.appendChild(back);
+    svg.appendChild(front);
+    return svg;
+  }
+
+  // copyControl builds one row's copy control: a transparent icon button that
+  // opens the shared menu on the row it belongs to. It carries no text of its
+  // own — the role line of the message is where it lives, and the menu names the
+  // three flavours.
+  function copyControl(row) {
+    var box = document.createElement('span');
+    box.className = 'row-actions';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy';
+    btn.title = 'copy this message as markdown, HTML or text';
+    btn.setAttribute('aria-label', 'copy this message');
+    btn.setAttribute('aria-haspopup', 'menu');
+    btn.setAttribute('aria-expanded', 'false');
+    btn.appendChild(copyGlyph());
+    btn.onclick = function (e) {
+      // The popup lives outside the row: this click must not reach the document
+      // handler that closes it.
+      e.stopPropagation();
+      if (copyPop && !copyPop.hidden && copyTarget === row) { closeCopyMenu(); return; }
+      openCopyMenu(row, btn);
+    };
+    box.appendChild(btn);
+    return box;
+  }
+
+  // ---- revealing the icon without a hover ----
+  // A touch screen has no hover, so the icon is brought up by a long press on the
+  // row itself (and by a plain tap, which does nothing else on a message): the
+  // revealed row keeps it until the reader taps somewhere else. The press is
+  // measured the way every long press is — a finger that drifts (a scroll) or
+  // lifts early is not one.
+  var LONG_PRESS_MS = 450;
+  var LONG_PRESS_SLOP = 10; // pixels a finger may drift while the press runs
+  var longPressTimer = null;
+  var longPressRow = null;
+  var longPressFrom = null;
+  var longPressAt = 0;
+  var revealedRow = null;
+
+  // touchScreen reports a device whose pointer has no hover: there app.css cannot
+  // reveal the icon, so the page has to.
+  function touchScreen() {
+    return !!(coarseQuery && coarseQuery.matches);
+  }
+
+  // copyRowOf walks up from an event target to the transcript row it belongs to.
+  function copyRowOf(node) {
+    while (node && node !== log) {
+      if (node.classList && node.classList.contains('row')) { return node; }
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  function revealCopyControl(row) {
+    if (!row || revealedRow === row) { return; }
+    hideCopyControl();
+    revealedRow = row;
+    row.classList.add('show-actions');
+  }
+
+  function hideCopyControl() {
+    if (!revealedRow) { return; }
+    revealedRow.classList.remove('show-actions');
+    revealedRow = null;
+  }
+
+  function cancelLongPress() {
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    longPressRow = null;
+    longPressFrom = null;
+    longPressAt = 0;
+  }
+
+  function onCopyTouchStart(e) {
+    if (e.touches.length !== 1) { cancelLongPress(); return; }
+    var row = copyRowOf(e.target);
+    if (!row || !row.querySelector('.row-actions')) { cancelLongPress(); return; }
+    longPressRow = row;
+    longPressFrom = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    longPressAt = Date.now();
+    // The press reveals the icon as soon as it is long enough; the press record
+    // stays for touchend, which is what suppresses the click such a press would
+    // otherwise turn into (see onCopyTouchEnd).
+    longPressTimer = setTimeout(function () {
+      longPressTimer = null;
+      revealCopyControl(longPressRow);
+    }, LONG_PRESS_MS);
+  }
+
+  // onCopyTouchEnd finishes the press. A press that lasted long enough reveals
+  // the icon even if its timer was late — a page in the background has its timers
+  // throttled while the events still arrive on time. The click the browser
+  // synthesizes for that press is dropped: the icon it just brought up must not
+  // be toggled away by it. This is why this listener is not passive.
+  function onCopyTouchEnd(e) {
+    var row = longPressRow;
+    var held = longPressAt ? Date.now() - longPressAt : 0;
+    cancelLongPress();
+    if (!row || held < LONG_PRESS_MS) { return; }
+    if (e.cancelable) { e.preventDefault(); }
+    revealCopyControl(row);
+  }
+
+  function onCopyTouchMove(e) {
+    if (!longPressFrom || e.touches.length !== 1) { return; }
+    var dx = e.touches[0].clientX - longPressFrom.x;
+    var dy = e.touches[0].clientY - longPressFrom.y;
+    if (dx * dx + dy * dy > LONG_PRESS_SLOP * LONG_PRESS_SLOP) { cancelLongPress(); }
+  }
+
+  // openCopyMenu shows the menu next to the button that opened it. The button
+  // keeps the focus: the entries are one Tab away, Escape comes back here, and a
+  // phone must not raise its keyboard for a menu tap.
+  function openCopyMenu(row, btn) {
+    if (!copyPop) { return; }
+    if (copyTimer) { clearTimeout(copyTimer); copyTimer = null; }
+    // The marks of the previous copy go first: a menu always opens with its
+    // entries in their idle colour.
+    clearCopyMarks();
+    if (copyNote) { copyNote.textContent = ''; }
+    copyTarget = row;
+    copyButton = btn;
+    btn.setAttribute('aria-expanded', 'true');
+    copyPop.hidden = false;
+    placeCopyMenu(btn);
+    try { btn.focus(); } catch (err) { /* focus is a nicety */ }
+  }
+
+  // closeCopyMenu hides the menu and forgets the row it acted on.
+  function closeCopyMenu() {
+    if (copyTimer) { clearTimeout(copyTimer); copyTimer = null; }
+    if (copyButton) {
+      copyButton.setAttribute('aria-expanded', 'false');
+      copyButton = null;
+    }
+    copyTarget = null;
+    clearCopyMarks();
+    if (!copyPop || copyPop.hidden) { return; }
+    copyPop.hidden = true;
+    if (copyNote) { copyNote.textContent = ''; }
+  }
+
+  // clearCopyMarks puts the entries back to their idle colour. The green says
+  // "this is the flavour you just copied" and is only meant to last as long as
+  // the menu that copied it — otherwise the next row's menu would open with one
+  // entry still green, which reads as the state of the page rather than as a
+  // remark about the copy that is over.
+  function clearCopyMarks() {
+    if (!copyPop) { return; }
+    var done = copyPop.querySelectorAll('button.done');
+    for (var i = 0; i < done.length; i++) { done[i].classList.remove('done'); }
+  }
+
+  // placeCopyMenu puts the popup next to the button that opened it. It lives
+  // inside .app — the popup's containing block — so it is never clipped by the
+  // log's own scroll box; it hangs under the button and flips above it (which
+  // also turns its entrance animation around, see the .copy-pop rules) when the
+  // bottom of the page is close.
+  function placeCopyMenu(btn) {
+    var host = copyPop.offsetParent; // .app, while the popup is on screen
+    if (!host) { return; }
+    var box = btn.getBoundingClientRect();
+    var base = host.getBoundingClientRect();
+    var left = box.left - base.left;
+    var rightmost = host.clientWidth - copyPop.offsetWidth - 8;
+    if (left > rightmost) { left = rightmost; }
+    if (left < 8) { left = 8; }
+    var top = box.bottom - base.top + 6;
+    var flip = top + copyPop.offsetHeight > host.clientHeight - 8;
+    if (flip) { top = box.top - base.top - copyPop.offsetHeight - 6; }
+    if (top < 8) { top = 8; }
+    copyPop.classList.toggle('flip', flip);
+    copyPop.style.left = Math.round(left) + 'px';
+    copyPop.style.top = Math.round(top) + 'px';
+  }
+
+  // copyRow hands one row to the clipboard. mode is the flavour the user picked;
+  // an HTML copy carries the plain text too, so a paste into a plain editor stays
+  // clean.
+  function copyRow(row, mode, item) {
+    var span = rowText(row);
+    if (!span) { return; }
+    var source = rowSourceText(span);
+    var text = source;
+    var html = '';
+    if (mode === 'text') { text = rowPlainText(span, source); }
+    else if (mode === 'html') {
+      text = rowPlainText(span, source);
+      html = rowHTML(span, source);
+    }
+    writeClipboard(text, html).then(function (ok) { noteCopied(ok, item); });
+  }
+
+  // rowSourceText is the text the row was drawn from; a span that was never
+  // filled falls back to what it shows.
+  function rowSourceText(span) {
+    var source = rowSource.get(span);
+    return typeof source === 'string' ? source : (span.textContent || '');
+  }
+
+  // rowPlainText is the row as it reads on screen: a markdown-rendered row is
+  // taken from the browser's own rendering of it (the markers are gone), a row
+  // drawn as plain text already is plain text.
+  function rowPlainText(span, source) {
+    if (!span.classList.contains('md')) { return source; }
+    var text = span.innerText;
+    return (typeof text === 'string' && text !== '') ? text : (span.textContent || source);
+  }
+
+  // rowHTML renders a row as HTML for the clipboard: the row's own markup when it
+  // is already rendered, otherwise the source parsed with the same libraries
+  // (which works while the /markdown switch is off too), and escaped text as the
+  // last resort — so the entry is never empty.
+  function rowHTML(span, source) {
+    if (span.classList.contains('md')) { return span.innerHTML; }
+    if (typeof marked !== 'undefined') {
+      try {
+        var html = marked.parse(source, { gfm: true, breaks: true });
+        if (typeof DOMPurify !== 'undefined') { html = DOMPurify.sanitize(html); }
+        return html;
+      } catch (e) { /* not markdown after all: fall through to the escaped text */ }
+    }
+    return escapeHTML(source).replace(/\n/g, '<br>');
+  }
+
+  function escapeHTML(text) {
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // writeClipboard puts text — and, when asked for, an HTML flavour — on the
+  // clipboard. The async Clipboard API exists only in a secure context, and the
+  // mirror is normally reached over plain http (a LAN address, from a phone), so
+  // the older path is the one those pages take. Both are started inside the click
+  // that asked for the copy, which is what iOS Safari requires.
+  function writeClipboard(text, html) {
+    var api = navigator.clipboard;
+    if (window.isSecureContext && api && api.write && typeof ClipboardItem === 'function') {
+      var parts = { 'text/plain': new Blob([text], { type: 'text/plain' }) };
+      if (html) { parts['text/html'] = new Blob([html], { type: 'text/html' }); }
+      return api.write([new ClipboardItem(parts)]).then(function () { return true; },
+        function () { return legacyCopy(text, html); });
+    }
+    return Promise.resolve(legacyCopy(text, html));
+  }
+
+  // legacyCopy copies through a selection, which is how a page without the
+  // Clipboard API does it: an off-screen textarea holds the text, the copy event
+  // carries the HTML flavour (a rich editor takes it, a plain one the text), and
+  // the reader's own selection is put back afterwards. A textarea rather than a
+  // range, because iOS Safari only copies out of a form field.
+  function legacyCopy(text, html) {
+    var holder = document.createElement('textarea');
+    holder.value = text;
+    holder.setAttribute('readonly', 'readonly');
+    holder.setAttribute('aria-hidden', 'true');
+    holder.setAttribute('tabindex', '-1');
+    holder.style.position = 'absolute';
+    holder.style.left = '-9999px';
+    holder.style.top = '0';
+    holder.style.width = '1px';
+    holder.style.height = '1px';
+    document.body.appendChild(holder);
+    var selection = window.getSelection();
+    var saved = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    holder.select();
+    holder.setSelectionRange(0, text.length);
+    var onCopy = function (e) {
+      if (!e.clipboardData) { return; }
+      e.clipboardData.setData('text/plain', text);
+      if (html) { e.clipboardData.setData('text/html', html); }
+      e.preventDefault();
+    };
+    document.addEventListener('copy', onCopy);
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    document.removeEventListener('copy', onCopy);
+    if (holder.parentNode) { holder.parentNode.removeChild(holder); }
+    if (selection) {
+      selection.removeAllRanges();
+      // The saved range can point into a row that is gone by now.
+      if (saved) {
+        try { selection.addRange(saved); } catch (err) { /* nothing to restore */ }
+      }
+    }
+    return ok;
+  }
+
+  // noteCopied reports the outcome in a small pill under the menu and closes it;
+  // a failed copy is the one case worth a hint, and the full advice lives in the
+  // pill's tooltip so the line itself stays short.
+  function noteCopied(ok, item) {
+    if (copyButton) { try { copyButton.focus(); } catch (err) { /* focus is a nicety */ } }
+    if (!ok) {
+      if (copyNote) {
+        copyNote.textContent = 'copy failed';
+        copyNote.title = 'select the text and press Ctrl+C';
+      }
+      return;
+    }
+    if (item && item.classList) { item.classList.add('done'); }
+    if (copyNote) {
+      copyNote.textContent = 'copied';
+      copyNote.title = '';
+    }
+    copyTimer = setTimeout(closeCopyMenu, COPY_DONE_MS);
+  }
+
+  if (copyPop) {
+    // An entry copies the row the menu was opened on.
+    copyPop.addEventListener('click', function (e) {
+      var item = e.target && e.target.closest ? e.target.closest('button[data-copy]') : null;
+      if (!item || !copyTarget) { return; }
+      copyRow(copyTarget, item.getAttribute('data-copy'), item);
+    });
+    // A click on the transcript ends the reveal a long press started, and on a
+    // touch screen it brings up the icon of the row that was tapped instead —
+    // tapping that row again puts it away (the icon itself never gets here: it
+    // stops the event). Any click that moves a row out from under an open menu
+    // closes that too.
+    document.addEventListener('click', function (e) {
+      var row = copyRowOf(e.target);
+      var wasRevealed = revealedRow;
+      hideCopyControl();
+      if (touchScreen() && row && row !== wasRevealed && row.querySelector('.row-actions')) {
+        revealCopyControl(row);
+      }
+      if (copyPop.hidden) { return; }
+      if (copyPop.contains(e.target)) { return; } // an entry handles itself
+      closeCopyMenu();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (!copyPop.hidden && (e.key === 'Escape' || e.keyCode === 27)) { closeCopyMenu(); }
+    });
+    log.addEventListener('scroll', closeCopyMenu, { passive: true });
+    window.addEventListener('resize', closeCopyMenu);
+    // The long press that brings the icon up where there is no hover: the two
+    // listeners that follow a gesture are passive (scrolling and text selection
+    // stay the browser's own gestures), the two that end it are not — touchend
+    // drops the click such a press would turn into.
+    log.addEventListener('touchstart', onCopyTouchStart, { passive: true });
+    log.addEventListener('touchmove', onCopyTouchMove, { passive: true });
+    log.addEventListener('touchend', onCopyTouchEnd);
+    log.addEventListener('touchcancel', cancelLongPress, { passive: true });
   }
 
   // ---- command rail ----
@@ -843,6 +1252,9 @@
     pendingRows = [];
     // The rows the voice was reading are gone: drop its buffers and silence it.
     TTS.reset();
+    // The open copy menu points at a row that is being replaced.
+    closeCopyMenu();
+    hideCopyControl();
     // Nothing queued points at a row in the document any more.
     mdPending.clear();
     replaying = true;
