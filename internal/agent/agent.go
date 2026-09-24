@@ -430,8 +430,6 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		a.startSteeringTurn()
 	}()
 
-	turnStart := a.historyLen()
-	userCount := len(inputs)
 	for _, input := range inputs {
 		a.appendMessage(llm.Message{Role: "user", Content: input.text, Media: input.media})
 	}
@@ -453,6 +451,14 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 	skipCompact := false
 
 	for i := 0; i < a.maxIter; i++ {
+		if ctx.Err() != nil {
+			// The turn was interrupted while the previous step was running
+			// and that step still completed (a tool call that cannot be cut
+			// short is allowed to finish): the turn ends here instead of
+			// asking the model for another reply it would never get.
+			a.finishInterrupt()
+			return
+		}
 		a.drainSteering()
 
 		if skipCompact {
@@ -464,7 +470,9 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		resp, err := a.callLLM(ctx)
 		if err != nil {
 			if turnInterrupted(ctx, err) {
-				a.finishInterrupt(turnStart, userCount)
+				// The reply the provider had already streamed (if any) stays
+				// in the history; the tool calls it carried do not.
+				a.finishInterruptedModelCall(resp)
 				return
 			}
 			// A request the provider rejected for its size is recovered
@@ -561,15 +569,31 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 
 		var pendingSplits []llm.ToolCall
 		for idx, tc := range resp.ToolCalls {
-			res, canceled := a.dispatchToolCall(ctx, tc)
-			if canceled {
-				// The user stopped the turn: report the interrupted call (and
-				// every call after it, so the assistant/tool pairing stays
-				// valid in the next request) and end the turn.
+			if ctx.Err() != nil {
+				if idx == 0 {
+					// The user stopped the turn before the round's first call
+					// could start: the calls come off the reply (none of them
+					// ran, and a reply that is still arriving may hold
+					// fragments) and the message stays only while it has text
+					// left. Nothing is answered — the message no longer asks
+					// for anything — and the turn ends here.
+					a.finishUnstartedToolRound()
+					return
+				}
+				// The user stopped the turn while the previous call was
+				// running and that call returned on its own (a tool that
+				// cannot be cut short finishes, and so does a poll, which
+				// stops waiting). Every call that never started is answered
+				// as interrupted — the calls from this index on, and the
+				// write parts an earlier call still owes — which keeps the
+				// assistant message's tool_calls paired, and the turn ends
+				// without asking the model again.
+				a.reportInterruptedSplits(pendingSplits)
 				a.reportInterruptedTools(resp.ToolCalls, idx)
-				a.finishInterrupt(turnStart, userCount)
+				a.finishInterrupt()
 				return
 			}
+			res := a.dispatchToolCall(ctx, tc)
 			rest, split := continuations[idx]
 			if !split {
 				continue
@@ -602,12 +626,19 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		// once the payload is on disk in order.
 		if len(pendingSplits) > 0 {
 			if !a.runWriteSplits(ctx, pendingSplits) {
-				a.finishInterrupt(turnStart, userCount)
+				a.finishInterrupt()
 				return
 			}
 		}
 	}
 
+	if ctx.Err() != nil {
+		// The last round's call finished after the user interrupted the turn
+		// and the iteration budget is spent: report the interrupted end
+		// instead of a turn that used up all of its rounds.
+		a.finishInterrupt()
+		return
+	}
 	a.bus.Publish(Event{
 		Type: EventInfo,
 		Text: fmt.Sprintf("reached the maximum of %d tool iterations; stopping this turn", a.maxIter),
@@ -621,13 +652,14 @@ func turnInterrupted(ctx context.Context, err error) bool {
 
 // dispatchToolCall publishes one tool call, runs it and records its answer as a
 // tool message, which is what keeps the assistant message's tool_calls paired.
-// It reports the result and whether the turn was cancelled before the call
-// finished.
-func (a *Agent) dispatchToolCall(ctx context.Context, tc llm.ToolCall) (*tools.Result, bool) {
+// The call always ends with an answer: a tool that can react to the turn's
+// cancellation returns early with what it has, and one that cannot is allowed to
+// finish, so the answer is its real result either way.
+func (a *Agent) dispatchToolCall(ctx context.Context, tc llm.ToolCall) *tools.Result {
 	a.bus.Publish(Event{Type: EventToolCall, Name: tc.Function.Name, Args: tc.Function.Arguments})
-	res, canceled := a.executeTool(ctx, tc)
-	if canceled {
-		return nil, true
+	res := a.executeTool(ctx, tc)
+	if res == nil {
+		res = tools.Fail("the tool produced no result")
 	}
 	if a.ToolResultsVisible() {
 		a.bus.Publish(Event{
@@ -644,36 +676,32 @@ func (a *Agent) dispatchToolCall(ctx context.Context, tc llm.ToolCall) (*tools.R
 		Content:    res.ForLLM,
 		Media:      res.Media,
 	})
-	return res, false
+	return res
 }
 
-// executeTool runs one tool call and reports whether the turn was cancelled
-// before it finished. Tools receive the turn context, so those that can observe
-// cancellation (exec_command kills its process) stop promptly instead of
-// blocking the interrupt.
-func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) (*tools.Result, bool) {
-	done := make(chan *tools.Result, 1)
-	go func() {
-		// unlock_tool skips resending a schema that is still present in the
-		// current effective (uncompacted) context: the lookup scans the live
-		// history, from which compaction has already dropped older messages, so
-		// an evicted schema is re-delivered automatically.
-		execCtx := tools.WithUnlockLookup(ctx, func(toolName string) bool {
-			return tools.MessagesContainUnlockRecord(a.History(), toolName)
-		})
-		done <- a.reg.Execute(execCtx, tc.Function.Name, tc.Function.Arguments)
-	}()
-	select {
-	case res := <-done:
-		return res, false
-	case <-ctx.Done():
-		return nil, true
-	}
+// executeTool runs one tool call and waits for its answer. The turn context
+// travels with the call, so the tools that can observe an interrupt return early
+// on their own: exec_command terminates its process tree and reports the output
+// the process had produced until then, manage_session poll stops waiting and
+// reports the output it has (the process keeps running). A tool that cannot be
+// cut short is simply allowed to finish — abandoning it would throw its work
+// away — and its own result is what the call is answered with.
+func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) *tools.Result {
+	// unlock_tool skips resending a schema that is still present in the
+	// current effective (uncompacted) context: the lookup scans the live
+	// history, from which compaction has already dropped older messages, so
+	// an evicted schema is re-delivered automatically.
+	execCtx := tools.WithUnlockLookup(ctx, func(toolName string) bool {
+		return tools.MessagesContainUnlockRecord(a.History(), toolName)
+	})
+	return a.reg.Execute(execCtx, tc.Function.Name, tc.Function.Arguments)
 }
 
-// reportInterruptedTools publishes the interrupted feedback for the call that
-// was stopped and records tool messages for it and every call after it, so the
-// assistant message's tool_calls all have a matching answer.
+// reportInterruptedTools publishes the interrupted feedback for every call from
+// from on and records a tool message for each of them, so the assistant
+// message's tool_calls all have a matching answer. These calls never started:
+// the turn was interrupted after the call before them had returned. The answers
+// are recorded only — the turn ends here, so the model is never asked with them.
 func (a *Agent) reportInterruptedTools(calls []llm.ToolCall, from int) {
 	for i := from; i < len(calls); i++ {
 		a.bus.Publish(Event{
@@ -686,52 +714,115 @@ func (a *Agent) reportInterruptedTools(calls []llm.ToolCall, from int) {
 			Role:       "tool",
 			ToolCallID: calls[i].ID,
 			Name:       calls[i].Function.Name,
-			Content:    "interrupted by user before the tool finished",
+			Content:    "interrupted by user before the call started",
 		})
 	}
 }
 
-// finishInterrupt ends a turn that the user cancelled. When the turn produced
-// nothing yet (it was cancelled while waiting for the model), the user records it
-// appended are dropped so the conversation is left exactly as it was before the
-// turn; otherwise the records stay and only a marker is reported. The next user
-// message then starts a fresh turn. userCount is how many user messages the turn
-// recorded.
-func (a *Agent) finishInterrupt(turnStart, userCount int) {
-	if a.rollbackTurn(turnStart, userCount) {
-		a.bus.Publish(Event{
-			Type: EventInterrupted,
-			Text: "interrupted while waiting for the model; the pending message was discarded",
-		})
-		return
+// finishUnstartedToolRound ends a tool round the user interrupted before its
+// first call could start. The reply keeps its text but loses every tool call it
+// carried, and the message goes too when that leaves it without text — an
+// assistant message without content has nothing to tell the next request. No tool
+// answer is recorded: the message no longer asks for anything, and the turn ends
+// here, so the model is never asked with these results.
+func (a *Agent) finishUnstartedToolRound() {
+	dropped, messageGone := a.dropUnstartedToolCalls()
+	text := fmt.Sprintf("interrupted before any tool call started; the reply was kept without its %d tool call(s)", dropped)
+	if messageGone {
+		text = fmt.Sprintf("interrupted before any tool call started; the reply had no text, so it and its %d tool call(s) were dropped", dropped)
 	}
-	a.bus.Publish(Event{Type: EventInterrupted, Text: "interrupted; the turn was stopped"})
+	a.bus.Publish(Event{Type: EventInterrupted, Text: text})
 }
 
-// rollbackTurn drops the records appended for this turn when nothing else was
-// produced. It reports whether it rolled back.
-func (a *Agent) rollbackTurn(turnStart, userCount int) bool {
+// dropUnstartedToolCalls takes the tool calls off the reply the user interrupted
+// before any of them could start, and drops the message itself when it has no
+// text left. It reports how many calls were dropped and whether the message went
+// with them.
+func (a *Agent) dropUnstartedToolCalls() (int, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	end := turnStart + userCount
-	if len(a.history) != end {
-		// Something was produced (or the history moved on): nothing to drop.
+	n := len(a.history)
+	if n == 0 || a.history[n-1].Role != "assistant" {
+		return 0, false
+	}
+	dropped := len(a.history[n-1].ToolCalls)
+	a.history[n-1].ToolCalls = nil
+	if strings.TrimSpace(a.history[n-1].Content) == "" {
+		a.history = a.history[:n-1]
+		return dropped, true
+	}
+	return dropped, false
+}
+
+// finishInterruptedModelCall ends a turn the user interrupted while the model was
+// answering. The user message always stays: an interrupt never rewrites what the
+// user sent. What is dropped is the assistant side of the turn —
+//
+//   - text the provider had already delivered is kept as one assistant message
+//     (see keepPartialReply);
+//   - a reply whose text is empty after trimming (thinking or tool calls only) is
+//     dropped entirely, because an assistant message without content has nothing
+//     to tell the next request;
+//   - a reply that never arrived leaves no record at all.
+//
+// Whatever is kept travels with the next user message, never as a call of its own.
+func (a *Agent) finishInterruptedModelCall(resp *llm.Response) {
+	switch {
+	case a.keepPartialReply(resp):
+		a.bus.Publish(Event{
+			Type: EventInterrupted,
+			Text: "interrupted while the reply was streaming; the partial reply was kept",
+		})
+	case resp == nil || (resp.Content == "" && resp.Reasoning == "" && len(resp.ToolCalls) == 0):
+		a.bus.Publish(Event{
+			Type: EventInterrupted,
+			Text: "interrupted while waiting for the model; nothing had been produced",
+		})
+	default:
+		text := "interrupted; the reply had no text, so its message was dropped"
+		if n := len(resp.ToolCalls); n > 0 {
+			text = fmt.Sprintf("interrupted; the reply had no text, so its message and its %d tool call(s) were dropped", n)
+		}
+		a.bus.Publish(Event{Type: EventInterrupted, Text: text})
+	}
+}
+
+// keepPartialReply records the reply a cancelled model call had streamed so far
+// as one assistant message: its text (with the thinking that came with it) is
+// kept, the tool calls it carried are not. None of those calls started, and the
+// reply never finished, so even a call that looks complete can be a fragment; the
+// turn ends here, which means nothing would ever run them. It reports whether a
+// message was kept — a reply whose text is empty after trimming has nothing to
+// contribute to the next request — and the kept text is published as the
+// assistant row the front-ends had been streaming, so the row is finalized live
+// and replayed from the mirror.
+func (a *Agent) keepPartialReply(resp *llm.Response) bool {
+	if resp == nil || strings.TrimSpace(resp.Content) == "" {
 		return false
 	}
-	for _, m := range a.history[turnStart:end] {
-		if m.Role != "user" {
-			return false
-		}
+	a.appendMessage(llm.Message{
+		Role:             "assistant",
+		Content:          resp.Content,
+		ReasoningContent: resp.Reasoning,
+	})
+	a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content})
+	if n := len(resp.ToolCalls); n > 0 {
+		a.bus.Publish(Event{
+			Type: EventInfo,
+			Text: fmt.Sprintf("the interrupted reply carried %d tool call(s); none of them ran and they were dropped", n),
+		})
 	}
-	a.history = a.history[:turnStart]
 	return true
 }
 
-// historyLen returns the number of recorded messages.
-func (a *Agent) historyLen() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return len(a.history)
+// finishInterrupt ends a turn the user cancelled after the turn had already
+// produced records: the tool round that was interrupted (the running call's own
+// answer plus the interrupted answers of the calls that never started) stays in
+// the history and only a marker is reported. The user messages stay too — an
+// interrupt never rewrites what the user sent — and the next user message starts
+// a fresh turn whose request carries everything recorded here.
+func (a *Agent) finishInterrupt() {
+	a.bus.Publish(Event{Type: EventInterrupted, Text: "interrupted; the turn was stopped"})
 }
 
 // callLLM performs one completion over the current context.

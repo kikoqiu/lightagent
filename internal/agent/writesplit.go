@@ -94,16 +94,35 @@ func (a *Agent) autoSplitWriteCalls(calls []llm.ToolCall) map[int][]llm.ToolCall
 // own assistant message followed by its tool result, so the model afterwards
 // sees a chain of completed writes. It reports whether the turn ran to the end
 // (false when the user cancelled it).
+//
+// A write_file whose payload exceeds the per-call limit is simply spread over
+// several write calls, so these parts are ordinary calls of the same batch the
+// model issued in that one reply — they get no treatment of their own on an
+// interrupt: the part in flight is answered with its real result and the parts
+// after it, like any call that never started, are answered as interrupted (see
+// the interrupt rules in docs/architecture.md).
 func (a *Agent) runWriteSplits(ctx context.Context, calls []llm.ToolCall) bool {
-	for _, call := range calls {
-		a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{call}})
-		if _, canceled := a.dispatchToolCall(ctx, call); canceled {
-			a.reportInterruptedTools([]llm.ToolCall{call}, 0)
+	for i, call := range calls {
+		if ctx.Err() != nil {
+			a.reportInterruptedSplits(calls[i:])
 			return false
 		}
+		a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{call}})
+		a.dispatchToolCall(ctx, call)
 		a.bus.Publish(a.usageEvent())
 	}
 	return true
+}
+
+// reportInterruptedSplits answers the calls of an interrupted round that never
+// started: every one still gets its assistant message — a write part is recorded
+// as the call it is — together with an interrupted answer that matches it, so the
+// assistant/tool pairing stays complete in the next request.
+func (a *Agent) reportInterruptedSplits(calls []llm.ToolCall) {
+	for _, call := range calls {
+		a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{call}})
+		a.reportInterruptedTools([]llm.ToolCall{call}, 0)
+	}
 }
 
 // encodeWriteArgs renders one planned call's arguments back into the JSON string

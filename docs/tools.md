@@ -72,6 +72,10 @@ type Tool interface {
   内容（同一状态出现在两次调用里是允许的——那是下一次调用自己的事）。从未被就地改写的未完成行
   （如不带换行的提示符）照常立即可见。交出的内容随后按 `max_lines`/`max_chars` 做头尾折叠，上限
   只约束**本次调用**（不跨调用、不按进程生命周期累计）。
+* **被用户中断**（回合的中断 / Stop）：`exec_command` 是唯一**不允许继续跑**的调用——整棵进程
+  树被强制结束，返回同一份 JSON 契约、`status=interrupted`，`output` 就是进程被终止前已经打印的
+  内容（没有输出则为空），`session_id` 为 `null`（没有任何东西留在后台）。恰好在中断时退出的
+  进程仍按 `completed` 报告。
 
 参数：
 
@@ -90,15 +94,15 @@ type Tool interface {
 
 ```json
 {
-  "status": "completed",   // completed | running | failed
-  "exit_code": 0,          // status != running 时存在
+  "status": "completed",   // completed | running | failed | interrupted
+  "exit_code": 0,          // 进程已退出时存在（running / interrupted 时为 null）
   "session_id": null,      // status == running 时存在
   "output": "...",
   "truncated": false,
   "total_lines": 1,
   "total_bytes": 5,
   "elapsed_seconds": 0.51,
-  "warning": null
+  "warning": null          // 附注，例如 poll 被中断（进程仍在运行）
 }
 ```
 
@@ -142,6 +146,8 @@ type Tool interface {
   `status=completed` 且带 `exit_code`。因此进度条按每次 poll 当时的状态进入上下文，而两次 poll
   之间被覆盖掉的中间刷新不会出现。`max_lines`/`max_chars` 只约束**本次 poll** 返回的量（不跨
   poll、不按进程生命周期累计）：上限是「这一次交给模型多少」，而不是「这个进程一共交给模型多少」。
+  等待可被**回合中断**取消：中断像 `wait_timeout` 到期一样结束等待，`warning` 说明 poll 被中断
+  而进程仍在运行——poll 只是观察者，绝不去动它监视的进程；下一次 poll 继续接着读。
 * `input`：写入 stdin。纯控制键会被翻译：`ctrl-c`、`ctrl-d`、`ctrl-z`、`enter`/`return`、
   `tab`、`esc`、`up`/`down`/`left`/`right`、`backspace`；其余文本原样写入（如需换行请写 `"\n"`）。
   stdio 编码在 `exec_command` 启动该会话时已确定（Windows 上的 `use_utf8`），`manage_session` 不再另行选择。

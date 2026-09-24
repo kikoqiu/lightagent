@@ -94,7 +94,7 @@ func (t *ManageSessionTool) Execute(ctx context.Context, args map[string]any) *R
 	case "list":
 		return t.executeList(start)
 	case "poll":
-		return t.executePoll(start, args, waitTimeout, maxLines, maxChars)
+		return t.executePoll(ctx, start, args, waitTimeout, maxLines, maxChars)
 	case "input":
 		return t.executeInput(start, args)
 	case "kill":
@@ -152,7 +152,7 @@ func (t *ManageSessionTool) executeList(start time.Time) *Result {
 	}).toResultInfo()
 }
 
-func (t *ManageSessionTool) executePoll(start time.Time, args map[string]any, waitTimeout time.Duration, maxLines, maxChars int) *Result {
+func (t *ManageSessionTool) executePoll(ctx context.Context, start time.Time, args map[string]any, waitTimeout time.Duration, maxLines, maxChars int) *Result {
 	session, failResult := t.lookup(start, args, "poll")
 	if failResult != nil {
 		return failResult
@@ -165,8 +165,14 @@ func (t *ManageSessionTool) executePoll(start time.Time, args map[string]any, wa
 	// and the next poll only reports what arrives after it. The exit is read
 	// first, so a process that exited during the window reports all of its output
 	// (its pipes are closed before the session is marked done).
+	//
+	// The wait is cancellable: a poll only observes the process, so the user
+	// interrupting the turn ends the wait exactly like a wait_timeout does and
+	// the process keeps running — the output collected so far is returned with a
+	// warning saying so, and the next poll picks up from there.
+	interrupted := false
 	if !session.IsDone() {
-		session.WaitForExit(waitTimeout)
+		_, _, interrupted = session.WaitForExitContext(ctx, waitTimeout)
 	}
 	done := session.IsDone()
 	raw := session.TakeOutput()
@@ -190,6 +196,9 @@ func (t *ManageSessionTool) executePoll(start time.Time, args map[string]any, wa
 	} else {
 		cr.Status = statusRunning
 		cr.SessionID = strPtr(session.ID)
+		if interrupted {
+			cr.Warning = strPtr("poll interrupted by user: the process is still running; poll again to take its output")
+		}
 	}
 	return cr.toResultInfo()
 }

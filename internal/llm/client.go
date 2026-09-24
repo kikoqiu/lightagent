@@ -559,21 +559,40 @@ func (c *Client) readStream(r io.Reader, onDelta, onReasoning func(string)) (*Re
 			acc.Function.Arguments += decodeArguments(tc.Function.Arguments)
 		}
 	}
+	// Flatten to a stable, index-ordered slice. It happens before the stream's
+	// error is reported, so a reply that was cut short still carries the calls
+	// it managed to assemble — the caller decides what to do with them (an
+	// interrupted reply, for instance, drops them and says so).
+	result.ToolCalls = flattenToolCalls(toolAccum)
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read stream: %w", err)
-	}
-
-	// Flatten to a stable, index-ordered slice.
-	for i := 0; i < len(toolAccum); i++ {
-		if tc, ok := toolAccum[i]; ok {
-			if tc.Type == "" {
-				tc.Type = "function"
-			}
-			result.ToolCalls = append(result.ToolCalls, *tc)
-		}
+		// The stream stopped early — the connection broke, or the caller
+		// cancelled the request. What was assembled so far travels back with
+		// the error, so a reply the user interrupted mid-stream can be kept
+		// instead of being dropped with the failure.
+		return result, fmt.Errorf("read stream: %w", err)
 	}
 	if err := validateResponse(result); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// flattenToolCalls turns the per-index accumulator of a streamed reply into the
+// stable, index-ordered slice a Response carries.
+func flattenToolCalls(acc map[int]*ToolCall) []ToolCall {
+	if len(acc) == 0 {
+		return nil
+	}
+	calls := make([]ToolCall, 0, len(acc))
+	for i := 0; i < len(acc); i++ {
+		tc, ok := acc[i]
+		if !ok {
+			continue
+		}
+		if tc.Type == "" {
+			tc.Type = "function"
+		}
+		calls = append(calls, *tc)
+	}
+	return calls
 }

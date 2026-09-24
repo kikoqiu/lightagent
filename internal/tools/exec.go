@@ -404,11 +404,25 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 	// does not end the wait: it accumulates and is reported with the result (see
 	// sessionOutput). Once the window passes, the process is left running in the
 	// background. A cancelled context (user interrupt) kills it instead of
-	// leaving it behind.
+	// leaving it behind — this is the one call that is not allowed to keep
+	// running — and what the process had printed until then is reported with the
+	// interrupted status instead of being discarded. A process that exited at
+	// the very moment of the interrupt is still reported as completed.
 	deadline := start.Add(waitTimeout)
-	if _, _, canceled := session.WaitForExitContext(ctx, time.Until(deadline)); canceled {
+	_, _, canceled := session.WaitForExitContext(ctx, time.Until(deadline))
+	if canceled && !session.IsDone() {
+		raw := session.TakeOutput()
 		_ = session.Kill()
-		return fail("interrupted by user")
+		shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
+		totalLines, totalBytes := countLinesAndBytes(clean)
+		return commandResult{
+			Status:         statusInterrupted,
+			Output:         shown,
+			Truncated:      truncated,
+			TotalLines:     totalLines,
+			TotalBytes:     totalBytes,
+			ElapsedSeconds: elapsedSeconds(start),
+		}.toResult()
 	}
 	// The wait is over: take what the child produced, whether it exited within
 	// the window or is still running. The whole buffer is handed over as it

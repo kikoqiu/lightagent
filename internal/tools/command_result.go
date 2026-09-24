@@ -11,6 +11,10 @@ const (
 	statusCompleted = "completed"
 	statusRunning   = "running"
 	statusFailed    = "failed"
+	// statusInterrupted marks a call the user cut short: exec_command's process
+	// tree is terminated and the output it had produced until then is reported
+	// with this status.
+	statusInterrupted = "interrupted"
 )
 
 // commandResult is the unified JSON contract returned by exec_command and
@@ -43,15 +47,22 @@ func (cr commandResult) marshal() string {
 func (cr commandResult) toResult() *Result {
 	res := &Result{
 		ForLLM:  cr.marshal(),
-		IsError: cr.Status == statusFailed,
+		IsError: cr.Status == statusFailed || cr.Status == statusInterrupted,
 	}
 	switch {
 	case cr.Status == statusRunning:
 		res.ForUser = fmt.Sprintf("Command is running in session %s (poll with manage_session)", derefString(cr.SessionID))
+	case cr.Status == statusInterrupted:
+		res.ForUser = "Command interrupted by user."
 	case cr.Status == statusFailed:
 		res.ForUser = "Command failed."
 	default:
 		res.ForUser = "Command completed."
+	}
+	// The warning explains a state the status alone cannot: the poll the user
+	// interrupted, for instance, leaves the process running.
+	if cr.Warning != nil && *cr.Warning != "" {
+		res.ForUser += "\n" + *cr.Warning
 	}
 	if cr.Output != "" {
 		res.ForUser += "\n" + cr.Output

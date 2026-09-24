@@ -646,3 +646,50 @@ func TestMessageMarshalsReasoningContent(t *testing.T) {
 		t.Fatalf("empty reasoning must be omitted: %s", without)
 	}
 }
+
+// cutStreamReader yields a streamed payload and then fails, the way a connection
+// that broke mid-reply does — which is also what the client sees when the user
+// interrupts a turn while the reply is still arriving.
+type cutStreamReader struct {
+	data []byte
+	err  error
+}
+
+func (r *cutStreamReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestReadStreamReturnsThePartialReplyOnAFailedStream pins the contract a kept
+// partial reply relies on: a stream that stops before the provider finished still
+// reports what was assembled — text, thinking and the tool calls — alongside the
+// error, instead of losing it with the failure.
+func TestReadStreamReturnsThePartialReplyOnAFailedStream(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"hmm","content":"Hel"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file_lines","arguments":"{\"pa"}}]}}]}`,
+		"",
+	}, "\n")
+
+	var streamed string
+	client := &Client{}
+	resp, err := client.readStream(&cutStreamReader{data: []byte(stream), err: io.ErrUnexpectedEOF}, func(s string) {
+		streamed += s
+	}, nil)
+	if err == nil {
+		t.Fatal("expected the cut stream to fail")
+	}
+	if resp == nil {
+		t.Fatal("the partial reply was dropped with the error")
+	}
+	if resp.Content != "Hel" || resp.Reasoning != "hmm" || streamed != "Hel" {
+		t.Fatalf("partial reply = %+v (streamed %q), want the text and thinking read so far", resp, streamed)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_1" {
+		t.Fatalf("tool calls = %+v, want the assembled partial call", resp.ToolCalls)
+	}
+}

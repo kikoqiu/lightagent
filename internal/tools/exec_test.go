@@ -312,17 +312,93 @@ func TestManageSessionPollWaitsForExit(t *testing.T) {
 	}
 }
 
+// TestManageSessionPollInterruptLeavesTheProcessRunning covers interrupting a
+// long poll: the wait ends the way a wait_timeout ends — the output collected so
+// far is reported with status=running and a warning saying the poll was
+// interrupted — while the process keeps running, so a later poll still follows it
+// to its exit. A poll only observes a session, so an interrupt must never kill
+// what it watches.
+func TestManageSessionPollInterruptLeavesTheProcessRunning(t *testing.T) {
+	command := "for i in 1 2 3 4 5 6 7 8 9 10; do echo tick $i; sleep 0.3; done"
+	if runtime.GOOS == "windows" {
+		command = "1..10 | ForEach-Object { Write-Output \"tick $_\"; Start-Sleep -Milliseconds 300 }"
+	}
+
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	execTool := NewExecCommandTool(engine)
+	manageTool := NewManageSessionTool(engine)
+
+	// wait_timeout 1 backgrounds the command, which keeps printing for ~3s.
+	res := execTool.Execute(context.Background(), map[string]any{"command": command, "wait_timeout": 1})
+	sessionID := sessionIDFromResult(t, res.ForLLM)
+	if sessionID == "" {
+		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
+	}
+	session, err := engine.sessions.Get(sessionID)
+	if err != nil {
+		t.Fatalf("session %s is gone: %v", sessionID, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan *Result, 1)
+	go func() {
+		done <- manageTool.Execute(ctx, map[string]any{
+			"action": "poll", "session_id": sessionID, "wait_timeout": 30,
+		})
+	}()
+
+	// The poll is waiting for the exit; interrupt it once it holds output, so
+	// the interrupted answer has something to report.
+	waitForBufferedOutput(t, engine, 5*time.Second)
+	cancel()
+
+	select {
+	case poll := <-done:
+		cr := commandResultFromResult(t, poll.ForLLM)
+		if poll.IsError || cr.Status != statusRunning {
+			t.Fatalf("poll = %+v (%s), want a still-running session", poll, poll.ForLLM)
+		}
+		if cr.SessionID == nil || *cr.SessionID != sessionID {
+			t.Fatalf("session_id = %v, want %s: the session is still there to poll", cr.SessionID, sessionID)
+		}
+		if cr.Warning == nil || !strings.Contains(*cr.Warning, "poll interrupted by user") {
+			t.Fatalf("warning = %v, want the interrupted-poll note (%s)", cr.Warning, poll.ForLLM)
+		}
+		if !strings.Contains(cr.Output, "tick") {
+			t.Fatalf("output = %q, want the output collected before the interrupt", cr.Output)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poll wait was not interrupted")
+	}
+	if session.IsDone() {
+		t.Fatal("the interrupted poll terminated the process it was watching")
+	}
+
+	// The process is still running, and the next poll follows it to its exit.
+	final := manageTool.Execute(context.Background(), map[string]any{
+		"action": "poll", "session_id": sessionID, "wait_timeout": 30,
+	})
+	if final.IsError {
+		t.Fatalf("final poll error: %s", final.ForLLM)
+	}
+	if cr := commandResultFromResult(t, final.ForLLM); cr.Status != statusCompleted {
+		t.Fatalf("final poll = %s, want the process to have finished", final.ForLLM)
+	}
+}
+
 // TestExecCommandInterruptKillsProcess covers interrupting a running command: the
-// synchronous wait is cancelled and the process is killed instead of being left
-// behind in the background.
+// synchronous wait is cancelled, the process tree is terminated instead of being
+// left behind in the background, and the output the process had printed until
+// then is reported with the interrupted status instead of being discarded.
 func TestExecCommandInterruptKillsProcess(t *testing.T) {
 	engine := NewExecEngine(60, 30, true)
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	command := "sleep 5; echo done"
+	command := "echo working; sleep 5; echo done"
 	if runtime.GOOS == "windows" {
-		command = "Start-Sleep -Seconds 5; Write-Output done"
+		command = "Write-Output working; Start-Sleep -Seconds 5; Write-Output done"
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -331,20 +407,22 @@ func TestExecCommandInterruptKillsProcess(t *testing.T) {
 		done <- tool.Execute(ctx, map[string]any{"command": command, "wait_timeout": 30})
 	}()
 
-	// Wait until the session exists, then interrupt it.
-	deadline := time.Now().Add(5 * time.Second)
-	for len(engine.sessions.List()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the command never started")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Interrupt once the command runs and has printed its first line, so there
+	// is output to report with the interrupted answer.
+	waitForBufferedOutput(t, engine, 5*time.Second)
 	cancel()
 
 	select {
 	case res := <-done:
-		if !res.IsError || !strings.Contains(res.ForLLM, "interrupted") {
-			t.Fatalf("result = %+v, want an interrupted failure", res)
+		cr := commandResultFromResult(t, res.ForLLM)
+		if !res.IsError || cr.Status != statusInterrupted {
+			t.Fatalf("result = %+v (%s), want an interrupted failure", res, res.ForLLM)
+		}
+		if !strings.Contains(cr.Output, "working") {
+			t.Fatalf("output = %q, want what the process had printed before the interrupt", cr.Output)
+		}
+		if cr.SessionID != nil {
+			t.Fatalf("session_id = %q, want none: an interrupted command is not left behind", *cr.SessionID)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the command was not interrupted")
@@ -354,6 +432,31 @@ func TestExecCommandInterruptKillsProcess(t *testing.T) {
 		if info.Status == "running" {
 			t.Fatalf("session %s is still running after the interrupt", info.ID)
 		}
+	}
+}
+
+// bufferedOutput reports how much output the session holds for the next
+// hand-over, which is how a test waits for a child's first line.
+func bufferedOutput(session *ProcessSession) int {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.output.published.Len()
+}
+
+// waitForBufferedOutput waits until the engine's session holds output.
+func waitForBufferedOutput(t *testing.T, engine *ExecEngine, timeout time.Duration) *ProcessSession {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if list := engine.sessions.List(); len(list) > 0 {
+			if session, err := engine.sessions.Get(list[0].ID); err == nil && bufferedOutput(session) > 0 {
+				return session
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command produced no output")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

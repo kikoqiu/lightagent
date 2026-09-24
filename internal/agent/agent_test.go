@@ -19,7 +19,8 @@ import (
 )
 
 // blockingTool blocks inside Execute until the turn is cancelled (or the test
-// releases it), so an interrupt lands during a tool call.
+// releases it), so an interrupt lands during a tool call. It is not interruptible
+// mid-flight: whatever the turn context says, it answers with its normal result.
 type blockingTool struct {
 	started chan struct{}
 	release chan struct{}
@@ -36,7 +37,26 @@ func (t *blockingTool) Execute(ctx context.Context, _ map[string]any) *tools.Res
 	case <-ctx.Done():
 	case <-t.release:
 	}
-	return tools.OK("finished")
+	return &tools.Result{ForLLM: "finished", ForUser: "finished"}
+}
+
+// cancelAwareTool stops as soon as the turn is cancelled and answers with what it
+// has, the way exec_command terminates its process (reporting the output it had
+// produced) and manage_session poll stops waiting.
+type cancelAwareTool struct {
+	started chan struct{}
+	once    sync.Once
+	text    string
+}
+
+func (t *cancelAwareTool) Name() string               { return "cancelaware" }
+func (t *cancelAwareTool) Description() string        { return "stops when the turn is cancelled" }
+func (t *cancelAwareTool) Parameters() map[string]any { return map[string]any{"type": "object"} }
+
+func (t *cancelAwareTool) Execute(ctx context.Context, _ map[string]any) *tools.Result {
+	t.once.Do(func() { close(t.started) })
+	<-ctx.Done()
+	return &tools.Result{ForLLM: t.text, ForUser: t.text}
 }
 
 // waitForTurnEnd drains events until the turn ends and reports whether an
@@ -61,10 +81,12 @@ func waitForTurnEnd(t *testing.T, events <-chan Event) bool {
 	}
 }
 
-// TestInterruptDiscardsPendingTurn covers interrupting while the model call is in
-// flight: nothing was produced, so the pending user record is dropped and an
-// interrupted marker is published before the turn ends.
-func TestInterruptDiscardsPendingTurn(t *testing.T) {
+// TestInterruptKeepsTheUserMessage covers interrupting while the model call is in
+// flight, i.e. before anything was produced: the assistant side leaves no record
+// at all, while the user message stays in the history — an interrupt never
+// rewrites what the user sent — and an interrupted marker is published before the
+// turn ends.
+func TestInterruptKeepsTheUserMessage(t *testing.T) {
 	requested := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -103,8 +125,9 @@ func TestInterruptDiscardsPendingTurn(t *testing.T) {
 	if a.Busy() {
 		t.Fatal("the agent is still busy after the interrupt")
 	}
-	if msgs := a.History(); len(msgs) != 0 {
-		t.Fatalf("history = %d messages, want the pending turn discarded", len(msgs))
+	msgs := a.History()
+	if len(msgs) != 1 || msgs[0].Role != "user" || msgs[0].Content != "do something" {
+		t.Fatalf("history = %+v, want the user message kept", msgs)
 	}
 	// The next user message starts a fresh turn right away.
 	a.Submit("again")
@@ -115,15 +138,30 @@ func TestInterruptDiscardsPendingTurn(t *testing.T) {
 		t.Fatal("the new turn should be interruptible too")
 	}
 	waitForTurnEnd(t, events)
+	if msgs := a.History(); len(msgs) != 2 || msgs[1].Content != "again" {
+		t.Fatalf("history = %+v, want both user messages kept", msgs)
+	}
 }
 
-// TestInterruptStopsToolCall covers interrupting during a tool call: the tool is
-// reported as interrupted, the call is answered so the transcript stays valid,
-// and the records produced so far are kept.
-func TestInterruptStopsToolCall(t *testing.T) {
+// TestInterruptDuringAToolRound covers interrupting a round with several tool
+// calls. A tool call that cannot be cut short is allowed to finish, so the call
+// that was running reports its real result; the calls that never started are
+// answered as interrupted, which keeps the assistant message's tool_calls paired.
+// The answers only enter the history — the model is never asked with them.
+func TestInterruptDuringAToolRound(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests int
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"block","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[`+
+			`{"id":"c1","type":"function","function":{"name":"block","arguments":"{}"}},`+
+			`{"id":"c2","type":"function","function":{"name":"block","arguments":"{}"}}]},`+
+			`"finish_reason":"tool_calls"}]}`)
 	}))
 	defer srv.Close()
 
@@ -149,17 +187,19 @@ func TestInterruptStopsToolCall(t *testing.T) {
 		t.Fatal("Interrupt reported no running turn")
 	}
 
-	var sawToolResult, sawInterrupted bool
+	var sawRealResult, sawInterrupted, sawMarker bool
 	deadline := time.After(10 * time.Second)
 drain:
 	for {
 		select {
 		case ev := <-events:
 			switch {
+			case ev.Type == EventToolResult && ev.Text == "finished" && !ev.IsError:
+				sawRealResult = true
 			case ev.Type == EventToolResult && strings.Contains(ev.Text, "interrupted"):
-				sawToolResult = true
-			case ev.Type == EventInterrupted:
 				sawInterrupted = true
+			case ev.Type == EventInterrupted:
+				sawMarker = true
 			case ev.Type == EventTurnDone:
 				break drain
 			}
@@ -167,19 +207,650 @@ drain:
 			t.Fatal("no turn_done after the interrupt")
 		}
 	}
-	if !sawToolResult {
-		t.Fatal("the interrupted tool call was not reported")
+	if !sawRealResult {
+		t.Fatal("the running tool call's real result was not reported")
 	}
 	if !sawInterrupted {
+		t.Fatal("the call that never started was not answered as interrupted")
+	}
+	if !sawMarker {
+		t.Fatal("no interrupted event was published")
+	}
+	mu.Lock()
+	asked := requests
+	mu.Unlock()
+	if asked != 1 {
+		t.Fatalf("the model was asked %d time(s), want 1: the interrupted round is not sent back to it", asked)
+	}
+
+	msgs := a.History()
+	if len(msgs) != 4 {
+		t.Fatalf("history = %d messages, want user + assistant + 2 tool answers", len(msgs))
+	}
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "c1" || msgs[2].Content != "finished" {
+		t.Fatalf("the running call's record = %+v, want its real result", msgs[2])
+	}
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "c2" || !strings.Contains(msgs[3].Content, "interrupted") {
+		t.Fatalf("the pending call's record = %+v, want an interrupted answer", msgs[3])
+	}
+}
+
+// TestInterruptStopsACancelAwareTool covers the other half of a tool round: a tool
+// that reacts to the cancellation — exec_command terminates its process and
+// reports what it had printed, manage_session poll stops waiting — answers with
+// what it has, and that answer is what its call records. The call after it, which
+// never started, is still answered as interrupted, and the answers are not sent
+// back to the model.
+func TestInterruptStopsACancelAwareTool(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[`+
+			`{"id":"c1","type":"function","function":{"name":"cancelaware","arguments":"{}"}},`+
+			`{"id":"c2","type":"function","function":{"name":"cancelaware","arguments":"{}"}}]},`+
+			`"finish_reason":"tool_calls"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	tool := &cancelAwareTool{started: make(chan struct{}), text: "half the work"}
+	reg := tools.NewRegistry()
+	reg.Register(tool)
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Submit("run it")
+	select {
+	case <-tool.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tool never started")
+	}
+	if !a.Interrupt() {
+		t.Fatal("Interrupt reported no running turn")
+	}
+	if !waitForTurnEnd(t, events) {
 		t.Fatal("no interrupted event was published")
 	}
 
 	msgs := a.History()
-	if len(msgs) != 3 {
-		t.Fatalf("history = %d messages, want user + assistant + tool", len(msgs))
+	if len(msgs) != 4 {
+		t.Fatalf("history = %d messages, want user + assistant + 2 tool answers", len(msgs))
 	}
-	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "c1" || !strings.Contains(msgs[2].Content, "interrupted") {
-		t.Fatalf("tool record = %+v, want an interrupted answer", msgs[2])
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "c1" || msgs[2].Content != "half the work" {
+		t.Fatalf("the running call's record = %+v, want what the tool reported", msgs[2])
+	}
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "c2" || !strings.Contains(msgs[3].Content, "interrupted") {
+		t.Fatalf("the call that never started = %+v, want an interrupted answer", msgs[3])
+	}
+	mu.Lock()
+	asked := requests
+	mu.Unlock()
+	if asked != 1 {
+		t.Fatalf("the model was asked %d time(s), want 1: the interrupted round is not sent back to it", asked)
+	}
+}
+
+// TestInterruptKeepsTheStreamedPartialReply covers interrupting while the reply is
+// still streaming: the text the provider had already delivered is kept as the
+// assistant message, the tool calls the partial reply carried are dropped — none
+// of them started, and a reply cut short can carry fragments — and the turn ends
+// there instead of being sent to the model as if it were complete.
+func TestInterruptKeepsTheStreamedPartialReply(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("the test server cannot flush")
+			return
+		}
+		// The call arrives between two text chunks, so it is assembled before
+		// the test interrupts: seeing the third chunk means the second was read.
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n")
+		flusher.Flush()
+		<-release
+	}))
+	// Registered in this order so release runs before Close (cleanups are LIFO).
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = true
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("say hello")
+	// The last streamed chunk means the frames before it were assembled: the
+	// reply holds "Hello" and a tool call by the time the interrupt lands.
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == EventAssistantDelta && ev.Text == "lo" {
+				goto interrupt
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the reply never streamed its last chunk")
+		}
+	}
+
+interrupt:
+	if !a.Interrupt() {
+		t.Fatal("Interrupt reported no running turn")
+	}
+
+	var sawPartial, sawDropped, sawToolCall, sawMarker bool
+	deadline := time.After(10 * time.Second)
+drain:
+	for {
+		select {
+		case ev := <-events:
+			switch {
+			case ev.Type == EventAssistant && ev.Text == "Hello":
+				sawPartial = true
+			case ev.Type == EventInfo && strings.Contains(ev.Text, "dropped"):
+				sawDropped = true
+			case ev.Type == EventToolCall:
+				sawToolCall = true
+			case ev.Type == EventInterrupted:
+				sawMarker = true
+			case ev.Type == EventTurnDone:
+				break drain
+			}
+		case <-deadline:
+			t.Fatal("no turn_done after the interrupt")
+		}
+	}
+	if !sawPartial {
+		t.Fatal("the kept partial reply was not published")
+	}
+	if !sawDropped {
+		t.Fatal("the dropped tool calls were not reported")
+	}
+	if sawToolCall {
+		t.Fatal("a tool call of the partial reply was announced")
+	}
+	if !sawMarker {
+		t.Fatal("no interrupted event was published")
+	}
+
+	msgs := a.History()
+	if len(msgs) != 2 {
+		t.Fatalf("history = %d messages, want user + the partial reply", len(msgs))
+	}
+	if msgs[1].Role != "assistant" || msgs[1].Content != "Hello" {
+		t.Fatalf("partial reply = %+v, want the streamed text kept", msgs[1])
+	}
+	if len(msgs[1].ToolCalls) != 0 {
+		t.Fatalf("the partial reply kept %d tool call(s), want none", len(msgs[1].ToolCalls))
+	}
+}
+
+// TestInterruptDropsATextlessReply covers a reply that was cut short before it
+// produced any text: only thinking and a tool call had arrived. Nothing of it
+// enters the history — an assistant message without content has nothing to tell
+// the next request — while the user message stays, and the turn ends there.
+func TestInterruptDropsATextlessReply(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("the test server cannot flush")
+			return
+		}
+		// The call arrives before the last thinking chunk, so the test knows it
+		// was assembled by the time it interrupts.
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"thinking\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" more\"}}]}\n\n")
+		flusher.Flush()
+		<-release
+	}))
+	// Registered in this order so release runs before Close (cleanups are LIFO).
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = true
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("think about it")
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == EventReasoningDelta && ev.Text == " more" {
+				goto interrupt
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the reply never streamed its last chunk")
+		}
+	}
+
+interrupt:
+	if !a.Interrupt() {
+		t.Fatal("Interrupt reported no running turn")
+	}
+
+	var sawAssistant, sawToolCall, sawMarker bool
+	var markerText string
+	deadline := time.After(10 * time.Second)
+drain:
+	for {
+		select {
+		case ev := <-events:
+			switch {
+			case ev.Type == EventAssistant:
+				sawAssistant = true
+			case ev.Type == EventToolCall:
+				sawToolCall = true
+			case ev.Type == EventInterrupted:
+				sawMarker = true
+				markerText = ev.Text
+			case ev.Type == EventTurnDone:
+				break drain
+			}
+		case <-deadline:
+			t.Fatal("no turn_done after the interrupt")
+		}
+	}
+	if sawAssistant {
+		t.Fatal("a reply without text was finalized as an assistant row")
+	}
+	if sawToolCall {
+		t.Fatal("a tool call of the dropped reply was announced")
+	}
+	if !sawMarker || !strings.Contains(markerText, "dropped") {
+		t.Fatalf("marker = %q (seen=%v), want a note that the message was dropped", markerText, sawMarker)
+	}
+
+	msgs := a.History()
+	if len(msgs) != 1 {
+		t.Fatalf("history = %d messages, want only the user message", len(msgs))
+	}
+	if msgs[0].Role != "user" || msgs[0].Content != "think about it" {
+		t.Fatalf("history[0] = %+v, want the user message kept", msgs[0])
+	}
+}
+
+// TestInterruptBeforeTheFirstCallDropsTheRound covers the rule in the real tool
+// loop: the reply is recorded and the turn is cancelled before its first call
+// starts. The round is dropped whole — the text stays, the calls do not, and no
+// tool answer is recorded, because the message no longer asks for anything.
+func TestInterruptBeforeTheFirstCallDropsTheRound(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"writing","tool_calls":[`+
+			`{"id":"c1","type":"function","function":{"name":"write_file","arguments":"{}"}}]},`+
+			`"finish_reason":"tool_calls"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	writer := &interruptingWriter{}
+	reg := tools.NewRegistry()
+	reg.Register(writer)
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	// The planning hook runs once the reply is recorded and before the first
+	// call starts: cancelling there is exactly the window this test pins.
+	writer.interrupt = func() { a.Interrupt() }
+
+	a.Submit("write it")
+	if !waitForTurnEnd(t, events) {
+		t.Fatal("no interrupted event was published")
+	}
+	if writer.ran {
+		t.Fatal("a call of the dropped round was executed")
+	}
+
+	msgs := a.History()
+	if len(msgs) != 2 {
+		t.Fatalf("history = %d messages, want the user message and the reply", len(msgs))
+	}
+	if msgs[1].Role != "assistant" || msgs[1].Content != "writing" || len(msgs[1].ToolCalls) != 0 {
+		t.Fatalf("reply = %+v, want the text kept without its tool call", msgs[1])
+	}
+	mu.Lock()
+	asked := requests
+	mu.Unlock()
+	if asked != 1 {
+		t.Fatalf("the model was asked %d time(s), want 1", asked)
+	}
+}
+
+// interruptingWriter stands in for write_file: its PlanWriteCalls hook is called
+// between the reply being recorded and the first call starting, so a test can
+// cancel the turn exactly there. It never plans a split.
+type interruptingWriter struct {
+	interrupt func()
+	ran       bool
+}
+
+func (w *interruptingWriter) Name() string               { return writeFileToolName }
+func (w *interruptingWriter) Description() string        { return "cancels the turn before its own call runs" }
+func (w *interruptingWriter) Parameters() map[string]any { return map[string]any{"type": "object"} }
+
+func (w *interruptingWriter) PlanWriteCalls(map[string]any) ([]map[string]any, bool) {
+	w.interrupt()
+	return nil, false
+}
+
+func (w *interruptingWriter) Execute(context.Context, map[string]any) *tools.Result {
+	w.ran = true
+	return tools.OK("wrote")
+}
+
+// TestDropUnstartedToolCalls pins what a round interrupted before its first call
+// records: the reply keeps its text and loses every tool call, a reply left
+// without text goes away entirely, and no tool answer is written for either —
+// nothing ran, and no call is left to answer.
+func TestDropUnstartedToolCalls(t *testing.T) {
+	cases := []struct {
+		name     string
+		content  string
+		wantMsgs int
+		wantText string
+	}{
+		{name: "the text is kept", content: "Here is what I found", wantMsgs: 2, wantText: "kept without its 2 tool call(s)"},
+		{name: "a reply without text is dropped", content: "  \n", wantMsgs: 1, wantText: "it and its 2 tool call(s) were dropped"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestAgent(t)
+			events, cancel := a.Bus().Subscribe()
+			defer cancel()
+
+			a.appendMessage(llm.Message{Role: "user", Content: "ask"})
+			a.appendMessage(llm.Message{
+				Role:    "assistant",
+				Content: tc.content,
+				ToolCalls: []llm.ToolCall{
+					{ID: "c1", Type: "function", Function: llm.ToolCallFunction{Name: "echo", Arguments: "{}"}},
+					{ID: "c2", Type: "function", Function: llm.ToolCallFunction{Name: "echo", Arguments: "{}"}},
+				},
+			})
+
+			a.finishUnstartedToolRound()
+
+			msgs := a.History()
+			if len(msgs) != tc.wantMsgs {
+				t.Fatalf("history = %d messages, want %d: %+v", len(msgs), tc.wantMsgs, msgs)
+			}
+			if msgs[0].Role != "user" {
+				t.Fatalf("history[0] = %+v, want the user message to stay", msgs[0])
+			}
+			if tc.wantMsgs > 1 && (msgs[1].Role != "assistant" || msgs[1].Content != tc.content || len(msgs[1].ToolCalls) != 0) {
+				t.Fatalf("history[1] = %+v, want the text kept without tool calls", msgs[1])
+			}
+			for _, m := range msgs {
+				if m.Role == "tool" {
+					t.Fatalf("history = %+v, want no tool answer for a round that never started", msgs)
+				}
+			}
+
+			select {
+			case ev := <-events:
+				if ev.Type != EventInterrupted || !strings.Contains(ev.Text, tc.wantText) {
+					t.Fatalf("event = %+v, want a marker mentioning %q", ev, tc.wantText)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("no interrupted marker was published")
+			}
+		})
+	}
+}
+
+// TestWriteSplitsAnsweredAsInterrupted covers the write parts of a round
+// interrupted after the round's own calls had finished: the parts are ordinary
+// calls of that batch, so the ones that never started are answered like any other
+// call that never ran — one assistant/tool pair each with an interrupted answer —
+// and nothing of theirs is executed.
+func TestWriteSplitsAnsweredAsInterrupted(t *testing.T) {
+	a := newTestAgent(t)
+	events, cancel := a.Bus().Subscribe()
+	defer cancel()
+
+	ctx, cancelTurn := context.WithCancel(context.Background())
+	cancelTurn()
+
+	calls := []llm.ToolCall{
+		{ID: "c_part2", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
+		{ID: "c_part3", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
+	}
+	if a.runWriteSplits(ctx, calls) {
+		t.Fatal("runWriteSplits reported a completed turn")
+	}
+	msgs := a.History()
+	if len(msgs) != 4 {
+		t.Fatalf("history = %d messages, want 2 assistant/tool pairs: %+v", len(msgs), msgs)
+	}
+	for i, id := range []string{"c_part2", "c_part3"} {
+		call, answer := msgs[i*2], msgs[i*2+1]
+		if call.Role != "assistant" || len(call.ToolCalls) != 1 || call.ToolCalls[0].ID != id {
+			t.Fatalf("msgs[%d] = %+v, want the assistant message of %s", i*2, call, id)
+		}
+		if answer.Role != "tool" || answer.ToolCallID != id || !strings.Contains(answer.Content, "interrupted") {
+			t.Fatalf("msgs[%d] = %+v, want %s answered as interrupted", i*2+1, answer, id)
+		}
+	}
+	// Both answers were announced (publishing is synchronous, so everything is
+	// already queued).
+	var announced int
+drain:
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == EventToolResult && strings.Contains(ev.Text, "interrupted") {
+				announced++
+			}
+		default:
+			break drain
+		}
+	}
+	if announced != 2 {
+		t.Fatalf("announced interrupted answers = %d, want 2", announced)
+	}
+}
+
+// cancelOnRunTool stands in for write_file in the split tests: it cancels the
+// context it runs with (the way a user interrupt lands while the parts are
+// running) and answers normally.
+type cancelOnRunTool struct {
+	cancel func()
+	ran    int
+}
+
+func (t *cancelOnRunTool) Name() string               { return writeFileToolName }
+func (t *cancelOnRunTool) Description() string        { return "cancels the turn while it runs" }
+func (t *cancelOnRunTool) Parameters() map[string]any { return map[string]any{"type": "object"} }
+
+func (t *cancelOnRunTool) Execute(context.Context, map[string]any) *tools.Result {
+	t.ran++
+	t.cancel()
+	return &tools.Result{ForLLM: "wrote part", ForUser: "wrote part"}
+}
+
+// TestWriteSplitsInterruptedWhileRunning covers the parts of an auto-split write
+// interrupted while the batch is already running: the part in flight is answered
+// with its real result, the parts after it are answered as interrupted, and the
+// assistant/tool pairing stays complete for the next request.
+func TestWriteSplitsInterruptedWhileRunning(t *testing.T) {
+	a := newTestAgent(t)
+	events, cancel := a.Bus().Subscribe()
+	defer cancel()
+
+	ctx, cancelTurn := context.WithCancel(context.Background())
+	defer cancelTurn()
+	tool := &cancelOnRunTool{cancel: cancelTurn}
+	a.reg.Register(tool)
+
+	calls := []llm.ToolCall{
+		{ID: "c_part2", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
+		{ID: "c_part3", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
+	}
+	if a.runWriteSplits(ctx, calls) {
+		t.Fatal("runWriteSplits reported a completed turn")
+	}
+	if tool.ran != 1 {
+		t.Fatalf("the writer ran %d time(s), want 1: only the part that was in flight", tool.ran)
+	}
+	msgs := a.History()
+	if len(msgs) != 4 {
+		t.Fatalf("history = %d messages, want 2 assistant/tool pairs: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "assistant" || len(msgs[0].ToolCalls) != 1 || msgs[0].ToolCalls[0].ID != "c_part2" {
+		t.Fatalf("msgs[0] = %+v, want the assistant message of the part that ran", msgs[0])
+	}
+	if msgs[1].Role != "tool" || msgs[1].ToolCallID != "c_part2" || msgs[1].Content != "wrote part" {
+		t.Fatalf("msgs[1] = %+v, want the real result of the part that ran", msgs[1])
+	}
+	if msgs[2].Role != "assistant" || len(msgs[2].ToolCalls) != 1 || msgs[2].ToolCalls[0].ID != "c_part3" {
+		t.Fatalf("msgs[2] = %+v, want the assistant message of the pending part", msgs[2])
+	}
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "c_part3" || !strings.Contains(msgs[3].Content, "interrupted") {
+		t.Fatalf("msgs[3] = %+v, want the pending part answered as interrupted", msgs[3])
+	}
+	// The pending part's feedback is announced too (publishing is synchronous, so
+	// everything is already queued).
+	var sawInterrupted bool
+drain:
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == EventToolResult && strings.Contains(ev.Text, "interrupted") {
+				sawInterrupted = true
+			}
+		default:
+			break drain
+		}
+	}
+	if !sawInterrupted {
+		t.Fatal("the pending part's interrupted answer was not announced")
+	}
+}
+
+// planWriter stands in for write_file when the split flow itself is under test: it
+// plans three writes for any call, so the "multiple writes" batch exists without a
+// huge payload, and counts the calls it really executed.
+type planWriter struct {
+	parts []map[string]any
+	ran   int
+}
+
+func (w *planWriter) Name() string               { return writeFileToolName }
+func (w *planWriter) Description() string        { return "plans a fixed split" }
+func (w *planWriter) Parameters() map[string]any { return map[string]any{"type": "object"} }
+
+func (w *planWriter) PlanWriteCalls(map[string]any) ([]map[string]any, bool) {
+	return w.parts, true
+}
+
+func (w *planWriter) Execute(context.Context, map[string]any) *tools.Result {
+	w.ran++
+	return &tools.Result{ForLLM: "wrote a part", ForUser: "wrote a part"}
+}
+
+// TestInterruptDuringARoundWithWriteParts covers the shape the write-split feature
+// really produces: the reply is [write_file(...), block] and the oversized write
+// becomes several write calls of that same batch. The interrupt lands while the
+// second call runs, so that call is answered with its real result and every call
+// that never started — the write parts the first call still owed — is answered as
+// interrupted, exactly like any other unstarted call of the batch.
+func TestInterruptDuringARoundWithWriteParts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[`+
+			`{"id":"c1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"p.txt\",\"content\":\"x\"}"}},`+
+			`{"id":"c2","type":"function","function":{"name":"block","arguments":"{}"}}]},`+
+			`"finish_reason":"tool_calls"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	writer := &planWriter{parts: []map[string]any{
+		{"path": "p.txt", "mode": "w", "content": "one"},
+		{"path": "p.txt", "mode": "a", "content": "two"},
+		{"path": "p.txt", "mode": "a", "content": "three"},
+	}}
+	block := &blockingTool{started: make(chan struct{}), release: make(chan struct{})}
+	defer close(block.release)
+	reg := tools.NewRegistry()
+	reg.Register(writer)
+	reg.Register(block)
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Submit("write it")
+	select {
+	case <-block.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second call never started")
+	}
+	if !a.Interrupt() {
+		t.Fatal("Interrupt reported no running turn")
+	}
+	if !waitForTurnEnd(t, events) {
+		t.Fatal("no interrupted event was published")
+	}
+	if writer.ran != 1 {
+		t.Fatalf("the writer ran %d time(s), want 1: only the first part", writer.ran)
+	}
+
+	msgs := a.History()
+	if len(msgs) != 8 {
+		t.Fatalf("history = %d messages, want user + reply + 2 answers + 2 part pairs: %+v", len(msgs), msgs)
+	}
+	if args := msgs[1].ToolCalls[0].Function.Arguments; !strings.Contains(args, `"content":"one"`) {
+		t.Fatalf("the first call's args = %s, want the first part that was executed", args)
+	}
+	if msgs[2].ToolCallID != "c1" || msgs[2].Content != "wrote a part" {
+		t.Fatalf("msgs[2] = %+v, want the real result of the first part", msgs[2])
+	}
+	if msgs[3].ToolCallID != "c2" || msgs[3].Content != "finished" {
+		t.Fatalf("msgs[3] = %+v, want the real result of the call that was running", msgs[3])
+	}
+	for i, want := range []string{`"content":"two"`, `"content":"three"`} {
+		call, answer := msgs[4+i*2], msgs[5+i*2]
+		if call.Role != "assistant" || len(call.ToolCalls) != 1 || !strings.Contains(call.ToolCalls[0].Function.Arguments, want) {
+			t.Fatalf("msgs[%d] = %+v, want the assistant message of the part with %s", 4+i*2, call, want)
+		}
+		if answer.Role != "tool" || answer.ToolCallID != call.ToolCalls[0].ID || !strings.Contains(answer.Content, "interrupted") {
+			t.Fatalf("msgs[%d] = %+v, want the unstarted part answered as interrupted", 5+i*2, answer)
+		}
 	}
 }
 

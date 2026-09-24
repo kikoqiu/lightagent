@@ -36,7 +36,8 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
    4. `callLLM()`：构造 `[system, ...history]`，附带工具定义，流式调用；模型可见回答的增量
       文本发布为 `assistant_delta`；若服务商返回思考内容（`reasoning_content` / `reasoning`），
       其增量先发布为 `reasoning_delta`。
-      * **调用失败**：被用户中断的走下面的「中断」分支；**服务商以「上下文超限」拒绝**
+      * **调用失败**：被用户中断的走下面的「中断」分支（服务商已经流出的那部分回复会保留）；
+        **服务商以「上下文超限」拒绝**
         （`llm.IsContextLengthError`，见[溢出恢复](#溢出恢复provider-拒绝后回退--摘要--重发)）时
         回退本轮消息、摘要后重发同一条消息（次数有上限）；其余错误仍以 `error` 结束回合。
    5. 追加 assistant 消息（含组装后的思考 `reasoning_content`，会随后续请求回传）并广播
@@ -59,7 +60,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
    7. 逐个执行工具，发布 `tool_call` / `tool_result`，把结果作为 `tool` 消息追加；本轮结束后
       广播 `usage`（工具结果同样占用上下文），回到 2。tool 消息的正文就是工具函数的返回值
       （`res.ForLLM`），不加任何包装/信封；被中断的调用也在这条通路上记一条
-      `interrupted by user before the tool finished`。
+      `interrupted by user before the call started`（见下面的「中断」）。
       * **带附件的工具结果**（目前只有 `upload_media`）：`res.Media` 非空时该 tool 消息的
         `content` 写成**数组** —— 文本 part（`ForLLM`）在前，附件 part 在后；不带附件时仍是普通
         字符串，`llm.Message` 的编解码负责这个形态（会话文件里的 media part 同一形态，但**只写
@@ -70,18 +71,48 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
         文本载荷超过 `write_file.max_lines`，该调用的参数在落库前先被改写成第一段（历史、前端展示与
         后续请求回传的都是实际执行的参数），其余分段在本轮工具结果之后追加为**独立的 assistant/tool
         往返**（每段一个 `tool_call` + `tool_result`，续写段 `mode='a'`），全部写完才回到 2 继续问
-        模型；第一段失败则丢弃其余分段并发布 `info`。
+        模型；第一段失败则丢弃其余分段并发布 `info`。超限的写**就是先被展开成多条写**：这些分段与
+        同批其他调用没有任何区别——不管它们是模型一次发出的，还是被展开出来的——中断时同样不特殊
+        处理（在跑的那段反馈真实结果，其余未开始的段记为 `interrupted by user`，见下面的「中断」）。
    8. 达到 `max_tool_iterations` 时发布 `info` 并结束。
 3. 结束时置 `busy=false`、保存会话、发布 `turn_done`；随后若 `steerCh` 仍非空（消息在最后一轮
    **之后**才到，已无轮次可并入），则由 `startSteeringTurn()` 立刻把它们作为**独立的新回合**继续
    处理，并在那里广播它们的 `user` 事件（与 `drainSteering` 同一时机语义），不会滞留到用户下次输入。
 
 > **中断**：每个回合有自己的可取消 context（`Agent.Interrupt()` 触发，CLI 的 Ctrl+C /
-> `/stop`、网页的 Stop 按钮 / `/stop`）。中断会取消正在进行的模型调用或工具调用：
-> 处在「等模型」阶段（本条记录尚无任何产出）时**回滚该条用户记录**并发布 `interrupted`；
-> 处在工具阶段时保留已有记录，把被中断（及其后未执行）的工具调用记为
-> `interrupted by user`，发布 `interrupted` 后结束回合。之后 Agent 回到空闲，等待下一条
-> 用户消息开始新回合。`exec_command` 的同步等待可被取消：中断会直接结束其进程。
+> `/stop`、网页的 Stop 按钮 / `/stop`）。中断取消正在进行的模型调用或工具调用，语义按
+> **有没有工具调用已经开始**分两类：
+>
+> * **没有任何工具调用开始**（正在等模型；或回复已到达/仍在流式，但第一个调用尚未开始）：
+>   * 服务商已经流出的**正文**保留为一条 assistant 消息（连同一起流出的思考）：流式过程中它由
+>     `assistant` 事件定稿（前端把正在绘制的行收尾，回放缓冲记录这一行），完整到达的回复则本来
+>     就已入历史。消息里携带的 tool 调用**全部丢弃**——它们一个都没开始执行，而被截断的回复本身
+>     可能只含半条调用——丢弃数量以 `info`（消息已落库时写在 `interrupted` 文案里）说明；这种
+>     情况下调用是**从已记录的消息上摘掉**的，因此不会为任何调用记 tool 回答。随后发布
+>     `interrupted` 并结束回合。
+>   * **正文 trim 后为空**（只流出了思考 / tool 调用）时整条 assistant 消息**不保留**：空 content
+>     的消息对下一次请求毫无意义。用户消息仍留在历史里。
+>   * 连一个字符都没流出（严格处于「等模型」）：assistant 侧同样什么都不记，只发布
+>     `interrupted while waiting for the model; nothing had been produced`。
+>   * **用户消息在任何中断下都保留**：中断不会改写用户发过的东西，历史里始终留着那条 user 消息，
+>     下一次请求时它和上面的记录一起进入上下文（没有回复的 user 消息本身依然合法）。
+> * **已有工具调用开始**（单个或多个一样）：普通工具调用无法从中间打断，所以**正在执行的那一个
+>   照常跑完**，它的**真实结果**就是这次调用的回答；它**之后**的调用（一个都没开始，包括同一批里
+>   被展开出来的 write_file 分段）逐个发布 `interrupted by user` 并记为
+>   `interrupted by user before the call started`，使 assistant 的 `tool_calls` 与 `tool` 回答保持
+>   一一配对。随后发布 `interrupted` 并结束回合。两个例外：
+>   * `exec_command`：**强制终止**整棵进程树，并以其 `commandResult` 的 `status=interrupted`
+>     反馈**已经输出的终端内容**（`session_id` 为 `null`，没有进程留在后台）；恰好在中断时
+>     退出的进程仍按 `completed` 报告。
+>   * `manage_session` 的 `poll`：提前结束等待（等价于一次 `wait_timeout` 到期），反馈
+>     `status=running` + `session_id` + 已有输出，`warning` 说明 poll 被中断、进程仍在运行——
+>     poll 只是观察者，绝不去动它监视的进程；下一次 poll 继续接着读。
+>
+> 以上反馈都**只写进消息历史**（`assistant` / `tool` 消息）：回合就此结束，不会再带着它们请求
+> 模型——它们随**下一条用户消息**一起进入上下文。中断期间产生的 `assistant` / `tool_call` /
+> `tool_result` / `info` / `interrupted` 事件与普通轮次一样广播给各前端，因此两端看到的行与历史
+> 一致。之后 Agent 回到空闲，等待下一条用户消息开始新回合。若某个工具既不能中断又迟迟不返回，
+> 回合会一直等到它返回——这正是"普通工具调用中间无法中断"的直接后果。
 
 > steering 的语义：忙碌时用户输入不会丢失，而是在下一个安全点（下一轮 LLM 调用前）
 > 插入到对话里，因此 Agent 能在工具循环中途「听到」新的用户指令。若消息是在**最后一轮**
