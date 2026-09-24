@@ -101,7 +101,43 @@
         <button class="ghost gear" type="button" data-config-open title="edit config.json" aria-label="edit config.json">⚙</button>
       </span>
     </header>
-    <div id="log" role="log" aria-live="polite"></div>
+    <!-- The transcript and its floating jump buttons share one box: the buttons
+         must not scroll with the rows, and the area they act on is exactly this
+         box. Like every overlay on the page they are absolutely positioned,
+         never fixed — a phone's dynamic viewport would drag such an element
+         around (see the .stream rules in app.css). "Previous" walks back through
+         the messages the user wrote and stops the automatic follow with it; it
+         is always there. "Latest" is the way back down — it resumes following,
+         so app.js fades it out while the view follows already and it is only
+         offered when it is needed. A phone shows both as round icon buttons, a
+         desktop as pills with the glyph and the word. -->
+    <div class="stream">
+      <div id="log" role="log" aria-live="polite"></div>
+      <div class="jump" id="jump">
+        <!-- The glyphs are the list's own "jump to the first/last row" marks: a
+             bar with a chevron beside it (the vertical twin of |← and →|), so
+             the pair reads as one control and not as two plain arrows. They are
+             drawn with the copy icons' stroke, see .jump-icon in app.css. -->
+        <button class="jump-btn" id="jumpPrev" type="button"
+                title="jump to the previous message you sent (and stop following)" aria-label="jump to the previous message you sent">
+          <svg class="jump-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path d="M3.4 3.6h9.2"/>
+            <path d="M8 13V6.4"/>
+            <path d="M4.8 9.6 8 6.4l3.2 3.2"/>
+          </svg>
+          <span class="jump-label">Previous</span>
+        </button>
+        <button class="jump-btn off" id="jumpLatest" type="button"
+                title="jump to the newest message (and follow again)" aria-label="jump to the newest message">
+          <svg class="jump-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path d="M3.4 12.4h9.2"/>
+            <path d="M8 3v6.6"/>
+            <path d="M4.8 6.4 8 9.6l3.2-3.2"/>
+          </svg>
+          <span class="jump-label">Latest</span>
+        </button>
+      </div>
+    </div>
     <footer>
       <!-- Attachments waiting to be sent. A chip is added when the browser
            uploads a file (see app.js) and removed when the user cancels it; the

@@ -64,21 +64,74 @@
   // it, and a fresh snapshot restores the transcript on the way back.
   function visible() { return !document.hidden; }
 
-  // The transcript follows new output exactly while the reader is already at the
-  // bottom: dragging (or wheeling) up to read or copy history unpins the view, so
-  // streamed output keeps growing below without yanking the reader back down.
-  // Scrolling back to the bottom resumes following. The slack absorbs sub-pixel
-  // rounding, so "at the bottom" does not need an exact scrollHeight match.
+  // The transcript follows new output while the reader is following it. The
+  // reader's own gestures — a wheel turning up, a finger dragging the content
+  // down, a page key — stop that at once, and the view then stays where it was
+  // put while the output keeps growing below. Reaching the end of the transcript
+  // again (by hand, by sending a message, or with the "latest" button) resumes
+  // following. The slack absorbs sub-pixel rounding, so "at the bottom" does not
+  // need an exact scrollHeight match.
   //
-  // Everything that changes the log samples atBottom() *before* touching the DOM
-  // and calls pinBottom() afterwards only when it was true: adding or growing a
-  // row moves the bottom away, so checking after the change would always report a
-  // scrolled-away view and nothing would ever auto-follow. Sampling first also
-  // keeps a drag intact without listening for scroll events.
+  // Geometry alone cannot express this: while text streams in, the bottom moves
+  // away every frame, so a reader who is dragging upward is back inside "at the
+  // bottom" the moment a pin lands there — one such pin is enough to cancel the
+  // gesture and yank the reader down again, which is what made a scroll-back so
+  // hard to hold. Following is therefore a state of its own (see the gesture
+  // probes below), not a distance.
+  //
+  // Every part of the page that adds or grows a row goes through the same two
+  // steps: read followable(), change the DOM, then pinBottom() if it said yes.
+  // The pin has to come last — it must see the grown content to land on the new
+  // bottom — and the decision is taken first so a row that arrives while the
+  // reader is up in the history is not followed.
   var STICK_SLACK = 8;
 
   function atBottom() {
     return log.scrollHeight - log.scrollTop - log.clientHeight <= STICK_SLACK;
+  }
+
+  // following is the reader's standing answer to "should new output pull the view
+  // down?". A page opens at the newest row, so it starts as yes, and only the
+  // reader's own gestures turn it off.
+  var following = true;
+
+  // unpinnedAt is when following was last switched off: the scroll event of that
+  // very move (a gesture, the "previous message" button) arrives right after it,
+  // and a move that ends inside the STICK_SLACK band must not read as "heading
+  // back down" and turn following on again — see the band rule in onLogScroll,
+  // which holds that reading back for REPIN_GRACE_MS.
+  var unpinnedAt = 0;
+  var REPIN_GRACE_MS = 400;
+
+  // pinned reports the view sitting at the exact end of the transcript. Reader
+  // gestures land there (the browser clamps a scroll at the end) and so does the
+  // page's own pin, so this is the geometry that means "follow again". A gesture
+  // that only moved the view inside the STICK_SLACK band deliberately does not
+  // count: that small step up is exactly how a scroll-back starts.
+  function pinned() {
+    return log.scrollHeight - log.scrollTop - log.clientHeight <= 1;
+  }
+
+  // followable is the reader's intent, and only that: while text streams in, the
+  // bottom of the transcript moves away every frame, so a view that is a few
+  // pixels off it — content above it grew, a picture landed — must still be
+  // pulled back to the newest row. Geometry cannot decide this: the reader's own
+  // gestures have already turned following off by the time a pin writes (the
+  // browser dispatches the scroll event of a gesture before the animation frame
+  // the pin was queued in, see pinBottom).
+  function followable() {
+    return following;
+  }
+
+  // setFollowing records that answer and keeps the transcript's jump buttons in
+  // step: the "latest" one is exactly the way back from a view that stopped
+  // following, so it is faded out while the view follows (see updateJump).
+  function setFollowing(on) {
+    on = !!on;
+    if (on === following) { return; }
+    following = on;
+    if (!on) { unpinnedAt = Date.now(); }
+    updateJump();
   }
 
   // pinBottom shows the newest row regardless of where the reader was; on an
@@ -86,15 +139,19 @@
   // is coalesced into one animation frame: a streamed row can be re-drawn and
   // several rows appended between two frames, and every scroll write forces a
   // layout, so the frame ends with a single write to the true bottom. Whether to
-  // follow is still the caller's decision, taken by sampling atBottom() before
-  // it touched the DOM.
+  // follow is still the caller's decision (followable), and the reader can still
+  // take the view back in the frame between that decision and this write: the
+  // browser fires a gesture's scroll event before the animation frame callbacks
+  // of the same frame, so `following` is already off by the time a pin queued for
+  // that frame writes — the gesture wins over a pin already on its way.
   var pinQueued = false;
 
   function pinBottom() {
-    if (pinQueued) { return; }
+    if (pinQueued || !following) { return; }
     pinQueued = true;
     var write = function () {
       pinQueued = false;
+      if (!following) { return; }
       log.scrollTop = log.scrollHeight;
     };
     if (typeof window.requestAnimationFrame === 'function') {
@@ -103,6 +160,158 @@
       write();
     }
   }
+
+  // ---- reader intent: what stops and what resumes the follow ----
+  // The probes below are what lets a scroll-back hold: they run before the browser
+  // applies the gesture, so an up-gesture wins over a pin that is already queued
+  // for this frame. They are all passive — none of them changes what the gesture
+  // itself does.
+  function unpinView() {
+    // Nothing above to scroll to (a transcript shorter than its box): an
+    // up-gesture means nothing there, and unpinning would leave the reader
+    // following nothing.
+    if (log.scrollHeight - log.clientHeight > 1) { setFollowing(false); }
+  }
+
+  // A wheel turning up (deltaY < 0) is the desktop reader asking for history.
+  log.addEventListener('wheel', function (e) {
+    if (e.deltaY < 0) { unpinView(); }
+  }, { passive: true });
+
+  // On a touch screen the finger moves down the screen while the content moves
+  // up: the same request. Momentum needs nothing of its own — the scroll events
+  // it produces keep the view unpinned (see onLogScroll). A gesture that starts
+  // with two fingers (a pinch) is not a scroll and is left alone.
+  var touchY = 0;
+  var touchDrag = false;
+
+  log.addEventListener('touchstart', function (e) {
+    touchDrag = e.touches.length === 1;
+    touchY = touchDrag ? e.touches[0].clientY : 0;
+  }, { passive: true });
+  log.addEventListener('touchmove', function (e) {
+    if (!touchDrag || e.touches.length !== 1) { return; }
+    var y = e.touches[0].clientY;
+    if (y - touchY > 1) { unpinView(); }
+    touchY = y;
+  }, { passive: true });
+
+  // Keyboard scrolling: PageUp/Home/ArrowUp (and Shift+Space) when the log holds
+  // the focus or nothing in particular does. A key typed into the composer — or
+  // into a form field of the config editor — is that field's own business.
+  function isFormField(el) {
+    if (!el || !el.tagName) { return false; }
+    var tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!el.isContentEditable;
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (isFormField(e.target)) { return; }
+    if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home' || (e.key === ' ' && e.shiftKey)) {
+      unpinView();
+    }
+  });
+
+  // The scroll event is where the reader's own scrollbar drag and the page's own
+  // pin both land (the pin always lands on the exact end), so it is the one place
+  // that decides to follow again: reaching the very end means "keep the newest row
+  // in view", and a scroll that moved the view up means the reader is reading
+  // history — whichever gesture produced it, a scrollbar drag having no wheel or
+  // touch event of its own.
+  var lastScrollTop = 0;
+
+  function onLogScroll() {
+    var top = log.scrollTop;
+    var moved = top - lastScrollTop;
+    lastScrollTop = top;
+    if (pinned()) { setFollowing(true); }
+    else if (moved < 0) { setFollowing(false); }
+    // Came back into the bottom band on the way down: the reader is heading for
+    // the bottom, and the next output should pull them the rest of the way. Not
+    // right after an unpin though — that move is the one being read.
+    else if (moved > 0 && atBottom() && Date.now() - unpinnedAt > REPIN_GRACE_MS) { setFollowing(true); }
+  }
+
+  log.addEventListener('scroll', onLogScroll, { passive: true });
+
+  // A resize moves the bottom (the composer wraps, a phone's keyboard shrinks the
+  // viewport): a following view is put back on the newest row, which is what the
+  // reader was looking at anyway.
+  window.addEventListener('resize', function () {
+    if (following) { pinBottom(); }
+  });
+
+  // ---- the transcript's jump buttons ----
+  // Two floating buttons: up walks back through the messages the reader wrote —
+  // the click also stops the follow, because reading history and following the
+  // newest output are opposites — and down goes to the newest row and follows
+  // again. The "latest" one is faded out exactly while the view follows, so it
+  // only ever offers the way back when it is needed (see updateJump).
+  var jumpPrevEl = document.getElementById('jumpPrev');
+  var jumpLatestEl = document.getElementById('jumpLatest');
+  // JUMP_PAD is the gap a jump leaves above the message it lands on, JUMP_EDGE
+  // the line the search looks at (a message "passed" by the reader starts above
+  // it); the two differ on purpose, so a row the previous click aligned is not
+  // offered twice.
+  var JUMP_PAD = 10;
+  var JUMP_EDGE = 14;
+  // lastJumpRow is the message the last click landed on. The search skips it, so
+  // clicking again walks one message further up whatever rounding did to where
+  // that row ended up.
+  var lastJumpRow = null;
+
+  // updateJump keeps the buttons in step with the follow state. "Latest" is
+  // faded out (.off) rather than removed: it keeps its place in the stack, so
+  // only the opacity changes when the reader scrolls away and back.
+  function updateJump() {
+    if (jumpLatestEl) { jumpLatestEl.classList.toggle('off', following); }
+  }
+
+  // prevUserRow is the newest message the reader wrote that starts above the top
+  // edge of the transcript: the one a click on "Previous" goes to. A message the
+  // page is still waiting to send (a pending row) counts like any other — it is
+  // a message the reader wrote.
+  function prevUserRow() {
+    var edge = log.getBoundingClientRect().top + JUMP_EDGE;
+    var found = null;
+    for (var i = 0; i < log.children.length; i++) {
+      var row = log.children[i];
+      if (!row.classList.contains('user')) { continue; }
+      if (row.getBoundingClientRect().top >= edge) { break; }
+      // The row the previous click landed on is not the next target: a click on
+      // top of that one means "one message further up".
+      if (row !== lastJumpRow) { found = row; }
+    }
+    return found;
+  }
+
+  // scrollRowToTop puts one row at the top edge of the transcript box, leaving
+  // JUMP_PAD above it so its role line is not flush against the header.
+  function scrollRowToTop(row) {
+    var box = log.getBoundingClientRect();
+    var top = log.scrollTop + (row.getBoundingClientRect().top - box.top) - JUMP_PAD;
+    log.scrollTop = top > 0 ? top : 0;
+  }
+
+  // jumpToPrevMessage goes to that message and stops following, so the output
+  // that keeps arriving below cannot pull the view away from what is being read.
+  // With nothing above to go to it does nothing at all and leaves the view alone.
+  function jumpToPrevMessage() {
+    var row = prevUserRow();
+    if (!row) { return; }
+    setFollowing(false);
+    scrollRowToTop(row);
+    lastJumpRow = row;
+  }
+
+  // jumpToLatest pins the view to the newest row and follows again.
+  function jumpToLatest() {
+    setFollowing(true);
+    pinBottom();
+  }
+
+  if (jumpPrevEl) { jumpPrevEl.onclick = jumpToPrevMessage; }
+  if (jumpLatestEl) { jumpLatestEl.onclick = jumpToLatest; }
 
   // The elapsed badge in the running pill times the current turn, mirroring the
   // CLI prompt (busyElapsedLocked): tenths of a second up to a minute, then
@@ -462,8 +671,9 @@
   function placeRow(row) {
     if (replayBatch) { replayBatch.appendChild(row); return; }
     var anchor = pendingRows.length ? pendingRows[0].el : null;
-    // Follow the new row only if the reader was at the bottom (sampled first).
-    var follow = atBottom();
+    // follow is the decision the page took before it touched the DOM: this row
+    // is to be followed, because the reader was following when it arrived.
+    var follow = followable();
     if (anchor) { log.insertBefore(row, anchor); } else { log.appendChild(row); }
     if (follow) { pinBottom(); }
   }
@@ -505,9 +715,11 @@
   }
 
   // appendRow puts a row at the very end of the log (the pending messages it
-  // queues behind), following it when the reader was at the bottom.
+  // queues behind), following it while the reader is following.
   function appendRow(row) {
-    var follow = atBottom();
+    // follow is the decision the page took before it touched the DOM: this row
+    // is to be followed, because the reader was following when it arrived.
+    var follow = followable();
     log.appendChild(row);
     if (follow) { pinBottom(); }
   }
@@ -528,8 +740,8 @@
     // is pinned once, when the snapshot ends: there is nothing to follow and no
     // layout to read here.
     if (replaying) { setSpan(rowText(el), text, renderMD); return; }
-    // A streamed re-render can grow the row, so the sample comes first too.
-    var follow = atBottom();
+    // A streamed re-render can grow the row, so the pin has to come after it.
+    var follow = followable();
     setSpan(rowText(el), text, renderMD);
     if (follow) { pinBottom(); }
   }
@@ -1249,6 +1461,11 @@
   function beginHistory(ev) {
     recordHistoryVersion(ev);
     log.innerHTML = '';
+    // A snapshot rebuilds the transcript from scratch: the page starts over at
+    // the newest row (the replay ends pinned there) and follows it again, and the
+    // rows the jump buttons pointed at are gone with the old ones.
+    setFollowing(true);
+    lastJumpRow = null;
     current = null;
     currentText = '';
     answerRenderedAt = 0;
@@ -1780,9 +1997,10 @@
     if (!text && ids.length === 0) { return; }
     input.value = '';
     autoGrow();
-    // Sending is an explicit "show me what comes next" action: re-pin the view
-    // (also makes the pending user row count as at-the-bottom) even when the
-    // reader had scrolled back through history.
+    // Sending is an explicit "show me what comes next" action: follow again and
+    // re-pin the view (which also makes the pending user row count as
+    // at-the-bottom) even when the reader had scrolled back through history.
+    setFollowing(true);
     pinBottom();
     // A message sent while a turn is running joins it (steering): its row is drawn
     // right away, marked pending, and the running reply keeps streaming above it

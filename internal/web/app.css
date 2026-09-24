@@ -199,6 +199,10 @@
   [data-idle] header .run .spin { animation-play-state:paused; }
 
   /* ---- transcript ---- */
+  /* .stream is the box the transcript scrolls in and the one the floating jump
+     buttons are anchored to: the buttons must not scroll with the rows, and the
+     area they act on is exactly this box. */
+  .stream { position:relative; display:flex; flex-direction:column; flex:1 1 auto; min-height:0; }
   #log {
     flex:1 1 auto; min-height:0;
     overflow-y:auto; overscroll-behavior:contain;
@@ -213,6 +217,47 @@
     content:"Waiting for messages…"; display:block; margin-top:56px;
     text-align:center; color:var(--fg-dim); font-size:13px;
   }
+
+  /* ---- the transcript's floating jump buttons ---- */
+  /* "Previous" walks back through the messages the user wrote (the click also
+     stops the automatic follow), "Latest" is the way down again and resumes it.
+     app.js fades "Latest" out while the view follows already (the .off rule
+     below), and the empty state takes both off the placeholder text. They are
+     stacked — the up mark above the down one — thin, and see-through at rest so
+     the transcript can be read around them. */
+  #log:empty ~ .jump { display:none; }
+  .jump {
+    position:absolute; z-index:2;
+    /* The window's edge, not the message column's: on a wide screen these are a
+       control of the screen itself, and the transcript keeps its column clean. */
+    right:16px; bottom:20px;
+    display:flex; flex-direction:column; align-items:stretch; gap:8px;
+  }
+  .jump-btn {
+    display:inline-flex; align-items:center; justify-content:center; gap:7px;
+    min-height:34px; padding:0 14px;
+    border:1px solid rgba(37,50,74,.6); border-radius:999px;
+    background:rgba(18,26,38,.4); color:var(--fg-muted);
+    font-family:inherit; font-size:12px; font-weight:600; letter-spacing:.2px;
+    box-shadow:0 10px 24px -20px rgba(0,0,0,.9);
+    -webkit-tap-highlight-color:transparent;
+    transition:opacity .24s ease, visibility .24s ease, background .2s ease,
+               border-color .2s ease, color .2s ease, box-shadow .2s ease;
+  }
+  /* A button that is not offered fades out where it stands: taking it out of the
+     flow would shift its neighbour down, and the pair is one control. */
+  .jump-btn.off { opacity:0; visibility:hidden; pointer-events:none; }
+  /* Only a device with a pointer gets the solid state: a touch screen would keep
+     the hover after the tap and leave the button lit. */
+  @media (hover: hover) {
+    .jump-btn:hover {
+      background:rgba(26,36,51,.96); border-color:var(--accent); color:var(--fg);
+      box-shadow:0 18px 36px -20px rgba(0,0,0,.98);
+    }
+  }
+  /* The glyph is a bar plus a chevron, drawn with the copy icons' stroke. */
+  .jump-btn .jump-icon { flex:0 0 auto; width:15px; height:15px; }
+  .jump-btn .jump-icon path { fill:none; stroke:currentColor; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
 
   .row { margin:0 0 15px; word-break:break-word; animation:rise .22s ease both; }
   @keyframes rise { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
@@ -733,6 +778,16 @@
     .row-actions button.copy svg { width:15px; height:15px; }
     .copy-pop button { width:36px; height:32px; }
     .copy-pop button svg { width:15px; height:15px; }
+    /* The jump buttons turn round on a phone and keep the glyph alone: their
+       words would eat a good part of the transcript's width. A tap must not
+       leave a highlight or a border behind either — the glyph does the telling,
+       and the press is over. The circle is 40px (small enough to stay clear of
+       the text, big enough for a thumb) and shares the desktop's opacity. */
+    .jump { right:max(12px, env(safe-area-inset-right)); bottom:16px; gap:10px; }
+    .jump-btn { width:40px; height:40px; min-width:40px; padding:0; border-radius:50%; }
+    .jump-btn .jump-icon { width:16px; height:16px; }
+    .jump-btn .jump-label { display:none; }
+    .jump-btn:focus, .jump-btn:focus-visible { outline:none; }
     button { padding:0 14px; }
   }
   @media (max-height: 460px) {

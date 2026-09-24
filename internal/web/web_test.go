@@ -185,6 +185,96 @@ func TestResponsiveAffordances(t *testing.T) {
 	}
 }
 
+// TestFollowLockAndJumpButtons pins the transcript's follow lock and the two
+// floating jump buttons. Following is a state of the reader's intent, not a
+// distance: an up-gesture (a wheel turning up, a finger dragging the content
+// down, a page key) and any upward scroll stop it at once — a pin already queued
+// for that frame yields to the gesture — while reaching the exact end of the
+// transcript starts it again. "Previous" walks back through the user's own
+// messages (and stops the follow), "Latest" returns to the newest row and follows
+// again, and that one is hidden while the view follows already.
+func TestFollowLockAndJumpButtons(t *testing.T) {
+	for _, want := range []string{
+		"function followable()",
+		"function pinned()",
+		"function setFollowing(on)",
+		// A pin that is already on its way still yields to a reader's gesture.
+		"if (pinQueued || !following) { return; }",
+		"      if (!following) { return; }",
+		// The probes: wheel, touch drag, page keys, and the scroll direction.
+		"log.addEventListener('wheel', function (e) {",
+		"if (e.deltaY < 0) { unpinView(); }",
+		"log.addEventListener('touchstart', function (e) {",
+		"log.addEventListener('touchmove', function (e) {",
+		"if (y - touchY > 1) { unpinView(); }",
+		"document.addEventListener('keydown', function (e) {",
+		"if (isFormField(e.target)) { return; }",
+		"log.addEventListener('scroll', onLogScroll, { passive: true });",
+		"if (pinned()) { setFollowing(true); }",
+		"else if (moved < 0) { setFollowing(false); }",
+		// The buttons, and the state that hides the "latest" one.
+		"function updateJump()",
+		"jumpLatestEl.classList.toggle('off', following);",
+		"function prevUserRow()",
+		"log.children",
+		"var lastJumpRow = null;", // the click after a jump goes one message higher
+		"function jumpToPrevMessage()",
+		"function jumpToLatest()",
+		"if (jumpPrevEl) { jumpPrevEl.onclick = jumpToPrevMessage; }",
+		"if (jumpLatestEl) { jumpLatestEl.onclick = jumpToLatest; }",
+		"setFollowing(false);", // the jump stops the follow...
+		"setFollowing(true);",  // ...and sending / the "latest" button resume it
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		`id="jumpPrev"`,
+		`id="jumpLatest"`,
+		`class="jump-btn"`,
+		`class="jump-btn off"`, // it starts faded out, before app.js runs
+		`class="jump-icon"`,    // the glyph is part of both layouts...
+		`class="jump-label"`,   // ...the word is the phone's to drop
+		// The transcript and its buttons share the box the rows scroll in.
+		".stream { position:relative; display:flex; flex-direction:column; flex:1 1 auto; min-height:0; }",
+		"#log:empty ~ .jump { display:none; }",
+		// Stacked (up above down), a thin pill at the window's edge, and
+		// see-through until a pointer is on it.
+		"display:flex; flex-direction:column; align-items:stretch; gap:8px;",
+		"right:16px; bottom:20px;",
+		"border:1px solid rgba(37,50,74,.6); border-radius:999px;",
+		"background:rgba(18,26,38,.4);",
+		".jump-btn.off { opacity:0; visibility:hidden; pointer-events:none; }",
+		"@media (hover: hover) {",
+		"-webkit-tap-highlight-color:transparent;",
+		// The glyphs are a bar with a chevron, in both layouts.
+		`d="M3.4 3.6h9.2"`,
+		`d="M3.4 12.4h9.2"`,
+		".jump-btn .jump-icon { flex:0 0 auto; width:15px; height:15px; }",
+		// A phone keeps the round glyph buttons (40px, the desktop's opacity) and
+		// no tap highlight.
+		".jump-btn { width:40px; height:40px; min-width:40px; padding:0; border-radius:50%; }",
+		".jump-btn .jump-icon { width:16px; height:16px; }",
+		".jump-btn .jump-label { display:none; }",
+		".jump-btn:focus, .jump-btn:focus-visible { outline:none; }",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	// The pair reads as one designed control: no bare up/down arrows left, the
+	// "latest" button is never shown or hidden abruptly, and a phone does not
+	// carry an opacity of its own.
+	for _, reject := range []string{
+		`d="M8 13V3.4"`, `d="M8 3v9.6"`, "jumpLatestEl.hidden = following;", "rgba(18,26,38,.62)",
+	} {
+		if strings.Contains(pageSource(), reject) {
+			t.Errorf("the page still carries %q", reject)
+		}
+	}
+}
+
 // TestHiddenPageSavesEnergy pins the power behaviour of the page: a desktop keeps
 // its mirror and its transcript while it is hidden (it only slows its redraws
 // down), a phone gets a grace period before it is stopped, a background page
