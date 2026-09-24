@@ -2,7 +2,9 @@ package tools
 
 import "bytes"
 
-// maxOutputBufferSize caps the per-session output buffer at 1MB.
+// maxOutputBufferSize caps the output buffer at 1MB per hand-over window: what a
+// call is about to take is buffered up to this, then the loss is marked and the
+// rest of that window is dropped (see sessionOutput).
 const maxOutputBufferSize = 1 << 20
 
 // outputTruncateMarker is appended once when the buffer cap is reached.
@@ -31,33 +33,31 @@ const maxCursorColumn = 4096
 //   - an LF ends the line. A CRLF is that CR followed by this LF, so the
 //     delivered line holds no CR.
 //
-// One rule is ours, not the terminal's: a line rewritten in place (by a CR, a
-// backspace or a CSI move) is withheld from readers until it is final — ended by
-// an LF, or released when the child exits (see flush). Such a line is a progress
-// repaint, and every state it replaced is noise a reader must not report. A line
-// that was never rewritten in place is delivered as soon as it appears, so a
-// prompt without a trailing newline stays visible.
+// The buffer is the window between two hand-overs: it holds what the child wrote
+// since the last call took the output, and a hand-over returns it as it stands
+// and empties the buffer (see take). The window is what keeps a progress bar
+// quiet: a line the child repaints in place keeps being overwritten in the
+// buffer, so the intermediate states of one window never reach a reader — only
+// the state the line holds when the buffer is handed over, together with every
+// line the child finished on the way. A line that was never rewritten in place is
+// visible as soon as it arrives, so a prompt without a trailing newline reaches a
+// reader too.
 //
 // All methods are called with ProcessSession.mu held.
 type sessionOutput struct {
-	// published is the delivered stream: finished lines (each ending in LF)
-	// followed by the bytes of the current line.
+	// published is the visible stream of the current window: finished lines
+	// (each ending in LF) followed by the bytes of the line being written.
 	published bytes.Buffer
-	// readOffset is the delivered prefix of published.
-	readOffset int
 	// rowStart is where the current line begins in published.
 	rowStart int
 	// col is the cell the next character lands in, counted from rowStart.
 	col int
-	// edited marks a current line that was rewritten in place: only its final
-	// version goes to a reader.
-	edited bool
 	// crPending marks a CR that ended its chunk: an LF may still follow, which
 	// makes it the line break of a CRLF instead of a cursor move.
 	crPending bool
 	// escape carries a CSI sequence that a chunk boundary cut in half.
 	escape []byte
-	// truncated is set once the cap was hit; everything after it is dropped.
+	// truncated is set once the cap was hit; the rest of the window is dropped.
 	truncated bool
 }
 
@@ -73,8 +73,8 @@ func (o *sessionOutput) append(p []byte) {
 	}
 	if o.published.Len() >= maxOutputBufferSize {
 		// The cap is reached: what is buffered stays, the loss is marked once
-		// and everything after it is dropped. The marker ends the line it lands
-		// on, so a withheld line is not lost with the rest.
+		// and the rest of this window is dropped. The marker ends the line it
+		// lands on, so the line being rewritten is not glued to it.
 		o.published.WriteString(outputTruncateMarker)
 		o.endLine()
 		o.truncated = true
@@ -131,7 +131,7 @@ func (o *sessionOutput) append(p []byte) {
 // returns how many bytes it used. 0 means the chunk ended inside the sequence:
 // its bytes are parked in o.escape until the rest arrives. Only the CSI family
 // (ESC [) is emulated; any other escape is ordinary output, and a sequence that
-// never completes is dropped by flush, since a terminal would not act on it
+// never completes is never handed over, since a terminal would not act on it
 // either.
 func (o *sessionOutput) consumeEscape(p []byte) int {
 	if len(p) < 2 {
@@ -215,8 +215,8 @@ func orOne(n int) int {
 	return n
 }
 
-// cursorTo moves the write cursor inside the current line and marks the line as
-// rewritten in place, which withholds it from readers until it is final.
+// cursorTo moves the write cursor inside the current line, so what the child
+// writes next lands in the cells of the line it is repainting.
 func (o *sessionOutput) cursorTo(col int) {
 	if col < 0 {
 		col = 0
@@ -225,7 +225,6 @@ func (o *sessionOutput) cursorTo(col int) {
 		col = maxCursorColumn
 	}
 	o.col = col
-	o.edited = true
 }
 
 // writeCell puts one character at the cursor, overwriting the cell already
@@ -272,37 +271,24 @@ func (o *sessionOutput) endLine() {
 	o.published.WriteByte('\n')
 	o.rowStart = o.published.Len()
 	o.col = 0
-	o.edited = false
 	o.crPending = false
 }
 
-// flush releases the line a child was rewriting when it exited: no byte can
-// rewrite the line anymore, so what it holds is its final version. An escape
-// sequence the stream ended in the middle of is dropped, as it stands for
-// nothing.
-func (o *sessionOutput) flush() {
-	o.escape = nil
+// take hands the whole buffer over to a caller: everything the child has written
+// since the last hand-over is returned as it stands — including the line it is
+// still rewriting, which is what a terminal would show right now — and the buffer
+// starts empty. The child's next write therefore forms a fresh line instead of
+// rewriting bytes a caller already got, nothing is reported twice, and how the
+// fresh line relates to what was handed over is the next call's business (a
+// repeated repaint simply arrives as the state it is). An escape sequence a chunk
+// boundary cut in half stays parked: it belongs to the child's stream, not to the
+// output handed over.
+func (o *sessionOutput) take() string {
+	data := string(o.published.Bytes())
+	o.published.Reset()
+	o.rowStart = 0
+	o.col = 0
 	o.crPending = false
-	o.edited = false
-}
-
-// read returns the deliverable delta and advances the delivery cursor.
-func (o *sessionOutput) read() string {
-	end := o.deliverEnd()
-	if end <= o.readOffset {
-		return ""
-	}
-	data := o.published.Bytes()[o.readOffset:end]
-	o.readOffset = end
-	return string(data)
-}
-
-// deliverEnd is the end of the region readers may see: a line that is being
-// rewritten in place is withheld until it is final, so a progress repaint never
-// reaches a reader.
-func (o *sessionOutput) deliverEnd() int {
-	if o.edited {
-		return o.rowStart
-	}
-	return o.published.Len()
+	o.truncated = false
+	return data
 }

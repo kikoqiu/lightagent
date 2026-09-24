@@ -23,7 +23,8 @@ func (t *ManageSessionTool) Name() string { return "manage_session" }
 // Description implements Tool.
 func (t *ManageSessionTool) Description() string {
 	return "Manage background processes created by exec_command. Supports non-blocking " +
-		"and long-polling output retrieval, input sending, listing and termination."
+		"and long-polling output retrieval (each call returns the whole output buffered " +
+		"so far and clears it), input sending, listing and termination."
 }
 
 // Parameters implements Tool.
@@ -38,7 +39,7 @@ func (t *ManageSessionTool) Parameters() map[string]any {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        []string{"poll", "input", "kill", "list"},
-				"description": "'poll': fetch incremental logs and status; 'input': write to stdin; 'kill': terminate; 'list': list active sessions.",
+				"description": "'poll': take the buffered output and the status; 'input': write to stdin; 'kill': terminate; 'list': list active sessions.",
 			},
 			"data": map[string]any{
 				"type":        "string",
@@ -47,17 +48,17 @@ func (t *ManageSessionTool) Parameters() map[string]any {
 			"wait_timeout": map[string]any{
 				"type":        "integer",
 				"default":     10,
-				"description": "For action='poll': max seconds to wait for the process to exit. Output arriving in the meantime does not end the wait. Default: 10.",
+				"description": "For action='poll': max seconds to wait for the process to exit. Output arriving in the meantime does not end the wait; the buffered output is returned either way, including the line a running process is repainting. Default: 10.",
 			},
 			"max_lines": map[string]any{
 				"type":        "integer",
 				"default":     200,
-				"description": "Maximum incremental lines to return (head/tail folded). Default: 200.",
+				"description": "Maximum lines this call returns (head/tail folded). The limit is per call, not over the process lifetime. Default: 200.",
 			},
 			"max_chars": map[string]any{
 				"type":        "integer",
 				"default":     30000,
-				"description": "Maximum incremental characters to return. Default: 30000.",
+				"description": "Maximum characters this call returns. The limit is per call, not over the process lifetime. Default: 30000.",
 			},
 		},
 		"required": []string{"action"},
@@ -158,12 +159,17 @@ func (t *ManageSessionTool) executePoll(start time.Time, args map[string]any, wa
 	}
 
 	// poll waits for the process to finish, up to wait_timeout: output written in
-	// the meantime does not end the wait (see WaitForExit), it comes back as one
-	// delta below.
+	// the meantime does not end the wait (see WaitForExit). Whether it exited or
+	// is still alive, the whole buffer is then handed over and emptied (see
+	// TakeOutput): a progress line is reported as the state it holds right now,
+	// and the next poll only reports what arrives after it. The exit is read
+	// first, so a process that exited during the window reports all of its output
+	// (its pipes are closed before the session is marked done).
 	if !session.IsDone() {
 		session.WaitForExit(waitTimeout)
 	}
-	raw, done := session.ReadAllPending()
+	done := session.IsDone()
+	raw := session.TakeOutput()
 	shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
 	totalLines, totalBytes := countLinesAndBytes(clean)
 

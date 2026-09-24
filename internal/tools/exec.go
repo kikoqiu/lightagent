@@ -145,9 +145,6 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 		// a character split by the final pipe read is still emitted.
 		_ = stdout.Close()
 		_ = stderr.Close()
-		// The child is gone, so the line the buffer held back (a progress line
-		// a CR may still have rewritten) is final: release its last version.
-		session.flushOutput()
 
 		code := 0
 		switch {
@@ -284,9 +281,11 @@ func (t *ExecCommandTool) Description() string {
 		"script language (available: %s; default: %s, the host shell). "+
 		"Synchronously waits up to `wait_timeout` seconds (default: %d). If it finishes within "+
 		"that window, returns exit_code and output directly. If it exceeds `wait_timeout` it "+
-		"detaches to the background and returns a `session_id`. The whole process lifetime is "+
-		"capped by `run_timeout` (default: %d seconds). Output is cleaned and truncated by "+
-		"`max_lines`/`max_chars`.",
+		"detaches to the background and returns a `session_id`: the call is a start followed by "+
+		"the same step as `manage_session` poll, so either one reports the whole output buffered "+
+		"at that moment and clears it. The process lifetime is capped by `run_timeout` (default: "+
+		"%d seconds). Output is cleaned and truncated by `max_lines`/`max_chars`, which bound what "+
+		"a call returns rather than the process lifetime.",
 		scriptLanguageSummary(), hostScriptLanguageID(), t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
 	if !useUTF8ParamAvailable() {
 		return description
@@ -340,12 +339,12 @@ func (t *ExecCommandTool) Parameters() map[string]any {
 	properties["max_lines"] = map[string]any{
 		"type":        "integer",
 		"default":     200,
-		"description": "Maximum output lines to return (head/tail folded). Default: 200.",
+		"description": "Maximum lines this call returns (head/tail folded). The limit is per call, not over the process lifetime. Default: 200.",
 	}
 	properties["max_chars"] = map[string]any{
 		"type":        "integer",
 		"default":     30000,
-		"description": "Maximum output characters to return. Default: 30000.",
+		"description": "Maximum characters this call returns. The limit is per call, not over the process lifetime. Default: 30000.",
 	}
 	return map[string]any{
 		"type":       "object",
@@ -411,12 +410,20 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 		_ = session.Kill()
 		return fail("interrupted by user")
 	}
-
-	raw := session.ReadIncremental()
+	// The wait is over: take what the child produced, whether it exited within
+	// the window or is still running. The whole buffer is handed over as it
+	// stands — the line it is still repainting included — and emptied, so the
+	// next call (manage_session poll, for instance) reports only what arrives
+	// after this one. The exit is read first: a process that has already exited
+	// has all of its output in the buffer (the child is reaped and its pipes are
+	// closed before the session is marked done), so nothing the caller needs is
+	// left behind.
+	done := session.IsDone()
+	raw := session.TakeOutput()
 	shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
 	totalLines, totalBytes := countLinesAndBytes(clean)
 
-	if session.IsDone() {
+	if done {
 		code := session.GetExitCode()
 		return commandResult{
 			Status:         statusCompleted,

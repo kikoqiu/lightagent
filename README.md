@@ -357,7 +357,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 
 ### `exec_command`
 执行脚本，采用「等待后转后台」模型：同步等待最多 `wait_timeout` 秒（默认 10），
-若超时则自动转入后台并返回 `session_id`。硬超时由 `run_timeout`（默认取配置）限制。
+若超时则自动转入后台并返回 `session_id`。**`exec_command` 就是「启动 + 一次 `poll`」**：
+窗口结束后的输出处理与 `manage_session` 的 `poll` 完全相同（把缓冲区当前内容整份交给模型并清空），
+`max_lines`/`max_chars` 只约束**本次调用**返回的量。硬超时由 `run_timeout`（默认取配置）限制。
 输出经 ANSI 清理与头尾折叠。
 
 每次调用自成一个**进程树**：结束会话、硬超时、lightagent 退出（含 Ctrl+C / SIGTERM）
@@ -374,7 +376,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
   非 Windows 主机始终 UTF-8。
 
 ### `manage_session`
-管理 `exec_command` 产生的后台会话：`poll`（轮询增量输出，支持长轮询）、
+管理 `exec_command` 产生的后台会话：`poll`（轮询增量输出，支持长轮询；**不论进程是否结束，都把
+缓冲区当前内容整份交出并清空**（含被就地重画的那一行），所以每次 poll 都能看到进度条当时的状态；
+`max_lines`/`max_chars` 只约束本次调用返回的量，不跨调用累计）、
 `input`（写入 stdin，支持 `ctrl-c`、`enter` 等控制键）、`kill`（结束整棵进程树）、`list`。
 
 ### `read_file_lines`

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -79,13 +80,19 @@ func TestExecCommandCollapsesCRProgress(t *testing.T) {
 		}
 	}
 
-	// When the process was still running as the wait window closed, the rest of
-	// its output must not carry the refreshes either.
+	// When the process was still running as the wait window closed, the polls
+	// that follow report the paint it had reached — the current state of the
+	// line, one per poll, never a state older than one already reported.
 	sessionID := sessionIDFromResult(t, res.ForLLM)
 	if sessionID == "" {
 		return
 	}
 	manageTool := NewManageSessionTool(engine)
+	last := 0
+	// The line printed after the repaints may arrive with the hand-over that
+	// reports the exit, so the whole delta is checked at the end.
+	var delta strings.Builder
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		poll := manageTool.Execute(context.Background(), map[string]any{
 			"action": "poll", "session_id": sessionID, "wait_timeout": 5,
@@ -93,13 +100,21 @@ func TestExecCommandCollapsesCRProgress(t *testing.T) {
 		if poll.IsError {
 			t.Fatalf("poll error: %s", poll.ForLLM)
 		}
-		for _, stale := range []string{"Downloading 1%", "Downloading 2%"} {
-			if strings.Contains(poll.ForLLM, stale) {
-				t.Fatalf("a refreshed line reached the model: %s", poll.ForLLM)
+		delta.WriteString(poll.ForLLM)
+		if state := repaintNumber(t, poll.ForLLM, "Downloading"); state >= 0 {
+			if state < last {
+				t.Fatalf("an older state than the one already reported reached the model: %s", poll.ForLLM)
 			}
+			last = state
 		}
 		if strings.Contains(poll.ForLLM, `"status":"completed"`) {
+			if !strings.Contains(delta.String(), "All done") {
+				t.Fatalf("the line printed after the repaints is missing: %s", delta.String())
+			}
 			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the child never exited: %s", poll.ForLLM)
 		}
 	}
 }
@@ -187,12 +202,14 @@ func TestExecCommandBackgroundThenManageSession(t *testing.T) {
 	}
 }
 
-// TestManageSessionPollHidesRefreshedLines covers the poll side of the terminal
-// line model: while the child only repaints one line, neither call reports that
-// line's intermediate versions.
-func TestManageSessionPollHidesRefreshedLines(t *testing.T) {
+// TestManageSessionPollReportsTheRepaintState covers the poll side of the
+// terminal line model: a line that is still being repainted is published as its
+// current state, so a reader watching a running child sees where the child got
+// to instead of a silent buffer — and no call reports a state older than one
+// already reported.
+func TestManageSessionPollReportsTheRepaintState(t *testing.T) {
 	// The child repaints one line for ~3s and prints a real line only afterwards,
-	// so both wait windows below land inside the repainting phase.
+	// so every call below lands inside the repainting phase.
 	command := "i=0; while [ $i -lt 30 ]; do printf '\\rprogress %s' \"$i\"; i=$((i+1)); sleep 0.1; done; printf '\\ndone\\n'"
 	if runtime.GOOS == "windows" {
 		command = "$out = [Console]::OpenStandardOutput(); " +
@@ -210,25 +227,49 @@ func TestManageSessionPollHidesRefreshedLines(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
-	if strings.Contains(res.ForLLM, "progress") {
-		t.Fatalf("a refreshed line reached the model: %s", res.ForLLM)
+	if !strings.Contains(res.ForLLM, `"status":"running"`) {
+		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
+	}
+	// The handoff reports the state the repaint had reached: the child paints for
+	// ~3s while the window above was 1s, so the last state is not there yet.
+	state := repaintNumber(t, res.ForLLM, "progress")
+	if state < 0 || state > 29 {
+		t.Fatalf("the handoff does not report the current state of the repaint: %s", res.ForLLM)
 	}
 	sessionID := sessionIDFromResult(t, res.ForLLM)
 	if sessionID == "" {
-		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
+		t.Fatalf("no session_id in %s", res.ForLLM)
 	}
 
-	poll := manageTool.Execute(context.Background(), map[string]any{
-		"action": "poll", "session_id": sessionID, "wait_timeout": 1,
-	})
-	if poll.IsError {
-		t.Fatalf("poll error: %s", poll.ForLLM)
-	}
-	if !strings.Contains(poll.ForLLM, `"status":"running"`) {
-		t.Fatalf("the session did not stay running: %s", poll.ForLLM)
-	}
-	if strings.Contains(poll.ForLLM, "progress") {
-		t.Fatalf("a refreshed line reached the model: %s", poll.ForLLM)
+	// Every poll reports the state the repaint had reached as its own line, and
+	// the states only move forward: a refresh no call observed never reaches the
+	// model. The line printed after the repaints arrives with the hand-over that
+	// reports the exit.
+	deadline := time.Now().Add(30 * time.Second)
+	var all strings.Builder
+	for {
+		poll := manageTool.Execute(context.Background(), map[string]any{
+			"action": "poll", "session_id": sessionID, "wait_timeout": 1,
+		})
+		if poll.IsError {
+			t.Fatalf("poll error: %s", poll.ForLLM)
+		}
+		all.WriteString(poll.ForLLM)
+		if next := repaintNumber(t, poll.ForLLM, "progress"); next >= 0 {
+			if next < state {
+				t.Fatalf("an older state than the one already reported reached the model: %s", poll.ForLLM)
+			}
+			state = next
+		}
+		if strings.Contains(poll.ForLLM, `"status":"completed"`) {
+			if !strings.Contains(all.String(), "done") {
+				t.Fatalf("the line printed after the repaints is missing: %s", all.String())
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the child never exited: %s", poll.ForLLM)
+		}
 	}
 }
 
@@ -411,13 +452,98 @@ func heartbeatSize(t *testing.T, path string) int64 {
 // sessionIDFromResult extracts session_id from a commandResult JSON string.
 func sessionIDFromResult(t *testing.T, payload string) string {
 	t.Helper()
-	var parsed struct {
-		SessionID string `json:"session_id"`
+	return derefString(commandResultFromResult(t, payload).SessionID)
+}
+
+// commandResultFromResult parses the structured contract out of a command tool
+// result, so a test can assert on the fields the model reads.
+func commandResultFromResult(t *testing.T, payload string) commandResult {
+	t.Helper()
+	var cr commandResult
+	if err := json.Unmarshal([]byte(payload), &cr); err != nil {
+		t.Fatalf("parse result: %v (%s)", err, payload)
 	}
-	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-		t.Fatalf("parse result: %v", err)
+	return cr
+}
+
+// TestPollFlushesPerCallAndLimitsApplyPerCall pins what a poll is: it hands the
+// whole output buffered up to that moment to the model and clears the buffer, and
+// the max_lines/max_chars budget belongs to that call instead of the process
+// lifetime — the second poll reports its own batch rather than inheriting the
+// first one's fold.
+func TestPollFlushesPerCallAndLimitsApplyPerCall(t *testing.T) {
+	// The child prints one batch of 60 lines per input line it reads, so every
+	// poll below has exactly one batch of its own to hand over.
+	command := "while read line; do i=0; while [ $i -lt 60 ]; do i=$((i+1)); echo $i; done; done"
+	if runtime.GOOS == "windows" {
+		command = "while ($null -ne ($line = [Console]::In.ReadLine())) { " +
+			"1..60 | ForEach-Object { \"line $_\" } }"
 	}
-	return parsed.SessionID
+
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	execTool := NewExecCommandTool(engine)
+	manageTool := NewManageSessionTool(engine)
+
+	// The child only waits for input, so its start hands over no output.
+	res := execTool.Execute(context.Background(), map[string]any{"command": command, "max_lines": 10})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	sessionID := sessionIDFromResult(t, res.ForLLM)
+	if sessionID == "" {
+		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
+	}
+
+	for batch := 1; batch <= 2; batch++ {
+		in := manageTool.Execute(context.Background(), map[string]any{
+			"action": "input", "session_id": sessionID, "data": "go\n",
+		})
+		if in.IsError {
+			t.Fatalf("batch %d: input error: %s", batch, in.ForLLM)
+		}
+		poll := manageTool.Execute(context.Background(), map[string]any{
+			"action": "poll", "session_id": sessionID, "wait_timeout": 2, "max_lines": 10,
+		})
+		if poll.IsError {
+			t.Fatalf("batch %d: poll error: %s", batch, poll.ForLLM)
+		}
+		cr := commandResultFromResult(t, poll.ForLLM)
+		if !cr.Truncated {
+			t.Fatalf("batch %d was not folded under max_lines=10: %s", batch, poll.ForLLM)
+		}
+		// The call counts what it received, not what it was allowed to return.
+		if cr.TotalLines != 60 {
+			t.Fatalf("batch %d reports %d lines, want the 60 of that call alone: %s", batch, cr.TotalLines, poll.ForLLM)
+		}
+		// The fold keeps the tail, so the batch's last line is what the model sees.
+		if !strings.HasSuffix(strings.TrimSpace(cr.Output), "60") {
+			t.Fatalf("batch %d lost the end of its output: %s", batch, poll.ForLLM)
+		}
+	}
+}
+
+// repaintNumber reads the number a repainting child printed in its "<label> N"
+// line out of a tool result (-1 when the result does not carry that line).
+func repaintNumber(t *testing.T, result, label string) int {
+	t.Helper()
+	at := strings.Index(result, label+" ")
+	if at < 0 {
+		return -1
+	}
+	rest := result[at+len(label)+1:]
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	if digits == 0 {
+		t.Fatalf("no number after %q in %s", label, result)
+	}
+	number, err := strconv.Atoi(rest[:digits])
+	if err != nil {
+		t.Fatalf("bad number after %q in %s: %v", label, result, err)
+	}
+	return number
 }
 
 // TestExecCommandDecodesLocalizedOutput covers the legacy ANSI code page path

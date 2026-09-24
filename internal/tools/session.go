@@ -71,14 +71,14 @@ func (s *ProcessSession) appendOutput(p []byte) {
 	s.output.append(p)
 }
 
-// flushOutput releases the line the buffer still held back because the child was
-// rewriting it in place. The output writers call it once the child is gone: no
-// byte can rewrite the line anymore, so what it holds is what the child left on
-// screen (see sessionOutput).
-func (s *ProcessSession) flushOutput() {
+// TakeOutput hands the whole buffered output over and empties the buffer: every
+// call reports what the child has written since the previous one, whether or not
+// it has exited, including the line it is still repainting (see sessionOutput).
+// Nothing is withheld, and nothing already handed over is reported again.
+func (s *ProcessSession) TakeOutput() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.output.flush()
+	return s.output.take()
 }
 
 // startWatchdog force-terminates the process once timeout elapses.
@@ -176,21 +176,6 @@ func (s *ProcessSession) GetExitCode() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ExitCode
-}
-
-// ReadIncremental returns the unconsumed output delta and advances the cursor.
-func (s *ProcessSession) ReadIncremental() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.output.read()
-}
-
-// ReadAllPending returns the pending delta plus whether the process exited.
-func (s *ProcessSession) ReadAllPending() (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	done := s.Status == "done"
-	return s.output.read(), done
 }
 
 // Write sends data to the process stdin.

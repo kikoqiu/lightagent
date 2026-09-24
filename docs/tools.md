@@ -52,8 +52,10 @@ type Tool interface {
   * 非 Windows 主机**没有** `use_utf8` 参数（也没有可回退的 ANSI 代码页）：始终 UTF-8，
     仅额外注入 `PYTHONIOENCODING=utf-8`。
 * 同步等待最多 `wait_timeout` 秒（默认取 `exec.wait_seconds`，10s）：等的是**进程退出**，窗口内写出的
-  内容不会提前结束等待（与 `manage_session` 的 `poll` 同一语义）。若在窗口内完成，直接返回 `exit_code`
-  与输出；否则转入后台并返回 `session_id`，期间累积的输出随该结果一起给出。
+  内容不会提前结束等待。**`exec_command` 就是「启动 + 一次 `poll`」**：窗口结束后的输出处理与
+  `manage_session` 的 `poll` 完全一致——把缓冲区当前内容整份交给模型并清空，所以窗口内完成就直接
+  返回 `exit_code` 与输出，未完成就转后台返回 `session_id` 并附上当时缓冲区的内容。`max_lines`/
+  `max_chars` 只约束**本次调用**返回的量（不跨调用、不按进程生命周期累计）。
 * 硬超时 `run_timeout`（默认取 `exec.timeout_seconds`，3600s）到点强制结束进程；
   `run_timeout=0` 关闭硬超时。
 * 每次调用都是一个会话，会话的根进程（宿主 shell 或 Python 解释器）是它**自己进程树的根**：
@@ -63,9 +65,13 @@ type Tool interface {
   行内 CSI 也照做——`CSI K`（`0`/`1`/`2`，擦除行内）与 `CSI <n> G`/`C`/`D`（列定位、左右移动），这正是
   进度条与 `\r` 搭配的写法（`\r\x1b[K…`）；其余 CSI（颜色、上下移、私有模式等）一律吞掉，不会把转义
   字节交给模型。`\n`（含 CRLF）结束一行，交付的行里不含 `\r`。
-* **被就地改写过的行会扣住不交付**，直到被 `\n` 定稿、或子进程退出（此时交出最后一版）——进度条刷新
-  多少次都只算一行、中间状态也不进上下文；从未被就地改写的未完成行（如不带换行的提示符）照常立即交付。
-  之后按 `max_lines`/`max_chars` 做头尾折叠。
+* **被就地改写过的行不会逐次刷新地进入上下文**：缓冲区是两次交接之间的窗口，同一窗口内对同一行的
+  重画只是在反复覆盖缓冲区里的这一行，因此**只有交接那一刻该行的状态**（连同窗口内写完的每一行）会
+  进入上下文。交接 = `exec_command` 的返回与 `manage_session` 的 `poll`：**不论进程是否结束**都把
+  缓冲区当前内容整份交出并清空，所以每次调用都能看到进度条当时的状态，下一次调用只看到之后写出的
+  内容（同一状态出现在两次调用里是允许的——那是下一次调用自己的事）。从未被就地改写的未完成行
+  （如不带换行的提示符）照常立即可见。交出的内容随后按 `max_lines`/`max_chars` 做头尾折叠，上限
+  只约束**本次调用**（不跨调用、不按进程生命周期累计）。
 
 参数：
 
@@ -77,8 +83,8 @@ type Tool interface {
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
 | `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |
-| `max_lines` | int | `200` | 输出行数上限 |
-| `max_chars` | int | `30000` | 输出字符上限 |
+| `max_lines` | int | `200` | **本次调用**返回的行数上限（头尾折叠；不跨调用累计） |
+| `max_chars` | int | `30000` | **本次调用**返回的字符上限（不跨调用累计） |
 
 返回（JSON 字符串）：
 
@@ -116,7 +122,8 @@ type Tool interface {
 
 ## `manage_session`
 
-管理 `exec_command` 产生的后台会话（共享同一个会话池）。
+管理 `exec_command` 产生的后台会话（共享同一个会话池）。`exec_command` 可理解为**「启动 + 一次
+`poll`」**：窗口结束后的那一步与这里的 `poll` 是同一个操作。
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
@@ -124,15 +131,17 @@ type Tool interface {
 | `session_id` | string | — | 目标会话（`list` 不需要） |
 | `data` | string | — | `input` 时写入 stdin 的内容 |
 | `wait_timeout` | int | `10` | `poll` 最长等待**进程退出**的秒数（中间有输出也不提前返回） |
-| `max_lines` | int | `200` | 增量输出行数上限 |
-| `max_chars` | int | `30000` | 增量输出字符上限 |
+| `max_lines` | int | `200` | **本次调用**返回的行数上限（头尾折叠；不跨调用累计） |
+| `max_chars` | int | `30000` | **本次调用**返回的字符上限（不跨调用累计） |
 
 行为：
 
 * `poll`：等待**进程退出**，最多 `wait_timeout` 秒（与 `exec_command` 的同步等待同一语义：
-  窗口内写出的内容不会提前结束等待，最后一次性返回**自上次消费以来的增量**）。仍在运行 →
-  `status=running`；已退出 → `status=completed` 且带 `exit_code`。被就地改写过的行进不去增量，
-  要等它定稿（`\n` 或进程退出）才作为一行出现，因此进度条不会逐次刷新地进入上下文。
+  窗口内写出的内容不会提前结束等待）。**不论进程是否结束**，都把缓冲区当前内容**整份交出并清空**
+  （含被就地重画、尚未定稿的那一行）：仍在运行 → `status=running`（附 `session_id`），已退出 →
+  `status=completed` 且带 `exit_code`。因此进度条按每次 poll 当时的状态进入上下文，而两次 poll
+  之间被覆盖掉的中间刷新不会出现。`max_lines`/`max_chars` 只约束**本次 poll** 返回的量（不跨
+  poll、不按进程生命周期累计）：上限是「这一次交给模型多少」，而不是「这个进程一共交给模型多少」。
 * `input`：写入 stdin。纯控制键会被翻译：`ctrl-c`、`ctrl-d`、`ctrl-z`、`enter`/`return`、
   `tab`、`esc`、`up`/`down`/`left`/`right`、`backspace`；其余文本原样写入（如需换行请写 `"\n"`）。
   stdio 编码在 `exec_command` 启动该会话时已确定（Windows 上的 `use_utf8`），`manage_session` 不再另行选择。
