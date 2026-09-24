@@ -41,30 +41,75 @@
     -webkit-text-size-adjust:100%;
   }
 
-  /* ---- app shell: one column on phones, rail + content on desktop ---- */
-  /* .app is the positioning context for the config editor modal: the overlay is
-     absolutely positioned, never fixed, so the layout stays in the dynamic
-     viewport on mobile. */
-  .app { display:grid; grid-template-columns:1fr; height:100vh; height:100dvh; position:relative; }
-  .main { display:flex; flex-direction:column; min-width:0; min-height:0; }
+  /* ---- app shell: the banner over (rail | content) ---- */
+  /* .app is a two-row grid: the banner takes the first row across the whole width,
+     and the rail and the content share the second one. The rail is placed in that
+     row — the same in both layouts — so a phone's drawer is held under the banner
+     (an absolutely positioned grid child resolves against the area it was placed
+     in) and can never reach up into it. .app is also the positioning context of
+     the config editor modal and the copy menu: those overlays are absolutely
+     positioned, never fixed, so the layout stays in the dynamic viewport on
+     mobile. */
+  .app {
+    display:grid; grid-template-columns:1fr; grid-template-rows:auto 1fr;
+    height:100vh; height:100dvh; position:relative;
+  }
+  /* The content: the original column of header, transcript and composer — the
+     header is the banner row above it (see the .app note). */
+  .main { grid-row:2; grid-column:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 
-  /* ---- side rail (desktop only) ---- */
+  /* ---- the side rail ---- */
+  /* Below the desktop breakpoint the rail is a drawer: folded off-canvas until the
+     mark in the banner is tapped, then sliding in over the content (the mark is
+     #railToggle, the scrim behind the rail is .rail-backdrop; the wiring is in
+     app.js). It is positioned absolutely — never fixed, the rule every overlay on
+     this page follows — in the row under the banner (its own grid area, see .app
+     above), so the banner stays in view: the mark that opened the rail is also the
+     one that folds it away. The desktop media query below turns the same element
+     into the plain column it is on a wide screen. */
   .sidebar {
-    display:none; flex-direction:column; gap:14px; min-height:0;
-    padding:18px 16px calc(18px + env(safe-area-inset-bottom));
-    background:linear-gradient(180deg, rgba(19,27,40,.92), rgba(11,16,24,.78));
+    display:flex; flex-direction:column; gap:14px; min-height:0;
+    grid-row:2; grid-column:1;
+    /* A hair above the row: the top edge then lands on the banner's own bottom
+       edge, and no hairline of the transcript can show between the two. */
+    position:absolute; top:-1px; bottom:0; left:0; z-index:45;
+    width:min(var(--sidebar-w), 86vw);
+    padding:18px max(16px, env(safe-area-inset-left)) calc(18px + env(safe-area-inset-bottom));
+    /* Opaque: the transcript stays behind the drawer, never faintly inside it. */
+    background:linear-gradient(180deg, #131b28, #0b1018);
     border-right:1px solid var(--border-soft);
+    box-shadow:0 30px 60px -30px rgba(0,0,0,.95);
     overflow-y:auto; overscroll-behavior:contain;
+    transform:translateX(-100%); visibility:hidden;
+    /* One quick slide. The visibility change waits for the end of the ride, so a
+       folding rail stays painted while it leaves (the open state below arms it
+       with no delay instead, so a fresh drawer is on screen from the first
+       frame). */
+    transition:transform .16s cubic-bezier(.22,.61,.36,1), visibility 0s linear .16s;
   }
-  .side-head { display:flex; align-items:center; gap:11px; padding:2px 4px 4px; }
-  .side-head .logo {
-    flex:0 0 auto; width:32px; height:32px; border-radius:10px; position:relative;
-    background:linear-gradient(135deg, #4f8cff 0%, #a371f7 100%);
-    box-shadow:inset 0 0 0 1px rgba(255,255,255,.18), 0 10px 24px -12px rgba(90,162,255,.95);
+  /* A fresh drawer is focused as a whole (setRailOpen in app.js): it needs no ring
+     of its own, its controls carry theirs. */
+  .sidebar:focus { outline:none; }
+  /* The open state lives on .app, so one class moves the rail and its scrim
+     together. visibility keeps the folded rail out of the tab order and off the
+     accessibility tree. */
+  .app.rail-open .sidebar {
+    transform:none; visibility:visible;
+    transition:transform .16s cubic-bezier(.22,.61,.36,1), visibility 0s;
   }
-  .side-head .logo::after { content:""; position:absolute; inset:8px; border-radius:4px; background:rgba(8,11,17,.82); }
-  .side-head .brand b { display:block; font-size:15px; font-weight:800; letter-spacing:.2px; }
-  .side-head .brand small { display:block; color:var(--fg-dim); font-size:10px; letter-spacing:1.1px; text-transform:uppercase; }
+  /* The scrim rides the same row and the same state, so it dims the content while
+     the banner above stays a live control. */
+  .rail-backdrop {
+    grid-row:2; grid-column:1;
+    position:absolute; inset:0; z-index:44;
+    background:rgba(4,7,12,.58);
+    opacity:0; visibility:hidden;
+    transition:opacity .16s linear, visibility 0s linear .16s;
+  }
+  .app.rail-open .rail-backdrop {
+    opacity:1; visibility:visible;
+    transition:opacity .16s linear, visibility 0s;
+  }
   .card {
     background:linear-gradient(180deg, rgba(26,36,51,.72), rgba(16,23,34,.58));
     border:1px solid var(--border-soft); border-radius:var(--radius);
@@ -130,9 +175,11 @@
   .cmd .cmd-state[data-on="0"] { color:var(--fg-dim); }
   .side-foot { margin-top:auto; padding:6px 4px 0; color:var(--fg-dim); font-size:10.5px; letter-spacing:.6px; text-transform:uppercase; }
 
-  /* ---- top bar ---- */
+  /* ---- banner ---- */
+  /* The page's top row, spanning the whole width: the rail (and a phone's
+     drawer) sits under it instead of beside it (see .app above). */
   header {
-    flex:0 0 auto;
+    grid-row:1; grid-column:1 / -1;
     display:flex;
     align-items:center;
     gap:10px;
@@ -150,6 +197,17 @@
     box-shadow:inset 0 0 0 1px rgba(255,255,255,.16), 0 8px 18px -10px rgba(90,162,255,.9);
   }
   header .logo::after { content:""; position:absolute; inset:6px; border-radius:3px; background:rgba(8,11,17,.8); }
+  /* The mark's handle: a transparent button around the bare mark, so a phone can
+     tap it to open the rail (see .sidebar above). Its box is 36px — the size of
+     the header's other tap targets — and the negative margin pulls that ring back
+     out of the flex line, so the mark, the brand beside it and the header's
+     height are exactly what they were. Hover and press stay the page's own. */
+  header .rail-toggle {
+    flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center;
+    min-height:0; min-width:0; padding:6px; margin:-6px; border:0;
+    background:transparent; box-shadow:none; cursor:pointer;
+    -webkit-tap-highlight-color:transparent;
+  }
   header .brand { display:flex; flex-direction:column; line-height:1.15; min-width:0; }
   header .brand b { color:var(--fg); font-size:14.5px; font-weight:800; letter-spacing:.2px; }
   header .brand small {
@@ -735,8 +793,23 @@
 
   /* ---- responsive: phones vs desktop ---- */
   @media (min-width: 1000px) {
+    /* The banner spans the whole width here too, and the rail and the content share
+       the row under it: the rail takes the fixed first column, the content the
+       rest. The rail is in view at all times — no sliding, no scrim, and a hint of
+       the page showing through it as before (the drawer's opaque fill is a
+       phone-only concern). The mark in the banner is a bare mark again — the
+       pointer goes through it, and app.js drops it from the tab order at this same
+       breakpoint. */
     .app { grid-template-columns:var(--sidebar-w) 1fr; }
-    .sidebar { display:flex; }
+    .main { grid-column:2; }
+    .sidebar {
+      position:static; width:auto; transform:none; visibility:visible;
+      padding:18px max(16px, env(safe-area-inset-left)) calc(18px + env(safe-area-inset-bottom));
+      background:linear-gradient(180deg, rgba(19,27,40,.92), rgba(11,16,24,.78));
+      box-shadow:none; transition:none;
+    }
+    .rail-backdrop { display:none; }
+    header .rail-toggle { pointer-events:none; cursor:default; }
     header .brand small { font-size:10.5px; }
   }
   @media (max-width: 720px) {
@@ -799,4 +872,9 @@
   @media (prefers-reduced-motion: reduce) {
     .row { animation:none; }
     .copy-pop { animation:none; }
+    /* The drawer's quick slide too: the rail is simply where it belongs and the
+       scrim is simply there. The open state carries a transition of its own, so it
+       is named here as well. */
+    .sidebar, .rail-backdrop,
+    .app.rail-open .sidebar, .app.rail-open .rail-backdrop { transition:none; }
   }

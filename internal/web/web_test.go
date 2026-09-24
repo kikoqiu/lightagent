@@ -165,6 +165,57 @@ func TestMobileChrome(t *testing.T) {
 	}
 }
 
+// TestPhoneRailDrawer pins the rail under the banner: the app is a two-row grid
+// (the banner across the whole width, the rail and the content sharing the row
+// under it), so the rail — the desktop's first column and a phone's drawer — never
+// covers the banner, and the page keeps one mark: the banner's, which is also the
+// drawer's handle. The content column itself stays the original one. The drawer is
+// sealed against the banner and opaque, so no hairline of the transcript can show
+// between them or through it, and it arrives with one quick slide. app.js owns the
+// state: the stylesheet's desktop breakpoint read backwards decides whether that
+// mark is a control or decoration, a tap on the scrim or one Escape closes the
+// drawer, and acting inside the rail brings the page back.
+func TestPhoneRailDrawer(t *testing.T) {
+	src := pageSource()
+	for _, want := range []string{
+		`id="sideRail"`,   // the rail the mark points at...
+		`id="railToggle"`, // ...with the banner's mark as its handle
+		`aria-controls="sideRail"`,
+		`tabindex="-1"`,                             // the stop a fresh drawer takes the focus with
+		`id="railBackdrop"`,                         // the scrim that closes it
+		"grid-template-rows:auto 1fr",               // the banner is a row of its own...
+		"grid-row:2; grid-column:1;",                // ...and the rail is pinned under it,
+		"top:-1px",                                  // its top edge sealed on the banner's own bottom edge,
+		"linear-gradient(180deg, #131b28, #0b1018)", // painted opaque,
+		".16s cubic-bezier(.22,.61,.36,1)",          // and moved by one quick slide
+		"transform:translateX(-100%)",               // (the rail starts off-canvas...
+		".app.rail-open .sidebar",                   // ...and one state on .app brings it in)
+		".app.rail-open .rail-backdrop",             // the scrim rides the same class
+		"function setRailOpen",                      // one place decides open/closed
+		"railEl.focus();",                           // the focus lands inside a fresh drawer
+		"matchMedia('(min-width: 1000px)')",         // the stylesheet's breakpoint, inverted
+		"var focusInsideRail = railEl.contains(document.activeElement);", // ...and leaves it before the fold
+		"document.querySelector('.modal:not([hidden])')",                 // a panel above owns Escape
+		"header .rail-toggle { pointer-events:none; cursor:default; }",   // decoration on a wide screen
+		".rail-backdrop { transition:none; }",                            // reduced motion stills the slide
+		// The content column stays the original one: header, transcript and composer
+		// are a plain flex column in the second row, with the rail merely sharing it.
+		".main { grid-row:2; grid-column:1; display:flex; flex-direction:column; min-width:0; min-height:0; }",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the phone rail drawer is missing %q", want)
+		}
+	}
+	// The rail carries no mark of its own — no rail head with a second logo, and no
+	// close button inside it: the banner's mark is the page's only one, and it stays
+	// in view while the drawer is out, so it is what folds the rail away again.
+	for _, reject := range []string{`class="side-head"`, ".side-head", "data-rail-close", "rail-close"} {
+		if strings.Contains(src, reject) {
+			t.Errorf("the rail still carries %q", reject)
+		}
+	}
+}
+
 // TestResponsiveAffordances guards the polished mirror chrome: the connection
 // status label, the auto-growing composer, disabled-while-offline send button
 // and the mobile-safe padding/tap targets must all stay wired.

@@ -1319,6 +1319,107 @@
     setSwitch('/markdown', MARKDOWN);
   }
 
+  // ---- the rail as a drawer (phones) ----
+  // A phone lays the page out in one column, so the rail is folded off-canvas
+  // under the banner and the mark in that banner is the handle that slides it in
+  // over the content (the drawer itself is in app.css). The breakpoint is the
+  // stylesheet's own, read the other way round: what a viewport narrower than the
+  // desktop grid gets is the drawer, and the same query tells this script when the
+  // rail has left the screen for good — there the mark is decoration and the rail
+  // is a column of the grid.
+  var RAIL_SHOW = 'show the session panel';
+  var RAIL_HIDE = 'hide the session panel';
+  // What a tap inside the rail is allowed to answer with "and now show me the
+  // page": a command (it runs on the connection) and the editor or the voice panel
+  // (they come up over the page).
+  var RAIL_ACTION = '[data-cmd],[data-config-open],[data-tts-open]';
+  var wideQuery = window.matchMedia ? window.matchMedia('(min-width: 1000px)') : null;
+  var appEl = document.querySelector('.app');
+  var railEl = document.getElementById('sideRail');
+  var railToggleEl = document.getElementById('railToggle');
+  var railBackdropEl = document.getElementById('railBackdrop');
+
+  // railOpen reports whether the drawer is out. The class on .app is the state
+  // itself — the stylesheet moves the rail and the scrim from it — so there is
+  // never a second copy of it to drift.
+  function railOpen() { return !!appEl && appEl.classList.contains('rail-open'); }
+
+  // setRailOpen slides the drawer in or out. A desktop is always the closed state:
+  // the rail is a column there, and the class would ask the stylesheet for a scrim
+  // over a rail that is in view anyway.
+  function setRailOpen(open) {
+    if (!appEl || !railEl || !railToggleEl) { return; }
+    var drawer = !(wideQuery && wideQuery.matches);
+    open = !!open && drawer;
+    var wasOpen = railOpen();
+    // Read where the focus stands before the class moves: a rail that becomes
+    // hidden by the stylesheet drops the focus it held, so the answer has to be
+    // taken while it is still on screen.
+    var focusInsideRail = railEl.contains(document.activeElement);
+    appEl.classList.toggle('rail-open', open);
+    if (drawer) {
+      railToggleEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+      railToggleEl.title = open ? RAIL_HIDE : RAIL_SHOW;
+      railToggleEl.removeAttribute('aria-hidden');
+    } else {
+      // On a desktop the rail never leaves the screen, so the mark is plain
+      // decoration again: nothing to expand, no tooltip, no tab stop (a button
+      // that does nothing is worse than no button) and no name for a screen
+      // reader to announce — the stylesheet lets the pointer through it.
+      railToggleEl.removeAttribute('aria-expanded');
+      railToggleEl.removeAttribute('title');
+      railToggleEl.setAttribute('aria-hidden', 'true');
+    }
+    railToggleEl.tabIndex = drawer ? 0 : -1;
+    if (!open && focusInsideRail) {
+      // Nothing may keep the focus inside a rail the layout is folding away, so it
+      // goes back to the handle that owns it.
+      railToggleEl.focus();
+    }
+    if (open && !wasOpen) {
+      // ...and a fresh drawer takes it, so a keyboard lands inside what it just
+      // opened instead of walking the banner again (the rail itself is a
+      // tabindex="-1" stop, see index.html).
+      railEl.focus();
+    }
+  }
+
+  if (railToggleEl) {
+    railToggleEl.onclick = function () { setRailOpen(!railOpen()); };
+  }
+  if (railBackdropEl) {
+    railBackdropEl.onclick = function () { setRailOpen(false); };
+  }
+  // One action inside the rail brings the page back: a command runs on the
+  // connection, the editor and the voice panel open over everything, and the
+  // reader is looking at the transcript again either way. The rail's own controls
+  // stay where they are — the Commands fold and the read-aloud switch are rail
+  // state, not an action somewhere else.
+  if (railEl && railEl.addEventListener) {
+    railEl.addEventListener('click', function (e) {
+      var node = e.target;
+      while (node && node !== railEl && !(node.matches && node.matches(RAIL_ACTION))) { node = node.parentNode; }
+      if (node && node !== railEl) { setRailOpen(false); }
+    });
+  }
+  // Escape closes the drawer, the way it closes the panels (config.js and the
+  // read-aloud one). A panel above the rail owns the key while it is up: it is what
+  // covers the page, and one key closing both would be a surprise.
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || !railOpen()) { return; }
+    if (document.querySelector('.modal:not([hidden])')) { return; }
+    setRailOpen(false);
+  });
+  // Crossing the breakpoint (a rotation, a resized window) leaves the drawer state
+  // behind: the rail is a column on the wide side of it, so a stale "open" would
+  // bring a scrim over the layout the moment the narrow side came back.
+  if (wideQuery) {
+    var onRailLayoutChange = function () { setRailOpen(false); };
+    if (wideQuery.addEventListener) { wideQuery.addEventListener('change', onRailLayoutChange); }
+    else if (wideQuery.addListener) { wideQuery.addListener(onRailLayoutChange); }
+  }
+  setRailOpen(false);
+
   var ws = null;
   // historyVersion is the transcript version the log on screen was built from. It
   // rides back on the next connection (?since=), so a page that reconnects after

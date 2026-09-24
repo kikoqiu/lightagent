@@ -30,11 +30,52 @@
 </head>
 <body>
 <div class="app">
-  <aside class="sidebar" aria-label="session panel">
-    <div class="side-head">
+  <!-- The banner: a row of its own across the whole width — over the rail on a
+       desktop, and above the drawer a phone slides out under it (see .app and
+       .sidebar in app.css, and the rail drawer in app.js). It carries the page's
+       one mark, which a phone also uses as the drawer's handle. -->
+  <header>
+    <!-- The mark, wrapped in the handle a phone taps to open the rail (the
+         drawer is in app.css, its wiring in app.js). A desktop keeps the rail in
+         view at all times, so the button is inert there: the wrapper stays one
+         shape for both layouts — the rule lets the pointer through and app.js
+         drops it from the tab order. -->
+    <button class="rail-toggle" id="railToggle" type="button" aria-controls="sideRail" aria-expanded="false"
+            title="show the session panel" aria-label="show the session panel">
       <span class="logo" aria-hidden="true"></span>
-      <span class="brand"><b>Console</b><small>local agent</small></span>
-    </div>
+    </button>
+    <span class="brand"><b>lightagent</b><small id="status">connecting…</small></span>
+    <span class="head-right">
+      <span class="run" id="run"><span class="spin"></span><span id="runText">running</span><span id="elapsed"></span></span>
+      <!-- The context-usage badge. It is three nodes so each layout can keep
+           what fits: the "ctx" word, the percentage and the token counts. A wide
+           header shows all three; a phone keeps the percentage alone (see
+           .usage-label/.usage-tokens in app.css). The title keeps the full
+           numbers on every layout, and setUsage() fills the two empty ones. -->
+      <span class="usage" id="usage"><span class="usage-label">ctx </span><span id="usagePct"></span><span class="usage-tokens" id="usageTokens"></span></span>
+      <span class="dot" id="dot" title="disconnected" aria-label="connection status"></span>
+      <!-- The way out of the session. It carries a glyph and a word: a wide
+           header shows "Sign out", a phone shows only the glyph (icon buttons
+           line up with the read-aloud one and the gear). -->
+      <button class="ghost signout" id="signOut" type="button" title="sign out" aria-label="sign out" hidden>
+        <svg class="signout-glyph" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
+          <path d="M6.4 2.4H3.9a1.6 1.6 0 0 0-1.6 1.6v8a1.6 1.6 0 0 0 1.6 1.6h2.5"/>
+          <path d="M9.5 5.2 12.3 8l-2.8 2.8"/>
+          <path d="M12 8H6.7"/>
+        </svg>
+        <span class="signout-label">Sign out</span>
+      </button>
+      <button class="ghost tts-open" id="ttsOpen" type="button" data-tts-open title="read aloud (browser speech)" aria-label="read-aloud settings">🔊</button>
+      <button class="ghost gear" type="button" data-config-open title="edit config.json" aria-label="edit config.json">⚙</button>
+    </span>
+  </header>
+  <!-- The side rail. Above the desktop breakpoint it is the first column of the
+       row under the banner; below it, the drawer the banner's mark slides in
+       there — the rail never covers the banner itself, so the mark that opened
+       it is also the control that folds it away again. Its id is what that mark
+       points at with aria-controls, and tabindex="-1" is the stop a fresh drawer
+       takes the focus with (see setRailOpen in app.js). -->
+  <aside class="sidebar" id="sideRail" tabindex="-1" aria-label="session panel">
     <section class="card">
       <div class="card-title"><span>Context window</span><span class="card-pct" id="meterPct">—</span></div>
       <div class="meter" role="progressbar" aria-label="context usage"><span id="meterFill"></span></div>
@@ -73,34 +114,12 @@
     </section>
     <div class="side-foot">lightagent web</div>
   </aside>
+  <!-- The scrim of the phone drawer: it dims the content, and a tap on it folds
+       the rail away. It is pinned to the row under the banner like the rail (see
+       .rail-backdrop in app.css), and the rail paints above it (z-index) and is
+       its sibling, so a tap on the rail itself never lands here. -->
+  <div class="rail-backdrop" id="railBackdrop" aria-hidden="true"></div>
   <div class="main">
-    <header>
-      <span class="logo" aria-hidden="true"></span>
-      <span class="brand"><b>lightagent</b><small id="status">connecting…</small></span>
-      <span class="head-right">
-        <span class="run" id="run"><span class="spin"></span><span id="runText">running</span><span id="elapsed"></span></span>
-        <!-- The context-usage badge. It is three nodes so each layout can keep
-             what fits: the "ctx" word, the percentage and the token counts. A
-             wide header shows all three; a phone keeps the percentage alone (see
-             .usage-label/.usage-tokens in app.css). The title keeps the full
-             numbers on every layout, and setUsage() fills the two empty ones. -->
-        <span class="usage" id="usage"><span class="usage-label">ctx </span><span id="usagePct"></span><span class="usage-tokens" id="usageTokens"></span></span>
-        <span class="dot" id="dot" title="disconnected" aria-label="connection status"></span>
-        <!-- The way out of the session. It carries a glyph and a word: a wide
-             header shows "Sign out", a phone shows only the glyph (icon buttons
-             line up with the read-aloud one and the gear). -->
-        <button class="ghost signout" id="signOut" type="button" title="sign out" aria-label="sign out" hidden>
-          <svg class="signout-glyph" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
-            <path d="M6.4 2.4H3.9a1.6 1.6 0 0 0-1.6 1.6v8a1.6 1.6 0 0 0 1.6 1.6h2.5"/>
-            <path d="M9.5 5.2 12.3 8l-2.8 2.8"/>
-            <path d="M12 8H6.7"/>
-          </svg>
-          <span class="signout-label">Sign out</span>
-        </button>
-        <button class="ghost tts-open" id="ttsOpen" type="button" data-tts-open title="read aloud (browser speech)" aria-label="read-aloud settings">🔊</button>
-        <button class="ghost gear" type="button" data-config-open title="edit config.json" aria-label="edit config.json">⚙</button>
-      </span>
-    </header>
     <!-- The transcript and its floating jump buttons share one box: the buttons
          must not scroll with the rows, and the area they act on is exactly this
          box. Like every overlay on the page they are absolutely positioned,
