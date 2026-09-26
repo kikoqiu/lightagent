@@ -155,6 +155,7 @@ func TestMobileChrome(t *testing.T) {
 		`class="signout-glyph"`, // the icon-only way out...
 		`class="signout-label"`, // ...that replaces the word
 		".signout .signout-glyph { display:block; }",
+		".head-right { gap:4px; }", // the badges and the icon buttons stand closer
 		`data-placeholder-short`,           // the composer's short hint
 		"setComposerPlaceholder",           // it is swapped by app.js...
 		"matchMedia('(max-width: 480px)')", // ...at the stylesheet's phone breakpoint
@@ -216,6 +217,24 @@ func TestPhoneRailDrawer(t *testing.T) {
 	}
 }
 
+// TestBannerNeverWidensThePage pins the app shell's column: a 1fr track takes its
+// minimum from its items' min-content, and the banner is a row of pills of nowrap
+// text that cannot shrink below their words — with a queued count in the running
+// pill it grew wider than a phone, which stretched the whole page with it (body
+// clips the excess, so the right-aligned user rows, the pending one included, were
+// cut off past the right edge of the screen). minmax(0, 1fr) floors the track at
+// zero on both layouts, so a cramped banner is the banner's own problem.
+func TestBannerNeverWidensThePage(t *testing.T) {
+	for _, want := range []string{
+		"grid-template-columns:minmax(0, 1fr)",                  // the phone column...
+		"grid-template-columns:var(--sidebar-w) minmax(0, 1fr)", // ...and the wide one
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the app shell is missing %q", want)
+		}
+	}
+}
+
 // TestResponsiveAffordances guards the polished mirror chrome: the connection
 // status label, the auto-growing composer, disabled-while-offline send button
 // and the mobile-safe padding/tap targets must all stay wired.
@@ -246,8 +265,32 @@ func TestResponsiveAffordances(t *testing.T) {
 // again, and that one is hidden while the view follows already.
 func TestFollowLockAndJumpButtons(t *testing.T) {
 	for _, want := range []string{
-		"function followable()",
 		"function pinned()",
+		// A change that lands while the page is carrying the view is written back in
+		// the same task, so a row that grows above the pending one cannot shake it
+		// (waiting for the frame would show the bottom 22-80px behind every chunk).
+		// "Carrying the view" is the page's own last scroll position, not a
+		// distance: a keyboard or a rounding could leave a few pixels behind and
+		// every chunk would wait for the frame again.
+		"var pageScrollTop = -1;",
+		"function writeBottom()",
+		"function keepBottom()",
+		"if (pageScrollTop >= 0 && Math.abs(log.scrollTop - pageScrollTop) > 1) { pinBottom(); return; }",
+		// The bottom is written by measurement (two passes), not by arithmetic: a
+		// scroll position only lands on whole pixels, so the fractional part of a
+		// streamed row's height used to move the last row on every chunk.
+		"function contentOffset()",
+		"var off = contentOffset();",
+		"log.scrollTop = log.scrollTop + off;",
+		// ...and a phone's URL bar or keyboard, which changes the viewport height and
+		// so moves the bottom under a following view, is written in the same task too
+		// (the frame the viewport changed in would otherwise paint it 60px off).
+		"window.addEventListener('resize', function () {",
+		"if (following) { writeBottom(); }",
+		"window.visualViewport.addEventListener('resize', function () {",
+		// ...and the transcript's line heights are whole pixels for that same reason
+		// (see the #log rule in app.css).
+		"line-height:22px",
 		"function setFollowing(on)",
 		// A pin that is already on its way still yields to a reader's gesture.
 		"if (pinQueued || !following) { return; }",
@@ -261,7 +304,10 @@ func TestFollowLockAndJumpButtons(t *testing.T) {
 		"document.addEventListener('keydown', function (e) {",
 		"if (isFormField(e.target)) { return; }",
 		"log.addEventListener('scroll', onLogScroll, { passive: true });",
-		"if (pinned()) { setFollowing(true); }",
+		"if (pinned()) {",
+		// Reaching the very end puts the page back in charge of the position, which
+		// is what lets the next change write it in its own task (see keepBottom).
+		"pageScrollTop = top;",
 		"else if (moved < 0) { setFollowing(false); }",
 		// The buttons, and the state that hides the "latest" one.
 		"function updateJump()",
@@ -635,6 +681,12 @@ func TestSteeringRowOrder(t *testing.T) {
 		// The badge counts the messages this page sent while the turn was running.
 		"var queued = 0;",
 		"queuedText()",
+		// ...and a phone keeps the number alone: the word is what would push the
+		// banner past the screen (see TestBannerNeverWidensThePage). The whole
+		// phrase rides in the pill's title.
+		"if (phoneQuery && phoneQuery.matches) { return ' · ' + queued; }",
+		"' · ' + queued + ' queued'",
+		"queued + ' queued; it joins the conversation after the current reply'",
 	} {
 		if !strings.Contains(pageSource(), want) {
 			t.Errorf("the page is missing %q", want)

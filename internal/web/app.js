@@ -80,18 +80,24 @@
   // probes below), not a distance.
   //
   // Every part of the page that adds or grows a row goes through the same two
-  // steps: read followable(), change the DOM, then pinBottom() if it said yes.
-  // The pin has to come last — it must see the grown content to land on the new
-  // bottom — and the decision is taken first so a row that arrives while the
-  // reader is up in the history is not followed.
+  // steps: change the DOM, then keepBottom(). The write comes last — it must see
+  // the grown content to land on the new bottom — and it is the reader's own
+  // position that decides whether it happens now or in the frame (see
+  // keepBottom), so a row that arrives while the reader is up in the history is
+  // not followed.
   var STICK_SLACK = 8;
 
   function atBottom() {
     return log.scrollHeight - log.scrollTop - log.clientHeight <= STICK_SLACK;
   }
 
-  // following is the reader's standing answer to "should new output pull the view
-  // down?". A page opens at the newest row, so it starts as yes, and only the
+  // Whether new output pulls the view down is the reader's intent (following), and
+  // only that: while text streams in the bottom moves away every frame, so a view
+  // that is a few pixels off it still belongs to a reader who is following.
+  // Geometry only says where that reader is sitting right now — which is what
+  // separates a change the page writes back in the same task (see keepBottom) from
+  // one it leaves to the animation frame, where a gesture still wins (see
+  // pinBottom). A page opens at the newest row, so it starts as yes, and only the
   // reader's own gestures turn it off.
   var following = true;
 
@@ -112,17 +118,6 @@
     return log.scrollHeight - log.scrollTop - log.clientHeight <= 1;
   }
 
-  // followable is the reader's intent, and only that: while text streams in, the
-  // bottom of the transcript moves away every frame, so a view that is a few
-  // pixels off it — content above it grew, a picture landed — must still be
-  // pulled back to the newest row. Geometry cannot decide this: the reader's own
-  // gestures have already turned following off by the time a pin writes (the
-  // browser dispatches the scroll event of a gesture before the animation frame
-  // the pin was queued in, see pinBottom).
-  function followable() {
-    return following;
-  }
-
   // setFollowing records that answer and keeps the transcript's jump buttons in
   // step: the "latest" one is exactly the way back from a view that stopped
   // following, so it is faded out while the view follows (see updateJump).
@@ -138,13 +133,59 @@
   // empty (freshly rebuilt) log it also establishes "at the bottom". The write
   // is coalesced into one animation frame: a streamed row can be re-drawn and
   // several rows appended between two frames, and every scroll write forces a
-  // layout, so the frame ends with a single write to the true bottom. Whether to
-  // follow is still the caller's decision (followable), and the reader can still
-  // take the view back in the frame between that decision and this write: the
-  // browser fires a gesture's scroll event before the animation frame callbacks
-  // of the same frame, so `following` is already off by the time a pin queued for
-  // that frame writes — the gesture wins over a pin already on its way.
+  // layout, so the frame ends with a single write to the true bottom. It is what
+  // handles a reader who is following from a distance — one whose view the page
+  // itself last wrote gets the immediate write instead (see keepBottom). The
+  // reader can still take the view back in the frame between that decision and
+  // this write: the browser fires a gesture's scroll event before the animation
+  // frame callbacks of the same frame, so `following` is already off by the time a
+  // pin queued for that frame writes — the gesture wins over a pin on its way.
   var pinQueued = false;
+
+  // pageScrollTop is the position the page itself last wrote. It is how a change
+  // tells a view that is still where the page put it (that reader is at the
+  // bottom, following) from one the reader has just moved — before that move's
+  // scroll event has been dispatched.
+  var pageScrollTop = -1;
+
+  // contentOffset is how far the content's bottom (the last row's margin and the
+  // box's own bottom padding included) sits below the box's bottom: 0 means exactly
+  // at the bottom. Both numbers are read live — the padding follows the phone
+  // breakpoint and a row's margin is what the stylesheet says, not a constant.
+  function contentOffset() {
+    var last = log.lastElementChild;
+    if (!last) { return 0; }
+    var paddingBottom = parseFloat(window.getComputedStyle(log).paddingBottom) || 0;
+    var marginBottom = parseFloat(window.getComputedStyle(last).marginBottom) || 0;
+    return (last.getBoundingClientRect().bottom + marginBottom + paddingBottom)
+      - log.getBoundingClientRect().bottom;
+  }
+
+  function writeBottom() {
+    // Nothing to scroll (the transcript is shorter than its box): the bottom is
+    // the top.
+    if (log.scrollHeight <= log.clientHeight) {
+      if (log.scrollTop !== 0) { log.scrollTop = 0; }
+      pageScrollTop = log.scrollTop;
+      return;
+    }
+    // Correct by measurement rather than by arithmetic: scrollHeight and
+    // clientHeight are rounded integers while the content's real bottom is what the
+    // last row's box says, and the browser quantizes the scroll position it stores
+    // as well. The transcript's line heights are whole pixels for exactly this
+    // reason (see #log in app.css): a fractional content height left a fraction of
+    // a pixel behind on every chunk, and the pending row trembled by that fraction
+    // (1-3 device pixels on a phone). Two passes land the content's bottom exactly
+    // on the box's bottom.
+    for (var pass = 0; pass < 2; pass++) {
+      var off = contentOffset();
+      if (off === 0) { break; }
+      log.scrollTop = log.scrollTop + off;
+    }
+    // Read the value back: the browser quantizes what it stores, and that value is
+    // what the next comparison must use.
+    pageScrollTop = log.scrollTop;
+  }
 
   function pinBottom() {
     if (pinQueued || !following) { return; }
@@ -152,13 +193,33 @@
     var write = function () {
       pinQueued = false;
       if (!following) { return; }
-      log.scrollTop = log.scrollHeight;
+      writeBottom();
     };
     if (typeof window.requestAnimationFrame === 'function') {
       window.requestAnimationFrame(write);
     } else {
       write();
     }
+  }
+
+  // ---- a change the reader is sitting on ----
+  // A row that grows moves everything below it down, and the pending row of a
+  // steering message is always the last one: writing the bottom only in the
+  // animation frame (see pinBottom) paints one frame with that row pushed down
+  // and the next one with it snapped back — the shake a streaming answer used to
+  // give the pending bubble, which a phone's coarser redraw cadence turned into a
+  // steady beat (measured: the bottom fell 22-80px behind on every chunk). So the
+  // write happens here, in the same task as the change, for a reader the page is
+  // already carrying — and for that test it is not enough to ask whether the view
+  // sits exactly at the end (keyboard, a resize, a rounding can leave a few pixels
+  // behind, and every chunk would then wait for the frame again, shaking as
+  // before). What matters is whether the position is still the page's own: a
+  // reader who moved it keeps the frame-write, where a gesture wins (their scroll
+  // event may not have been dispatched yet).
+  function keepBottom() {
+    if (!following) { return; }
+    if (pageScrollTop >= 0 && Math.abs(log.scrollTop - pageScrollTop) > 1) { pinBottom(); return; }
+    writeBottom();
   }
 
   // ---- reader intent: what stops and what resumes the follow ----
@@ -224,7 +285,12 @@
     var top = log.scrollTop;
     var moved = top - lastScrollTop;
     lastScrollTop = top;
-    if (pinned()) { setFollowing(true); }
+    if (pinned()) {
+      // The reader reached the very end: the page carries the view again, so the
+      // next change may write it in its own task (see keepBottom).
+      pageScrollTop = top;
+      setFollowing(true);
+    }
     else if (moved < 0) { setFollowing(false); }
     // Came back into the bottom band on the way down: the reader is heading for
     // the bottom, and the next output should pull them the rest of the way. Not
@@ -234,12 +300,27 @@
 
   log.addEventListener('scroll', onLogScroll, { passive: true });
 
-  // A resize moves the bottom (the composer wraps, a phone's keyboard shrinks the
-  // viewport): a following view is put back on the newest row, which is what the
-  // reader was looking at anyway.
+  // A resize moves the bottom: the composer wraps, and a phone's URL bar or soft
+  // keyboard changes the viewport height while the answer streams. A following view
+  // is put back on the newest row in this same task — waiting for the animation
+  // frame (pinBottom) paints the frame the viewport changed in with the bottom far
+  // off screen (measured: the pending row swung by 112px with 39 direction changes
+  // while a URL-bar animation ran), which is the trembling a phone showed and a
+  // desktop, whose window never changes size, never did. The position is written
+  // whatever it was: a viewport that grew makes the browser clamp it, and the
+  // "the page wrote this position" test would send that write back to the frame.
   window.addEventListener('resize', function () {
-    if (following) { pinBottom(); }
+    if (following) { writeBottom(); }
   });
+  // The same viewport, seen the other way: on a phone that resizes its visual
+  // viewport (a keyboard that shrinks the page rather than the layout viewport, a
+  // pinch) the layout box can stay put while what the reader sees moves. Writing
+  // the bottom is idempotent, so listening to both costs nothing.
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', function () {
+      if (following) { writeBottom(); }
+    });
+  }
 
   // ---- the transcript's jump buttons ----
   // Two floating buttons: up walks back through the messages the reader wrote —
@@ -329,8 +410,17 @@
   // pill is the only acknowledgement that they went through.
   var queued = 0;
 
+  // queuedText is the queued part of the running pill: the count and, where there
+  // is room for it, the word. A phone-width banner keeps the number alone — its
+  // badges are pills of nowrap text and this one is the widest of them, so the
+  // word is what makes the header wider than the screen the moment a message is
+  // pending (a wider header drags the transcript's right edge with it, see .app in
+  // app.css). The whole phrase stays in the pill's title, on every layout (see
+  // tickTurn), the way the context badge keeps the words a phone drops.
   function queuedText() {
-    return queued > 0 ? ' · ' + queued + ' queued' : '';
+    if (queued <= 0) { return ''; }
+    if (phoneQuery && phoneQuery.matches) { return ' · ' + queued; }
+    return ' · ' + queued + ' queued';
   }
 
   function elapsedText(ms) {
@@ -342,6 +432,9 @@
 
   function tickTurn() {
     if (elapsedEl) { elapsedEl.textContent = elapsedText(Date.now() - turnStart) + queuedText(); }
+    // The pill's title spells the queued count out whatever the layout shows (the
+    // CLI prints the same sentence when it has to queue a message).
+    runEl.title = queued > 0 ? queued + ' queued; it joins the conversation after the current reply' : '';
   }
 
   // The clock's cadence: the terminal redraws its spinner every 100ms and a
@@ -382,6 +475,7 @@
     if (turnTimer) { clearInterval(turnTimer); turnTimer = null; }
     turnStart = 0;
     if (elapsedEl) { elapsedEl.textContent = ''; }
+    runEl.title = '';
   }
 
   // running reports whether a turn is in progress (see setRunning).
@@ -671,11 +765,10 @@
   function placeRow(row) {
     if (replayBatch) { replayBatch.appendChild(row); return; }
     var anchor = pendingRows.length ? pendingRows[0].el : null;
-    // follow is the decision the page took before it touched the DOM: this row
-    // is to be followed, because the reader was following when it arrived.
-    var follow = followable();
     if (anchor) { log.insertBefore(row, anchor); } else { log.appendChild(row); }
-    if (follow) { pinBottom(); }
+    // The bottom follows a row that landed while the page was carrying the view
+    // (see keepBottom).
+    keepBottom();
   }
 
   function addRow(cls, role, text, renderMD, attachments) {
@@ -717,11 +810,10 @@
   // appendRow puts a row at the very end of the log (the pending messages it
   // queues behind), following it while the reader is following.
   function appendRow(row) {
-    // follow is the decision the page took before it touched the DOM: this row
-    // is to be followed, because the reader was following when it arrived.
-    var follow = followable();
     log.appendChild(row);
-    if (follow) { pinBottom(); }
+    // The pending row a message adds is at the very bottom, so the bottom follows
+    // it the same way (see keepBottom).
+    keepBottom();
   }
 
   // rowText returns the row's own text span. It is not simply the last child: a
@@ -740,10 +832,11 @@
     // is pinned once, when the snapshot ends: there is nothing to follow and no
     // layout to read here.
     if (replaying) { setSpan(rowText(el), text, renderMD); return; }
-    // A streamed re-render can grow the row, so the pin has to come after it.
-    var follow = followable();
+    // A streamed re-render can grow the row, so the bottom follows it — in this
+    // same task while the page is carrying the view, which is what keeps a growing
+    // answer from shaking the pending row below it (see keepBottom).
     setSpan(rowText(el), text, renderMD);
-    if (follow) { pinBottom(); }
+    keepBottom();
   }
 
   // parseArgObject turns a tool call's JSON argument string into an object, or
@@ -1479,11 +1572,16 @@
     if (kind === 'user') {
       setRunning(true);
       // A message this page sent while the turn was running is being sent now:
-      // its pending row becomes an ordinary one, in place (it already sits after
+      // Its pending row becomes an ordinary one, in place (it already sits after
       // everything the interrupted reply produced), picking up the files the
-      // message carried.
+      // message carried. The files can make the row taller, so the bottom follows
+      // it the same way (see keepBottom) — only ever while the page is live: a
+      // replayed row reads no layout and writes nothing (see the replay path in
+      // setRow/placeRow), and pendingRows is empty during one, so the settle below
+      // misses anyway.
       if (settlePendingRow(ev.text || '', ev.attachments)) {
         if (queued) { queued--; tickTurn(); }
+        if (!replaying) { keepBottom(); }
         return;
       }
     }

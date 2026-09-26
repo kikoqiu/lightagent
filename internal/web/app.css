@@ -49,9 +49,14 @@
      in) and can never reach up into it. .app is also the positioning context of
      the config editor modal and the copy menu: those overlays are absolutely
      positioned, never fixed, so the layout stays in the dynamic viewport on
-     mobile. */
+     mobile. The column is minmax(0, 1fr) rather than 1fr: a plain 1fr track takes
+     its minimum from the items' min-content, so the banner — whose badges are
+     pills of nowrap text and cannot shrink below their words — would stretch the
+     whole page past the viewport (body clips it, so the right-aligned user rows
+     ended up off the right edge of a phone). With the floor at zero the track is
+     the screen, and a cramped banner is the banner's own problem. */
   .app {
-    display:grid; grid-template-columns:1fr; grid-template-rows:auto 1fr;
+    display:grid; grid-template-columns:minmax(0, 1fr); grid-template-rows:auto 1fr;
     height:100vh; height:100dvh; position:relative;
   }
   /* The content: the original column of header, transcript and composer — the
@@ -265,6 +270,22 @@
     flex:1 1 auto; min-height:0;
     overflow-y:auto; overscroll-behavior:contain;
     -webkit-overflow-scrolling:touch;
+    /* The page owns the scroll position (see keepBottom/pinBottom in app.js): the
+       browser's own scroll anchoring fights it — it keeps the element at the top of
+       the viewport still while the answer above the pending row grows, and the page
+       writes the new bottom in the same task, so the two take turns and the row
+       wobbles. */
+    overflow-anchor:none;
+    /* A whole-pixel line height, not the page's 1.6 (which is 22.4px at 14px): a
+       scroll position can only land on whole pixels, so a fractional content height
+       left the transcript's bottom a fraction of a pixel short of the box on every
+       chunk, and that fraction changed with each new line — the pending row (and
+       the bubble in it) trembled by up to a pixel, which is 1-3 device pixels on a
+       phone. With whole line heights the content is a whole number of pixels tall
+       and the bottom lands exactly where it is written. The elements whose rows
+       were not 22px already carry their own whole-pixel height (see .role, .tool,
+       .reasoning, .attachment and the headings below). */
+    line-height:22px;
     padding:22px max(16px, calc(50% - 460px)) 26px;
   }
   #log::-webkit-scrollbar { width:10px; height:10px; }
@@ -327,6 +348,8 @@
   .role {
     display:block;
     font-size:10px; font-weight:700; letter-spacing:.9px; text-transform:uppercase;
+    /* Whole pixels, like everything in the transcript (see #log's line-height). */
+    line-height:16px;
     color:var(--fg-dim); margin-bottom:4px;
   }
   .role::before {
@@ -361,11 +384,11 @@
   .assistant .role { color:var(--accent); }
   .assistant .text { border-left:2px solid rgba(90,162,255,.35); padding-left:12px; }
 
-  .reasoning { border-left:2px solid var(--border); padding-left:12px; color:var(--fg-muted); font-size:13px; }
+  .reasoning { border-left:2px solid var(--border); padding-left:12px; color:var(--fg-muted); font-size:13px; line-height:21px; }
   .reasoning .role { color:var(--fg-muted); }
   .reasoning .text:not(.md) { font-style:italic; }
 
-  .tool, .result, .error, .interrupted { border-left:2px solid transparent; padding-left:12px; font-size:12.5px; }
+  .tool, .result, .error, .interrupted { border-left:2px solid transparent; padding-left:12px; font-size:12.5px; line-height:20px; }
   .tool { color:var(--yellow); border-left-color:var(--yellow); }
   .result { color:var(--fg-muted); border-left-color:var(--border); }
   .error { color:var(--red); border-left-color:var(--red); }
@@ -395,9 +418,12 @@
 
   /* ---- markdown ---- */
   .row p { margin:0 0 8px; }
-  .row h1, .row h2, .row h3, .row h4, .row h5, .row h6 { margin:15px 0 7px; line-height:1.3; }
-  .row h1 { font-size:19px; } .row h2 { font-size:17px; } .row h3 { font-size:15px; }
-  .row h4, .row h5, .row h6 { font-size:14px; }
+  .row h1, .row h2, .row h3, .row h4, .row h5, .row h6 { margin:15px 0 7px; }
+  /* Whole-pixel line heights (the page's 1.6 would be 24.7px at h1's 19px, and a
+     fractional row height is what makes the transcript's bottom float by a pixel
+     while the answer streams, see #log's line-height). */
+  .row h1 { font-size:19px; line-height:25px; } .row h2 { font-size:17px; line-height:22px; } .row h3 { font-size:15px; line-height:20px; }
+  .row h4, .row h5, .row h6 { font-size:14px; line-height:18px; }
   .row ul, .row ol { margin:0 0 8px; padding-left:22px; }
   .row li { margin:2px 0; }
   .row code { background:rgba(8,11,17,.6); border:1px solid var(--border-soft); border-radius:5px; padding:1px 5px; font-size:.92em; }
@@ -487,7 +513,7 @@
     display:inline-flex; align-items:center; gap:8px; max-width:100%;
     min-height:32px; padding:4px 6px 4px 10px;
     background:rgba(8,11,17,.55); border:1px solid var(--border); border-radius:999px;
-    font-size:12px; color:var(--fg-muted);
+    font-size:12px; line-height:19px; color:var(--fg-muted);
   }
   .attachment.busy { opacity:.65; }
   .attachment.bad { border-color:#a13d3d; color:#f0b4b4; }
@@ -591,7 +617,7 @@
     position:absolute; left:0; top:100%; margin-top:6px;
     width:max-content; max-width:min(240px, 70vw);
     padding:3px 9px 4px; border-radius:8px;
-    background:rgba(16,23,34,.86); color:var(--fg-muted); font-size:10.5px;
+    background:rgba(16,23,34,.86); color:var(--fg-muted); font-size:10.5px; line-height:16px;
     box-shadow:0 12px 26px -18px rgba(0,0,0,.9);
     pointer-events:none;
   }
@@ -800,7 +826,7 @@
        phone-only concern). The mark in the banner is a bare mark again — the
        pointer goes through it, and app.js drops it from the tab order at this same
        breakpoint. */
-    .app { grid-template-columns:var(--sidebar-w) 1fr; }
+    .app { grid-template-columns:var(--sidebar-w) minmax(0, 1fr); }
     .main { grid-column:2; }
     .sidebar {
       position:static; width:auto; transform:none; visibility:visible;
@@ -832,8 +858,12 @@
     /* The phone header is the tightest spot: every affordance keeps its tap
        target but drops its words. The usage badge keeps the bare percentage
        (numbers only — the full tag stays in its title), and the way out becomes
-       the same glyph button as the read-aloud one and the gear. */
-    .head-right { gap:6px; }
+       the same glyph button as the read-aloud one and the gear. The badges and
+       the icon buttons stand a little closer too: with the queued count in the
+       running pill the row would otherwise spill past a 360px screen, and the
+       banner must never be wider than the page (see .app — a wider banner drags
+       the transcript's right edge with it). */
+    .head-right { gap:4px; }
     /* When the header runs out of room the brand must not spill over the icon
        buttons: it ellipsizes instead. */
     header .brand b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
