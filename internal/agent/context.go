@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"unicode/utf8"
+	"unicode"
 
 	"lightagent/internal/llm"
 )
@@ -18,24 +18,75 @@ import (
 // corrects the estimate on the very next call.
 const mediaPartTokens = 1200
 
-// EstimateMessageTokens estimates the token cost of one message as it appears
-// in the request. The message's
-// character count (content, reasoning, tool call name/arguments/id) times 2/5 —
-// roughly 2.5 characters per token — plus a small per-message overhead, plus a
-// flat cost per media part.
+// EstimateMessageTokens estimates the token cost of one message as it appears in
+// the request. The count is a lower bound built from the units a tokenizer really
+// splits text into — one token per whitespace-separated run (an English word, a
+// number, a chunk of code) and one token per CJK character — instead of a fixed
+// characters-per-token ratio, which has to be calibrated for one script and then
+// over-counts every other one. Every field that travels on the wire is counted
+// (content, reasoning, tool-call name/arguments/id and the tool call id of a
+// result), plus a flat cost per media part (see mediaPartTokens).
+//
+// The function never sees the whole request: the provider's own prompt-token
+// report is the ground truth the caller anchors on (see Agent.contextTokensLocked),
+// and this estimate only covers the messages appended after that report — which is
+// why a lower bound is the right shape for it. A long unbroken run is not one
+// token: its cost grows by one token per four characters, so a minified JSON line
+// or a base64 payload cannot collapse into a single token (see runUnits).
 func EstimateMessageTokens(m llm.Message) int {
-	chars := utf8.RuneCountInString(m.Content)
-	chars += utf8.RuneCountInString(m.ReasoningContent)
-	chars += utf8.RuneCountInString(m.Name)
+	units := estimateUnits(m.Content)
+	units += estimateUnits(m.ReasoningContent)
+	units += estimateUnits(m.Name)
+	units += estimateUnits(m.ToolCallID)
 	for _, tc := range m.ToolCalls {
-		chars += len(tc.ID) + len(tc.Type)
-		chars += len(tc.Function.Name) + len(tc.Function.Arguments)
+		units += estimateUnits(tc.ID) + estimateUnits(tc.Type)
+		units += estimateUnits(tc.Function.Name) + estimateUnits(tc.Function.Arguments)
 	}
-	if m.ToolCallID != "" {
-		chars += len(m.ToolCallID)
+	return units + len(m.Media)*mediaPartTokens
+}
+
+// estimateUnits counts the token units of s: one per CJK character (they carry a
+// token each and their scripts have no spaces to split runs on) and one per
+// whitespace-separated run of anything else, with a long run costing more (see
+// runUnits). Punctuation rides with the run it touches, so "hello, world!" is two
+// units.
+func estimateUnits(s string) int {
+	units, runes := 0, 0
+	for _, r := range s {
+		switch {
+		case unicode.IsSpace(r):
+			units += runUnits(runes)
+			runes = 0
+		case isCJK(r):
+			units += runUnits(runes) + 1
+			runes = 0
+		default:
+			runes++
+		}
 	}
-	chars += 12 // per-message JSON/role overhead
-	return chars*2/5 + len(m.Media)*mediaPartTokens
+	return units + runUnits(runes)
+}
+
+// runUnits is the cost of one whitespace-separated run of runes characters: one
+// token, plus one more for every four characters the run grows past that. A run is
+// the unit because a word (or a number, or a short code fragment) is what a
+// tokenizer keeps whole, and the growth keeps a long unbroken run — a minified
+// JSON line, a base64 payload — from collapsing into a single token.
+func runUnits(runes int) int {
+	if units := runes / 4; units > 1 {
+		return units
+	}
+	if runes > 0 {
+		return 1
+	}
+	return 0
+}
+
+// isCJK reports whether r belongs to a script written without spaces, where a
+// character is the unit that carries a token: Chinese characters (the case a
+// character-ratio estimate got wrong) and the kana that share their layout.
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r)
 }
 
 // EstimateMessagesTokens sums EstimateMessageTokens over a message list.
@@ -117,7 +168,10 @@ type livePrefix struct {
 // prompt and rest's messages, with the accumulated summary in the place this
 // prefix came with. Both the live calls and the summarizing one build their
 // message list here, so the two cannot drift apart and the summarizing call's
-// prefix stays byte-identical to the live one.
+// prefix stays byte-identical to the live one. The summarizing call is therefore
+// a one-sided (tail-only) extension of the live request: the head it sends is the
+// head the live requests send, the messages being compressed follow unchanged,
+// and the only tokens appended are the summarize instruction at the very end.
 func (p livePrefix) head(rest []llm.Message) []llm.Message {
 	return headMessages(p.systemPrompt, rest, p.summary, p.summaryInSystemPrompt)
 }
@@ -178,21 +232,15 @@ func (c *compactor) tokenLimit() int {
 	return limit
 }
 
-// shouldCompact reports whether the conversation exceeds the trigger (a
-// percentage of the context window). The prefix is the one the next request will
-// carry, so the system prompt and the accumulated summary count towards the
-// trigger like any other context.
-func (c *compactor) shouldCompact(history []llm.Message, prefix livePrefix, usageTokens int) bool {
-	estimate := EstimateMessagesTokens(history)
-	estimate += EstimateMessageTokens(llm.Message{Role: "system", Content: prefix.systemPrompt})
-	if !prefix.summaryInSystemPrompt {
-		if msg, ok := summaryMessage(prefix.summary); ok {
-			estimate += EstimateMessageTokens(msg)
-		}
-	}
-	if usageTokens > estimate {
-		estimate = usageTokens
-	}
+// shouldCompact reports whether the context has reached the trigger (a percentage
+// of the context window). estimate is the size of the request the next iteration
+// will carry: the provider-reported prompt-token count plus the messages appended
+// since that report (see Agent.contextTokensLocked). A whole-context estimate is
+// deliberately not compared against it — a lower bound and a real count must not
+// compete, or the pass fires at a fraction of the configured percentage while the
+// frontends show that very number. A request the provider rejects for its size is
+// recovered from instead (see Agent.recoverContextOverflow).
+func (c *compactor) shouldCompact(estimate int) bool {
 	return estimate >= c.tokenLimit()
 }
 
@@ -416,8 +464,11 @@ func (c *compactor) compact(ctx context.Context, history []llm.Message, prefix l
 // directory, unlock rule, MCP servers) and the same accumulated summary as it did
 // while the messages were produced, and the call shares its prefix with the live
 // requests, so the provider can serve it from its cached prompt prefix instead of
-// re-processing a different one. The instruction matches that same layout, so it
-// only mentions the summary where the model can see it.
+// re-processing a different one. The batch is appended to that prefix and the
+// instruction to the batch, so nothing in front of the instruction is rendered,
+// reordered or rewritten: the pass only ever extends the request at its tail.
+// The instruction matches that same layout, so it only mentions the summary
+// where the model can see it.
 func (c *compactor) digest(ctx context.Context, batch []llm.Message, prefix livePrefix) (string, error) {
 	if c.client == nil {
 		return "", fmt.Errorf("no llm client")

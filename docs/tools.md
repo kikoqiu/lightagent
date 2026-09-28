@@ -272,8 +272,8 @@ type Tool interface {
   Web 端只显示文件名（图片取不回来），而发给模型的请求里用一句
   `[attachment shot.png is no longer available: …]` 文本 part 代替它（`requestMessages`）。
 * `path`/`mime` 从不发给模型：请求里的 media part 只有载荷本身（`requestMessages` 会剥掉这两个字段）。
-* 上下文用量估算对每个附件 part 记一个固定成本（不按 base64 长度估算），真实的
-  `usage.prompt_tokens` 会在下一次调用时覆盖估算值。
+* 上下文用量估算对每个附件 part 记一个固定成本（不按 base64 长度估算）；真实的
+  `usage.prompt_tokens` 是基准：下一次调用返回的真实计数会取代估算，其后的消息再在下限估算上叠加。
 
 ---
 

@@ -282,10 +282,12 @@ func (a *Agent) Stats() Stats {
 }
 
 // contextTokensLocked returns the best estimate of the tokens the next request
-// will carry. A provider-reported prompt-token count anchors the total and the
-// messages appended since that report are estimated on top of it; without a
-// report (or when the history shrank past the anchor) it falls back to the pure
-// local estimate. The caller must hold a.mu.
+// will carry, and the number the compaction trigger is measured on (see
+// compactIfNeeded). A provider-reported prompt-token count anchors the total and
+// the messages appended since that report are estimated on top of it — a
+// lower-bound count, never a competing whole-context estimate (see
+// EstimateMessageTokens). Without a report (or when the history shrank past the
+// anchor) it falls back to the pure local estimate. The caller must hold a.mu.
 func (a *Agent) contextTokensLocked() int {
 	if a.usage > 0 && a.usageAt >= 0 && a.usageAt <= len(a.history) {
 		return a.usage + EstimateMessagesTokens(a.history[a.usageAt:])
@@ -825,10 +827,16 @@ func (a *Agent) finishInterrupt() {
 	a.bus.Publish(Event{Type: EventInterrupted, Text: "interrupted; the turn was stopped"})
 }
 
-// callLLM performs one completion over the current context.
+// callLLM performs one completion over the current context. The request head —
+// the system message, the accumulated summary where the configuration puts it
+// and the declared tools — comes from one livePrefix snapshot, the very function
+// the compaction pass calls (see livePrefixLocked): the ordinary calls and the
+// summarizing one cannot then carry heads taken from different states, so the
+// provider's cached prompt prefix stays valid across a pass.
 func (a *Agent) callLLM(ctx context.Context) (*llm.Response, error) {
 	a.mu.Lock()
-	msgs := a.buildMessagesLocked()
+	prefix := a.livePrefixLocked()
+	msgs := prefix.head(a.history)
 	a.mu.Unlock()
 
 	onDelta := func(text string) {
@@ -837,7 +845,7 @@ func (a *Agent) callLLM(ctx context.Context) (*llm.Response, error) {
 	onReasoning := func(text string) {
 		a.bus.Publish(Event{Type: EventReasoningDelta, Text: text})
 	}
-	return a.client.Chat(ctx, msgs, a.reg.Definitions(), onDelta, onReasoning)
+	return a.client.Chat(ctx, msgs, prefix.tools, onDelta, onReasoning)
 }
 
 // appendMessage appends a message to the history.
@@ -849,10 +857,12 @@ func (a *Agent) appendMessage(m llm.Message) {
 
 // buildMessagesLocked renders the full request message list: the system message,
 // the accumulated summary (as the first user message, or in the system prompt
-// when agent.summary_in_system_prompt asks for it) and the history. The caller
-// must hold a.mu.
+// when agent.summary_in_system_prompt asks for it) and the history. It is the
+// livePrefix rendering itself (see livePrefix.head), so the ordinary calls, the
+// usage estimate and the summarizing call all take their head from one place.
+// The caller must hold a.mu.
 func (a *Agent) buildMessagesLocked() []llm.Message {
-	return headMessages(a.systemMessageLocked().Content, a.history, a.summary, a.summaryInSystem)
+	return a.livePrefixLocked().head(a.history)
 }
 
 // drainSteering folds the queued steering messages into the history, announcing
@@ -946,17 +956,27 @@ func (a *Agent) setUsage(u llm.Usage) {
 	a.mu.Unlock()
 }
 
+// compactionDue reports whether the automatic compaction pass has to run. It
+// measures the request the next iteration will send — the provider-reported
+// prompt-token count plus the lower-bound estimate of the messages appended since
+// that report (see contextTokensLocked), i.e. the number the frontends display.
+// The character-count estimate of the whole context is deliberately NOT compared
+// against it: a lower bound in different units is not a competing measurement, and
+// letting the two compete made a pass fire at 60% of the window while the setting
+// said 80%. A request the provider rejects for its size is recovered from instead
+// (see recoverContextOverflow).
+func (a *Agent) compactionDue() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.compactor == nil {
+		return false
+	}
+	return a.compactor.shouldCompact(a.contextTokensLocked())
+}
+
 // compactIfNeeded compresses the context when it exceeds the configured trigger.
 func (a *Agent) compactIfNeeded(ctx context.Context) {
-	if a.compactor == nil {
-		return
-	}
-	a.mu.Lock()
-	// The trigger is estimated against the very prefix the next request will
-	// carry, so the capability sections appended below the base prompt count.
-	need := a.compactor.shouldCompact(a.history, a.livePrefixLocked(), a.usage)
-	a.mu.Unlock()
-	if need {
+	if a.compactionDue() {
 		a.doCompact(ctx, summarizeModeAuto)
 	}
 }

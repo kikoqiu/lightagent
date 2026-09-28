@@ -32,7 +32,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
    2. 每轮开始时 `drainSteering()`：把 `steerCh` 中的消息按序追加为 user 消息，**并在此刻广播
       `user` 事件**——消息行出现在它真正进入对话的位置（它所打断的那条回复之后），因此各前端
       画出的顺序、以及 web 回放缓冲记录的顺序，都与模型看到的消息顺序一致。
-   3. `compactIfNeeded()`：估算 token 超阈值则压缩（见下）。
+   3. `compactIfNeeded()`：请求用量超阈值则压缩（见下）。
    4. `callLLM()`：构造 `[system, ...history]`，附带工具定义，流式调用；模型可见回答的增量
       文本发布为 `assistant_delta`；若服务商返回思考内容（`reasoning_content` / `reasoning`），
       其增量先发布为 `reasoning_delta`。
@@ -219,8 +219,12 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 
 ### 触发
 
-估算 token（或接口返回的 `usage.prompt_tokens`）≥ `context_window * summarize_token_percent%`
-即压缩。**服务商直接拒绝（上下文超限）时不受该阈值约束**——估算对媒体 part 与超大 tool 反馈
+**用量** ≥ `context_window * summarize_token_percent%` 即压缩。用量 = 接口返回的
+`usage.prompt_tokens`（上一次请求的真实大小）**加上**此后追加消息的**下限估算**；没有上报值时
+（进程刚启动、会话刚恢复、历史被回退到锚点之前）退回对整份请求的估算（系统提示与摘要都算在内）。
+两把尺不相比：整份历史的估算只是下限计数，**不与上报值取大**，否则压缩会在设置的百分比之外提前
+触发（曾出现设置 80%、实际 60% 就压缩：报告值 157125 而字符估算已到 209715）。
+**服务商直接拒绝（上下文超限）时不受该阈值约束**——估算对媒体 part 与超大 tool 反馈
 只是粗略计数，被拒后由引擎主动做一次溢出恢复（见
 [溢出恢复](#溢出恢复provider-拒绝后回退--摘要--重发)）。
 
@@ -231,7 +235,9 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
    结果永远不会被切开，窗口也不会悬挂在孤立的 tool 结果上。
 2. **token 预算**：`available = context_window - openai.max_tokens`（≤0 时回退
    `context_window`）；预算 = `available / 10`（自动）或 `available / 20`（手动 `/compact`）；
-   溢出恢复（`summarizeModeOverflow`）的预算为 **0**，即不保留任何原始消息。
+   溢出恢复（`summarizeModeOverflow`）的预算为 **0**，即不保留任何原始消息。预算按 Turn 的
+   **下限估算**（见 [token 估算](#token-估算estimatetokens)）累加，因此保留窗口的真实 token 可能
+   略高于预算。
 3. **回合数上限**：自动最多保留 3 条 user 消息（3 个 Turn），手动最多 2 条，溢出恢复不保留。
 4. **自新到旧累加**：从最新的 Turn 开始向前保留，只要加入下一个更旧的 Turn 后仍
    **严格小于**预算且未超过回合数上限；两者谁先触顶谁停止。
@@ -244,10 +250,14 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 
 被压缩的部分（切点之前）按 append_instruction 模式交给模型总结：总结请求原样复用**实时请求的
 请求头** —— 系统提示（基础提示词 + unlock 规则 + MCP 全局信息 + 运行时行 + 工作目录行）与同一份
-tools 声明都由 `Agent.livePrefixLocked()` 这一处渲染，摘要由 `headMessages()` 放到配置指定的位置，
-只是把它放到被压缩消息之前、并在末尾追加压缩指令。因此模型总结时所处的环境与产生这些消息时一致
+tools 声明都由 `Agent.livePrefixLocked()` 这一处渲染（实时请求 `callLLM` 也从同一个快照取消息列表与
+tools，两侧因此不可能来自不同状态），摘要由 `headMessages()` 放到配置指定的位置，
+只是把它放到被压缩消息之前、并在末尾追加压缩指令：请求因此是实时请求的**单侧延长**——被压缩消息
+之前逐字节相同、不重排不重渲染，新增的 token 只有末尾那条压缩指令。因此模型总结时所处的环境与产生这些消息时一致
 （基础提示词以下的段落不会被丢掉），请求前缀与实时请求逐字节相同——服务端提示缓存仍可命中该前缀，
-不会被每次压缩重置。压缩指令（`summarizeInstruction`，按本次请求的实际情况生成）告诉模型：它写出的报告
+不会被每次压缩重置。压缩本身仍有代价：摘要文本变了，所以**下一次实时请求**的前缀从摘要那里就与缓存
+不同（摘要放在系统提示词时更靠前），保留下来的那点最新消息要重新 prefill 一次——它由保留预算
+（≈ 可用窗口的 1/10）兜住，而总结调用自己完全命中缓存。压缩指令（`summarizeInstruction`，按本次请求的实际情况生成）告诉模型：它写出的报告
 是**下次对话唯一的历史上下文**，必须自足。摘要放进**系统提示词**（`agent.summary_in_system_prompt=true`）
 且已经有摘要时，再补一句**新摘要会替换 `# CONVERSATION SUMMARY` 段里的摘要**——系统提示词是特殊情形，
 需要点明；默认布局下报告本身就是那条 `[engine]` 摘要消息，无需额外说明。返回的报告即新的累积摘要，
@@ -281,11 +291,14 @@ user:   <历史里的第一条 user>
 
 ### token 估算（`EstimateMessageTokens`）
 
-与主项目 tokenizer 一致：`(字符数 + 12) * 2/5`，其中字符数包含 content、tool call 的
-name/arguments/id 等，即约 2.5 字符/token，另加每消息 12 字符的固定开销。触发判断时
-优先采用接口返回的 `usage.prompt_tokens`（若更大）。媒体 part 按**个数**粗算
-（`mediaPartTokens`，每 part 固定值），不按 base64 字节数：否则一张图片就会被算成几十万
-token。正因如此，估算可能小于真实占用，被服务商拒绝时走下面的溢出恢复。
+**下限**计数，单位就是 tokenizer 真正切出的单位：英语单词、数字、代码片段按**空格切分**的每一段算
+1 个 token，中文（以及同属不分词书写的假名）**逐字**算 1 个 token；连续文本每多 4 个字符再加 1 个
+token，所以长串（压成一行的 JSON、base64 载荷）不会塌成 1 个 token。content、reasoning、
+tool call 的 name/arguments/id 都计入。媒体 part
+按**个数**粗算（`mediaPartTokens`，每 part 固定值），不按 base64 字节数：否则一张图片就会被算成
+几十万 token。估算只用于两处：**上报值之后追加的消息**（触发与用量显示）与**保留预算**的 Turn
+累加；它不与上报值比较，也没有「每消息固定开销」——两把尺相比正是压缩提前触发的原因。
+正因它只是下限，估算可能小于真实占用，被服务商拒绝时走下面的溢出恢复。
 
 ### 溢出恢复（provider 拒绝后回退 + 摘要 + 重发）
 

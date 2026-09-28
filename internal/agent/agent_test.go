@@ -1624,6 +1624,155 @@ func TestCompactionDigestCarriesSummaryWhereTheLiveCallDoes(t *testing.T) {
 	}
 }
 
+// TestCompactionPassExtendsTheLiveRequestPrefix pins the prefill semantics of a
+// pass that runs after an ordinary request: the summarizing call re-sends, byte
+// for byte, the messages that request carried — its head (system message plus the
+// accumulated summary where the configuration puts it, and the same tools)
+// included — and only appends at the tail: what the conversation recorded after
+// that request (the tool round) and then the summarize instruction. Nothing in
+// front of the instruction is rendered, reordered or rewritten, which is what
+// lets the provider serve the summarizing call from the prompt prefix it cached
+// for the ordinary request instead of prefilling the whole batch again.
+func TestCompactionPassExtendsTheLiveRequestPrefix(t *testing.T) {
+	type wireRequest struct {
+		Messages []json.RawMessage `json:"messages"`
+		Tools    json.RawMessage   `json:"tools"`
+	}
+	// messageOf decodes one wire message, so a request can be told apart by its
+	// roles and its last message.
+	messageOf := func(raw json.RawMessage) capturedMessage {
+		var m capturedMessage
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Errorf("decode message: %v", err)
+		}
+		return m
+	}
+	// endsWithInstruction reports whether a request is a compaction pass: its
+	// final message is the summarize instruction.
+	endsWithInstruction := func(req wireRequest) bool {
+		if len(req.Messages) == 0 {
+			return false
+		}
+		return strings.HasPrefix(messageOf(req.Messages[len(req.Messages)-1]).Content, summarizeInstructionIntro)
+	}
+	rolesOf := func(msgs []json.RawMessage) []string {
+		roles := make([]string, 0, len(msgs))
+		for _, raw := range msgs {
+			roles = append(roles, messageOf(raw).Role)
+		}
+		return roles
+	}
+
+	var (
+		mu     sync.Mutex
+		lives  int
+		bodies []wireRequest
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req wireRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		pass := endsWithInstruction(req)
+
+		mu.Lock()
+		bodies = append(bodies, req)
+		if !pass {
+			lives++
+		}
+		live := lives
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case pass:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"the report"},"finish_reason":"stop"}]}`)
+		case live == 1:
+			// The turn carries on with a tool round, so the next iteration
+			// compresses the grown history and that pass has an ordinary
+			// request in front of it. The padded arguments keep the round well
+			// over the tiny retention budget, so the whole history is
+			// compressed.
+			fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"stub","arguments":%q}}]},"finish_reason":"tool_calls"}]}`,
+				`{"pad":"`+strings.Repeat("x", 200)+`"}`)
+		default:
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	// A tiny window with a 1% trigger compresses on every iteration, and the
+	// retention budget leaves no room for the newest turn, so each pass
+	// summarizes the whole history.
+	cfg.Context.ContextWindow = 100
+	cfg.Context.SummarizeTokenPercent = 1
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "stub", desc: "a stub tool"})
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+
+	a.Load([]llm.Message{
+		userRunes("old ", 100),
+		{Role: "assistant", Content: "old answer"},
+	}, "")
+	a.Submit(userRunes("question ", 100).Content)
+	drainEvents(t, events)
+
+	mu.Lock()
+	captured := append([]wireRequest(nil), bodies...)
+	mu.Unlock()
+
+	// Only the pass with an ordinary request in front of it says anything: the
+	// first pass of a turn runs before the turn's first call.
+	var live, pass *wireRequest
+	for i := 1; i < len(captured); i++ {
+		if endsWithInstruction(captured[i]) && !endsWithInstruction(captured[i-1]) {
+			live, pass = &captured[i-1], &captured[i]
+			break
+		}
+	}
+	if live == nil {
+		t.Fatalf("no pass followed an ordinary request (%d requests captured)", len(captured))
+	}
+	if len(pass.Messages) <= len(live.Messages) {
+		t.Fatalf("the summarizing call sent %d messages, the ordinary request %d: it has to extend it",
+			len(pass.Messages), len(live.Messages))
+	}
+	// The shared prefix really is the head plus the batch: the system message
+	// first, the accumulated summary in the place the default layout puts it
+	// (the [engine] message), the messages being compressed behind it.
+	if msg := messageOf(live.Messages[0]); msg.Role != "system" {
+		t.Fatalf("the ordinary request starts with %q, want the system message", msg.Role)
+	}
+	if msg := messageOf(pass.Messages[1]); !strings.HasPrefix(msg.Content, summaryUserPrefix) {
+		t.Fatalf("the second message of the summarizing call is %q, want the accumulated summary", msg.Content)
+	}
+	// The shared prefix: head and batch byte for byte, exactly as sent.
+	for i, want := range live.Messages {
+		if got := pass.Messages[i]; string(got) != string(want) {
+			t.Fatalf("message %d of the summarizing call differs from the ordinary request:\ngot:  %s\nwant: %s",
+				i, got, want)
+		}
+	}
+	// The only additions are at the tail: what the conversation recorded after
+	// that request, with the instruction last.
+	appended := pass.Messages[len(live.Messages) : len(pass.Messages)-1]
+	if len(appended) == 0 {
+		t.Fatal("the summarizing call added nothing but the instruction")
+	}
+	if got := strings.Join(rolesOf(appended), ","); got != "assistant,tool" {
+		t.Fatalf("the summarizing call appended %q, want the tool round behind the shared prefix", got)
+	}
+	if string(pass.Tools) != string(live.Tools) {
+		t.Fatalf("the summarizing call declares different tools:\npass: %s\nlive: %s", pass.Tools, live.Tools)
+	}
+}
+
 // TestCompactionReplacesTheSummary verifies a pass stores the report the model
 // wrote as the new accumulated summary: the summarizing call carried the previous
 // summary and asked for the complete text, so the field ends up holding that full
@@ -1677,6 +1826,57 @@ func TestContextTokensAnchorsToProviderUsage(t *testing.T) {
 	want := 5000 + EstimateMessageTokens(assistant)
 	if got := a.Stats().EstimatedTok; got != want {
 		t.Fatalf("EstimatedTok after the append = %d, want %d", got, want)
+	}
+}
+
+// TestCompactionTriggerUsesTheProviderReport pins what the automatic pass is
+// triggered on: the provider-reported prompt-token count plus the lower-bound
+// estimate of the messages appended after that report — the same number the
+// frontends display. The character count of the whole context is deliberately not
+// compared against it, because a lower bound in different units is not a
+// competing measurement: comparing them fired a pass at 60% of the window while
+// the setting said 80%. A request the provider really does reject for its size is
+// recovered from instead (see recoverContextOverflow).
+func TestCompactionTriggerUsesTheProviderReport(t *testing.T) {
+	cfg := config.Default()
+	// The window the report this behaviour came from ran with: 80% of 262144
+	// tokens is the 209715-token trigger.
+	cfg.Context.ContextWindow = 262144
+	cfg.Context.SummarizeTokenPercent = 80
+	a := New(cfg, nil, tools.NewRegistry(), NewBus())
+
+	// A history whose character count runs far past the trigger — 840000 runes in
+	// one unbroken run is 210000 estimated tokens — while the provider reported
+	// 157125 tokens, i.e. 60% of the window.
+	a.Load([]llm.Message{{Role: "user", Content: strings.Repeat("x", 840000)}}, "")
+	a.setUsage(llm.Usage{PromptTokens: 157125})
+	if got := a.Stats().EstimatedTok; got != 157125 {
+		t.Fatalf("context estimate = %d, want the reported 157125 tokens", got)
+	}
+	if a.compactionDue() {
+		t.Fatal("the pass fired on the character count of the history instead of the reported usage")
+	}
+
+	// What the provider has not seen yet is counted on top of that report.
+	a.appendMessage(llm.Message{Role: "tool", Content: strings.Repeat("x", 40000)})
+	if got := a.Stats().EstimatedTok; got != 157125+10000 {
+		t.Fatalf("context estimate = %d, want the report plus the appended estimate", got)
+	}
+	if a.compactionDue() {
+		t.Fatal("the appended messages alone must not reach the trigger")
+	}
+	a.appendMessage(llm.Message{Role: "tool", Content: strings.Repeat("x", 240000)})
+	if !a.compactionDue() {
+		t.Fatal("a context past the trigger must compact")
+	}
+
+	// With no report yet (a fresh process, a resumed session) the request itself
+	// is estimated — the system prompt and its capability sections included.
+	freshCfg := config.Default()
+	freshCfg.Agent.SystemPrompt = strings.Repeat("p", 400000)
+	fresh := New(freshCfg, nil, tools.NewRegistry(), NewBus())
+	if !fresh.compactionDue() {
+		t.Fatal("without a report the estimated request must be measured, system prompt included")
 	}
 }
 

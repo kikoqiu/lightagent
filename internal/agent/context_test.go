@@ -27,34 +27,48 @@ func singleTurnMessages(n int) []llm.Message {
 	return msgs
 }
 
-// exactTokenMessage builds a user message whose EstimateMessageTokens is tokens.
-func exactTokenMessage(prefix string, tokens int) llm.Message {
-	target := tokens*5/2 - 12
-	for runes := target; runes <= target+8; runes++ {
-		if m := userRunes(prefix, runes); EstimateMessageTokens(m) == tokens {
-			return m
-		}
+// exactTokenMessage builds a user message whose EstimateMessageTokens is tokens:
+// one unbroken run counts one unit per four characters (see estimateUnits).
+func exactTokenMessage(tokens int) llm.Message {
+	if tokens < 1 {
+		tokens = 1
 	}
-	panic("exactTokenMessage: no rune count produced the requested tokens")
+	return llm.Message{Role: "user", Content: strings.Repeat("x", tokens*4)}
 }
 
 // budgetMessages builds n single-message turns each estimated at exactly tokens.
 func budgetMessages(n, tokens int) []llm.Message {
 	msgs := make([]llm.Message, 0, n)
 	for i := 0; i < n; i++ {
-		msgs = append(msgs, exactTokenMessage(fmt.Sprintf("m%d", i), tokens))
+		msgs = append(msgs, exactTokenMessage(tokens))
 	}
 	return msgs
 }
 
 func TestEstimateMessageTokens(t *testing.T) {
-	// tokens = (runeCount + 12) * 2 / 5
-	if got := EstimateMessageTokens(llm.Message{Role: "user"}); got != 4 {
-		t.Fatalf("empty = %d, want 4", got)
+	// One unit per whitespace-separated run, one per CJK character, and a run
+	// longer than four characters costs one unit per four characters.
+	cases := []struct {
+		name    string
+		content string
+		want    int
+	}{
+		{"empty", "", 0},
+		{"words", "the quick brown fox", 4},
+		{"punctuation rides with the run it touches", "hello, world!", 2},
+		{"chinese per character", "上下文压缩", 5},
+		{"runs and characters mixed", "压缩 context is full", 5},
+		{"a long unbroken run is not one token", strings.Repeat("x", 88), 22},
 	}
-	if got := EstimateMessageTokens(userRunes("ab", 88)); got != 40 {
-		t.Fatalf("88-rune message = %d, want 40", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EstimateMessageTokens(llm.Message{Role: "user", Content: tc.content}); got != tc.want {
+				t.Fatalf("estimate of %q = %d, want %d", tc.content, got, tc.want)
+			}
+		})
 	}
+
+	// Every field that travels on the wire counts, tool calls included.
 	withCall := llm.Message{
 		Role:    "assistant",
 		Content: "x",
@@ -287,22 +301,27 @@ func TestSummarizeTailCutBudgetHoldsOnlyNewestTurn(t *testing.T) {
 	}
 }
 
+// TestShouldCompact pins the trigger arithmetic only: the caller measures the
+// request (see Agent.contextTokensLocked) and passes that number in, so a pass can
+// never fire on a competing estimate in different units.
 func TestShouldCompact(t *testing.T) {
 	c := &compactor{contextWindow: 1000, summarizeTokenPercent: 50}
-	if c.shouldCompact(nil, livePrefix{}, 0) {
-		t.Fatal("empty context should not trigger compaction")
+	if c.shouldCompact(0) {
+		t.Fatal("an empty context should not trigger compaction")
 	}
-	big := []llm.Message{{Role: "user", Content: strings.Repeat("a", 3000)}}
-	if !c.shouldCompact(big, livePrefix{}, 0) {
-		t.Fatal("oversized context should trigger compaction")
+	if c.shouldCompact(499) {
+		t.Fatal("just below the trigger should not compact")
 	}
-	// The system prompt counts as context too, capability sections included.
-	if !c.shouldCompact(nil, livePrefix{systemPrompt: strings.Repeat("p", 3000)}, 0) {
-		t.Fatal("an oversized system prompt should trigger compaction")
+	if !c.shouldCompact(500) {
+		t.Fatal("reaching the trigger should compact")
 	}
-	// A reported usage larger than the estimate also triggers.
-	if !c.shouldCompact(nil, livePrefix{}, 600) {
-		t.Fatal("usage above the limit should trigger compaction")
+	if !c.shouldCompact(1500) {
+		t.Fatal("a context past the trigger should compact")
+	}
+	// A percentage that leaves no usable limit falls back to 3/4 of the window.
+	c2 := &compactor{contextWindow: 1000}
+	if c2.shouldCompact(749) || !c2.shouldCompact(750) {
+		t.Fatal("the fallback trigger is not 3/4 of the context window")
 	}
 }
 
