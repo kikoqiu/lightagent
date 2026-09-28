@@ -428,6 +428,20 @@ func TestConfigScriptIsServed(t *testing.T) {
 		if script == "/config.js" && !strings.Contains(string(body), "/api/config") {
 			t.Fatalf("config.js does not talk to /api/config: %s", body)
 		}
+		// The compaction retention options must reach the browser with the form,
+		// not only live in config.json: they are what the panel writes.
+		if script == "/config.js" {
+			for _, path := range []string{
+				"context.summarize_keep.auto.budget_percent",
+				"context.summarize_keep.auto.turns",
+				"context.summarize_keep.manual.budget_percent",
+				"context.summarize_keep.manual.turns",
+			} {
+				if !strings.Contains(string(body), "'"+path+"'") {
+					t.Errorf("the served config.js does not offer %s", path)
+				}
+			}
+		}
 		if script == "/auth.js" && !strings.Contains(string(body), "/api/login") {
 			t.Fatalf("auth.js does not talk to /api/login: %s", body)
 		}
