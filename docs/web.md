@@ -251,7 +251,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "tool_call", "name": "exec_command", "args": "{\"command\":\"ls\"}" }
 { "type": "tool_result", "name": "exec_command", "text": "展示文本", "is_error": false }
 { "type": "info", "text": "..." }
-{ "type": "compacted", "text": "context compressed: 20 -> 9 messages", "summary": "被压缩消息的累积摘要" }
+{ "type": "compacted", "text": "context compressed: 20 -> 1 messages", "summary": "被压缩消息的累积摘要" }
 { "type": "interrupted", "text": "interrupted; the turn was stopped" }
 { "type": "error", "text": "..." }
 { "type": "usage", "tokens": 1234, "context_window": 131072 }
@@ -264,6 +264,9 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   CLI 与网页都在**截断处**显示它——CLI 先打印 `[info] context compressed: …` 再打印一个
   `[summary]` 块，网页在信息行之后追加一条 `summary` 行；网页的这条行同时写进回放缓冲，
   所以刷新/重连后摘要仍出现在同一个位置。
+  箭头后的条数 = 摘要 + 保留策略留下的原始消息（`context.summarize_keep`，默认一条都不留，
+  因此是 `1` —— 整段历史都被压缩时，剩下的那条是引擎补的 `[engine] Context summarized,
+  continue.` 标记）。
   总结要调用模型（可能较慢），因此压缩**开始前**会先广播一条 `info`：
   `compacting context: summarizing N of M messages`，两端立刻显示「正在压缩」；没有可压缩
   内容时不广播任何事件（`/compact` 由命令处理方回复 `nothing to compress yet`）。

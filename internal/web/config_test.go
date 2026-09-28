@@ -157,6 +157,50 @@ func TestConfigPutWritesTheFileWithoutApplyingIt(t *testing.T) {
 	}
 }
 
+// TestConfigRetentionPolicyRoundTrip covers the editor's half of the compaction
+// retention options: a file that omits them reports the default (keep nothing),
+// and a document that sets them is accepted, written back and echoed — so the
+// form (whose fields the page pins separately) writes a file the next start uses.
+func TestConfigRetentionPolicyRoundTrip(t *testing.T) {
+	srv := newTestServer(t, "")
+	path := seedConfigFile(t, srv, `{"openai":{"api_key":"sk-secret","model":"m1"}}`)
+
+	status, reply := callConfig(t, srv, http.MethodGet, "")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", status, reply.Error)
+	}
+	if got := reply.Config.Context.SummarizeKeep; got != (config.SummarizeKeepConfig{}) {
+		t.Fatalf("summarize_keep = %+v, want the default (keep nothing)", got)
+	}
+
+	body := `{"openai":{"api_key":"sk-secret"},"context":{"summarize_keep":{` +
+		`"auto":{"budget_percent":10,"turns":3},"manual":{"budget_percent":5,"turns":2}}}}`
+	status, reply = callConfig(t, srv, http.MethodPut, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", status, reply.Error)
+	}
+	want := config.SummarizeKeepConfig{
+		Auto:   config.SummarizeKeepPolicy{BudgetPercent: 10, Turns: 3},
+		Manual: config.SummarizeKeepPolicy{BudgetPercent: 5, Turns: 2},
+	}
+	if got := reply.Config.Context.SummarizeKeep; got != want {
+		t.Fatalf("reply summarize_keep = %+v, want %+v", got, want)
+	}
+
+	saved, err := config.Parse([]byte(readConfigString(t, path)))
+	if err != nil {
+		t.Fatalf("parse the saved config: %v", err)
+	}
+	if saved.Context.SummarizeKeep != want {
+		t.Fatalf("file summarize_keep = %+v, want %+v", saved.Context.SummarizeKeep, want)
+	}
+
+	// A browser that reloads the panel reads the saved policy back.
+	if _, again := callConfig(t, srv, http.MethodGet, ""); again.Config.Context.SummarizeKeep != want {
+		t.Fatalf("a later read = %+v, want %+v", again.Config.Context.SummarizeKeep, want)
+	}
+}
+
 // TestConfigPutRejectsBadDocuments pins that a document the next start could not
 // use is refused: the file must stay startable, and a rejection must not touch
 // it.
@@ -335,6 +379,8 @@ func TestConfigEditorWiring(t *testing.T) {
 		"openai.temperature", "openai.max_tokens", "openai.timeout_seconds", "openai.extra_body",
 		"openai.media_types",
 		"context.context_window", "context.summarize_token_percent",
+		"context.summarize_keep.auto.budget_percent", "context.summarize_keep.auto.turns",
+		"context.summarize_keep.manual.budget_percent", "context.summarize_keep.manual.turns",
 		"web.host", "web.port", "web.password",
 		"tools.exec.enabled", "tools.exec.timeout_seconds", "tools.exec.wait_seconds", "tools.exec.use_utf8",
 		"tools.read_file_lines.enabled", "tools.read_file_lines.max_read_file_size", "tools.read_file_lines.max_read_file_lines",

@@ -131,6 +131,8 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		contextWindow:         contextWindow,
 		maxTokens:             cfg.OpenAI.MaxTokens,
 		summarizeTokenPercent: summarizePercent,
+		keepAuto:              cfg.Context.SummarizeKeep.Auto,
+		keepManual:            cfg.Context.SummarizeKeep.Manual,
 	}
 	return a
 }
@@ -1061,9 +1063,10 @@ const maxContextOverflowRecoveries = 2
 //  1. rolls the newest messages back out of the context — the assistant/tool rows
 //     this turn appended and the user messages no answer followed, i.e. exactly
 //     the content that made the request too large (see overflowRollbackCut),
-//  2. compresses everything that is left with the overflow mode, whose zero
-//     retention budget keeps nothing raw: the surviving history is replaced by
-//     the accumulated summary. Those rolled-back user messages are deliberately
+//  2. compresses everything that is left with the overflow mode, which keeps
+//     nothing raw (only the summary may survive a retry, whatever the configured
+//     retention policies say): the surviving history is replaced by the
+//     accumulated summary. Those rolled-back user messages are deliberately
 //     not part of that batch, so an oversized attachment among them cannot make
 //     the summarizing call overflow too,
 //  3. replays them on top of the summary, so the model is asked again with the

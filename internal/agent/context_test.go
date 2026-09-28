@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"lightagent/internal/config"
 	"lightagent/internal/llm"
 )
 
@@ -93,46 +94,80 @@ func TestParseTurnBoundaries(t *testing.T) {
 	}
 }
 
-func TestRetentionBudget(t *testing.T) {
-	c := &compactor{contextWindow: 10000, maxTokens: 1000}
-	if got := c.retentionBudget(summarizeModeAuto); got != 900 {
-		t.Fatalf("auto budget = %d, want 900", got)
+// TestRetentionPolicyComesFromConfig pins where the retention policy of a pass
+// comes from: the automatic and the manual pass read the configured share and turn
+// cap (which default to keeping nothing — some inference engines do not preserve
+// their prompt cache across the rollback a retention performs, see
+// config.SummarizeKeepPolicy), while the overflow recovery keeps nothing whatever
+// the configuration says.
+func TestRetentionPolicyComesFromConfig(t *testing.T) {
+	c := &compactor{
+		contextWindow: 10000,
+		maxTokens:     1000,
+		keepAuto:      config.SummarizeKeepPolicy{BudgetPercent: 50, Turns: 3},
+		keepManual:    config.SummarizeKeepPolicy{BudgetPercent: 20, Turns: 2},
 	}
-	if got := c.retentionBudget(summarizeModeManual); got != 450 {
-		t.Fatalf("manual budget = %d, want 450", got)
+	// The share is taken from the available input budget (window - output
+	// reserve).
+	if got := c.retentionBudget(summarizeModeAuto); got != 4500 {
+		t.Fatalf("auto budget = %d, want 4500 (50%% of 9000)", got)
 	}
-	// The overflow recovery keeps nothing raw: the provider has just proven the
-	// estimate too small, so only the summary may survive the retry.
+	if got := c.retentionBudget(summarizeModeManual); got != 1800 {
+		t.Fatalf("manual budget = %d, want 1800 (20%% of 9000)", got)
+	}
+	if got := c.maxKeptTurns(summarizeModeAuto); got != 3 {
+		t.Fatalf("auto turn cap = %d, want 3", got)
+	}
+	if got := c.maxKeptTurns(summarizeModeManual); got != 2 {
+		t.Fatalf("manual turn cap = %d, want 2", got)
+	}
+	// maxTokens >= contextWindow falls back to the full context window.
+	c2 := &compactor{contextWindow: 1000, maxTokens: 5000, keepAuto: config.SummarizeKeepPolicy{BudgetPercent: 50}}
+	if got := c2.retentionBudget(summarizeModeAuto); got != 500 {
+		t.Fatalf("fallback budget = %d, want 500", got)
+	}
+
+	// The overflow recovery has no setting: the provider has just proven the
+	// estimate too small there, so only the summary may survive the retry.
 	if got := c.retentionBudget(summarizeModeOverflow); got != 0 {
 		t.Fatalf("overflow budget = %d, want 0", got)
 	}
-	if got := summarizeMaxKeptTurns(summarizeModeOverflow); got != 0 {
+	if got := c.maxKeptTurns(summarizeModeOverflow); got != 0 {
 		t.Fatalf("overflow turn cap = %d, want 0", got)
 	}
-	// maxTokens >= contextWindow falls back to the full context window.
-	c2 := &compactor{contextWindow: 1000, maxTokens: 5000}
-	if got := c2.retentionBudget(summarizeModeAuto); got != 100 {
-		t.Fatalf("fallback budget = %d, want 100", got)
+
+	// The built-in policy keeps nothing: a compactor built from the defaults
+	// summarizes the whole history, and a zero share is safe before any
+	// arithmetic runs (an unset window included).
+	for _, zero := range []*compactor{{}, {contextWindow: 1000, maxTokens: 5000}, {contextWindow: 10000, maxTokens: 1000}} {
+		for _, mode := range []summarizeMode{summarizeModeAuto, summarizeModeManual, summarizeModeOverflow} {
+			if got := zero.retentionBudget(mode); got != 0 {
+				t.Fatalf("default budget (mode %d) = %d, want 0", mode, got)
+			}
+			if got := zero.maxKeptTurns(mode); got != 0 {
+				t.Fatalf("default turn cap (mode %d) = %d, want 0", mode, got)
+			}
+		}
 	}
 }
 
-// TestOverflowPassCutsTheWholeHistory pins the point of the overflow mode: a pass
-// that follows a rejected request condenses the entire surviving history — the
-// same history the auto mode leaves alone for being far below the window.
-func TestOverflowPassCutsTheWholeHistory(t *testing.T) {
+// TestEveryPassCutsTheWholeHistory pins what the default retention policy means
+// for a pass: every mode condenses the entire history, the newest turn included,
+// so the summary is all that survives and the request that follows is the summary
+// plus the engine's continue marker.
+func TestEveryPassCutsTheWholeHistory(t *testing.T) {
 	c := &compactor{contextWindow: 100000, maxTokens: 1000}
-	// Three turns: the auto mode's retention budget and its three-turn cap both
-	// hold them, so it has nothing to condense.
+	// Three short turns: they fit any window, yet a zero retention budget keeps
+	// none of them.
 	msgs := budgetMessages(3, 40)
-	if _, ok := c.cut(msgs, summarizeModeAuto); ok {
-		t.Fatal("the auto mode condensed a history that fits its retention budget")
-	}
-	cut, ok := c.cut(msgs, summarizeModeOverflow)
-	if !ok {
-		t.Fatal("the overflow mode must condense everything")
-	}
-	if cut != len(msgs) {
-		t.Fatalf("overflow cut = %d, want %d (whole history)", cut, len(msgs))
+	for _, mode := range []summarizeMode{summarizeModeAuto, summarizeModeManual, summarizeModeOverflow} {
+		cut, ok := c.cut(msgs, mode)
+		if !ok {
+			t.Fatalf("mode %d condensed nothing: it must cut the whole history", mode)
+		}
+		if cut != len(msgs) {
+			t.Fatalf("mode %d cut = %d, want %d (whole history)", mode, cut, len(msgs))
+		}
 	}
 }
 
@@ -200,31 +235,53 @@ func TestOverflowRollbackCut(t *testing.T) {
 	}
 }
 
-func TestSummarizeTailCutAutoTurnCapThree(t *testing.T) {
-	msgs := singleTurnMessages(12) // 12 user messages = 12 turns
-	safeCut, ok := summarizeTailCut(msgs, 1<<30, summarizeMaxKeptTurns(summarizeModeAuto))
-	if !ok {
-		t.Fatal("expected a cut to be possible with a large budget")
+// TestSummarizeTailCutTurnCapBinds pins the algorithm's turn cap, which the
+// retention policy feeds a zero (see TestSummarizeTailCutZeroBudgetCutsWholeTail):
+// with a budget far larger than the history, the walk keeps exactly the newest
+// maxKeptTurns user messages.
+func TestSummarizeTailCutTurnCapBinds(t *testing.T) {
+	cases := []struct {
+		name         string
+		turns        int
+		maxKeptTurns int
+	}{
+		{"three of twelve", 12, 3},
+		{"two of eight", 8, 2},
 	}
-	if want := len(msgs) - 3; safeCut != want {
-		t.Fatalf("safeCut = %d, want %d (keep the newest 3 user messages of 12)", safeCut, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := singleTurnMessages(tc.turns)
+			safeCut, ok := summarizeTailCut(msgs, 1<<30, tc.maxKeptTurns)
+			if !ok {
+				t.Fatal("expected a cut to be possible with a large budget")
+			}
+			if want := len(msgs) - tc.maxKeptTurns; safeCut != want {
+				t.Fatalf("safeCut = %d, want %d (keep the newest %d user messages of %d)",
+					safeCut, want, tc.maxKeptTurns, tc.turns)
+			}
+		})
 	}
 }
 
-func TestSummarizeTailCutManualTurnCapTwo(t *testing.T) {
-	msgs := singleTurnMessages(8)
-	safeCut, ok := summarizeTailCut(msgs, 1<<30, summarizeMaxKeptTurns(summarizeModeManual))
+// TestSummarizeTailCutZeroBudgetCutsWholeTail pins the input the retention policy
+// hands the algorithm: a zero token budget (and the turn cap the policy zeroes as
+// well, which summarizeTailCut lifts to its minimum of one) leaves no turn inside
+// the window, so the whole history is compressed.
+func TestSummarizeTailCutZeroBudgetCutsWholeTail(t *testing.T) {
+	c := &compactor{} // the default policy: keeps nothing
+	msgs := singleTurnMessages(3)
+	safeCut, ok := summarizeTailCut(msgs, c.retentionBudget(summarizeModeAuto), c.maxKeptTurns(summarizeModeAuto))
 	if !ok {
-		t.Fatal("expected a cut to be possible with a large budget")
+		t.Fatal("expected a zero budget to condense everything")
 	}
-	if want := len(msgs) - 2; safeCut != want {
-		t.Fatalf("safeCut = %d, want %d (keep the newest 2 user messages of 8)", safeCut, want)
+	if safeCut != len(msgs) {
+		t.Fatalf("safeCut = %d, want %d (whole history)", safeCut, len(msgs))
 	}
 }
 
 func TestSummarizeTailCutEverythingFitsNoop(t *testing.T) {
 	msgs := singleTurnMessages(3)
-	if safeCut, ok := summarizeTailCut(msgs, 1<<30, summarizeMaxKeptTurns(summarizeModeAuto)); ok || safeCut != 0 {
+	if safeCut, ok := summarizeTailCut(msgs, 1<<30, 3); ok || safeCut != 0 {
 		t.Fatalf("expected no-op (safeCut=0, ok=false), got safeCut=%d ok=%v", safeCut, ok)
 	}
 }
@@ -238,7 +295,7 @@ func TestSummarizeTailCutTurnCapCountsUserMessagesNotRows(t *testing.T) {
 			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
-	safeCut, ok := summarizeTailCut(msgs, 1<<30, summarizeMaxKeptTurns(summarizeModeManual))
+	safeCut, ok := summarizeTailCut(msgs, 1<<30, 2)
 	if !ok {
 		t.Fatal("expected a cut to be possible with a large budget")
 	}

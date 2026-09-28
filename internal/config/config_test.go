@@ -921,3 +921,69 @@ func TestMediaConfigPartialFile(t *testing.T) {
 		t.Fatalf("max_bytes = %d, want the built-in cap (0)", cfg.Tools.UploadMedia.MaxBytes)
 	}
 }
+
+// TestSummarizeKeepDefaults verifies the context retention defaults: both
+// configurable passes keep no raw message, so a compaction replaces the whole
+// compressed history with the summary — some inference engines do not preserve
+// their prompt cache across the rollback a retention performs (see
+// SummarizeKeepPolicy).
+func TestSummarizeKeepDefaults(t *testing.T) {
+	keep := Default().Context.SummarizeKeep
+	if keep.Auto != (SummarizeKeepPolicy{}) {
+		t.Fatalf("summarize_keep.auto = %+v, want the zero policy (keep nothing)", keep.Auto)
+	}
+	if keep.Manual != (SummarizeKeepPolicy{}) {
+		t.Fatalf("summarize_keep.manual = %+v, want the zero policy (keep nothing)", keep.Manual)
+	}
+	// The policy is part of the built-in schema, so a file that omits it is
+	// completed on load instead of reading as unset.
+	raw, err := json.Marshal(Default())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `"summarize_keep":{"auto":{"budget_percent":0,"turns":0},"manual":{"budget_percent":0,"turns":0}}`
+	if !strings.Contains(string(raw), want) {
+		t.Fatalf("the default document must carry the retention policy %s: %s", want, raw)
+	}
+}
+
+// TestSummarizeKeepPartialFile verifies a config file sets the retention policy of
+// each pass, that an omitted value keeps the zero default, and that an unusable
+// share or turn cap falls back to it.
+func TestSummarizeKeepPartialFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	blob := `{"openai":{"api_key":"sk-x"},"context":{"context_window":81960,` +
+		`"summarize_keep":{"auto":{"budget_percent":10,"turns":3},"manual":{"budget_percent":5}}}}`
+	if err := os.WriteFile(path, []byte(blob), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIGHTAGENT_CONFIG", path)
+
+	cfg, _, _, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Context.SummarizeKeep.Auto; got.BudgetPercent != 10 || got.Turns != 3 {
+		t.Fatalf("auto retention = %+v, want the stored policy", got)
+	}
+	if got := cfg.Context.SummarizeKeep.Manual; got.BudgetPercent != 5 || got.Turns != 0 {
+		t.Fatalf("manual retention = %+v, want the stored share and the default turn cap", got)
+	}
+
+	// A share outside [0, 100] and a negative turn cap are unusable.
+	if err := os.WriteFile(path, []byte(
+		`{"openai":{"api_key":"sk-x"},"context":{"summarize_keep":{"auto":{"budget_percent":150,"turns":-1}}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := cfg.Context.SummarizeKeep.Auto; got != (SummarizeKeepPolicy{}) {
+		t.Fatalf("auto retention = %+v, want the default policy", got)
+	}
+	if got := cfg.Context.SummarizeKeep.Manual; got != (SummarizeKeepPolicy{}) {
+		t.Fatalf("manual retention = %+v, want the default policy", got)
+	}
+}

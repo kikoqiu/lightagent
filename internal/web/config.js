@@ -76,7 +76,11 @@
       title: 'Context', note: 'window size and compression threshold', open: true,
       fields: [
         { path: 'context.context_window', type: 'number', min: 1, help: 'model context window in tokens; drives compression and the usage badge' },
-        { path: 'context.summarize_token_percent', type: 'slider', min: 1, max: 100, step: 1, fallback: 75, help: 'compress once usage reaches this % of the window' }
+        { path: 'context.summarize_token_percent', type: 'slider', min: 1, max: 100, step: 1, fallback: 75, help: 'compress once usage reaches this % of the window' },
+        { path: 'context.summarize_keep.auto.budget_percent', type: 'slider', min: 0, max: 100, step: 1, fallback: 0, help: 'share of the available input budget (window minus max_tokens) the automatic pass keeps raw; 0 keeps no raw message, which keeps the prompt cache valid across the rollback some engines cannot handle' },
+        { path: 'context.summarize_keep.auto.turns', type: 'number', min: 0, help: 'complete turns the automatic pass keeps raw at most; 0 keeps none' },
+        { path: 'context.summarize_keep.manual.budget_percent', type: 'slider', min: 0, max: 100, step: 1, fallback: 0, help: 'same for /compact' },
+        { path: 'context.summarize_keep.manual.turns', type: 'number', min: 0, help: 'same for /compact' }
       ]
     },
     {

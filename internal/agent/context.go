@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode"
 
+	"lightagent/internal/config"
 	"lightagent/internal/llm"
 )
 
@@ -209,9 +210,11 @@ func summaryMessage(summary string) (llm.Message, bool) {
 
 // compactor implements the single, global context-compression strategy:
 // summarize the older portion of the conversation and store the digest as the
-// accumulated summary, keeping the most recent messages intact. Where a request
-// carries that summary — in the system prompt or as its first user message — is
-// decided by the request builder (see livePrefix.head).
+// accumulated summary, keeping as much of the newest history raw as the retention
+// policy allows — nothing by default, so a pass summarizes the whole history (see
+// retention). Where a request carries that summary — in the system prompt or as
+// its first user message — is decided by the request builder (see
+// livePrefix.head).
 //
 // The request prefix is deliberately not stored here: every pass receives the
 // one the live conversation renders (system message plus declared tools), so the
@@ -221,6 +224,10 @@ type compactor struct {
 	contextWindow         int
 	maxTokens             int
 	summarizeTokenPercent int
+	// keepAuto and keepManual are the configured retention policies of the
+	// automatic pass and of the one /compact triggers (see retention).
+	keepAuto   config.SummarizeKeepPolicy
+	keepManual config.SummarizeKeepPolicy
 }
 
 // tokenLimit returns the effective compaction trigger in tokens.
@@ -244,10 +251,11 @@ func (c *compactor) shouldCompact(estimate int) bool {
 	return estimate >= c.tokenLimit()
 }
 
-// summarizeMode distinguishes who requested a pass: automatic compaction keeps
-// a larger recent window than an explicit manual request, and the overflow
-// recovery (the pass that follows a request the provider rejected for its size)
-// keeps nothing raw at all.
+// summarizeMode distinguishes who requested a pass: the automatic and the manual
+// pass carry the retention policy the configuration gives them (they keep no raw
+// message by default, see config.SummarizeKeepPolicy), and the overflow recovery
+// — the pass that follows a request the provider rejected for its size — keeps
+// nothing raw at all.
 type summarizeMode int
 
 const (
@@ -275,29 +283,28 @@ func parseTurnBoundaries(history []llm.Message) []int {
 	return starts
 }
 
-// summarizeMaxKeptTurns caps how many of the newest user messages (complete
-// turns) a pass may retain regardless of the token budget: automatic keeps at
-// most 3, manual at most 2, and the overflow recovery none — its budget is zero
-// anyway, so the count is moot (and summarizeTailCut lifts it to its minimum of
-// one, never the budget).
-func summarizeMaxKeptTurns(m summarizeMode) int {
+// retention returns the retention policy mode runs with: the configured one for
+// the automatic and the manual pass, and none for the overflow recovery — the
+// provider has just proven the estimate too small there, so only the summary may
+// survive the retry. A zero policy keeps no raw message, which is what the
+// defaults ask for: some inference engines do not preserve their prompt cache
+// across the rollback a retention performs (see config.SummarizeKeepPolicy).
+func (c *compactor) retention(m summarizeMode) config.SummarizeKeepPolicy {
 	switch m {
 	case summarizeModeManual:
-		return 2
+		return c.keepManual
 	case summarizeModeOverflow:
-		return 0
+		return config.SummarizeKeepPolicy{}
 	}
-	return 3
+	return c.keepAuto
 }
 
-// retentionBudget returns how many tokens of the newest messages a pass may
-// keep visible: a fraction (1/10 auto, 1/20 manual) of the available input
-// budget (ContextWindow minus the MaxTokens output reserve). The overflow
-// recovery keeps nothing: the provider has just proven the estimate too small,
-// so only the summary may survive the retry (see
-// Agent.recoverContextOverflow).
+// retentionBudget returns how many tokens of the newest messages a pass may keep
+// visible: the configured share of the available input budget (ContextWindow
+// minus the MaxTokens output reserve). A zero share (the default) keeps nothing.
 func (c *compactor) retentionBudget(m summarizeMode) int {
-	if m == summarizeModeOverflow {
+	percent := c.retention(m).BudgetPercent
+	if percent <= 0 {
 		return 0
 	}
 	available := c.contextWindow - c.maxTokens
@@ -307,11 +314,15 @@ func (c *compactor) retentionBudget(m summarizeMode) int {
 	if available <= 0 {
 		return 0
 	}
-	divisor := 10
-	if m == summarizeModeManual {
-		divisor = 20
-	}
-	return available / divisor
+	return available * percent / 100
+}
+
+// maxKeptTurns caps how many of the newest user messages (complete turns) a pass
+// may retain regardless of the token budget (see the retention policy).
+// summarizeTailCut lifts a zero to its minimum of one, which never binds: a zero
+// budget already keeps nothing.
+func (c *compactor) maxKeptTurns(m summarizeMode) int {
+	return c.retention(m).Turns
 }
 
 // summarizeTailCut decides how many leading messages of the still-unsummarized
@@ -388,7 +399,7 @@ func (c *compactor) cut(history []llm.Message, mode summarizeMode) (int, bool) {
 	if len(history) < 2 {
 		return 0, false
 	}
-	cut, ok := summarizeTailCut(history, c.retentionBudget(mode), summarizeMaxKeptTurns(mode))
+	cut, ok := summarizeTailCut(history, c.retentionBudget(mode), c.maxKeptTurns(mode))
 	if !ok || cut <= 0 {
 		return 0, false
 	}
@@ -441,8 +452,9 @@ func (c *compactor) compact(ctx context.Context, history []llm.Message, prefix l
 	batch := history[:cut]
 	// Cutting everything — including the user turn that started the running
 	// loop — would leave the next request without a user message, which chat
-	// templates reject. The retained window always starts at a user message
-	// when it is non-empty, so this only fires on a fully compressed tail.
+	// templates reject, so ensureUserMessage adds the engine marker. The
+	// retention policy keeps no raw message by default (see retention), so a
+	// pass normally leaves that marker and nothing else.
 	tail := ensureUserMessage(history[cut:])
 
 	digest, err := c.digest(ctx, batch, prefix)

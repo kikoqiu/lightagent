@@ -1252,9 +1252,10 @@ func TestResetAndStats(t *testing.T) {
 // nothing to condense (its caller then reports that instead).
 func TestCompactionPublishesProgressAndSummary(t *testing.T) {
 	a := newTestAgent(t)
-	// Three turns; the manual retention window keeps two, so the oldest turn is
-	// compressed. The agent has no LLM client, so summarizing fails and the pass
-	// falls back to dropping those messages while keeping the current summary.
+	// Three turns; the default retention policy keeps none of them, so the whole
+	// history is compressed. The agent has no LLM client, so summarizing fails
+	// and the pass falls back to dropping those messages while keeping the
+	// current summary.
 	a.Load([]llm.Message{
 		{Role: "user", Content: "one"},
 		{Role: "assistant", Content: "two"},
@@ -1284,18 +1285,20 @@ func TestCompactionPublishesProgressAndSummary(t *testing.T) {
 			t.Fatalf("events = %v %v, want the info, the error and the compacted one", kinds, texts)
 		}
 	}
-	if kinds[0] != EventInfo || texts[0] != "compacting context: summarizing 2 of 5 messages" {
+	if kinds[0] != EventInfo || texts[0] != "compacting context: summarizing 5 of 5 messages" {
 		t.Fatalf("first event = %v %q, want the compacting info", kinds[0], texts[0])
 	}
 	if kinds[1] != EventError || kinds[2] != EventCompacted {
 		t.Fatalf("event kinds = %v, want info, error, compacted", kinds)
 	}
-	if texts[2] != "context compressed: 5 -> 3 messages" {
+	// Nothing was kept raw, so the pass leaves the engine's continue marker: a
+	// request without a user message is what chat templates reject.
+	if texts[2] != "context compressed: 5 -> 1 messages" {
 		t.Fatalf("compacted event text = %q", texts[2])
 	}
 
-	// The retained window now holds every turn, so a further pass has nothing to
-	// condense: it publishes nothing and says so to its caller.
+	// The history is down to that marker, which is not enough to condense: a
+	// further pass publishes nothing and says so to its caller.
 	if msg := a.CompactNow(context.Background()); msg != "nothing to compress yet" {
 		t.Fatalf("CompactNow on a compacted history = %q", msg)
 	}
@@ -1333,9 +1336,9 @@ func TestAutoCompactionKeepsAUserMessage(t *testing.T) {
 	cfg := config.Default()
 	cfg.OpenAI.APIBase = srv.URL
 	cfg.OpenAI.Stream = false
-	// A tiny window with a 1% trigger compresses on every iteration, and a
-	// retention budget of a few tokens leaves no room for the newest turn, so
-	// the whole tail is cut — the user turn included.
+	// A tiny window with a 1% trigger compresses on every iteration; the
+	// default retention policy keeps no raw message anyway, so the whole tail
+	// is cut — the user turn included.
 	cfg.Context.ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
 	bus := NewBus()
@@ -1421,7 +1424,7 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 	cfg.OpenAI.Stream = false
 	cfg.Agent.SystemPrompt = "custom base"
 	// A tiny window with a 1% trigger compresses on the first iteration, and the
-	// retention budget leaves no room for the newest turn, so the whole tail is
+	// default retention policy keeps nothing raw, so the whole tail is
 	// summarized.
 	cfg.Context.ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
@@ -1567,9 +1570,8 @@ func TestCompactionDigestCarriesSummaryWhereTheLiveCallDoes(t *testing.T) {
 			cfg.OpenAI.Stream = false
 			cfg.Agent.SummaryInSystemPrompt = inSystem
 			// A tiny window with a 1% trigger compresses on the first iteration,
-			// and a retention budget of a few tokens leaves no room for the newest
-			// turn, so the whole tail — the batch being summarized included — is
-			// compressed.
+			// and the default retention policy keeps nothing raw, so the whole
+			// tail — the batch being summarized included — is compressed.
 			cfg.Context.ContextWindow = 100
 			cfg.Context.SummarizeTokenPercent = 1
 			bus := NewBus()
@@ -1690,9 +1692,8 @@ func TestCompactionPassExtendsTheLiveRequestPrefix(t *testing.T) {
 		case live == 1:
 			// The turn carries on with a tool round, so the next iteration
 			// compresses the grown history and that pass has an ordinary
-			// request in front of it. The padded arguments keep the round well
-			// over the tiny retention budget, so the whole history is
-			// compressed.
+			// request in front of it. The default retention policy keeps
+			// nothing raw, so that pass compresses the whole history.
 			fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"stub","arguments":%q}}]},"finish_reason":"tool_calls"}]}`,
 				`{"pad":"`+strings.Repeat("x", 200)+`"}`)
 		default:
@@ -1704,9 +1705,9 @@ func TestCompactionPassExtendsTheLiveRequestPrefix(t *testing.T) {
 	cfg := config.Default()
 	cfg.OpenAI.APIBase = srv.URL
 	cfg.OpenAI.Stream = false
-	// A tiny window with a 1% trigger compresses on every iteration, and the
-	// retention budget leaves no room for the newest turn, so each pass
-	// summarizes the whole history.
+	// A tiny window with a 1% trigger compresses on every iteration; the
+	// default retention policy keeps nothing raw, so each pass summarizes the
+	// whole history.
 	cfg.Context.ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
 	reg := tools.NewRegistry()
@@ -1788,8 +1789,8 @@ func TestCompactionReplacesTheSummary(t *testing.T) {
 	cfg.OpenAI.APIBase = srv.URL
 	cfg.OpenAI.Stream = false
 	// A tiny window with a 1% trigger compresses on the first pass, and the
-	// retention budget leaves no room for the newest turn, so the whole history
-	// is summarized.
+	// default retention policy keeps nothing raw, so the whole history is
+	// summarized.
 	cfg.Context.ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
 	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), NewBus())

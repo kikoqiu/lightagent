@@ -61,14 +61,46 @@ type OpenAIConfig struct {
 }
 
 // ContextConfig controls context-window management.
-//
-// How much of the newest conversation a compression pass keeps visible is
-// derived: a token budget of
-// (context_window - openai.max_tokens) divided by 10 (auto) or 20 (manual),
-// capped at 3 (auto) or 2 (manual) complete user turns.
 type ContextConfig struct {
 	ContextWindow         int `json:"context_window"`
 	SummarizeTokenPercent int `json:"summarize_token_percent"`
+	// SummarizeKeep is the retention policy of the two configurable compaction
+	// passes (see SummarizeKeepPolicy).
+	SummarizeKeep SummarizeKeepConfig `json:"summarize_keep"`
+}
+
+// SummarizeKeepConfig configures how much of the newest conversation a compaction
+// pass leaves raw instead of summarizing it. The overflow recovery — the pass
+// that follows a request the provider rejected as too large — is deliberately not
+// configurable: the estimate was just proven too small there, so only the summary
+// may survive the retry.
+type SummarizeKeepConfig struct {
+	// Auto is the policy of the proactive post-turn pass.
+	Auto SummarizeKeepPolicy `json:"auto"`
+	// Manual is the policy of the pass /compact triggers.
+	Manual SummarizeKeepPolicy `json:"manual"`
+}
+
+// SummarizeKeepPolicy is the retention policy of one compaction pass: how much of
+// the newest history the pass keeps visible next to the summary.
+//
+// Retaining raw messages makes the request that follows a compaction start at an
+// earlier prefix than the one the provider cached, and some inference engines do
+// not preserve their prompt cache across such a rollback. Both values therefore
+// default to 0: the whole compressed history is replaced by the accumulated
+// summary, and the next request is the live prefix (system prompt plus summary)
+// followed by whatever comes after it, which keeps the cache valid. Raise them
+// only for a provider that does keep its cache across a rollback — the newest
+// turns are covered by the summary either way.
+type SummarizeKeepPolicy struct {
+	// BudgetPercent is the share, in percent, of the available input budget
+	// (context_window minus openai.max_tokens) the pass may keep raw. 0 (the
+	// default) keeps nothing.
+	BudgetPercent int `json:"budget_percent"`
+	// Turns caps how many complete turns — a user message plus the assistant and
+	// tool messages up to the next user message — may stay raw. 0 (the default)
+	// keeps none. Whichever limit is reached first stops the walk.
+	Turns int `json:"turns"`
 }
 
 // WebConfig controls the optional web mirror service.
@@ -407,6 +439,14 @@ func Default() *Config {
 		Context: ContextConfig{
 			ContextWindow:         81960,
 			SummarizeTokenPercent: 75,
+			// Both passes keep no raw message: some inference engines do not
+			// preserve the prompt cache across the rollback a retention
+			// performs, so the compressed history is replaced by the accumulated
+			// summary in full (see SummarizeKeepPolicy).
+			SummarizeKeep: SummarizeKeepConfig{
+				Auto:   SummarizeKeepPolicy{BudgetPercent: 0, Turns: 0},
+				Manual: SummarizeKeepPolicy{BudgetPercent: 0, Turns: 0},
+			},
 		},
 		Web: WebConfig{Host: "127.0.0.1", Port: 0, Password: ""},
 		Tools: ToolsConfig{
@@ -735,6 +775,18 @@ func Save(path string, cfg *Config) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
+// sanitizeKeepPolicy replaces an unusable retention policy with the default one: a
+// share outside [0, 100] and a negative turn cap are both invalid.
+func sanitizeKeepPolicy(p, def SummarizeKeepPolicy) SummarizeKeepPolicy {
+	if p.BudgetPercent < 0 || p.BudgetPercent > 100 {
+		p.BudgetPercent = def.BudgetPercent
+	}
+	if p.Turns < 0 {
+		p.Turns = def.Turns
+	}
+	return p
+}
+
 // applyDefaults fills zero values with defaults so partial config files remain
 // usable after new fields are added.
 func (c *Config) applyDefaults() {
@@ -765,6 +817,11 @@ func (c *Config) applyDefaults() {
 	if c.Context.SummarizeTokenPercent <= 0 || c.Context.SummarizeTokenPercent > 100 {
 		c.Context.SummarizeTokenPercent = def.Context.SummarizeTokenPercent
 	}
+	// summarize_keep is a policy whose default is "keep nothing", so an
+	// out-of-range value falls back to that default rather than to some non-zero
+	// window.
+	c.Context.SummarizeKeep.Auto = sanitizeKeepPolicy(c.Context.SummarizeKeep.Auto, def.Context.SummarizeKeep.Auto)
+	c.Context.SummarizeKeep.Manual = sanitizeKeepPolicy(c.Context.SummarizeKeep.Manual, def.Context.SummarizeKeep.Manual)
 	if c.Tools.Exec.TimeoutSeconds <= 0 {
 		c.Tools.Exec.TimeoutSeconds = def.Tools.Exec.TimeoutSeconds
 	}

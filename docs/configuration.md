@@ -42,7 +42,14 @@
   },
   "context": {
     "context_window": 131072,
-    "summarize_token_percent": 75
+    "summarize_token_percent": 75,
+    // 压缩时保留多少最新消息：auto = 主动压缩，manual = /compact。两者都默认 0，
+    // 即不保留任何原始消息：部分推理引擎在回退（请求前缀回到更早的位置）下不保存
+    // prompt 缓存，把整段被压缩历史换成累积摘要，下一次请求才继续命中缓存。
+    "summarize_keep": {
+      "auto":   { "budget_percent": 0, "turns": 0 },
+      "manual": { "budget_percent": 0, "turns": 0 }
+    }
   },
   "web": {
     "host": "127.0.0.1",
@@ -108,18 +115,24 @@
 |------|------|------|------|
 | `context_window` | int | `131072` | 模型上下文窗口（token），用于压缩触发与保留预算 |
 | `summarize_token_percent` | int | `75` | 用量达到 `context_window` 的该百分比触发压缩（1–100） |
+| `summarize_keep.auto.budget_percent` | int | `0` | 自动压缩保留的 token 预算占比（0–100）：可用输入预算 `context_window - openai.max_tokens` 的百分比；`0` = 不保留原始消息 |
+| `summarize_keep.auto.turns` | int | `0` | 自动压缩最多保留几个完整 Turn；`0` = 不保留 |
+| `summarize_keep.manual.budget_percent` | int | `0` | 手动 `/compact` 的预算占比（同上） |
+| `summarize_keep.manual.turns` | int | `0` | 手动 `/compact` 最多保留几个完整 Turn |
 
 > **用量是什么**：接口返回的 `usage.prompt_tokens`（上一次请求的真实 token 数）**加上**此后追加
 > 消息的**下限估算**（英语单词/代码片段按空格切分、中文逐字，各 1 个 token，每多 4 个字符再加 1 个）。
 > 没有上报值时（刚启动、刚恢复会话）才退回对整份请求的估算。
 > 整份历史的字符估算**不再**与上报值取大——两把尺相比会让压缩在设置百分比之外提前触发。
 
-> **保留多少最新消息由算法推导，无需配置**：token 预算 =
-> `(context_window - openai.max_tokens)` 除以 10（自动压缩）或 20（手动 `/compact`），
-> 且最多保留 3 个（自动）或 2 个（手动）完整 Turn。详见
+> **压缩保留多少最新消息可配置，默认一条都不留**：`context.summarize_keep.{auto,manual}` 的
+> `budget_percent`（占可用输入预算 `context_window - openai.max_tokens` 的百分比）与 `turns`
+> （最多保留几个完整 Turn，谁先触顶谁停）默认都是 `0`。原因是**部分推理引擎在回退下不保存 prompt
+> 缓存**——不留原始消息时，压缩后的下一次请求就是「系统提示词 + 摘要」开头的实时前缀，缓存因此仍然
+> 有效，而被放弃的最新几轮对话本身已经写进摘要。调大只对**能跨回退保住缓存**的服务商有意义。
+> 切分仍按 Turn 边界进行，因此 `assistant.tool_calls` 与 `tool` 结果不会被切开；详见
 > [architecture.md](architecture.md#保留summarizetailcut)。
-> 服务商直接以「上下文超限」拒绝请求时还会走一次**溢出恢复**（回退本轮消息 → 以
-> **不保留任何原始消息**的方式压缩 → 重发被退回的消息），它同样没有配置项；详见
+> 溢出恢复（服务商以「上下文超限」拒绝请求后的一次压缩）**没有配置项**、永远不保留原始消息；详见
 > [architecture.md](architecture.md#溢出恢复provider-拒绝后回退--摘要--重发)。
 
 ### `web`
@@ -353,7 +366,8 @@ lightagent gen-agent-prompt -f     # 强制覆盖
 2. **启动时自动对齐**：若文件缺失任何内置字段（或 `tools.mcp.servers` 为空），补全后写回
    `config.json`；文件本来完整时**不写回**，因此内容与修改时间都不变。
 3. 非法/越界值回退默认：`temperature=0` 视为未设置；`summarize_token_percent` 不在
-   `(0,100]` 时回退；负的 `keep_recent_messages` 回退。
+   `(0,100]` 时回退；`summarize_keep` 的 `budget_percent` 不在 `[0,100]`、`turns` 为负时回退
+   （默认两者都是 0，即不保留原始消息）。
 4. 若存在 `agent.md`，覆盖 `agent.system_prompt`（文件中的 `@include` 会先展开）。
 5. `ui.markdown` 与 `agent.include_working_dir` 默认 `true`，仅在文件中显式写 `false` 才会关闭；
    `agent.summary_in_system_prompt` 反之默认 `false`（摘要作为独立的 `[engine]` 消息紧跟系统提示词），显式写 `true` 才放进系统提示词。
