@@ -321,6 +321,16 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
   （因此运行时才生成的内容也能读到），且用的是 agent 自己的 profile；`chrome-attached` 讲的是**概念**：
   连接到了一个**使用者正在使用的浏览器**（只说这一点，不提 DevTools 端点这类技术细节），所以带上它的登录态、
   Cookie 与会话。只取源码的 `http` 模式描述里不会出现浏览器。
+* **加载完成之后的等待**（`internal/utils/webfetch.go`）：页面 `readyState` 到 `complete` 后**不立刻抓 DOM** ——
+  先等 **500ms**（宽限：不少站点的首个 AJAX 在 load 之后才发起），再判断**网络空闲**（连续 500ms 内既没有新请求、
+  也没有请求结束；已经发出的请求以它的**结束**事件算作活动），空闲后**再等 500ms**（让最后一次响应触发的 DOM 更新落地），
+  然后才序列化 DOM —— 这是"运行时才生成的内容也能读到"在 SPA / 延迟加载页上的落点。
+  判定只看**本页自己的协议会话**：跨域 iframe（OOPIF）有独立会话，其中的请求不计入。
+  判定有**上限**：最多再等 4 个空闲窗口、且不少于 5s（`WebFetchNetworkIdleLimitDefault`），并且**永不占用整次抓取的
+  最后 2s**（留给 DOM 序列化）；一直有流量的页面（聊天、直播、定时上报）到点就带着**现有 DOM** 返回，并在备注里写明
+  「the network was still busy …」，而不是把整次抓取耗光后报错。代价是每次**渲染**抓取多花约 1.5s。
+  页面没能在 `load_timeout` 内加载完（`Loaded=false`）时**不做这个等待**，直接抓现有 DOM；`http` 模式（只取源码）也没有等待。
+  内部 API：`WithFetchNetworkIdle(d)` 改这个值（宽限与收尾同用它），`0` 表示完全不等待。
 * `auto`、`chrome-headful`、`chrome-headless` 三种**会自己启动浏览器**的模式一律使用 **agent 自己的 profile**
   （工作目录下的 `.lightagent/browser-profile`：**无头模式同样**用它，所以多次抓取之间 Cookie 与登录态是连贯的）。
   不启动浏览器的两种模式**不设 profile**（`BrowserOptions.UserDataDir` 为空）：`chrome-attached` 用的是

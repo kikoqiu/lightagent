@@ -72,6 +72,23 @@ const (
 	WebFetchTimeoutDefault = 30 * time.Second
 	// WebFetchMaxBytesDefault caps the body of the HTTP source.
 	WebFetchMaxBytesDefault = 8 << 20
+	// WebFetchNetworkIdleDefault is the quiet window of the wait for the content
+	// a page loads after its document: the fetcher waits this long for the
+	// network to go quiet (no request starting, none finishing) before it
+	// captures the DOM, which catches the AJAX/XHR content that arrives after
+	// the initial HTML. The same value is the grace period in front of the check
+	// (some sites start their requests a moment after their load) and the settle
+	// after it (the DOM update the last response triggers).
+	WebFetchNetworkIdleDefault = 500 * time.Millisecond
+	// WebFetchNetworkIdleLimitDefault is the smallest cap on the checking phase
+	// of that wait: a page whose network never goes quiet (a chat, a live page,
+	// a stream of beacons) is captured after it, with a note, instead of eating
+	// the whole fetch and returning nothing.
+	WebFetchNetworkIdleLimitDefault = 5 * time.Second
+	// networkIdleCaptureMargin is the time the fetch keeps back for serializing
+	// the DOM: the checking phase never runs into the deadline of the fetch
+	// itself, so a fetch whose budget is almost spent still returns its page.
+	networkIdleCaptureMargin = 2 * time.Second
 	// pageCloseTimeout bounds dropping a page, so a request that already ran
 	// out of time does not wait for its tab to close.
 	pageCloseTimeout = 5 * time.Second
@@ -93,6 +110,16 @@ type WebFetchOptions struct {
 	// Settle is a quiet period after the load event, for pages that render
 	// their content asynchronously (default: none).
 	Settle time.Duration
+	// NetworkIdle is the quiet window of the wait for the content a page loads
+	// after its own document. When non-zero, the fetcher waits this long for
+	// the network to go quiet (no request starting, none finishing) before it
+	// captures the DOM, which catches AJAX/XHR content that arrives after the
+	// initial HTML. The same value is the grace period in front of the check
+	// (some sites start their requests a moment after their load) and the
+	// settle after it (the DOM update the last response triggers). The check
+	// is capped (see WebFetchNetworkIdleLimitDefault), so a page whose network
+	// never goes quiet still yields its DOM, with a note. Default: 500ms.
+	NetworkIdle time.Duration
 	// UserAgent overrides the user agent of both paths. Without it the
 	// browser uses its own default, and the HTTP source sends none.
 	UserAgent string
@@ -116,9 +143,10 @@ type WebFetchOptionFunc func(*WebFetchOptions)
 
 func defaultWebFetchOptions() WebFetchOptions {
 	return WebFetchOptions{
-		Mode:     FetchModeAuto,
-		Timeout:  WebFetchTimeoutDefault,
-		MaxBytes: WebFetchMaxBytesDefault,
+		Mode:        FetchModeAuto,
+		Timeout:     WebFetchTimeoutDefault,
+		MaxBytes:    WebFetchMaxBytesDefault,
+		NetworkIdle: WebFetchNetworkIdleDefault,
 	}
 }
 
@@ -140,6 +168,13 @@ func WithFetchLoadTimeout(timeout time.Duration) WebFetchOptionFunc {
 // WithFetchSettle adds a quiet period after the load event.
 func WithFetchSettle(settle time.Duration) WebFetchOptionFunc {
 	return func(o *WebFetchOptions) { o.Settle = settle }
+}
+
+// WithFetchNetworkIdle sets the network idle duration for detecting when the
+// page's network has gone quiet after the initial load. A zero value disables
+// the check entirely.
+func WithFetchNetworkIdle(idle time.Duration) WebFetchOptionFunc {
+	return func(o *WebFetchOptions) { o.NetworkIdle = idle }
 }
 
 // WithFetchUserAgent overrides the user agent of both paths.
@@ -376,6 +411,8 @@ func fetchRendered(ctx context.Context, target string, cfg WebFetchOptions) (Web
 	if !nav.Loaded {
 		notes = append(notes, fmt.Sprintf(
 			"the page had not finished loading after %s; the DOM was captured as it was", loadTimeout))
+	} else {
+		notes = append(notes, waitForNetworkIdle(ctx, page, cfg.NetworkIdle)...)
 	}
 	html, err := page.HTML(ctx)
 	if err != nil {
@@ -406,6 +443,61 @@ func fetchRendered(ctx context.Context, target string, cfg WebFetchOptions) (Web
 		Loaded:      nav.Loaded,
 		Notes:       notes,
 	}, nil
+}
+
+// waitForNetworkIdle lets the content a page fetches after its own document
+// arrive, for a page that has finished loading: a grace period first, so that
+// the requests a site starts late begin, then a wait for the network to go quiet,
+// then a settle for the DOM update the last response triggers. It must only be
+// called for a page whose load is over, since the events it reads mean "the page
+// is still working" (see Page.WaitNetworkIdle).
+//
+// The notes it returns explain a wait that had to be cut short: the DOM may then
+// be missing what was still on its way, and the caller has to say so. A wait cut
+// short by the deadline of the fetch itself returns no note here — serializing
+// the page is about to fail for the same reason, and the caller reports that.
+func waitForNetworkIdle(ctx context.Context, page *Page, idle time.Duration) []string {
+	if idle <= 0 {
+		return nil
+	}
+	limit := networkIdleLimit(ctx, idle)
+	if limit <= 0 {
+		return []string{"the fetch was out of time to wait for content loaded in the background; " +
+			"the DOM was captured as it was"}
+	}
+	if !page.WaitNetworkIdle(ctx, idle, idle, limit) {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return []string{fmt.Sprintf(
+			"the network was still busy %s after the load; the DOM was captured as it was", idle+limit)}
+	}
+	if err := sleepContext(ctx, idle); err != nil {
+		return nil
+	}
+	return nil
+}
+
+// networkIdleLimit bounds the checking phase of the network idle wait (see
+// waitForNetworkIdle): a few quiet windows, never less than
+// WebFetchNetworkIdleLimitDefault, and never so long that the serialization of
+// the DOM runs into the deadline of the fetch. A zero answer means there is no
+// time left to watch the network at all.
+func networkIdleLimit(ctx context.Context, idle time.Duration) time.Duration {
+	limit := 4 * idle
+	if limit < WebFetchNetworkIdleLimitDefault {
+		limit = WebFetchNetworkIdleLimitDefault
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline) - networkIdleCaptureMargin
+		if remaining <= 0 {
+			return 0
+		}
+		if remaining < limit {
+			limit = remaining
+		}
+	}
+	return limit
 }
 
 // fetchMethodOf names the method behind a browser mode.

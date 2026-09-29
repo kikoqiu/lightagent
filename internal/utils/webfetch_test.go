@@ -347,3 +347,43 @@ func TestNormalizeFetchURL(t *testing.T) {
 		}
 	}
 }
+
+func TestWebFetchNetworkIdleOption(t *testing.T) {
+	opts := defaultWebFetchOptions()
+	if opts.NetworkIdle != WebFetchNetworkIdleDefault {
+		t.Errorf("network idle = %s, want the built-in %s", opts.NetworkIdle, WebFetchNetworkIdleDefault)
+	}
+	WithFetchNetworkIdle(750 * time.Millisecond)(&opts)
+	if opts.NetworkIdle != 750*time.Millisecond {
+		t.Errorf("network idle = %s, want the configured 750ms", opts.NetworkIdle)
+	}
+	// Zero is the way to turn the wait off: nothing is watched, nothing waits.
+	WithFetchNetworkIdle(0)(&opts)
+	if opts.NetworkIdle != 0 {
+		t.Errorf("network idle = %s, want the wait disabled", opts.NetworkIdle)
+	}
+}
+
+func TestNetworkIdleLimit(t *testing.T) {
+	// Without a deadline the fetch caps the wait on quiet windows: a few of
+	// them, never below the built-in minimum.
+	if got := networkIdleLimit(context.Background(), WebFetchNetworkIdleDefault); got != WebFetchNetworkIdleLimitDefault {
+		t.Errorf("limit = %s, want %s", got, WebFetchNetworkIdleLimitDefault)
+	}
+	if got := networkIdleLimit(context.Background(), 2*time.Second); got != 8*time.Second {
+		t.Errorf("limit = %s, want four quiet windows (8s)", got)
+	}
+	// The deadline of the fetch wins, and the margin the serialization of the
+	// DOM needs is kept back.
+	bounded, cancelBounded := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancelBounded()
+	if got := networkIdleLimit(bounded, WebFetchNetworkIdleDefault); got > 4*time.Second || got < 3*time.Second {
+		t.Errorf("limit = %s, want the remainder of the fetch (about 4s)", got)
+	}
+	// No room left: the wait is skipped instead of eating the fetch.
+	tight, cancelTight := context.WithTimeout(context.Background(), time.Second)
+	defer cancelTight()
+	if got := networkIdleLimit(tight, WebFetchNetworkIdleDefault); got != 0 {
+		t.Errorf("limit = %s, want 0 (no time left to watch the network)", got)
+	}
+}

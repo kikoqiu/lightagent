@@ -359,6 +359,112 @@ func (p *Page) settled(ctx context.Context, wantURL string) (bool, string, error
 	return !isBlankURL(state.Href), state.Href, nil
 }
 
+// networkIdlePollInterval is how often the network idle wait looks for events;
+// it is the granularity of the quiet window it measures.
+const networkIdlePollInterval = 100 * time.Millisecond
+
+// WaitNetworkIdle waits until the network of the page has gone quiet: no request
+// started and none finished for idleDuration. The wait begins with graceDuration
+// in which the events are only collected and dropped, so that the requests a page
+// starts a moment after its load — the delayed loading of an SPA, for instance —
+// are seen once the check itself begins. limit bounds the checking phase, so a
+// page whose network never goes quiet (a chat, a live page, a stream of beacons)
+// cannot eat the fetch that called this: the DOM it has so far is still worth
+// capturing.
+//
+// It reports whether the network went quiet. False means the wait was cut short —
+// the context ended, the connection went away, or the limit was reached — and the
+// caller decides what to do with the DOM it has.
+func (p *Page) WaitNetworkIdle(ctx context.Context, graceDuration, idleDuration, limit time.Duration) bool {
+	if idleDuration <= 0 {
+		return true
+	}
+	if p == nil || p.browser == nil || p.browser.conn == nil {
+		return false
+	}
+	// Watching the network needs the Network domain. Every page enables it on
+	// its first operation (see prepare); doing it here as well keeps the wait
+	// honest for a caller that attached to a tab and asked nothing else of it,
+	// since a page without the domain sends no event at all and would look
+	// idle without ever having been looked at.
+	if err := p.prepare(ctx); err != nil {
+		return false
+	}
+
+	// A request already in flight is usually the one the page is waiting for,
+	// so its end matters as much as the start of the next one.
+	requests := p.browser.conn.subscribe(p.sessionID, "Network.requestWillBeSent")
+	defer requests.cancel()
+	finished := p.browser.conn.subscribe(p.sessionID, "Network.loadingFinished")
+	defer finished.cancel()
+	failed := p.browser.conn.subscribe(p.sessionID, "Network.loadingFailed")
+	defer failed.cancel()
+
+	// Grace period: let the requests a page starts late begin. Their events are
+	// dropped at its end, since everything up to there belongs to the load that
+	// has just finished.
+	if graceDuration > 0 {
+		if err := sleepContext(ctx, graceDuration); err != nil {
+			return false
+		}
+	}
+	drainSub(requests)
+	drainSub(finished)
+	drainSub(failed)
+
+	start := time.Now()
+	lastActivity := start
+	ticker := time.NewTicker(networkIdlePollInterval)
+	defer ticker.Stop()
+
+	for {
+		if time.Since(lastActivity) >= idleDuration {
+			return true
+		}
+		if limit > 0 && time.Since(start) >= limit {
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			// Every event of the three kinds is a sign of life, so all three
+			// are drained: leaving one behind would report the network idle a
+			// tick too early.
+			activity := drainSub(requests)
+			if drainSub(finished) {
+				activity = true
+			}
+			if drainSub(failed) {
+				activity = true
+			}
+			if activity {
+				lastActivity = time.Now()
+			}
+		case <-p.browser.conn.closeDone():
+			return false
+		}
+	}
+}
+
+// drainSub drains all pending events from a subscription.
+// Returns true if any events were drained.
+func drainSub(sub *cdpSubscription) bool {
+	if sub == nil {
+		return false
+	}
+	drained := false
+	for {
+		select {
+		case <-sub.ch:
+			drained = true
+		default:
+			return drained
+		}
+	}
+}
+
 // isBlankURL reports whether a URL is the empty starting page.
 func isBlankURL(raw string) bool {
 	trimmed := strings.TrimSpace(strings.ToLower(raw))

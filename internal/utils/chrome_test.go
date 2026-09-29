@@ -192,6 +192,107 @@ func newHangingServer(t *testing.T) *httptest.Server {
 	return server
 }
 
+// newDelayedAjaxServer serves a page whose content arrives through a request it
+// starts a moment after its document was parsed, and whose answer takes another
+// moment: the marker is therefore never in the source, and only a fetch that
+// waits for the network to settle sees it.
+func newDelayedAjaxServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/delayed":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, `<!DOCTYPE html><html><head><title>delayed</title></head><body>`+
+				`<div id="app">delayed-waiting</div>`+
+				`<script>setTimeout(function(){fetch('/delayed-data')`+
+				`.then(function(response){return response.text()})`+
+				`.then(function(text){document.getElementById('app').textContent = text})}, 600)</script>`+
+				`</body></html>`)
+		case "/delayed-data":
+			time.Sleep(300 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprint(w, "delayed-marker")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// newBusyServer serves a page that keeps requesting a beacon while it is open,
+// so its network never goes quiet.
+func newBusyServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/busy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, `<!DOCTYPE html><html><head><title>busy</title></head><body>`+
+				`<div>busy-marker</div>`+
+				`<script>setInterval(function(){fetch('/beacon').catch(function(){})}, 100)</script>`+
+				`</body></html>`)
+		default:
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprint(w, "beat")
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestWebFetchWaitsForDelayedAjax covers the content a page loads after its own
+// document: without the wait for the network to settle, the DOM would be
+// serialized before the answer of the request lands.
+func TestWebFetchWaitsForDelayedAjax(t *testing.T) {
+	requireBrowser(t)
+	server := newDelayedAjaxServer(t)
+	profile := testProfileDir(t)
+	t.Cleanup(func() { _ = CloseSharedBrowsers() })
+
+	result, err := WebFetch(testContext(t), server.URL+"/delayed",
+		WithFetchBrowser(BrowserOptions{UserDataDir: profile}),
+		WithFetchTimeout(45*time.Second))
+	if err != nil {
+		t.Fatalf("WebFetch: %v", err)
+	}
+	if !strings.Contains(result.HTML, "delayed-marker") {
+		t.Errorf("the DOM does not carry the delayed content: %.300q", result.HTML)
+	}
+	if result.Elapsed < 800*time.Millisecond {
+		t.Errorf("the fetch returned after %s, want it to have waited for the delayed request", result.Elapsed)
+	}
+	if containsAll(result.Notes, "still busy") {
+		t.Errorf("notes = %v, want an idle network (the page stops talking)", result.Notes)
+	}
+}
+
+// TestWebFetchCapturesAPageThatNeverGoesQuiet covers the cap of the wait: a page
+// whose network never goes quiet is captured after it, with a note, instead of
+// eating the whole fetch and failing.
+func TestWebFetchCapturesAPageThatNeverGoesQuiet(t *testing.T) {
+	requireBrowser(t)
+	server := newBusyServer(t)
+	profile := testProfileDir(t)
+	t.Cleanup(func() { _ = CloseSharedBrowsers() })
+
+	result, err := WebFetch(testContext(t), server.URL+"/busy",
+		WithFetchBrowser(BrowserOptions{UserDataDir: profile}),
+		WithFetchTimeout(30*time.Second), WithFetchNetworkIdle(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("WebFetch: %v", err)
+	}
+	if !strings.Contains(result.HTML, "busy-marker") {
+		t.Errorf("the DOM was not captured: %.300q", result.HTML)
+	}
+	if !containsAll(result.Notes, "still busy") {
+		t.Errorf("notes = %v, want the give-up of the wait for a quiet network", result.Notes)
+	}
+	if result.Elapsed > 15*time.Second {
+		t.Errorf("the fetch took %s, want the wait to be capped well below the timeout", result.Elapsed)
+	}
+}
+
 func TestSharedBrowserReusesOneInstance(t *testing.T) {
 	requireBrowser(t)
 	ctx := testContext(t)
