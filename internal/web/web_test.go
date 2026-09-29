@@ -95,6 +95,29 @@ func signedInClient(t *testing.T, srv *Server, password string) *http.Client {
 	return signIn(t, srv, password)
 }
 
+// functionBody returns the source of one page function, from its declaration down
+// to the line that closes it, so a test can assert on what that function does
+// itself rather than on the page as a whole.
+func functionBody(t *testing.T, name string) string {
+	t.Helper()
+	at := strings.Index(appJS, "function "+name+"(")
+	if at < 0 {
+		t.Fatalf("the page has no function %s", name)
+	}
+	// The body ends on the first line holding a lone closing brace at the
+	// function's own indentation: the blocks inside a body are indented further, so
+	// none of their braces can be mistaken for it.
+	seen := 0
+	for _, line := range strings.Split(appJS[at:], "\n") {
+		if strings.TrimSuffix(line, "\r") == "  }" {
+			return appJS[at : at+seen]
+		}
+		seen += len(line) + 1
+	}
+	t.Fatalf("function %s has no end", name)
+	return ""
+}
+
 // pageSource concatenates the page's embedded sources so the assertions below do
 // not need to know which file carries a given marker now that the HTML, CSS and
 // JS live in separate embedded files.

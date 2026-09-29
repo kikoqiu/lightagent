@@ -302,6 +302,48 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 	}
 }
 
+// TestPageFlushesPendingMarkdownWhenVisible guards the page against the scroll a
+// backgrounded tab used to come back to. Idle slices do not run for a page nobody
+// is drawing, so the markdown queue is at its longest exactly when the page is
+// looked at again — and every pass over it grows the rows above whoever was
+// reading, which walks their view down the transcript pass after pass, for as long
+// as the queue lasts. The catch-up is therefore taken in one task on the way back
+// to the foreground, and a pass holds the reader's own row in place (a following
+// reader still ends it at the bottom).
+func TestPageFlushesPendingMarkdownWhenVisible(t *testing.T) {
+	// goActive is the way back to the foreground: visibilitychange, resume and
+	// pageshow all land there.
+	active := functionBody(t, "goActive")
+	if !strings.Contains(active, "flushMarkdownNow();") {
+		t.Error("the way back to the foreground does not flush the pending markdown")
+	}
+	// The dial comes first: a reconnect that rebuilt the log would replace the rows
+	// a long catch-up upgrades, and it must not wait behind one.
+	if dial, flush := strings.Index(active, "connect();"), strings.Index(active, "flushMarkdownNow();"); dial < 0 || dial > flush {
+		t.Errorf("goActive must dial before it catches up (connect at %d, flush at %d)", dial, flush)
+	}
+	for _, want := range []string{
+		"function flushMarkdownNow",
+		"upgradeMarkdown(null, true)", // the catch-up takes the whole queue, no slice budget
+		"function holdView",
+		"function topVisibleRow",
+		"if (following) { return null; }", // a following reader is taken to the bottom instead
+		"if (release) { release(); }",
+		"if (!replaying) { keepBottom(); }",
+		"function sliceIsUp",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	// A slice that finds the queue already drained — the catch-up took it — must
+	// leave the view alone: a write there would fight the pass that just finished,
+	// and the reader would see the transcript move twice.
+	if !strings.Contains(functionBody(t, "flushMarkdown"), "if (mdPending.size === 0) { return; }") {
+		t.Error("a slice of an empty queue must not write the view")
+	}
+}
+
 // attachQueuedClient registers a client whose frames the test reads straight from
 // its queue instead of a socket: no writer goroutine runs, so the assertions are
 // deterministic. The connection is a pipe that is only ever closed.

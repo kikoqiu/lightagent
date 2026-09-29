@@ -583,7 +583,9 @@
   // That work is sliced into idle chunks instead of running as one long task:
   // the main thread stays responsive, the transcript paints batch by batch, and
   // each replayed row's plain text is upgraded in place. Rows that arrive live
-  // (a turn that is streaming) still render immediately.
+  // (a turn that is streaming) still render immediately; a page coming back to the
+  // foreground drains what queued up while nobody was looking in one batch (see
+  // flushMarkdownNow), and no pass moves a reader who scrolled back (see holdView).
   var mdPending = new Map(); // span -> latest text waiting for its markdown pass
   var mdFlushScheduled = false;
   var MD_SLICE_MS = 8;
@@ -619,41 +621,123 @@
     }
   }
 
-  // flushMarkdown upgrades as many queued rows as fit in one idle slice. The
-  // Map keeps insertion order and the lowest text wins per row (a row that was
-  // re-streamed while waiting is parsed once, with its final text).
+  // topVisibleRow is the row the reader's view starts at: the first one whose
+  // bottom edge is below the transcript's own top edge, and so the one a row that
+  // grows above it pushes down the screen. The rows are stacked blocks, so their
+  // bottoms only ever increase — the cost of finding that row in a log of
+  // thousands is a handful of measurements rather than one per row.
+  function topVisibleRow() {
+    var top = log.getBoundingClientRect().top;
+    var lo = 0, hi = log.children.length - 1, found = null;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (log.children[mid].getBoundingClientRect().bottom > top) {
+        found = log.children[mid];
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return found;
+  }
+
+  // holdView keeps the row the reader is reading exactly where it is across one
+  // batch of markdown upgrades, and returns the function that writes it back.
+  //
+  // An upgraded row grows — markdown brings paragraph margins, tables, code blocks
+  // and headings where a replayed row was one plain block — and the transcript has
+  // the browser's own scroll anchoring switched off (see #log in app.css: it pulls
+  // against the page's bottom writes). A pass that lands on rows above the reader
+  // therefore drags that reader along: the rows being read walk down the screen and
+  // older ones come in at the top, pass after pass, for as long as the queue lasts,
+  // and pulling back up only adds more of the same. That is the page that looked
+  // like it scrolled away on its own after a spell in the background, where the
+  // queue is at its longest (a hidden page draws nothing, so its idle slices do not
+  // run and every pass queues up).
+  //
+  // A reader who follows needs none of this: the batch ends at the bottom instead
+  // (see upgradeMarkdown).
+  function holdView() {
+    if (following) { return null; }
+    var row = topVisibleRow();
+    if (!row) { return null; }
+    var top = row.getBoundingClientRect().top;
+    return function () {
+      // The log can be rebuilt under the batch (a snapshot arrived with it).
+      if (row.parentNode !== log) { return; }
+      log.scrollTop += row.getBoundingClientRect().top - top;
+    };
+  }
+
+  // flushMarkdown is one idle slice of upgrades. A callback that finds an empty
+  // queue — one flushMarkdownNow already drained — does nothing at all, so the
+  // batch cannot be charged for a view write of its own.
   function flushMarkdown(deadline) {
     mdFlushScheduled = false;
+    if (mdPending.size === 0) { return; }
+    upgradeMarkdown(deadline, false);
+    scheduleMarkdownFlush();
+  }
+
+  // flushMarkdownNow drains the whole queue in one task, with no slice budget: the
+  // page is coming back to the foreground and has to be finished before it is
+  // looked at again. Left to the idle slices, the same queue upgrades rows over the
+  // frames that follow — the pass after pass holdView exists for — and it is at its
+  // longest exactly here, since nothing queued for a page nobody was drawing. Rows
+  // too large to render (MAX_MD_CHARS) stay plain text and bound the batch.
+  function flushMarkdownNow() {
+    if (mdPending.size === 0) { return; }
+    upgradeMarkdown(null, true);
+  }
+
+  // upgradeMarkdown upgrades the queued rows and leaves the reader where they
+  // belong. The Map keeps insertion order and the lowest text wins per row (a row
+  // that was re-streamed while waiting is parsed once, with its final text). A row
+  // still sitting in the batch fragment counts too: only rows whose log was
+  // replaced (no parent left) are skipped. One slice stops when its time is up; a
+  // whole pass (whole) takes the queue as it stands.
+  function upgradeMarkdown(deadline, whole) {
+    var release = holdView();
     var started = Date.now();
     var entries = mdPending.entries();
     for (var next = entries.next(); !next.done; next = entries.next()) {
       var span = next.value[0];
       var text = next.value[1];
       mdPending.delete(span);
-      // A row still sitting in the batch fragment counts too: only rows whose
-      // log was replaced (no parent left) are skipped. The size cap keeps one
-      // gigantic row from stalling the slice.
       if ((span.isConnected || span.parentNode) && text.length <= MAX_MD_CHARS) {
         applyMarkdown(span, text);
       }
-      if (deadline && typeof deadline.timeRemaining === 'function') {
-        if (deadline.timeRemaining() <= 1) { break; }
-      } else if (Date.now() - started >= MD_SLICE_MS) {
-        break;
-      }
+      if (!whole && sliceIsUp(deadline, started)) { break; }
     }
-    scheduleMarkdownFlush();
+    if (release) { release(); }
+    // A reader who follows ends the pass on the newest row, exactly like every
+    // other content change (see keepBottom): the rows above them grew, and the pass
+    // can pull the view back itself instead of waiting for the next output to. A
+    // snapshot still being replayed is left alone — those rows are not in the log
+    // yet, and the end of the replay pins the view once (see endHistory).
+    if (!replaying) { keepBottom(); }
+  }
+
+  // sliceIsUp reports a slice's budget being spent: the browser's own deadline when
+  // it gave one (it knows what is left of the frame), MD_SLICE_MS otherwise.
+  function sliceIsUp(deadline, started) {
+    if (deadline && typeof deadline.timeRemaining === 'function') {
+      return deadline.timeRemaining() <= 1;
+    }
+    return Date.now() - started >= MD_SLICE_MS;
   }
 
   function setSpan(span, text, renderMD) {
     // The source text is kept aside before anything is drawn: the copy control
     // needs it in every branch below.
     if (span) { rowSource.set(span, text); }
-    // While a snapshot is being replayed the markdown pass is deferred: the row
-    // is drawn as plain text now and upgraded in an idle slice (see
-    // queueMarkdown). Parsing thousands of rows in one synchronous pass is what
-    // froze the tab (and hid the log behind "Waiting for messages…") on a long
-    // conversation.
+    // While a snapshot is being replayed the markdown pass is deferred: the row is
+    // drawn as plain text now and upgraded in an idle slice (see queueMarkdown).
+    // Parsing thousands of rows as one long task is what froze the tab (and hid the
+    // log behind "Waiting for messages…") on a long conversation. The one pass that
+    // does run in a single task is the catch-up on the way back from the background
+    // (see flushMarkdownNow): a page nobody was drawing got no further than its
+    // queue, so that pass is bounded by one snapshot.
     if (renderMD && replaying) {
       span.className = 'text';
       span.textContent = text;
@@ -1892,21 +1976,29 @@
     stopTurnTimer();
     // The pending markdown passes are kept: the log may well survive the trip (a
     // reconnect with nothing to report is answered with history_same, which keeps
-    // it), and the log has to be complete when the page is looked at again. No
-    // timer of this page runs while it is hidden and stopped.
+    // it), and the log has to be complete when the page is looked at again — it is
+    // flushed in one batch as the page comes back (see flushMarkdownNow). No timer
+    // of this page runs while it is hidden and stopped.
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) { try { ws.close(); } catch (err) { /* already closed */ } }
   }
 
   // goActive puts the page back to work: the animation resumes, a stopped page
   // dials again (a fresh connection means a fresh snapshot), and the rhythm the
-  // foreground asks for is armed.
+  // foreground asks for is armed. The markdown passes that queued up while nobody
+  // was looking are done now, in one batch (see flushMarkdownNow): the page is
+  // about to be read again, and a queue left to the idle slices would upgrade rows
+  // under the reader's eyes for as long as it lasts.
   function goActive() {
     var wasStopped = stopped;
     stopped = false;
     document.documentElement.removeAttribute('data-idle');
     reconnectDelay = 0;
+    // The dial comes first, so a long catch-up cannot delay it: a reconnect that
+    // brings a fresh snapshot replaces the rows the pass upgrades anyway, and one
+    // answered with history_same needs the log complete as it stands.
     if (wasStopped && AUTH().ok()) { connect(); }
+    flushMarkdownNow();
     restartTurnTimer();
   }
 
