@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // FsConfig carries the file-tool limits.
@@ -794,11 +795,111 @@ func literalReplaceText(text, find, content string) (string, int, error) {
 	count := strings.Count(text, find)
 	switch {
 	case count == 0:
-		return "", 0, fmt.Errorf("find not found in file. Make sure it matches exactly")
+		return "", 0, findNotFoundError(text, find)
 	case count > 1:
-		return "", 0, fmt.Errorf("find appears %d times. Please provide more context to make it unique, or use mode='regex' to replace every match", count)
+		return "", 0, findNotUniqueError(count)
 	}
 	return strings.Replace(text, find, content, 1), 1, nil
+}
+
+// mismatchDiagnosticMaxBytes caps the file excerpt of a mismatch diagnostic. The
+// excerpt is bounded by lines first (see findMismatchDiagnostic), which a file
+// written as one enormous line - a minified bundle, for instance - would not
+// bound at all.
+const mismatchDiagnosticMaxBytes = 2 << 10
+
+// findNotFoundError is the error of a find that matched nothing in text: the
+// plain message, or one carrying the mismatch diagnostic when there is one to
+// give. Both literal modes share it, so an insert that misses its anchor is
+// explained the same way a replace is.
+func findNotFoundError(text, find string) error {
+	if diag := findMismatchDiagnostic(text, find); diag != "" {
+		return fmt.Errorf("`find` not found in file. %s", diag)
+	}
+	return fmt.Errorf("`find` not found in file. Make sure it matches exactly")
+}
+
+// findNotUniqueError is the error of a find that matched more than once. Both
+// literal modes share it, like the not-found error above: the condition is the
+// same in either mode, and so is the way out.
+func findNotUniqueError(count int) error {
+	return fmt.Errorf("`find` appears %d times. Please provide more context to make it unique, or use mode='regex' to replace every match", count)
+}
+
+// findMismatchDiagnostic attempts to find the longest line-prefix of find that
+// appears uniquely in text, and returns a diagnostic message showing the actual
+// file content from the last matched line onwards. Returns "" if no diagnostic
+// is possible (e.g. find is a single line, or no line-prefix matches uniquely);
+// an empty candidate is skipped for the same reason (see the loop below).
+func findMismatchDiagnostic(text, find string) string {
+	findLines := strings.Split(find, "\n")
+	if len(findLines) > 1 && findLines[len(findLines)-1] == "" {
+		findLines = findLines[:len(findLines)-1]
+	}
+	if len(findLines) <= 1 {
+		return ""
+	}
+
+	f := len(findLines)
+	for m := f - 1; m >= 1; m-- {
+		candidate := strings.Join(findLines[:m], "\n")
+		// An empty candidate occurs at every byte offset, so it says nothing
+		// about where the file diverged. Only m == 1 can be empty here, and
+		// only when the first line of find is blank.
+		if candidate == "" {
+			continue
+		}
+		if strings.Count(text, candidate) != 1 {
+			continue
+		}
+		pos := strings.Index(text, candidate)
+		s := strings.Count(text[:pos], "\n") + 1
+
+		// Byte offset of the last matched line within the candidate.
+		lastLineOffset := 0
+		for i := 0; i < m-1; i++ {
+			lastLineOffset += len(findLines[i]) + 1
+		}
+		lastLinePos := pos + lastLineOffset
+
+		// Show at most f-m+3 lines of the actual file content from the last
+		// matched line onwards (the mismatch region plus 2 extra lines as
+		// slack for possible empty lines in the file).
+		maxLines := f - m + 3
+		remaining := text[lastLinePos:]
+		if parts := strings.SplitN(remaining, "\n", maxLines+1); len(parts) > maxLines {
+			remaining = strings.Join(parts[:maxLines], "\n")
+		}
+		remaining = cutExcerpt(remaining)
+
+		return fmt.Sprintf(
+			"`find` has %d total line(s), only the first %d line(s) matched. "+
+				"This matched portion is unique in the file (starts at line %d). "+
+				"The exact content from line %d (last matched line) onwards is:\n%s",
+			f, m, s, s+m-1, remaining)
+	}
+	return ""
+}
+
+// cutExcerpt bounds the file excerpt of a mismatch diagnostic by bytes: the line
+// limit alone still lets one minified line put a whole file into the error
+// message, which then travels to the provider. The cut never splits a UTF-8 rune
+// and says that it happened.
+func cutExcerpt(excerpt string) string {
+	if len(excerpt) <= mismatchDiagnosticMaxBytes {
+		return excerpt
+	}
+	cut := excerpt[:mismatchDiagnosticMaxBytes]
+	// A cut can land inside a rune: the last rune has to decode, or the byte it
+	// is missing is dropped with it (DecodeLastRuneInString reports the
+	// truncated tail as RuneError with a size of 1).
+	for len(cut) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(cut); r != utf8.RuneError || size > 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "\n... (rest of the excerpt omitted)"
 }
 
 // insertBeforeText inserts content immediately before the unique occurrence of
@@ -806,10 +907,10 @@ func literalReplaceText(text, find, content string) (string, int, error) {
 func insertBeforeText(text, find, content string) (string, int, error) {
 	at := strings.Index(text, find)
 	if at < 0 {
-		return "", 0, fmt.Errorf("find not found in file. Make sure it matches exactly")
+		return "", 0, findNotFoundError(text, find)
 	}
 	if count := strings.Count(text, find); count > 1 {
-		return "", 0, fmt.Errorf("find appears %d times. Please provide more context to make it unique, or use mode='regex'", count)
+		return "", 0, findNotUniqueError(count)
 	}
 	return text[:at] + content + text[at:], 1, nil
 }

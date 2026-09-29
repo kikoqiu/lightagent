@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func writeFile(t *testing.T, dir, name, content string) string {
@@ -316,6 +317,280 @@ func TestEditFileLiteral(t *testing.T) {
 	}
 }
 
+// TestEditFileLiteralMismatchDiagnostic verifies that when find is not found
+// but a unique line-prefix exists, the error includes a diagnostic showing the
+// actual file content from the last matched line onwards.
+func TestEditFileLiteralMismatchDiagnostic(t *testing.T) {
+	// File content:
+	//   line1
+	//   line2
+	//   line3
+	//   line4
+	//   line5
+	fileContent := "line1\nline2\nline3\nline4\nline5"
+	p := writeFile(t, t.TempDir(), "diag.txt", fileContent)
+	tool := NewEditFileTool()
+
+	// find spans 3 lines but the 3rd line is wrong: "line3" should be "line3X"
+	// The first 2 lines "line1\nline2" match uniquely, so diagnostic should fire.
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "line1\nline2\nline3X", "content": "replaced",
+	})
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.ForLLM)
+	}
+	// Should contain the diagnostic message.
+	if !strings.Contains(res.ForLLM, "only the first 2 line(s) matched") {
+		t.Fatalf("expected diagnostic about 2 matched lines, got: %s", res.ForLLM)
+	}
+	// The matched portion starts at line 1 (s) while the excerpt starts at the
+	// last matched line (s+m-1 = 2), which is where the file stops agreeing.
+	if !strings.Contains(res.ForLLM, "from line 2 (last matched line)") {
+		t.Fatalf("expected the excerpt to start at line 2 (s+m-1), got: %s", res.ForLLM)
+	}
+	// Should show at most f-m+3 = 4 lines from line 2 (last matched line) onwards.
+	if !strings.Contains(res.ForLLM, "line2\nline3") {
+		t.Fatalf("expected actual file content from line 2 onwards, got: %s", res.ForLLM)
+	}
+	// File should not be modified.
+	if got := readFile(t, p); got != fileContent {
+		t.Fatalf("file was modified: %q", got)
+	}
+}
+
+// TestEditFileLiteralMismatchDiagnosticNoMatch verifies that when no line-prefix
+// of find matches uniquely, the original error message is returned.
+func TestEditFileLiteralMismatchDiagnosticNoMatch(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "nomatch.txt", "aaa\nbbb\nccc")
+	tool := NewEditFileTool()
+
+	// find has 2 lines but neither line appears in the file.
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "xxx\nyyy", "content": "z",
+	})
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.ForLLM)
+	}
+	// Should be the original generic error, not the diagnostic.
+	if !strings.Contains(res.ForLLM, "`find` not found in file. Make sure it matches exactly") {
+		t.Fatalf("expected generic not-found error, got: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileLiteralMismatchDiagnosticSingleLine verifies that a single-line
+// find that doesn't match does NOT trigger the diagnostic (needs >= 2 lines).
+func TestEditFileLiteralMismatchDiagnosticSingleLine(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "single.txt", "hello\nworld")
+	tool := NewEditFileTool()
+
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "goodbye", "content": "x",
+	})
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "`find` not found in file. Make sure it matches exactly") {
+		t.Fatalf("expected generic not-found error, got: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileLiteralMismatchDiagnosticNonUniquePrefix verifies that when the
+// longest matching prefix is not unique in the file, the diagnostic is not shown.
+func TestEditFileLiteralMismatchDiagnosticNonUniquePrefix(t *testing.T) {
+	// "dup" appears twice, so the prefix "dup\nnext" is not unique.
+	p := writeFile(t, t.TempDir(), "dup.txt", "dup\nnext\nother\ndup\nnext\nother")
+	tool := NewEditFileTool()
+
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "dup\nnext\nWRONG", "content": "x",
+	})
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.ForLLM)
+	}
+	// The prefix "dup\nnext" appears twice, so no diagnostic should fire.
+	if strings.Contains(res.ForLLM, "only the first") {
+		t.Fatalf("should not show diagnostic for non-unique prefix: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileLiteralMismatchDiagnosticPartialLines verifies that the
+// diagnostic works when the first or last line of find is not a complete
+// line in the file (partial-line matching).
+func TestEditFileLiteralMismatchDiagnosticPartialLines(t *testing.T) {
+	// File:
+	//   line1: "hello world foo"
+	//   line2: "bar baz qux"
+	//   line3: "test end"
+	//
+	// find = "world foo\nbar baz WRONG" (f=2)
+	//   - First line "world foo" is a partial match of line1 (not a full line)
+	//   - m=1: "world foo" appears once → s=1
+	//   - Last matched line = 1, show at most f-m+3 = 4 lines from line 1
+	fileContent := "hello world foo\nbar baz qux\ntest end"
+	p := writeFile(t, t.TempDir(), "partial.txt", fileContent)
+	tool := NewEditFileTool()
+
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "world foo\nbar baz WRONG", "content": "x",
+	})
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "only the first 1 line(s) matched") {
+		t.Fatalf("expected 1 matched line, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "starts at line 1") {
+		t.Fatalf("expected match at line 1, got: %s", res.ForLLM)
+	}
+	// Should show content from line 1 (partial line "world foo") onwards,
+	// at most f-m+3 = 4 lines (file only has 3 lines from line 1, so all shown).
+	if !strings.Contains(res.ForLLM, "world foo\nbar baz qux\ntest end") {
+		t.Fatalf("expected partial-line content, got: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileLiteralMismatchDiagnosticCRLF verifies that the diagnostic
+// works correctly when the file uses CRLF line endings. The text is
+// normalized to LF before matching, so the diagnostic should report
+// correct line numbers and content.
+func TestEditFileLiteralMismatchDiagnosticCRLF(t *testing.T) {
+	// File with CRLF:
+	//   line1: "hello"
+	//   line2: "world"
+	//   line3: "foo"
+	fileContent := "hello\r\nworld\r\nfoo\r\n"
+	p := writeFile(t, t.TempDir(), "crlf_diag.txt", fileContent)
+	tool := NewEditFileTool()
+
+	// find uses LF (normalized internally), f=2
+	// m=1: "world" appears once → s=2
+	// Last matched line = 2, show at most f-m+3 = 4 lines from line 2
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "world\nfoo WRONG", "content": "x",
+	})
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "only the first 1 line(s) matched") {
+		t.Fatalf("expected 1 matched line, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "starts at line 2") {
+		t.Fatalf("expected match at line 2, got: %s", res.ForLLM)
+	}
+	// Should show content from line 2 onwards (LF-normalized), at most 4 lines
+	// (the file has only 2 lines left from line 2, so both are shown).
+	if !strings.Contains(res.ForLLM, "world\nfoo") {
+		t.Fatalf("expected CRLF-normalized content, got: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileInsertMismatchDiagnostic verifies that mode='insert' reports the
+// same mismatch diagnostic as mode='replace': the diagnostic describes find
+// against the file, which does not depend on what the mode would have written.
+func TestEditFileInsertMismatchDiagnostic(t *testing.T) {
+	fileContent := "line1\nline2\nline3\n"
+	p := writeFile(t, t.TempDir(), "insert_diag.txt", fileContent)
+	tool := NewEditFileTool()
+
+	// f=3, the first 2 lines match uniquely, so the 3rd is where the file differs.
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "line1\nline2\nMISMATCH", "content": "inserted", "mode": "insert",
+	})
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "only the first 2 line(s) matched") {
+		t.Fatalf("expected the mismatch diagnostic for insert mode, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "starts at line 1") {
+		t.Fatalf("expected match at line 1, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "line2\nline3") {
+		t.Fatalf("expected actual file content from line 2 onwards, got: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != fileContent {
+		t.Fatalf("file was modified: %q", got)
+	}
+}
+
+// TestEditFileLiteralMismatchDiagnosticEmptyPrefixLine verifies the one candidate
+// prefix the diagnostic skips: the empty one, which only m == 1 can produce - a
+// find whose first line is blank. A longer find still has non-empty candidates
+// (m >= 2), so a leading blank line does not stop the diagnostic.
+func TestEditFileLiteralMismatchDiagnosticEmptyPrefixLine(t *testing.T) {
+	tool := NewEditFileTool()
+	cases := []struct {
+		name     string
+		content  string
+		find     string
+		wantDiag bool
+	}{
+		{"nonempty file, two-line find", "alpha\nbeta\n", "\ngamma", false},
+		{"empty file, two-line find", "", "\ngamma", false},
+		{"three-line find", "x\ngamma\ny\n", "\ngamma\nZZZ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := writeFile(t, t.TempDir(), "blank_first.txt", tc.content)
+			res := tool.Execute(context.Background(), map[string]any{
+				"path": p, "find": tc.find, "content": "x",
+			})
+			if !res.IsError {
+				t.Fatalf("expected error, got success: %s", res.ForLLM)
+			}
+			if got := strings.Contains(res.ForLLM, "only the first"); got != tc.wantDiag {
+				t.Fatalf("diagnostic = %v, want %v: %s", got, tc.wantDiag, res.ForLLM)
+			}
+			if tc.wantDiag {
+				return
+			}
+			if !strings.Contains(res.ForLLM, "`find` not found in file. Make sure it matches exactly") {
+				t.Fatalf("expected generic not-found error, got: %s", res.ForLLM)
+			}
+		})
+	}
+}
+
+// TestEditFileLiteralMismatchDiagnosticCapsExcerpt verifies that the excerpt the
+// diagnostic prints is bounded: one minified line (or a huge line) must not put
+// the whole file into the error message, and a cut must not split a rune.
+func TestEditFileLiteralMismatchDiagnosticCapsExcerpt(t *testing.T) {
+	tool := NewEditFileTool()
+	cases := []struct {
+		name    string
+		line    string
+		wantCut bool
+	}{
+		{"huge single line", strings.Repeat("x", 4000), true},
+		{"cut inside a multi-byte rune", strings.Repeat("中", 2000), true},
+		{"short lines are never cut", "one\ntwo\nthree", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := writeFile(t, t.TempDir(), "wide.txt", "start\n"+tc.line+"\nend\n")
+			res := tool.Execute(context.Background(), map[string]any{
+				"path": p, "find": "start\nMISMATCH", "content": "x",
+			})
+			if !res.IsError {
+				t.Fatalf("expected error, got success: %s", res.ForLLM)
+			}
+			if !strings.Contains(res.ForLLM, "starts at line 1") {
+				t.Fatalf("expected the diagnostic, got: %s", res.ForLLM)
+			}
+			cut := strings.Contains(res.ForLLM, "rest of the excerpt omitted")
+			if cut != tc.wantCut {
+				t.Fatalf("excerpt cut = %v, want %v: %s", cut, tc.wantCut, res.ForLLM)
+			}
+			if !utf8.ValidString(res.ForLLM) {
+				t.Fatalf("the excerpt must stay valid UTF-8, got: %q", res.ForLLM)
+			}
+			if len(res.ForLLM) > 2*mismatchDiagnosticMaxBytes {
+				t.Fatalf("excerpt is not bounded: %d bytes", len(res.ForLLM))
+			}
+		})
+	}
+}
+
 func TestEditFileLiteralRequiresUnique(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "u.txt", "x x")
 	tool := NewEditFileTool()
@@ -397,7 +672,8 @@ func TestEditFileInsertBeforeMatch(t *testing.T) {
 }
 
 // TestEditFileInsertRequiresUnique keeps the literal uniqueness rule in insert
-// mode: an ambiguous target is rejected and the file is left alone.
+// mode: an ambiguous target is rejected and the file is left alone. The message
+// is the shared one, so it points at mode='regex' exactly like replace does.
 func TestEditFileInsertRequiresUnique(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "ins_u.txt", "x x")
 	tool := NewEditFileTool()
@@ -406,6 +682,9 @@ func TestEditFileInsertRequiresUnique(t *testing.T) {
 	})
 	if !res.IsError {
 		t.Fatal("expected an error when the insert target is ambiguous")
+	}
+	if !strings.Contains(res.ForLLM, "mode='regex'") {
+		t.Fatalf("error does not suggest regex mode: %s", res.ForLLM)
 	}
 	if got := readFile(t, p); got != "x x" {
 		t.Fatalf("ambiguous insert modified the file: %q", got)

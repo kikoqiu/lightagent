@@ -409,6 +409,12 @@ with one newline: \n, or \r\n for a CRLF file.]`（下一步要 `mode='a'` 续�
 成功反馈给出匹配次数。
 `encoding` 支持字符集标签（解码匹配、写回再编码）与 `hex`/`base64` 字节级编辑（`regex` 不可用）；
 CRLF 文件按 LF 匹配、写回时恢复 CRLF。
+`replace`/`insert` 未找到 `find` 时，错误反馈会带上**不匹配诊断**：把 `find` 按行前缀从长到短尝试，找到
+第一个在全文中唯一出现的行前缀，再从最后匹配行起列出文件原文（最多 `f-m+3` 行，`f` 为 `find` 行数、
+`m` 为匹配到的行数；正文上限 2KB，截断处补 `... (rest of the excerpt omitted)`），模型因此能直接
+看到文件实际长什么样；`find` 为单行、没有唯一行前缀或候选前缀为空时只返回通用错误
+（`` `find` not found in file. Make sure it matches exactly ``），二进制编码与 `regex` 没有此诊断。
+两个字面模式的**未找到**与**不唯一**错误各共用一条消息（`insert` 的措辞与 `replace` 完全一致）。
 
 ### `webfetch`
 抓取网页 → 转成 Markdown 交给模型。`url` 必填，`timeout`（秒）默认取
