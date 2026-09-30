@@ -481,6 +481,9 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
   ...(below: 636 of 812 lines omitted — footer, related links or comments)
   ```
 
+  每个标记各自**独占一行**：`above` 之后紧接正文的第一行（不与它挤在同一行），`continues`
+  与 `below` 另起一行（上面 `above` 与 `continues` 之间没有空行）。
+
 * **超过限制且定位不到正文**（页面没声明正文，或声明的那块太小/全是链接）：回填**中间 `max_lines` 行**
   （上下各留一半），上下的标记只写省略了多少行：
 

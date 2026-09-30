@@ -629,6 +629,9 @@ func locatedFeedback(markdown string, total, limit int, content utils.ContentReg
 	var b strings.Builder
 	if before := start - 1; before > 0 {
 		b.WriteString(omittedLines("above", before, total, "navigation, sidebars or banner"))
+		// The marker is a line of its own: without the break it would run into
+		// the first line of the content it introduces.
+		b.WriteByte('\n')
 	}
 	b.WriteString(strings.Join(window, "\n"))
 	if omitted := regionLines - kept; omitted > 0 {

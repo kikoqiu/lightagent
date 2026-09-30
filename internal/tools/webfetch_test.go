@@ -573,11 +573,11 @@ func TestWebFetchToolCarriesTheMainContentOfALongPage(t *testing.T) {
 			t.Errorf("the body must leave the chrome out, found %q:\n%s", unwanted, body)
 		}
 	}
-	if !strings.Contains(lines[0], "omitted — navigation, sidebars or banner") {
-		t.Errorf("the body must mark the chrome above the content:\n%s", body)
+	if !strings.Contains(lines[0], "omitted — navigation, sidebars or banner") || !strings.HasSuffix(lines[0], "banner)") {
+		t.Errorf("the body must mark the chrome above the content on a line of its own:\n%s", body)
 	}
-	if lines[2] != "# Deep dive" {
-		t.Errorf("the content must start at its own first line, got %q:\n%s", lines[2], body)
+	if lines[1] != "# Deep dive" {
+		t.Errorf("the content must start at its own first line, got %q:\n%s", lines[1], body)
 	}
 	if !strings.Contains(body, "the main content continues: ") {
 		t.Errorf("a cut inside the content must be marked:\n%s", body)

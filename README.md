@@ -480,7 +480,7 @@ HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`：站�
 
 **反馈长度**默认限制在 `tools.webfetch.max_lines`（100）行：超长的页面优先只回填**正文**
 （`<article>`/`<main>`/`class=main` 之类的容器，导航、侧栏与页脚换成 `...(above/below: N of M lines omitted)`
-标记，并写出正文起始行号），定位不到正文时回填整篇的**中间 100 行**；整页（Markdown
+标记（各自独占一行），并写出正文起始行号），定位不到正文时回填整篇的**中间 100 行**；整页（Markdown
 正文）写进工作目录的 `.lightagent/webfetch/<时间>.md`，状态行说明"超长、总行数与总字节、这次取的是哪一段、
 文件路径"，需要全文时模型可用 `read_file_lines` 分页读取该文件。负数表示不限长度（此时不落盘）。
 正文里的站内链接写成**根相对路径**（`/docs/other`），状态行给出这次抓取的地址作为基准。
