@@ -20,6 +20,20 @@ var (
 	ErrNoStdin         = errors.New("no stdin available")
 )
 
+// Session status values. A session whose process exited is "done"; while its
+// exit state (the output buffered at the exit plus the exit code) has not been
+// handed over yet, list reports it as a "zombie" (see ProcessSession.Zombie).
+const (
+	sessionStatusRunning = "running"
+	sessionStatusDone    = "done"
+	sessionStatusZombie  = "zombie"
+)
+
+// zombieTTL is how long an exited session nobody collected is kept: its last
+// output and its exit code stay retrievable for this long, then the session is
+// dropped (see SessionManager.cleanupOldSessions).
+const zombieTTL = 24 * time.Hour
+
 // ProcessSession tracks one running (or finished) shell process.
 type ProcessSession struct {
 	mu        sync.Mutex
@@ -32,6 +46,12 @@ type ProcessSession struct {
 
 	proc  *exec.Cmd
 	stdin io.WriteCloser
+
+	// exitAt is the wall clock at which the process was marked done — the
+	// anchor of zombieTTL — and collected marks the exit state as handed over
+	// to a caller (see markCollected).
+	exitAt    int64
+	collected bool
 
 	output sessionOutput // terminal-accurate, bounded child-output buffer
 
@@ -47,6 +67,8 @@ type SessionInfo struct {
 	Status    string `json:"status"`
 	PID       int    `json:"pid"`
 	StartedAt int64  `json:"started_at"`
+	// ExitCode is set once the process exited (nil while it is still running).
+	ExitCode *int `json:"exit_code"`
 }
 
 // initChannels creates the done channel lazily, so a session assembled by hand
@@ -100,7 +122,7 @@ func (s *ProcessSession) startWatchdog(timeout time.Duration) {
 
 func (s *ProcessSession) expireAfterTimeout() {
 	s.mu.Lock()
-	if s.Status != "running" || s.proc == nil {
+	if s.Status != sessionStatusRunning || s.proc == nil {
 		s.mu.Unlock()
 		return
 	}
@@ -112,12 +134,59 @@ func (s *ProcessSession) expireAfterTimeout() {
 	_ = proc.Kill(cmd)
 
 	s.mu.Lock()
-	if s.Status == "running" {
-		s.Status = "done"
-		s.ExitCode = -1
-	}
+	s.markDoneLocked(-1)
 	s.mu.Unlock()
 	s.signalDone()
+}
+
+// markDoneLocked records the exit under the held lock. The first caller wins, so
+// the session keeps the exit code of whoever ended it first: for a killed
+// session that is the kill's -1 rather than whatever the reaper reports for the
+// terminated tree.
+func (s *ProcessSession) markDoneLocked(code int) {
+	if s.Status != sessionStatusRunning {
+		return
+	}
+	s.Status = sessionStatusDone
+	s.ExitCode = code
+	s.exitAt = time.Now().Unix()
+}
+
+// markCollected records that the session's exit state (the output taken just now
+// plus the exit code) has been handed over to a caller, and reports whether that
+// was the last thing the session had to offer: a done session lives in the pool
+// only until this happens (see SessionManager.Collect), while a running one
+// still has to be polled or killed.
+func (s *ProcessSession) markCollected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Status != sessionStatusDone {
+		return false
+	}
+	s.collected = true
+	return true
+}
+
+// Zombie reports whether the process has exited while its exit state has not
+// been handed over yet: the session stays in the pool so a later poll can still
+// deliver the last output and the exit code (see zombieTTL for how long).
+func (s *ProcessSession) Zombie() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zombieLocked()
+}
+
+// zombieLocked is Zombie under the held lock.
+func (s *ProcessSession) zombieLocked() bool {
+	return s.Status == sessionStatusDone && !s.collected
+}
+
+// expiredAt reports whether the session is a zombie whose exit state has been
+// waiting for collection since before cutoff.
+func (s *ProcessSession) expiredAt(cutoff int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zombieLocked() && s.exitAt < cutoff
 }
 
 // WaitForExit blocks until the process exits or the timeout elapses. Output does
@@ -161,7 +230,7 @@ func (s *ProcessSession) WaitForExitContext(ctx context.Context, timeout time.Du
 func (s *ProcessSession) IsDone() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.Status == "done"
+	return s.Status == sessionStatusDone
 }
 
 // GetStatus returns the current status string.
@@ -182,7 +251,7 @@ func (s *ProcessSession) GetExitCode() int {
 func (s *ProcessSession) Write(data string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.Status != "running" {
+	if s.Status != sessionStatusRunning {
 		return ErrSessionDone
 	}
 	if s.stdin == nil {
@@ -195,13 +264,12 @@ func (s *ProcessSession) Write(data string) error {
 // Kill terminates the process tree and marks the session done.
 func (s *ProcessSession) Kill() error {
 	s.mu.Lock()
-	if s.Status != "running" {
+	if s.Status != sessionStatusRunning {
 		s.mu.Unlock()
 		return ErrSessionDone
 	}
 	cmd := s.proc
-	s.Status = "done"
-	s.ExitCode = -1
+	s.markDoneLocked(-1)
 	s.mu.Unlock()
 
 	// The whole tree goes down: the shell plus everything it spawned.
@@ -210,17 +278,27 @@ func (s *ProcessSession) Kill() error {
 	return nil
 }
 
-// ToSessionInfo snapshots the session for listing.
+// ToSessionInfo snapshots the session for listing. A done session whose exit
+// state has not been collected yet is reported as a zombie: it is still in the
+// pool only to be polled, and its exit code is already known.
 func (s *ProcessSession) ToSessionInfo() SessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return SessionInfo{
+	info := SessionInfo{
 		ID:        s.ID,
 		Command:   s.Command,
 		Status:    s.Status,
 		PID:       s.PID,
 		StartedAt: s.StartTime,
 	}
+	if s.Status == sessionStatusDone {
+		if s.zombieLocked() {
+			info.Status = sessionStatusZombie
+		}
+		code := s.ExitCode
+		info.ExitCode = &code
+	}
+	return info
 }
 
 // SessionManager is a thread-safe registry of process sessions.
@@ -282,13 +360,15 @@ func (sm *SessionManager) KillAll() {
 	wg.Wait()
 }
 
-// cleanupOldSessions removes done sessions older than 30 minutes.
+// cleanupOldSessions drops the zombies nobody collected within zombieTTL: a
+// finished session is kept so its last output and its exit code can still be
+// polled, but not forever.
 func (sm *SessionManager) cleanupOldSessions() {
-	cutoff := time.Now().Add(-30 * time.Minute).Unix()
+	cutoff := time.Now().Add(-zombieTTL).Unix()
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	for id, session := range sm.sessions {
-		if session.IsDone() && session.StartTime < cutoff {
+		if session.expiredAt(cutoff) {
 			delete(sm.sessions, id)
 		}
 	}
@@ -317,6 +397,17 @@ func (sm *SessionManager) Remove(sessionID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	delete(sm.sessions, sessionID)
+}
+
+// Collect releases a session whose exit state (the output just handed over plus
+// the exit code) has been reported to a caller. A done session exists in the
+// pool only to be collected, so it leaves here; a running session stays — it
+// still has to be polled or killed.
+func (sm *SessionManager) Collect(session *ProcessSession) {
+	if !session.markCollected() {
+		return
+	}
+	sm.Remove(session.ID)
 }
 
 // List snapshots all sessions.

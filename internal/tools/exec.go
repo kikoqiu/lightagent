@@ -156,10 +156,7 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 			code = -1
 		}
 		session.mu.Lock()
-		if session.Status == "running" {
-			session.Status = "done"
-			session.ExitCode = code
-		}
+		session.markDoneLocked(code)
 		session.mu.Unlock()
 		session.signalDone()
 	}()
@@ -413,6 +410,9 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 	if canceled && !session.IsDone() {
 		raw := session.TakeOutput()
 		_ = session.Kill()
+		// The tree is gone and its output was just reported, so nothing is left
+		// to keep in the pool.
+		t.engine.sessions.Collect(session)
 		shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
 		totalLines, totalBytes := countLinesAndBytes(clean)
 		return commandResult{
@@ -439,6 +439,9 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 
 	if done {
 		code := session.GetExitCode()
+		// The exit code and the last output are both in this answer, so the
+		// session has nothing left to be kept for.
+		t.engine.sessions.Collect(session)
 		return commandResult{
 			Status:         statusCompleted,
 			ExitCode:       intPtr(code),

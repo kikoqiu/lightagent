@@ -24,7 +24,10 @@ func (t *ManageSessionTool) Name() string { return "manage_session" }
 func (t *ManageSessionTool) Description() string {
 	return "Manage background processes created by exec_command. Supports non-blocking " +
 		"and long-polling output retrieval (each call returns the whole output buffered " +
-		"so far and clears it), input sending, listing and termination."
+		"so far and clears it), input sending, listing and termination. A session whose " +
+		"process exited is kept as a zombie until a poll takes its last output and exit " +
+		"code (list shows it as status=zombie); it is dropped when it is collected, or " +
+		"after 24 hours."
 }
 
 // Parameters implements Tool.
@@ -39,7 +42,7 @@ func (t *ManageSessionTool) Parameters() map[string]any {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        []string{"poll", "input", "kill", "list"},
-				"description": "'poll': take the buffered output and the status; 'input': write to stdin; 'kill': terminate; 'list': list active sessions.",
+				"description": "'poll': take the buffered output and the status; an exited session reports its exit code with its last output and ends there, so poll a finished session to avoid losing that output. 'input': write to stdin. 'kill': terminate the process tree and release the session, reporting the output it had produced (exit_code -1: the process did not exit on its own); a process that already exited is a failure, still reported with its last output and its real exit code. 'list': list the sessions, a finished session whose output was not collected yet showing status=zombie.",
 			},
 			"data": map[string]any{
 				"type":        "string",
@@ -98,7 +101,7 @@ func (t *ManageSessionTool) Execute(ctx context.Context, args map[string]any) *R
 	case "input":
 		return t.executeInput(start, args)
 	case "kill":
-		return t.executeKill(start, args)
+		return t.executeKill(start, args, maxLines, maxChars)
 	default:
 		return fail(fmt.Sprintf("unknown action %q; expected poll, input, kill or list", action))
 	}
@@ -131,15 +134,27 @@ func (t *ManageSessionTool) lookup(start time.Time, args map[string]any, action 
 func (t *ManageSessionTool) executeList(start time.Time) *Result {
 	infos := t.engine.sessions.List()
 	var sb strings.Builder
+	zombies := 0
 	if len(infos) == 0 {
-		sb.WriteString("No active background sessions.")
+		sb.WriteString("No background sessions.")
 	} else {
 		for _, info := range infos {
 			sb.WriteString(fmt.Sprintf("session: %s\n", info.ID))
 			sb.WriteString(fmt.Sprintf("  command: %s\n", info.Command))
 			sb.WriteString(fmt.Sprintf("  status: %s\n", info.Status))
 			sb.WriteString(fmt.Sprintf("  pid: %d\n", info.PID))
+			if info.ExitCode != nil {
+				sb.WriteString(fmt.Sprintf("  exit_code: %d\n", *info.ExitCode))
+			}
+			if info.Status == sessionStatusZombie {
+				zombies++
+			}
 		}
+	}
+	if zombies > 0 {
+		// A zombie still holds the output written right before the exit and the
+		// exit code: polling is what delivers them and ends the session.
+		sb.WriteString("zombie = the process has exited; poll the session to take its last output and exit code\n")
 	}
 	text := sb.String()
 	return (commandResult{
@@ -166,6 +181,12 @@ func (t *ManageSessionTool) executePoll(ctx context.Context, start time.Time, ar
 	// first, so a process that exited during the window reports all of its output
 	// (its pipes are closed before the session is marked done).
 	//
+	// A finished session is kept in the pool until this hand-over, so a process
+	// that exited without anyone watching is still here as a zombie with its last
+	// output and its exit code. Reporting them is all this poll was for, so the
+	// session ends here (see SessionManager.Collect) instead of lingering; only a
+	// zombie nobody polls lives on, and only up to zombieTTL.
+	//
 	// The wait is cancellable: a poll only observes the process, so the user
 	// interrupting the turn ends the wait exactly like a wait_timeout does and
 	// the process keeps running — the output collected so far is returned with a
@@ -175,9 +196,7 @@ func (t *ManageSessionTool) executePoll(ctx context.Context, start time.Time, ar
 		_, _, interrupted = session.WaitForExitContext(ctx, waitTimeout)
 	}
 	done := session.IsDone()
-	raw := session.TakeOutput()
-	shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
-	totalLines, totalBytes := countLinesAndBytes(clean)
+	shown, truncated, totalLines, totalBytes := takeOutput(session, maxLines, maxChars)
 
 	cr := commandResult{
 		Output:         shown,
@@ -193,6 +212,7 @@ func (t *ManageSessionTool) executePoll(ctx context.Context, start time.Time, ar
 		if shown == "" {
 			cr.Output = fmt.Sprintf("process exited with code %d", code)
 		}
+		t.engine.sessions.Collect(session)
 	} else {
 		cr.Status = statusRunning
 		cr.SessionID = strPtr(session.ID)
@@ -214,9 +234,11 @@ func (t *ManageSessionTool) executeInput(start time.Time, args map[string]any) *
 		return cr.toResult()
 	}
 	if session.IsDone() {
+		// Nothing can be written anymore, but the exit is not lost: the session
+		// is still there for the poll that takes its last output and exit code.
 		cr := commandResult{
 			Status:         statusFailed,
-			Output:         fmt.Sprintf("process already exited with code %d", session.GetExitCode()),
+			Output:         fmt.Sprintf("process already exited with code %d; poll the session to take its last output", session.GetExitCode()),
 			ElapsedSeconds: elapsedSeconds(start),
 		}
 		return cr.toResult()
@@ -237,18 +259,46 @@ func (t *ManageSessionTool) executeInput(start time.Time, args map[string]any) *
 	}).toResultInfo()
 }
 
-func (t *ManageSessionTool) executeKill(start time.Time, args map[string]any) *Result {
+// takeOutput hands the session's buffered output over and folds it the way a
+// call reports it: shown is what the caller returns and clean is what the
+// counters count (see sanitizeAndFold).
+func takeOutput(session *ProcessSession, maxLines, maxChars int) (shown string, truncated bool, totalLines, totalBytes int) {
+	raw := session.TakeOutput()
+	shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
+	totalLines, totalBytes = countLinesAndBytes(clean)
+	return shown, truncated, totalLines, totalBytes
+}
+
+// executeKill terminates the process tree of a session. Either way the session
+// is released and what its tree had printed until then is handed over the way
+// poll does. A process that is still running is terminated (a success); one that
+// already exited has nothing left to terminate, which is a failure — but its
+// exit state (the last output plus the exit code) is reported with it instead of
+// being dropped.
+func (t *ManageSessionTool) executeKill(start time.Time, args map[string]any, maxLines, maxChars int) *Result {
 	session, failResult := t.lookup(start, args, "kill")
 	if failResult != nil {
 		return failResult
 	}
+
 	if session.IsDone() {
-		cr := commandResult{
-			Status:         statusFailed,
-			Output:         fmt.Sprintf("process already exited with code %d", session.GetExitCode()),
-			ElapsedSeconds: elapsedSeconds(start),
+		code := session.GetExitCode()
+		shown, truncated, totalLines, totalBytes := takeOutput(session, maxLines, maxChars)
+		if shown == "" {
+			shown = fmt.Sprintf("process already exited with code %d", code)
+		} else {
+			shown = fmt.Sprintf("process already exited with code %d\n%s", code, shown)
 		}
-		return cr.toResult()
+		t.engine.sessions.Collect(session)
+		return commandResult{
+			Status:         statusFailed,
+			ExitCode:       intPtr(code),
+			Output:         shown,
+			Truncated:      truncated,
+			TotalLines:     totalLines,
+			TotalBytes:     totalBytes,
+			ElapsedSeconds: elapsedSeconds(start),
+		}.toResult()
 	}
 	if err := session.Kill(); err != nil {
 		cr := commandResult{
@@ -258,13 +308,24 @@ func (t *ManageSessionTool) executeKill(start time.Time, args map[string]any) *R
 		}
 		return cr.toResult()
 	}
-	t.engine.sessions.Remove(session.ID)
-	return (commandResult{
+	shown, truncated, totalLines, totalBytes := takeOutput(session, maxLines, maxChars)
+	message := fmt.Sprintf("Process in session %s terminated", session.ID)
+	if shown != "" {
+		message += "\n" + shown
+	}
+	// The recorded code of a killed session is the kill's -1: the process did
+	// not exit on its own, so there is no real exit status to report.
+	code := session.GetExitCode()
+	t.engine.sessions.Collect(session)
+	return commandResult{
 		Status:         statusCompleted,
-		ExitCode:       intPtr(0),
-		Output:         fmt.Sprintf("Process in session %s terminated", session.ID),
+		ExitCode:       intPtr(code),
+		Output:         message,
+		Truncated:      truncated,
+		TotalLines:     totalLines,
+		TotalBytes:     totalBytes,
 		ElapsedSeconds: elapsedSeconds(start),
-	}).toResultInfo()
+	}.toResultInfo()
 }
 
 // controlKeys maps friendly names to their byte sequences.

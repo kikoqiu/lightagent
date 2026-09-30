@@ -10,7 +10,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 | `internal/config` | 读取程序目录的 `config.json` 与可选 `agent.md`，提供默认值与校验 |
 | `internal/llm` | OpenAI 兼容的 `/chat/completions` 客户端：流式 SSE 与非流式解析（含 `reasoning_content` / `reasoning` 思考透出）、工具调用聚合、`extra_body` 合并、空闲超时看门狗 |
 | `internal/agent` | 回合循环（tool loop）、steering、事件总线、上下文压缩、系统提示词 |
-| `internal/tools` | 工具接口与注册表（含 MCP unlock 的 deferred/grant 控制面、BM25 发现搜索、`unlock_tool`、`dynamic_call`）、命令执行引擎与会话池、文件工具、网页抓取（`webfetch`：utils 取页面 + 转 Markdown，取法/浏览器/UA/字节上限/反馈行数来自 `tools.webfetch`；正文站内链接写成根相对路径，超长页面优先只回填**定位到的正文**、否则回填中间若干行，省略处与落盘路径写进反馈；`method` 决定反馈放什么（含落盘、只要状态行），`invokejs` 的脚本报告放在反馈最前面）、字符集编解码 |
+| `internal/tools` | 工具接口与注册表（含 MCP unlock 的 deferred/grant 控制面、BM25 发现搜索、`unlock_tool`、`dynamic_call`）、命令执行引擎与会话池（进程退出后留作**僵尸**：输出 + `exit_code` 保留到被 poll/kill 取走，没人取走则 24h 后清理）、文件工具、网页抓取（`webfetch`：utils 取页面 + 转 Markdown，取法/浏览器/UA/字节上限/反馈行数来自 `tools.webfetch`；正文站内链接写成根相对路径，超长页面优先只回填**定位到的正文**、否则回填中间若干行，省略处与落盘路径写进反馈；`method` 决定反馈放什么（含落盘、只要状态行），`invokejs` 的脚本报告放在反馈最前面）、字符集编解码 |
 | `internal/utils` | HTML → Markdown 转换器（纯标准库 + `x/net/html`：标题/段落/列表/表格/代码块/公式/布局启发式，**可选把站内链接写成根相对路径**与**正文定位**（`<article>`/`<main>`/`class=main` 等容器，可按行号报告））；网页抓取（HTTP 源码 / 可见 / 无头 / 挂载浏览器四种取法 + 字符集、Cookie 与 profile，**在渲染好的页面里执行调用方给的脚本**（`Page.InvokeJS`：注入非枚举的 `_invokejs_done`，等待其回调或脚本失败））；浏览器池与 stealth |
 | `internal/mcp` | MCP 客户端（纯标准库）：JSON-RPC 2.0 over stdio / Streamable HTTP / HTTP+SSE；配置驱动的 `Manager` 与 `tools.Tool` 适配器 |
 | `internal/proc` | 子进程启动与停止：**树模式**（`Start`，Windows 用 Job Object「kill-on-close」、Unix 用独立进程组 `SIGTERM`→`SIGKILL`，exec 会话用）与**单进程模式**（`StartProcess`，只停止自己启动的那个进程，stdio MCP server 用）；`Shutdown` 在主进程退出或收到信号时按各自模式停止所有仍存活的进程 |

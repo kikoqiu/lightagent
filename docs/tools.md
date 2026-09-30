@@ -60,6 +60,8 @@ type Tool interface {
   `run_timeout=0` 关闭硬超时。
 * 每次调用都是一个会话，会话的根进程（宿主 shell 或 Python 解释器）是它**自己进程树的根**：
   结束会话 / 硬超时 / lightagent 退出时整棵树一起结束（[进程树与退出](architecture.md#进程树与退出)）。
+  窗口内就等到退出时，退出状态（输出 + `exit_code`）已在回答里，会话当场离开会话池；转后台的会话
+  保留到 `poll` 取走它的退出状态为止（没人取走的僵尸最多留 24 小时，见 [`manage_session`](#manage_session)）。
 * 输出在会话缓冲里按**终端规则**回放后再给模型：`\r` 只把光标移回第一列（**不擦除**），后续字符逐格
   覆盖，因此更短的重写会留下原文本的尾巴（与终端所见一致，需要擦除就发 `CSI K`）；`\b` 光标左移一格；
   行内 CSI 也照做——`CSI K`（`0`/`1`/`2`，擦除行内）与 `CSI <n> G`/`C`/`D`（列定位、左右移动），这正是
@@ -148,15 +150,30 @@ type Tool interface {
   poll、不按进程生命周期累计）：上限是「这一次交给模型多少」，而不是「这个进程一共交给模型多少」。
   等待可被**回合中断**取消：中断像 `wait_timeout` 到期一样结束等待，`warning` 说明 poll 被中断
   而进程仍在运行——poll 只是观察者，绝不去动它监视的进程；下一次 poll 继续接着读。
+  **把进程的退出状态（退出前写出的输出 + `exit_code`）交出来的那一次 poll 就是该会话的终点**：
+  会话随之离开会话池，此后同一个 `session_id` 报 not found。因此**进程退出后仍可 poll**——它就是
+  用来取走最后的输出与退出码的（见下面的僵尸说明）。
 * `input`：写入 stdin。纯控制键会被翻译：`ctrl-c`、`ctrl-d`、`ctrl-z`、`enter`/`return`、
   `tab`、`esc`、`up`/`down`/`left`/`right`、`backspace`；其余文本原样写入（如需换行请写 `"\n"`）。
   stdio 编码在 `exec_command` 启动该会话时已确定（Windows 上的 `use_utf8`），`manage_session` 不再另行选择。
-* `kill`：结束**整棵进程树**（宿主 shell 及其派生的所有子进程；Windows 经 Job Object，Unix 经进程组，见 [architecture.md](architecture.md#进程树与退出)）并从会话池移除。
-* `list`：列出当前会话（id/command/status/pid）。
+  进程已经退出时无法写入：回答 `failed`，并提示 poll 该会话取走它的输出。
+* `kill`：结束**整棵进程树**（宿主 shell 及其派生的所有子进程；Windows 经 Job Object，Unix 经进程组，见 [architecture.md](architecture.md#进程树与退出)）并**释放会话**，同时把该进程树到此刻为止写出的输出交出来（与 poll 同一套折叠）。两种情形：
+  * 进程**仍在运行** → 终止成功（`completed`），`exit_code = -1`（不是自己退出的，没有真实退出码），`output` = 终止说明 + 最后输出的内容；
+  * 进程**已经退出** → 没有树可结束，报 `failed`（`exit_code` 为**实际退出码**），`output` = `process already exited with code N` + 最后输出的内容——失败只是说明没杀到东西，退出状态照旧交出、不丢。
+  两种情形都会释放会话（此后同一 `session_id` 报 not found）。
+* `list`：列出当前会话（id/command/status/pid；已退出的会话带 `exit_code`）。进程已退出但退出状态
+  **还没被取走**的会话状态显示为 `zombie`，并附一行说明（poll 即可取走）。
+
+> **僵尸与清理**：会话的进程退出时**不立即清理**——退出前写出的输出与 `exit_code` 还留在池里等着
+> 被取走，这正是 `list` 里的 `zombie`（只有「输出 + 退出码等」这些状态，没有进程）。取走（poll 或
+> kill）即释放。**24 小时内始终没人 poll 的僵尸自动清理**（`zombieTTL`，见 `internal/tools/session.go`），
+> 之后该 `session_id` 报 not found。`exec_command` 在窗口内就等到退出时，退出状态已经写在回答里，
+> 会话当场释放、不会留下僵尸；转后台的会话则在 poll 取走退出状态时释放。
 
 > 进程树归属：会话的根进程是它自己进程树的根，因此
 > * 会话根进程自行退出时，它留下的后台子进程会被一并清理（会话池不会积累孤儿进程）；
->   若该子进程还占着 stdout/stderr，会话最多再等 2s（`WaitDelay`）收敛输出，然后置为 completed 并清理它；
+>   若该子进程还占着 stdout/stderr，会话最多再等 2s（`WaitDelay`）收敛输出，然后置为 completed 并把它清掉
+>   ——被清掉的是那个留下的**程序**，**会话本身**（输出 + `exit_code`）仍按上面「僵尸与清理」保留到被取走；
 > * lightagent 退出（正常退出、Ctrl+C、SIGTERM、终端挂断）时会结束所有仍在运行的会话——`exec_command` 启动的进程不会比 lightagent 活得更久；
 > * 仅 Windows 上「本进程被强杀」也能保证清理：kill-on-close 的 Job 句柄随 lightagent 进程关闭，OS 带走整棵树。
 
