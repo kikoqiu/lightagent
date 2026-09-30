@@ -36,7 +36,7 @@
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板） |
 | 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
-| 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；反馈默认**最多 200 行**（`max_lines`，可关），超长部分整页存到工作目录 `.lightagent/webfetch-<时间>.md`（Markdown 正文）并在反馈里给出路径 |
+| 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；`method` 决定反馈放什么（`fetch_as_md` 默认 / `save_as_md` / `save_as_html` / `ignore`），正文里的站内链接写成根相对路径（`/docs/other`，状态行给出抓取的地址），反馈默认**最多 100 行**（`max_lines`，可关）且**优先只回填正文**（`<article>`/`<main>`/`class=main` 之类的容器，导航/侧栏/页脚用 `...(omitted)` 标记代替），定位不到正文时回填中间的 100 行；`invokejs` 可在**页面加载后、抓取前**在页面里跑一段脚本（浏览器取法限定），用注入的 `_invokejs_done(value)` 结束并把值放在反馈最前面（拿 Cookie/token，供后续命令用同一身份）；整页存到工作目录 `.lightagent/webfetch/<时间>.md`（Markdown 正文）并在反馈里给出路径 |
 | 18 | 多媒体附件 | 模型侧 `openai.media_types` 声明**本模型可读的媒体类型**（如 `image/png`、`image/*`、`audio/wav`、`application/pdf`）。配置后：Web 输入框出现 **📎 附加按钮**，文件上传到工作目录 `.lightagent/uploads/`，**随下一条输入一起发给模型**（发送前点 ✕ 可取消并删掉已存文件），消息行会把带的附件显示出来（上传目录里的图片直接画成图片，取不回来时退回文件名）；若同时打开 `tools.upload_media.enabled`（两边都为真才启用），模型还拿到 `upload_media` 工具，可自行指定路径上传（类型不符 / 超限 / 空文件 / 目录都只报错，参数提示里列出可接收类型）。载荷：图片走 `image_url`（data URI）、音频走 `input_audio`（wav/mp3）、其余走 `file`（文件名 + data URI）；**会话文件只记附件路径与类型，不落 base64**（恢复时按路径读回，文件没了就只留名字） |
 | 19 | 复制消息 | 消息**角色标签旁**的透明复制图标（`agent` 右边 / `you` 左边，镜像对称、不占布局、平时不可见）：桌面鼠标移上去显现，**触屏长按消息**（或轻点）显现；**Markdown**（写入时的原文）/ **HTML**（渲染块 + 纯文本口味，粘进富文本或纯文本都不脏）/ **Text**（屏幕上的样子）；**半透明模糊的图标菜单**（三个口味各一个图标、无文字，带升起动画，空间不足时向上翻转），刚复制的图标临时变绿、随该菜单关闭即清除；安全上下文走异步 Clipboard API，明文 HTTP（局域网里的手机）自动退化为选中 + `execCommand('copy')`（HTML 口味经 `copy` 事件写入） |
 
@@ -159,7 +159,7 @@ source <(lightagent completion bash)       # bash 补全
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
-    "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "max_lines": 200 },
+    "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "max_lines": 100 },
     "upload_media":    { "enabled": false, "max_bytes": 0 },  // 与 openai.media_types 同时为真才注册该工具
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
@@ -195,11 +195,13 @@ source <(lightagent completion bash)       # bash 补全
 * `openai.extra_body` 的键会合并进 `/chat/completions` 请求体的**顶层**（可覆盖内置字段）。
 * `tools.mcp`：内置纯标准库 MCP 客户端，按 `servers` 连接外部 MCP server（`stdio` / `http` / `sse`）。详见
   [configuration.md](docs/configuration.md#toolsmcpmcp-客户端)。
-* `tools.webfetch`：网页抓取工具（`url` + `timeout` 参数），页面经浏览器渲染或 HTTP 源码取得后转成
-  Markdown；取法由 web 侧配置决定（`mode`：`auto` / `chrome-headful` / `chrome-headless` /
-  `chrome-attached` / `http`，另有 `browser_path`、`user_agent`、`max_bytes`，`chrome-attached` 还有
-  `attach_address`）；只收网页与文本内容，二进制地址直接报错；
-  进入上下文的正文默认最多 `max_lines`（200）行，超长的整页存到 `.lightagent/` 并把路径写进反馈。
+* `tools.webfetch`：网页抓取工具（`url` + `timeout` 参数，另有 `method` 决定反馈放什么、`invokejs` 在页面里
+  跑一段脚本来取 Cookie/token），页面经浏览器渲染或 HTTP 源码取得后转成 Markdown；取法由 web 侧配置决定
+  （`mode`：`auto` / `chrome-headful` / `chrome-headless` / `chrome-attached` / `http`，另有 `browser_path`、
+  `user_agent`、`max_bytes`，`chrome-attached` 还有 `attach_address`）；只收网页与文本内容，二进制地址直接报错；
+  进入上下文的正文默认最多 `max_lines`（100）行，且优先只回填**正文**（跳过导航/侧栏/页脚，
+  省略处用标记说明），定位不到正文时回填中间的 100 行；`save_as_md` / `save_as_html` 只落盘并报告路径与大小，
+  `ignore` 只要状态行。整页存到 `.lightagent/` 并把路径写进反馈。
   详见 [tools.md](docs/tools.md#webfetch)。
 * `tools.discovery`：MCP 工具发现 / unlock 机制（`tool_search_tool_bm25` → `unlock_tool` → `dynamic_call`）。
   MCP 工具恒为**锁定函数**，永不出现在 `tools` 声明里；系统提示词只注入 1 条全局机制规则 + 每 server 1 条 MCP 全局信息。详见
@@ -422,6 +424,22 @@ CRLF 文件按 LF 匹配、写回时恢复 CRLF。
 更小的配置值或参数值都会被抬到 30 秒。**只支持网页与文本内容**：地址返回二进制内容（PDF、图片、
 压缩包等）时直接返回错误，并提示改用 `exec_command` 下载/转换。
 
+`method` 决定反馈里放什么（默认 `fetch_as_md`）：
+
+* `fetch_as_md`（默认）：正文 Markdown，超长时优先只回填**正文**并落盘全文（见下）；
+* `save_as_md` / `save_as_html`：把**整页 Markdown** / 这次抓到的 **HTML**（渲染后的 DOM 或 HTTP 源码）
+  写到工作目录 `.lightagent/webfetch/<时间戳>.md|.html`，反馈**只有状态行**（路径、行数、大小），正文不进上下文；
+* `ignore`：什么都不回填，只有状态行 —— 适合"这次调用是为了副作用"（例如只为拿 `invokejs` 的值）。
+
+`invokejs` 给一段 JavaScript，在**页面加载完、抓取内容之前**执行，并注入全局函数
+**`_invokejs_done(value)`**（非枚举属性，页面遍历自己的全局看不到它）：脚本**必须调用它**才结束这次调用，
+值**原样**出现在反馈最前面（`invokejs return info:` + 值；字符串就是那串字符，其他值是 JSON），
+`undefined`/`null`/空串则**什么都不反馈**。脚本可以 `await`（例如自己 `fetch` 一个 token）；这个模式下
+**不再等网络空闲**，等待窗口 = 这次抓取剩下的时间（扣 2s 序列化余量）—— 脚本抛异常立刻反馈，
+一直不调用就在窗口用尽时反馈，页面照常抓回来。**只有浏览器取法支持**：`mode=http` 时参数直接报错，
+`auto` 在没有可用浏览器时也不退回源码，而是把"需要浏览器跑脚本"当成抓取失败。
+用途：取出 `document.cookie` / `localStorage` 里的 token，好让后续命令用和浏览器**一样的身份**下载文件、调接口。
+
 取法由 `tools.webfetch.mode` 决定：
 
 * `auto`（默认）：用**可见窗口**的浏览器渲染（减少被反爬拦截的可能），没有可用浏览器时回退 HTTP 源码；
@@ -449,12 +467,16 @@ CRLF 文件按 LF 匹配、写回时恢复 CRLF。
 `chrome-attached`。
 
 `browser_path` / `user_agent` / `max_bytes` 分别指定浏览器可执行文件、两条路径的 User-Agent 与
-HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`，相对链接按**重定向后的**地址补全。
-工具返回的正文（状态行 + `---` + Markdown）就和其他工具一样，按普通 tool 反馈记录，没有额外信封。
+HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`：站内链接写成**根相对路径**（`/docs/other`，
+状态行给出这次抓取的地址作为基准），并可定位正文。工具返回的正文（状态行 + `---` + Markdown）就和其他工具一样，
+按普通 tool 反馈记录，没有额外信封。
 
-**反馈长度**默认限制在 `tools.webfetch.max_lines`（200）行：超长的正文只保留前 N 行，整页（Markdown
-正文）写进工作目录的 `.lightagent/webfetch-<时间>.md`，状态行说明"超长、总行数与总字节、文件路径"，
-需要全文时模型可用 `read_file_lines` 分页读取该文件。负数表示不限长度（此时不落盘）。
+**反馈长度**默认限制在 `tools.webfetch.max_lines`（100）行：超长的页面优先只回填**正文**
+（`<article>`/`<main>`/`class=main` 之类的容器，导航、侧栏与页脚换成 `...(above/below: N of M lines omitted)`
+标记，并写出正文起始行号），定位不到正文时回填整篇的**中间 100 行**；整页（Markdown
+正文）写进工作目录的 `.lightagent/webfetch/<时间>.md`，状态行说明"超长、总行数与总字节、这次取的是哪一段、
+文件路径"，需要全文时模型可用 `read_file_lines` 分页读取该文件。负数表示不限长度（此时不落盘）。
+正文里的站内链接写成**根相对路径**（`/docs/other`），状态行给出这次抓取的地址作为基准。
 详见 [tools.md](docs/tools.md#webfetch)。
 
 ---

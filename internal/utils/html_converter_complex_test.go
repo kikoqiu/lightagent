@@ -338,17 +338,46 @@ func TestComplex_URLParenEscaping(t *testing.T) {
 	}
 }
 
-func TestComplex_ImageDataURImageAllowed(t *testing.T) {
-	res := convert(t, `<img src="data:image/png;base64,abc" alt="d">`)
-	if !strings.Contains(res.Markdown, "data:image/png") {
-		t.Fatalf("data:image not allowed: %q", res.Markdown)
+// TestComplex_ImageDataURImageOmitted pins what an inline (base64) image becomes:
+// the markdown keeps the image and the text around it, but the payload — which is
+// what would drown the page — is replaced by the short marker that says what it
+// was and how much of it there was.
+func TestComplex_ImageDataURImageOmitted(t *testing.T) {
+	res := convert(t, `<p>Look:</p><img src="data:image/png;base64,AAAAQUJD" alt="shot"><p>done</p>`)
+	if !strings.Contains(res.Markdown, "![shot](data:image/png;base64,omitted-8B)") {
+		t.Fatalf("the inline image must keep its marker: %q", res.Markdown)
+	}
+	if strings.Contains(res.Markdown, "AAAAQUJD") {
+		t.Fatalf("the payload must not reach the markdown: %q", res.Markdown)
+	}
+	if !strings.Contains(res.Markdown, "Look:") || !strings.Contains(res.Markdown, "done") {
+		t.Fatalf("the text around the image must stay: %q", res.Markdown)
 	}
 }
 
-func TestComplex_ImageDataURTextBlocked(t *testing.T) {
+// TestComplex_ImageDataURNotAnImageOmitted pins that the marker is what an image
+// position carries whatever the payload holds: nothing of the payload travels,
+// so a text or font payload is not a link a reader could follow but a marker.
+func TestComplex_ImageDataURNotAnImageOmitted(t *testing.T) {
 	res := convert(t, `<img src="data:text/plain;base64,abc" alt="d">`)
-	if strings.Contains(res.Markdown, "data:text/plain") {
-		t.Fatalf("data:text image should be blocked: %q", res.Markdown)
+	if strings.Contains(res.Markdown, "base64,abc") {
+		t.Fatalf("the payload must not reach the markdown: %q", res.Markdown)
+	}
+	if !strings.Contains(res.Markdown, "data:text/plain;base64,omitted-3B") {
+		t.Fatalf("the marker must say what was omitted: %q", res.Markdown)
+	}
+}
+
+// TestComplex_AnchorDataURDropped pins the other side: a link whose address is a
+// data URI is not carried at all, since a reader has nothing to follow — only
+// its text stays.
+func TestComplex_AnchorDataURDropped(t *testing.T) {
+	res := convert(t, `<a href="data:text/plain;base64,AAAA">Download the report</a>`)
+	if !strings.Contains(res.Markdown, "Download the report") {
+		t.Fatalf("the text of the link must stay: %q", res.Markdown)
+	}
+	if strings.Contains(res.Markdown, "data:") {
+		t.Fatalf("a data URI must not be carried as an address: %q", res.Markdown)
 	}
 }
 

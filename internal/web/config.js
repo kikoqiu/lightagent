@@ -129,7 +129,7 @@
           { value: 'http', label: 'http — the source only, never a browser' }
         ], help: 'how a page is obtained' },
         { path: 'tools.webfetch.timeout_seconds', type: 'number', min: 1, help: 'seconds allowed for one fetch; the default of the tool timeout argument. Below the built-in floor of 30 seconds the floor is used instead' },
-        { path: 'tools.webfetch.max_lines', type: 'number', help: 'lines of markdown fed back; a longer page is saved under .lightagent. 0 = built-in 200, negative = no limit' },
+        { path: 'tools.webfetch.max_lines', type: 'number', help: 'lines of markdown fed back; a longer page is answered with its main content (or its middle) and saved under .lightagent. 0 = built-in 100, negative = no limit' },
         { path: 'tools.webfetch.browser_path', type: 'text', placeholder: 'auto-detected', help: 'browser executable to render with; empty discovers an installed one' },
         { path: 'tools.webfetch.user_agent', type: 'text', placeholder: 'path default', help: 'user agent of both paths; empty keeps each path default' },
         { path: 'tools.webfetch.max_bytes', type: 'number', min: 0, help: 'body cap of the HTTP path in bytes; 0 = built-in 8 MiB' },

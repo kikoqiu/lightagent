@@ -23,11 +23,15 @@ func main() {
 // Exit codes: 0 ok, 1 runtime failure, 2 usage error.
 func run(args []string, stdout, stderr io.Writer) int {
 	var (
-		baseURL   = flag.String("base-url", "", "base URL used to resolve relative links")
-		bullet    = flag.String("bullet", "", "bullet marker for unordered lists")
-		codeFence = flag.String("code-fence", "", "code fence characters")
-		outFile   = flag.String("o", "", "write output to this file (single input only)")
-		showWarn  = flag.Bool("warnings", false, "print converter warnings to stderr")
+		baseURL       = flag.String("base-url", "", "base URL used to resolve relative links")
+		bullet        = flag.String("bullet", "", "bullet marker for unordered lists")
+		codeFence     = flag.String("code-fence", "", "code fence characters")
+		outFile       = flag.String("o", "", "write output to this file (single input only)")
+		showWarn      = flag.Bool("warnings", false, "print converter warnings to stderr")
+		relativeLinks = flag.Bool("relative-links", false,
+			"write links that stay on the base URL's host as root-relative paths")
+		mainContent = flag.Bool("main-content", false,
+			"report the located main content region on stderr")
 	)
 	flag.Usage = func() { printUsage(stderr) }
 	flag.Parse()
@@ -53,7 +57,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		out = f
 	}
 
-	opts := buildOptions(*baseURL, *bullet, *codeFence)
+	opts := buildOptions(*baseURL, *bullet, *codeFence, *relativeLinks, *mainContent)
 	code := 0
 	for _, file := range files {
 		if len(files) > 1 {
@@ -76,13 +80,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "html2md: %s: %s\n", file, w)
 			}
 		}
+		if *mainContent {
+			if res.Content.Located {
+				fmt.Fprintf(stderr, "html2md: %s: main content: %s, lines %d-%d (%d lines)\n", file,
+					res.Content.Label, res.Content.StartLine,
+					res.Content.StartLine+res.Content.LineCount-1, res.Content.LineCount)
+			} else {
+				fmt.Fprintf(stderr, "html2md: %s: main content: none located\n", file)
+			}
+		}
 		fmt.Fprintln(out, res.Markdown)
 	}
 	return code
 }
 
 // buildOptions maps the non-empty CLI flags onto converter option functions.
-func buildOptions(baseURL, bullet, codeFence string) []utils.Html2MdOptionFunc {
+func buildOptions(baseURL, bullet, codeFence string, relativeLinks, mainContent bool) []utils.Html2MdOptionFunc {
 	var opts []utils.Html2MdOptionFunc
 	if baseURL != "" {
 		opts = append(opts, utils.WithBaseURL(baseURL))
@@ -93,6 +106,12 @@ func buildOptions(baseURL, bullet, codeFence string) []utils.Html2MdOptionFunc {
 	if codeFence != "" {
 		opts = append(opts, utils.WithCodeFence(codeFence))
 	}
+	if relativeLinks {
+		opts = append(opts, utils.WithRelativeLinks(true))
+	}
+	if mainContent {
+		opts = append(opts, utils.WithMainContentSelection(true))
+	}
 	return opts
 }
 
@@ -102,11 +121,13 @@ func printUsage(w io.Writer) {
 			"  html2md [options] <file.html> [<file.html> ...]\n"+
 			"\n"+
 			"Options:\n"+
-			"  -base-url string   base URL used to resolve relative links\n"+
-			"  -bullet string     bullet marker for unordered lists (default \"-\")\n"+
-			"  -code-fence string code fence characters (default \"```\")\n"+
-			"  -o string          write output to this file (single input only)\n"+
-			"  -warnings          print converter warnings to stderr\n"+
+			"  -base-url string    base URL used to resolve relative links\n"+
+			"  -bullet string      bullet marker for unordered lists (default \"-\")\n"+
+			"  -code-fence string  code fence characters (default \"```\")\n"+
+			"  -relative-links     write links that stay on the base URL's host as root-relative paths\n"+
+			"  -main-content       report the located main content region on stderr\n"+
+			"  -o string           write output to this file (single input only)\n"+
+			"  -warnings           print converter warnings to stderr\n"+
 			"\n"+
 			"html2md converts one or more HTML files to Markdown and writes the\n"+
 			"result to stdout, or to the file given by -o.\n")

@@ -109,6 +109,13 @@ func (b *mdBuffer) String() string {
 	return string(b.buf)
 }
 
+// Len is how many bytes the buffer holds so far. A walk records it when it
+// reaches the element whose markdown is to be told apart from the rest, and
+// again once that element has been written out.
+func (b *mdBuffer) Len() int {
+	return len(b.buf)
+}
+
 // -------------------------------------------------------------
 // Core dispatch: walking the tree
 // -------------------------------------------------------------
@@ -136,6 +143,22 @@ func (c *Html2MdConverter) walk(n *nethtml.Node, buf *mdBuffer, ctx *walkContext
 
 	ctx.depth++
 	defer func() { ctx.depth-- }()
+
+	// The element the conversion picked as the page's main content is marked
+	// here: its markdown starts at the offset the buffer has reached, and ends
+	// where the buffer stands once the whole element has been written out.
+	if n == c.contentNode {
+		if !c.contentOpen {
+			c.contentStart = buf.Len()
+			c.contentOpen = true
+		}
+		defer func() {
+			if !c.contentClose {
+				c.contentEnd = buf.Len()
+				c.contentClose = true
+			}
+		}()
+	}
 
 	switch n.Type {
 	case nethtml.TextNode:
@@ -1695,12 +1718,12 @@ func sanitizeURL(raw string, allowDataImage bool) string {
 	}
 
 	if strings.HasPrefix(cleanLower, "data:") {
-		if allowDataImage && (strings.HasPrefix(cleanLower, "data:image/png") ||
-			strings.HasPrefix(cleanLower, "data:image/jpeg") ||
-			strings.HasPrefix(cleanLower, "data:image/gif") ||
-			strings.HasPrefix(cleanLower, "data:image/webp") ||
-			strings.HasPrefix(cleanLower, "data:image/avif")) {
-			return clean
+		// The payload of a data URI is what the page inlined (a base64 image, a
+		// font, a whole document). It is never carried over: an image keeps the
+		// short marker that stands for it (see DataURIPlaceholder), and anything
+		// else — an address a reader could not follow anywhere — is dropped.
+		if allowDataImage {
+			return DataURIPlaceholder(clean)
 		}
 		return ""
 	}
@@ -1725,15 +1748,55 @@ func (c *Html2MdConverter) resolveURL(raw string) string {
 	if raw == "" || c.baseURL == nil {
 		return raw
 	}
+	// A bare fragment points into the page itself: resolving it would repeat
+	// the page's own path on every link of its table of contents.
+	if strings.HasPrefix(strings.TrimSpace(raw), "#") {
+		return raw
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		c.warnings.addMsg(fmt.Sprintf("Bad URL: %q", raw))
 		return raw
 	}
 	if u.IsAbs() {
+		// An address that is already absolute stays as the page wrote it,
+		// unless the caller asked for references into the site itself to be
+		// written as paths, which is what a reader of the markdown can follow.
+		if c.opts.RelativeLinks && sameSite(c.baseURL, u) {
+			return rootRelativeURL(u)
+		}
 		return raw
 	}
-	return c.baseURL.ResolveReference(u).String()
+	resolved := c.baseURL.ResolveReference(u)
+	if c.opts.RelativeLinks && sameSite(c.baseURL, resolved) {
+		return rootRelativeURL(resolved)
+	}
+	return resolved.String()
+}
+
+// sameSite reports whether a reference points at the site of the base URL: the
+// same host over the same scheme.
+func sameSite(base, ref *url.URL) bool {
+	return base.Host != "" && strings.EqualFold(base.Host, ref.Host) &&
+		strings.EqualFold(base.Scheme, ref.Scheme)
+}
+
+// rootRelativeURL renders an address of the page's own site the way an anchor
+// inside the site writes it: the path below the site's root, with its query and
+// fragment. The scheme and the host drop out, since the reader is already on
+// that site.
+func rootRelativeURL(u *url.URL) string {
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	if u.RawQuery != "" {
+		path += "?" + u.RawQuery
+	}
+	if u.Fragment != "" {
+		path += "#" + u.Fragment
+	}
+	return path
 }
 
 // -------------------------------------------------------------

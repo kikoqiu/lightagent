@@ -339,8 +339,9 @@ const (
 // Built-in webfetch limits and endpoints.
 const (
 	// WebFetchMaxLinesDefault is how many lines of markdown webfetch feeds back
-	// before a page is cut and saved to disk instead (tools.webfetch.max_lines).
-	WebFetchMaxLinesDefault = 200
+	// before a page is answered with its main content (or its middle) and saved
+	// to disk instead (tools.webfetch.max_lines).
+	WebFetchMaxLinesDefault = 100
 	// WebFetchAttachAddressDefault is the DevTools endpoint a chrome-attached
 	// fetch reaches for when attach_address is empty.
 	WebFetchAttachAddressDefault = "127.0.0.1:9222"

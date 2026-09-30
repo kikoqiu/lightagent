@@ -2,6 +2,7 @@ package utils
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -79,7 +80,7 @@ const (
 	// the initial HTML. The same value is the grace period in front of the check
 	// (some sites start their requests a moment after their load) and the settle
 	// after it (the DOM update the last response triggers).
-	WebFetchNetworkIdleDefault = 500 * time.Millisecond
+	WebFetchNetworkIdleDefault = 1000 * time.Millisecond
 	// WebFetchNetworkIdleLimitDefault is the smallest cap on the checking phase
 	// of that wait: a page whose network never goes quiet (a chat, a live page,
 	// a stream of beacons) is captured after it, with a note, instead of eating
@@ -92,6 +93,14 @@ const (
 	// pageCloseTimeout bounds dropping a page, so a request that already ran
 	// out of time does not wait for its tab to close.
 	pageCloseTimeout = 5 * time.Second
+	// WebFetchInvokeJSWaitDefault bounds waiting for the script of a caller to
+	// report when the fetch itself is not bounded: a script that never calls
+	// the function it was handed must not hold the fetch forever.
+	WebFetchInvokeJSWaitDefault = 20 * time.Second
+	// invokeInfoLimit caps what a script may report back: the value travels in
+	// front of the page in the answer, so a value that ran away (a whole
+	// document, a large store) must not flood it.
+	invokeInfoLimit = 8 << 10
 )
 
 // WebFetchOptions configures WebFetch. The zero value is the usual default:
@@ -118,7 +127,7 @@ type WebFetchOptions struct {
 	// (some sites start their requests a moment after their load) and the
 	// settle after it (the DOM update the last response triggers). The check
 	// is capped (see WebFetchNetworkIdleLimitDefault), so a page whose network
-	// never goes quiet still yields its DOM, with a note. Default: 500ms.
+	// never goes quiet still yields its DOM, with a note. Default: 1s.
 	NetworkIdle time.Duration
 	// UserAgent overrides the user agent of both paths. Without it the
 	// browser uses its own default, and the HTTP source sends none.
@@ -133,6 +142,15 @@ type WebFetchOptions struct {
 	Jar http.CookieJar
 	// MaxBytes caps the body read over HTTP (default WebFetchMaxBytesDefault).
 	MaxBytes int64
+	// InvokeJS is a script to run in the page once it has loaded and before
+	// its content is read: the page is rendered, the script runs, and what it
+	// reports through the _invokejs_done function it is handed (see
+	// Page.InvokeJS) comes back in InvokeInfo. It replaces the wait for the
+	// network to go quiet — a script that asks for what it needs knows better
+	// when the page is ready — and it needs a browser: the HTTP fallback of
+	// FetchModeAuto does not take place when a script is asked for, since a
+	// source has nothing to run it in. Empty means no script (the usual case).
+	InvokeJS string
 	// Browser configures the browser: executable, profile, attach address,
 	// headless or not, keep-alive, ...
 	Browser BrowserOptions
@@ -197,6 +215,13 @@ func WithFetchMaxBytes(maxBytes int64) WebFetchOptionFunc {
 	return func(o *WebFetchOptions) { o.MaxBytes = maxBytes }
 }
 
+// WithFetchInvokeJS asks for a script to be run in the loaded page, before its
+// content is read; what it reports comes back in WebFetchResult.InvokeInfo (see
+// Page.InvokeJS for how the script hands its value over).
+func WithFetchInvokeJS(script string) WebFetchOptionFunc {
+	return func(o *WebFetchOptions) { o.InvokeJS = script }
+}
+
 // WithFetchBrowser replaces the browser configuration.
 func WithFetchBrowser(opts BrowserOptions) WebFetchOptionFunc {
 	return func(o *WebFetchOptions) { o.Browser = opts }
@@ -247,6 +272,16 @@ type WebFetchResult struct {
 	// short, a browser that was skipped, a browser that failed before the HTTP
 	// source was used.
 	Notes []string
+	// InvokeInfo is what the script of the caller (WebFetchOptions.InvokeJS)
+	// reported through _invokejs_done, as the script wrote it: a string stays
+	// what it is, any other value is the JSON of it. It is empty when no
+	// script was asked for, when the script reported undefined or null, or
+	// when it never reported (see InvokeNote).
+	InvokeInfo string
+	// InvokeNote explains a script that reported nothing: one that threw, one
+	// that never called the function before the wait ran out, or a call that
+	// could not be made at all.
+	InvokeNote string
 	// Elapsed is how long the whole fetch took.
 	Elapsed time.Duration
 }
@@ -317,6 +352,12 @@ func WebFetch(ctx context.Context, rawURL string, opts ...WebFetchOptionFunc) (W
 		// Every other mode asks for one way and nothing else, so the error is
 		// the answer: it says what that way was missing.
 		return WebFetchResult{}, err
+	}
+	if strings.TrimSpace(cfg.InvokeJS) != "" {
+		// A script needs the page a browser builds to run in, and there is
+		// none: returning the plain source would silently drop what the
+		// caller asked for, so the rendering error is the answer.
+		return WebFetchResult{}, fmt.Errorf("%w (a browser is needed to run the script asked for)", err)
 	}
 
 	source, sourceErr := fetchSource(ctx, target, cfg)
@@ -411,8 +452,14 @@ func fetchRendered(ctx context.Context, target string, cfg WebFetchOptions) (Web
 	if !nav.Loaded {
 		notes = append(notes, fmt.Sprintf(
 			"the page had not finished loading after %s; the DOM was captured as it was", loadTimeout))
-	} else {
+	} else if strings.TrimSpace(cfg.InvokeJS) == "" {
 		notes = append(notes, waitForNetworkIdle(ctx, page, cfg.NetworkIdle)...)
+	}
+	// A script of the caller's replaces that wait: it asks for what it needs
+	// itself and decides when the page is ready (see WebFetchOptions.InvokeJS).
+	var invokeInfo, invokeNote string
+	if script := strings.TrimSpace(cfg.InvokeJS); script != "" {
+		invokeInfo, invokeNote = runInvokeScript(ctx, page, script)
 	}
 	html, err := page.HTML(ctx)
 	if err != nil {
@@ -442,7 +489,91 @@ func fetchRendered(ctx context.Context, target string, cfg WebFetchOptions) (Web
 		Browser:     browser.Product(),
 		Loaded:      nav.Loaded,
 		Notes:       notes,
+		InvokeInfo:  invokeInfo,
+		InvokeNote:  invokeNote,
 	}, nil
+}
+
+// runInvokeScript runs the script a caller asked for in the loaded page and
+// turns its outcome into the two fields a result carries: what the script
+// reported, and the note that explains an invocation which reported nothing.
+//
+// The script gets what is left of the fetch, with the margin serializing the DOM
+// needs kept back, so a script that never reports still ends with a page to hand
+// back. A script that throws is reported at once instead of waiting the whole
+// window out: the caller learns what went wrong while the fetch is young.
+func runInvokeScript(ctx context.Context, page *Page, script string) (info, note string) {
+	wait := invokeWaitBudget(ctx)
+	if wait <= 0 {
+		return "", "the fetch was out of time before the script could run"
+	}
+	invokeCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+
+	report, err := page.InvokeJS(invokeCtx, script)
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return "", "the script did not call _invokejs_done before the fetch ran out of time"
+	case err != nil && ctx.Err() == nil && invokeCtx.Err() != nil:
+		return "", fmt.Sprintf("the script did not call _invokejs_done within %s",
+			roundWaitSeconds(wait))
+	case err != nil:
+		return "", "the script did not finish: " + err.Error()
+	case report.Failure != "":
+		return "", "the script failed before calling _invokejs_done: " + report.Failure
+	}
+	return invokeInfoText(report.Value), ""
+}
+
+// invokeWaitBudget is how long a script may take to report: what is left of the
+// fetch with the margin serializing the DOM needs kept back (see
+// networkIdleCaptureMargin), so a script that never reports still ends with a
+// page to return. A fetch without a deadline gets WebFetchInvokeJSWaitDefault,
+// which is the only thing that bounds the wait then.
+func invokeWaitBudget(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return WebFetchInvokeJSWaitDefault
+	}
+	return time.Until(deadline) - networkIdleCaptureMargin
+}
+
+// roundWaitSeconds renders a wait as a readable number of seconds, never zero.
+func roundWaitSeconds(wait time.Duration) time.Duration {
+	rounded := wait.Round(time.Second)
+	if rounded < time.Second {
+		rounded = time.Second
+	}
+	return rounded
+}
+
+// invokeInfoText renders what a script reported for the answer: a string stays
+// what the script wrote, and any other value is the JSON of it, since what a
+// caller asks for this way is data (a cookie header, a token, a slice of a
+// store). Nothing is reported for undefined and for null, and a value larger
+// than invokeInfoLimit is cut — it travels in front of the page in the answer,
+// so a runaway value must not flood it.
+func invokeInfoText(value json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(value))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	text := trimmed
+	if trimmed[0] == '"' {
+		var unquoted string
+		if err := json.Unmarshal(value, &unquoted); err != nil {
+			return trimmed
+		}
+		if unquoted == "" {
+			return ""
+		}
+		text = unquoted
+	}
+	if len(text) > invokeInfoLimit {
+		return strings.ToValidUTF8(text[:invokeInfoLimit], "") +
+			fmt.Sprintf("...(cut at %d bytes; the script reported %d bytes)", invokeInfoLimit, len(text))
+	}
+	return text
 }
 
 // waitForNetworkIdle lets the content a page fetches after its own document

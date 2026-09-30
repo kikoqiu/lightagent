@@ -15,14 +15,17 @@ import (
 	"lightagent/internal/utils"
 )
 
-// webfetchPageServer serves one page with a heading, a paragraph, a script and
-// an ad-like block, so the conversion has something to simplify.
+// webfetchPageServer serves one page with a heading, a paragraph, a link, an
+// inline (base64) image, a script and an ad-like block, so the conversion has
+// something to simplify, something to make relative and something to leave out.
 func webfetchPageServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Doc</title></head><body>
 <h1>Getting started</h1><p>Install it and run it.</p>
+<p>Read <a href="/docs/install">the guide</a> next.</p>
+<img src="data:image/png;base64,QUJDREVG" alt="shot">
 <div class="ad">Buy now!</div>
 <script>document.title = 'changed';</script>
 </body></html>`)
@@ -42,6 +45,36 @@ func webfetchLongPageServer(t *testing.T) *httptest.Server {
 			fmt.Fprintf(w, "<h2>Section %d</h2><p>Paragraph number %d of the page.</p>", i, i)
 		}
 		fmt.Fprint(w, "</body></html>")
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// webfetchLongArticleServer serves a page whose chrome is as long as its
+// content: a navigation bar, a sidebar and a footer around one article, so the
+// tool has something to leave out and something to keep.
+func webfetchLongArticleServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Guide</title></head><body>
+<header class="site-header"><nav class="main-nav"><ul>`)
+		for i := 1; i <= 20; i++ {
+			fmt.Fprintf(w, `<li><a href="/nav/%d">Navigation entry %d</a></li>`, i, i)
+		}
+		fmt.Fprint(w, `</ul></nav></header>
+<aside class="sidebar"><ul>`)
+		for i := 1; i <= 20; i++ {
+			fmt.Fprintf(w, `<li><a href="/side/%d">Sidebar entry %d</a></li>`, i, i)
+		}
+		fmt.Fprint(w, `</ul></aside>
+<article class="post-content"><h1>Deep dive</h1>`)
+		for i := 1; i <= 20; i++ {
+			fmt.Fprintf(w, `<p>Paragraph %d of the article body.</p>`, i)
+		}
+		fmt.Fprint(w, `</article>
+<footer class="site-footer"><p>Footer text of the site.</p></footer>
+</body></html>`)
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -75,8 +108,16 @@ func TestWebFetchToolConvertsPageToMarkdown(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("Execute reported an error: %s", res.ForLLM)
 	}
-	if !strings.HasPrefix(res.ForLLM, "Conversion succeeded. Converter warnings (if any): ") {
+	if !strings.HasPrefix(res.ForLLM, "Conversion succeeded (source: ") {
 		t.Errorf("the answer is missing the status line:\n%s", res.ForLLM)
+	}
+	// The status line names the page the markdown came from, which is what its
+	// root-relative links are relative to.
+	if !strings.Contains(res.ForLLM, server.URL+"/docs)") {
+		t.Errorf("the status line must name the fetched address:\n%s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, ". Converter warnings (if any): ") {
+		t.Errorf("the status line must carry the converter warnings:\n%s", res.ForLLM)
 	}
 	if !strings.Contains(res.ForLLM, "\n---\n\n") {
 		t.Errorf("the answer is missing the body separator:\n%s", res.ForLLM)
@@ -90,6 +131,25 @@ func TestWebFetchToolConvertsPageToMarkdown(t *testing.T) {
 		if !strings.Contains(res.ForLLM, want) {
 			t.Errorf("the markdown is missing %q:\n%s", want, res.ForLLM)
 		}
+	}
+	// Links inside the page are written relative to its own site; the address
+	// of the page itself only appears in the status line.
+	_, body, found := strings.Cut(res.ForLLM, "\n---\n\n")
+	if !found {
+		t.Fatalf("the answer is missing the body separator:\n%s", res.ForLLM)
+	}
+	if !strings.Contains(body, "[the guide](/docs/install)") {
+		t.Errorf("a same-site link must be a root-relative path:\n%s", body)
+	}
+	if strings.Contains(body, server.URL) {
+		t.Errorf("the markdown must not repeat the site address on its links:\n%s", body)
+	}
+	// An inline base64 image keeps its place and its name, but not its payload.
+	if !strings.Contains(body, "![shot](data:image/png;base64,omitted-8B)") {
+		t.Errorf("the inline image must be carried as a short marker:\n%s", body)
+	}
+	if strings.Contains(body, "QUJDREVG") {
+		t.Errorf("the payload of an inline image must not reach the model:\n%s", body)
 	}
 	if strings.Contains(res.ForLLM, "document.title") {
 		t.Errorf("the script should not reach the model:\n%s", res.ForLLM)
@@ -208,6 +268,12 @@ func TestWebFetchToolRejectsInvalidArguments(t *testing.T) {
 		{"blank url", map[string]any{"url": "   "}},
 		{"zero timeout", map[string]any{"url": "https://example.com", "timeout": 0}},
 		{"negative timeout", map[string]any{"url": "https://example.com", "timeout": -1}},
+		{"unknown method", map[string]any{"url": "https://example.com", "method": "bogus"}},
+		{"non-string method", map[string]any{"url": "https://example.com", "method": 7}},
+		{"non-string invokejs", map[string]any{"url": "https://example.com", "invokejs": 7}},
+		// The tool reads the source only: a script needs a browser to run in.
+		{"invokejs without a browser", map[string]any{
+			"url": "https://example.com", "invokejs": "_invokejs_done(1)"}},
 	}
 	for _, testCase := range cases {
 		res := tool.Execute(context.Background(), testCase.args)
@@ -227,8 +293,13 @@ func TestWebFetchToolDefaults(t *testing.T) {
 	if tool.cfg.Timeout != webFetchTimeoutDefault {
 		t.Errorf("timeout = %s, want %s", tool.cfg.Timeout, webFetchTimeoutDefault)
 	}
-	if tool.cfg.MaxLines != WebFetchMaxLinesDefault || WebFetchMaxLinesDefault != 200 {
+	if tool.cfg.MaxLines != WebFetchMaxLinesDefault || WebFetchMaxLinesDefault != 100 {
 		t.Errorf("max lines = %d, want the built-in %d", tool.cfg.MaxLines, WebFetchMaxLinesDefault)
+	}
+	// The model reads where a long page is put, which is the directory a fetch
+	// keeps its pages in below the agent's own directory.
+	if !strings.Contains(tool.Description(), ".lightagent/webfetch") {
+		t.Errorf("the description must name where a long page is saved:\n%s", tool.Description())
 	}
 }
 
@@ -360,9 +431,17 @@ func TestWebFetchToolRefusesContentThatIsNotAPage(t *testing.T) {
 	}
 }
 
-// TestWebFetchToolCutsLongFeedbackAndSavesThePage pins the feedback limit: the
-// markdown of a long page is cut, the whole markdown is written below .lightagent
-// in the working directory, and the answer reports the totals and the path.
+// webfetchSavedPages is the directory below the working directory a fetch keeps
+// the pages it writes in, and the pattern that finds one of them.
+func webfetchSavedPages(suffix string) string {
+	return filepath.Join(".lightagent", "webfetch", "*"+suffix)
+}
+
+// TestWebFetchToolCutsLongFeedbackAndSavesThePage pins the feedback limit of a
+// page that declares no main content: the middle of its markdown is fed back
+// with the lines left out marked, the whole markdown is written below
+// .lightagent/webfetch in the working directory, and the answer reports the
+// totals, the choice and the path.
 func TestWebFetchToolCutsLongFeedbackAndSavesThePage(t *testing.T) {
 	t.Chdir(t.TempDir())
 	server := webfetchLongPageServer(t)
@@ -372,24 +451,37 @@ func TestWebFetchToolCutsLongFeedbackAndSavesThePage(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("Execute reported an error: %s", res.ForLLM)
 	}
-	// The status line before the separator explains the cut; the body itself is
-	// the first five lines of the markdown.
+	// The status line before the separator explains the cut; the body is the
+	// middle five lines of the markdown, with what was left out marked.
 	status, body, found := strings.Cut(res.ForLLM, "\n---\n\n")
 	if !found {
 		t.Fatalf("the answer is missing the body separator:\n%s", res.ForLLM)
 	}
-	for _, want := range []string{"longer than the 5 line feedback limit", "lines /", "bytes"} {
+	for _, want := range []string{
+		"longer than the 5 line feedback limit", "lines /", "bytes",
+		"no main content could be located", "the middle ",
+	} {
 		if !strings.Contains(status, want) {
 			t.Errorf("the status line is missing %q:\n%s", want, status)
 		}
 	}
-	if got := countLines(body); got != 5 {
-		t.Errorf("the body holds %d lines, want the configured 5:\n%s", got, body)
+	lines := strings.Split(body, "\n")
+	// A marker above, the lines of the window, and a marker below; the window
+	// holds the configured five lines unless it would open or close on a blank
+	// one.
+	if len(lines) < 3 || len(lines) > 7 {
+		t.Fatalf("the body holds %d lines, want the markers and at most the configured 5:\n%s", len(lines), body)
+	}
+	if !strings.HasPrefix(lines[0], "...(above: ") || !strings.HasPrefix(lines[len(lines)-1], "...(below: ") {
+		t.Errorf("the body must mark the lines it left out above and below:\n%s", body)
+	}
+	if len(lines[1:len(lines)-1]) < 1 || strings.TrimSpace(lines[1]) == "" {
+		t.Errorf("the body must open on content, not on a blank line:\n%s", body)
 	}
 	if strings.Contains(body, "Section 60") {
-		t.Errorf("the body should hold the beginning of the page only:\n%s", body)
+		t.Errorf("the body must not hold the end of the page:\n%s", body)
 	}
-	matches, err := filepath.Glob(filepath.Join(".lightagent", "webfetch-*.md"))
+	matches, err := filepath.Glob(webfetchSavedPages(".md"))
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
@@ -414,10 +506,93 @@ func TestWebFetchToolCutsLongFeedbackAndSavesThePage(t *testing.T) {
 	if strings.Contains(string(saved), "<h2>") {
 		t.Error("the overflow file must not hold the HTML source")
 	}
-	// It is the same text as the feedback, so it continues exactly where the
-	// feedback was cut.
-	if !strings.HasPrefix(string(saved), body) {
-		t.Errorf("the overflow file must begin with the markdown that was fed back:\n%s", saved)
+	// The file carries neither the markers nor anything else the cut added: the
+	// lines the answer shows are a window of it, so the rest is read from there.
+	if strings.Contains(string(saved), "...(") {
+		t.Errorf("the overflow file must hold the page itself, not the answer's markers:\n%s", saved)
+	}
+	kept := strings.Join(lines[1:len(lines)-1], "\n")
+	if !strings.Contains(string(saved), kept) {
+		t.Errorf("the lines the answer carries must be a window of the whole page:\n%s", body)
+	}
+	if strings.Contains(kept, "Section 1\n") {
+		t.Errorf("the middle of the page, not its beginning, must be carried:\n%s", body)
+	}
+}
+
+// TestWebFetchToolCarriesTheMainContentOfALongPage pins what a long page is
+// answered with when its content can be told apart from its chrome: the article
+// alone, with the navigation, the sidebar and the footer replaced by a marker
+// each, the start of the content named, and the whole page on disk.
+func TestWebFetchToolCarriesTheMainContentOfALongPage(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server := webfetchLongArticleServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second, MaxLines: 5})
+
+	res := tool.Execute(context.Background(), map[string]any{"url": server.URL})
+	if res.IsError {
+		t.Fatalf("Execute reported an error: %s", res.ForLLM)
+	}
+	status, body, found := strings.Cut(res.ForLLM, "\n---\n\n")
+	if !found {
+		t.Fatalf("the answer is missing the body separator:\n%s", res.ForLLM)
+	}
+
+	matches, err := filepath.Glob(webfetchSavedPages(".md"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("saved pages = %v (err %v), want exactly one overflow file", matches, err)
+	}
+	saved, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read the overflow file: %v", err)
+	}
+	pageLines := strings.Split(strings.TrimSpace(string(saved)), "\n")
+	wantStart := 0
+	for i, line := range pageLines {
+		if strings.HasPrefix(line, "# Deep dive") {
+			wantStart = i + 1
+			break
+		}
+	}
+	if wantStart == 0 {
+		t.Fatalf("the saved page holds no heading to anchor the content:\n%s", saved)
+	}
+
+	if !strings.Contains(status, "article.post-content") ||
+		!strings.Contains(status, fmt.Sprintf("located at line %d", wantStart)) {
+		t.Errorf("the status line must name the region and where it starts:\n%s", status)
+	}
+
+	lines := strings.Split(body, "\n")
+	if len(lines) < 4 {
+		t.Fatalf("the body holds %d lines, want markers around the content:\n%s", len(lines), body)
+	}
+	// The chrome is gone, replaced by markers that say how much of it there was.
+	for _, unwanted := range []string{"Navigation entry", "Sidebar entry", "Footer text"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("the body must leave the chrome out, found %q:\n%s", unwanted, body)
+		}
+	}
+	if !strings.Contains(lines[0], "omitted — navigation, sidebars or banner") {
+		t.Errorf("the body must mark the chrome above the content:\n%s", body)
+	}
+	if lines[2] != "# Deep dive" {
+		t.Errorf("the content must start at its own first line, got %q:\n%s", lines[2], body)
+	}
+	if !strings.Contains(body, "the main content continues: ") {
+		t.Errorf("a cut inside the content must be marked:\n%s", body)
+	}
+	if !strings.HasPrefix(lines[len(lines)-1], "...(below: ") {
+		t.Errorf("the body must mark the footer it left out:\n%s", body)
+	}
+	if !strings.Contains(lines[len(lines)-1], "footer, related links or comments") {
+		t.Errorf("the marker below must say what such a stretch holds:\n%s", body)
+	}
+	// The chrome is still in the file, so nothing was lost.
+	for _, want := range []string{"Navigation entry 1", "Sidebar entry 1", "Footer text of the site."} {
+		if !strings.Contains(string(saved), want) {
+			t.Errorf("the saved page must hold the whole page, missing %q", want)
+		}
 	}
 }
 
@@ -456,7 +631,7 @@ func TestWebFetchToolBrowserProfileIsLocal(t *testing.T) {
 	for _, mode := range rendering {
 		tool := NewWebFetchTool(WebFetchConfig{Mode: mode})
 		var opts utils.WebFetchOptions
-		for _, opt := range tool.fetchOptions(5 * time.Second) {
+		for _, opt := range tool.fetchOptions(5*time.Second, "") {
 			opt(&opts)
 		}
 		if !strings.HasSuffix(opts.Browser.UserDataDir, want) {
@@ -473,7 +648,7 @@ func TestWebFetchToolBrowserProfileIsLocal(t *testing.T) {
 	for _, mode := range []utils.FetchMode{utils.FetchModeChromeAttached, utils.FetchModeHTTP} {
 		tool := NewWebFetchTool(WebFetchConfig{Mode: mode})
 		var opts utils.WebFetchOptions
-		for _, opt := range tool.fetchOptions(5 * time.Second) {
+		for _, opt := range tool.fetchOptions(5*time.Second, "") {
 			opt(&opts)
 		}
 		if opts.Browser.UserDataDir != "" {
@@ -618,7 +793,7 @@ func TestWebFetchToolWiresTheBrowserMode(t *testing.T) {
 	for _, tc := range cases {
 		tool := NewWebFetchTool(WebFetchConfig{Mode: tc.mode, AttachEndpoint: "127.0.0.1:9333"})
 		var opts utils.WebFetchOptions
-		for _, opt := range tool.fetchOptions(5 * time.Second) {
+		for _, opt := range tool.fetchOptions(5*time.Second, "") {
 			opt(&opts)
 		}
 		if opts.Mode != tc.mode {
@@ -633,5 +808,269 @@ func TestWebFetchToolWiresTheBrowserMode(t *testing.T) {
 		if got := opts.Browser.UserDataDir != ""; got != tc.profile {
 			t.Errorf("mode %q: own profile = %v, want %v", tc.mode, got, tc.profile)
 		}
+	}
+}
+
+// TestWebFetchToolSavesThePageAsHTML pins the method that keeps the page out of
+// the answer: the fetched HTML lands in the working directory, and the answer
+// reports its path and size instead of its content.
+func TestWebFetchToolSavesThePageAsHTML(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server := webfetchPageServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
+
+	res := tool.Execute(context.Background(),
+		map[string]any{"url": server.URL + "/docs", "method": "save_as_html"})
+	if res.IsError {
+		t.Fatalf("Execute reported an error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "Getting started") {
+		t.Errorf("the answer must not carry the page:\n%s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "\n---\n\n") {
+		t.Errorf("an answer without content carries no body separator:\n%s", res.ForLLM)
+	}
+	for _, want := range []string{"Saved ", "as HTML to ", "method save_as_html"} {
+		if !strings.Contains(res.ForLLM, want) {
+			t.Errorf("the status line is missing %q:\n%s", want, res.ForLLM)
+		}
+	}
+	matches, err := filepath.Glob(webfetchSavedPages(".html"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("saved pages = %v (err %v), want exactly one HTML file", matches, err)
+	}
+	if !strings.Contains(res.ForLLM, matches[0]) || !strings.Contains(res.ForUser, matches[0]) {
+		t.Errorf("the path %s must be reported to the model and the caller:\n%s\n%s",
+			matches[0], res.ForLLM, res.ForUser)
+	}
+	saved, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read the saved HTML: %v", err)
+	}
+	// The file holds the HTML the fetch got, not the markdown of it.
+	for _, want := range []string{"<h1>Getting started</h1>", "/docs/install"} {
+		if !strings.Contains(string(saved), want) {
+			t.Errorf("the saved HTML is missing %q:\n%s", want, saved)
+		}
+	}
+	if strings.Contains(string(saved), "# Getting started") {
+		t.Errorf("the saved HTML must not hold markdown:\n%s", saved)
+	}
+	// An inline image is what would not fit in a context: the file carries the
+	// marker instead of the payload, and the status line says so.
+	if strings.Contains(string(saved), "QUJDREVG") {
+		t.Errorf("the payload of an inline image must not be saved:\n%s", saved)
+	}
+	if !strings.Contains(string(saved), `src="data:image/png;base64,omitted-8B"`) {
+		t.Errorf("the saved HTML must carry the marker of the inline image:\n%s", saved)
+	}
+	if !strings.Contains(res.ForLLM, "1 inline data URIs were replaced by short markers (8 B of payload left out)") {
+		t.Errorf("the status line must report what was left out:\n%s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, fmt.Sprintf("(%d chars)", len(saved))) {
+		t.Errorf("the status line must report the size of the file (%d chars):\n%s", len(saved), res.ForLLM)
+	}
+}
+
+// TestWebFetchToolSavesThePageAsMarkdown pins the other saving method: the
+// markdown of the whole page goes to a file and the answer reports its path,
+// line count and size instead of the text.
+func TestWebFetchToolSavesThePageAsMarkdown(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server := webfetchPageServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
+
+	res := tool.Execute(context.Background(),
+		map[string]any{"url": server.URL + "/docs", "method": "save_as_md"})
+	if res.IsError {
+		t.Fatalf("Execute reported an error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "Getting started") {
+		t.Errorf("the answer must not carry the markdown:\n%s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "\n---\n\n") {
+		t.Errorf("an answer without content carries no body separator:\n%s", res.ForLLM)
+	}
+	for _, want := range []string{"as markdown to ", "method save_as_md", "lines /"} {
+		if !strings.Contains(res.ForLLM, want) {
+			t.Errorf("the status line is missing %q:\n%s", want, res.ForLLM)
+		}
+	}
+	matches, err := filepath.Glob(webfetchSavedPages(".md"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("saved pages = %v (err %v), want exactly one markdown file", matches, err)
+	}
+	saved, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read the saved markdown: %v", err)
+	}
+	for _, want := range []string{"# Getting started", "[the guide](/docs/install)"} {
+		if !strings.Contains(string(saved), want) {
+			t.Errorf("the saved markdown is missing %q:\n%s", want, saved)
+		}
+	}
+	if got := countLines(strings.TrimSpace(string(saved))); !strings.Contains(res.ForLLM,
+		fmt.Sprintf("(%d lines / %d chars)", got, len(saved))) {
+		t.Errorf("the status line must report %d lines and %d chars:\n%s", got, len(saved), res.ForLLM)
+	}
+}
+
+// TestWebFetchToolIgnoresTheContent pins the method that asks for the side
+// effect only: the page is fetched, nothing is written and nothing of it reaches
+// the answer.
+func TestWebFetchToolIgnoresTheContent(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server := webfetchPageServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
+
+	res := tool.Execute(context.Background(),
+		map[string]any{"url": server.URL + "/docs", "method": "ignore"})
+	if res.IsError {
+		t.Fatalf("Execute reported an error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "Getting started") || strings.Contains(res.ForLLM, "\n---\n\n") {
+		t.Errorf("the answer must carry no content:\n%s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "not returned") || !strings.Contains(res.ForLLM, "method ignore") {
+		t.Errorf("the status line must say that the content was not returned:\n%s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, server.URL+"/docs") {
+		t.Errorf("the status line must name the address that was fetched:\n%s", res.ForLLM)
+	}
+	if _, err := os.Stat(".lightagent"); !os.IsNotExist(err) {
+		t.Errorf("no file may be written by a call that ignores the content (stat: %v)", err)
+	}
+}
+
+// TestWebFetchToolReportsAFailedSave pins what a call whose page could not be
+// written gets: an error result that says so — the call did not do what it was
+// asked to do, and the model must not believe the file is there.
+func TestWebFetchToolReportsAFailedSave(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	// A file where the directory of saved pages belongs: the write cannot work.
+	if err := os.WriteFile(filepath.Join(dir, ".lightagent"), []byte("in the way"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := webfetchPageServer(t)
+	tool := newMarkdownWebFetchTool(WebFetchConfig{Timeout: 10 * time.Second})
+
+	res := tool.Execute(context.Background(),
+		map[string]any{"url": server.URL + "/docs", "method": "save_as_md"})
+	if !res.IsError {
+		t.Fatalf("Execute = %+v, want an error for a page that could not be saved", res)
+	}
+	if !strings.Contains(res.ForLLM, "could not be saved") {
+		t.Errorf("the error must say that the page could not be saved:\n%s", res.ForLLM)
+	}
+}
+
+// TestInvokeBlockPrecedesTheAnswer pins where what a script reported lands: ahead
+// of everything else, with a script that failed or ran out of time saying why
+// nothing is there, and a script that reported nothing leaving no trace at all.
+func TestInvokeBlockPrecedesTheAnswer(t *testing.T) {
+	cases := []struct {
+		name string
+		page utils.WebFetchResult
+		want string
+	}{
+		{"a value", utils.WebFetchResult{InvokeInfo: "session=abc123"},
+			"invokejs return info:\nsession=abc123\n\n"},
+		{"a script that failed", utils.WebFetchResult{InvokeNote: "the script failed before calling _invokejs_done: boom"},
+			"invokejs return info: none — the script failed before calling _invokejs_done: boom\n\n"},
+		{"a script that never reported", utils.WebFetchResult{},
+			""},
+	}
+	for _, tc := range cases {
+		if got := invokeBlock(tc.page); got != tc.want {
+			t.Errorf("%s: invokeBlock = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	// A value is what the answer opens with, before its status line.
+	answer := invokeBlock(utils.WebFetchResult{InvokeInfo: "session=abc123"}) + "Conversion succeeded."
+	if !strings.HasPrefix(answer, "invokejs return info:\nsession=abc123\n\n") {
+		t.Errorf("the reported value must open the answer:\n%s", answer)
+	}
+}
+
+// TestWebFetchToolPassesTheScriptToTheFetcher pins the wiring of invokejs: the
+// script of the call reaches the fetcher, and a call without one asks for none.
+func TestWebFetchToolPassesTheScriptToTheFetcher(t *testing.T) {
+	tool := NewWebFetchTool(WebFetchConfig{Mode: utils.FetchModeChromeHeadless})
+
+	var withScript utils.WebFetchOptions
+	for _, opt := range tool.fetchOptions(30*time.Second, "_invokejs_done(document.cookie)") {
+		opt(&withScript)
+	}
+	if withScript.InvokeJS != "_invokejs_done(document.cookie)" {
+		t.Errorf("InvokeJS = %q, want the script of the call", withScript.InvokeJS)
+	}
+
+	var withoutScript utils.WebFetchOptions
+	for _, opt := range tool.fetchOptions(30*time.Second, "") {
+		opt(&withoutScript)
+	}
+	if withoutScript.InvokeJS != "" {
+		t.Errorf("InvokeJS = %q, want none for a call without a script", withoutScript.InvokeJS)
+	}
+}
+
+// TestWebFetchToolAdvertisesTheMethodAndTheScript pins what the model reads about
+// the two arguments: a rendering tool offers both, and a tool that reads the
+// source only offers the methods but no script, which it could never run.
+func TestWebFetchToolAdvertisesTheMethodAndTheScript(t *testing.T) {
+	properties := func(cfg WebFetchConfig) map[string]any {
+		t.Helper()
+		props, ok := NewWebFetchTool(cfg).Parameters()["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("the schema of %+v carries no properties", cfg)
+		}
+		return props
+	}
+
+	rendering := properties(WebFetchConfig{Mode: utils.FetchModeChromeHeadless})
+	method, ok := rendering["method"].(map[string]any)
+	if !ok {
+		t.Fatal("a rendering tool must offer the method argument")
+	}
+	enum, ok := method["enum"].([]string)
+	if !ok || len(enum) != len(webFetchMethods) {
+		t.Fatalf("method enum = %v, want %v", method["enum"], webFetchMethodNames())
+	}
+	for i, want := range webFetchMethodNames() {
+		if enum[i] != want {
+			t.Errorf("method enum[%d] = %q, want %q", i, enum[i], want)
+		}
+	}
+	if method["default"] != string(webFetchMethodMarkdown) {
+		t.Errorf("method default = %v, want %q", method["default"], webFetchMethodMarkdown)
+	}
+	if description, _ := method["description"].(string); !strings.Contains(description, "ignore") {
+		t.Errorf("the method description must explain every value: %s", description)
+	}
+	script, ok := rendering["invokejs"].(map[string]any)
+	if !ok {
+		t.Fatal("a tool that renders must offer the invokejs argument")
+	}
+	scriptDescription, _ := script["description"].(string)
+	for _, want := range []string{"_invokejs_done", webFetchInvokeHeader, "undefined"} {
+		if !strings.Contains(scriptDescription, want) {
+			t.Errorf("the invokejs description is missing %q: %s", want, scriptDescription)
+		}
+	}
+	if !strings.Contains(NewWebFetchTool(WebFetchConfig{Mode: utils.FetchModeChromeHeadless}).Description(),
+		"invokejs") {
+		t.Error("the description of a tool that renders must name the script argument")
+	}
+
+	sourceOnly := properties(WebFetchConfig{Mode: utils.FetchModeHTTP})
+	if _, ok := sourceOnly["method"]; !ok {
+		t.Error("a tool that reads the source must offer the method argument as well")
+	}
+	if _, ok := sourceOnly["invokejs"]; ok {
+		t.Error("a tool that never renders must not offer an argument it would refuse")
+	}
+	if strings.Contains(NewWebFetchTool(WebFetchConfig{Mode: utils.FetchModeHTTP}).Description(), "invokejs") {
+		t.Error("a tool that never renders must not speak of a script")
 	}
 }

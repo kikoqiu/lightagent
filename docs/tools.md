@@ -296,6 +296,11 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
 |------|------|------|------|
 | `url` | string | 必填 | 页面地址（`http`/`https`；缺 scheme 时按 `https` 处理） |
 | `timeout` | int | `webfetch.timeout_seconds` | 整次抓取的秒数上限（渲染、加载与转换都算在内）。实际取值不会小于 30 秒，详情见下 |
+| `method` | string | `fetch_as_md` | 反馈里放什么：`fetch_as_md`（默认，正文 Markdown）/ `save_as_html` / `save_as_md` / `ignore`，见[四种反馈方式](#四种反馈方式method) |
+| `invokejs` | string | 空 | 页面加载完、抓取内容**之前**在页面里执行的 JavaScript（**只有浏览器取法支持**，见 [invokejs：在页面里跑脚本](#invokejs在页面里跑脚本)）。给 `http` 模式的工具时直接报参数错误，schema 里也不会出现这个参数 |
+
+* `method` 与 `invokejs` 都不会改变取页面的方式（`mode` 仍然是唯一的取法来源），它们只决定**抓到之后做什么**。
+* `invokejs` 是空字符串或省略时等于没给；给了就要求这次抓取真的渲染（`auto` 回退到源码时**不算成功**，见下）。
 
 * `timeout` 参数：工具 schema 的 `default` 就是配置的 `tools.webfetch.timeout_seconds`，描述里直接写出该秒数以及**下限**，
   模型因此知道一次抓取实际能拿到多少时间。**实际超时不会小于 30 秒**（`webFetchTimeoutDefault`）：配置值或参数值更小时
@@ -322,13 +327,13 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
   连接到了一个**使用者正在使用的浏览器**（只说这一点，不提 DevTools 端点这类技术细节），所以带上它的登录态、
   Cookie 与会话。只取源码的 `http` 模式描述里不会出现浏览器。
 * **加载完成之后的等待**（`internal/utils/webfetch.go`）：页面 `readyState` 到 `complete` 后**不立刻抓 DOM** ——
-  先等 **500ms**（宽限：不少站点的首个 AJAX 在 load 之后才发起），再判断**网络空闲**（连续 500ms 内既没有新请求、
-  也没有请求结束；已经发出的请求以它的**结束**事件算作活动），空闲后**再等 500ms**（让最后一次响应触发的 DOM 更新落地），
+  先等 **1000ms**（宽限：不少站点的首个 AJAX 在 load 之后才发起），再判断**网络空闲**（连续 1000ms 内既没有新请求、
+  也没有请求结束；已经发出的请求以它的**结束**事件算作活动），空闲后**再等 1000ms**（让最后一次响应触发的 DOM 更新落地），
   然后才序列化 DOM —— 这是"运行时才生成的内容也能读到"在 SPA / 延迟加载页上的落点。
   判定只看**本页自己的协议会话**：跨域 iframe（OOPIF）有独立会话，其中的请求不计入。
   判定有**上限**：最多再等 4 个空闲窗口、且不少于 5s（`WebFetchNetworkIdleLimitDefault`），并且**永不占用整次抓取的
   最后 2s**（留给 DOM 序列化）；一直有流量的页面（聊天、直播、定时上报）到点就带着**现有 DOM** 返回，并在备注里写明
-  「the network was still busy …」，而不是把整次抓取耗光后报错。代价是每次**渲染**抓取多花约 1.5s。
+  「the network was still busy …」，而不是把整次抓取耗光后报错。代价是每次**渲染**抓取多花约 3s。
   页面没能在 `load_timeout` 内加载完（`Loaded=false`）时**不做这个等待**，直接抓现有 DOM；`http` 模式（只取源码）也没有等待。
   内部 API：`WithFetchNetworkIdle(d)` 改这个值（宽限与收尾同用它），`0` 表示完全不等待。
 * `auto`、`chrome-headful`、`chrome-headless` 三种**会自己启动浏览器**的模式一律使用 **agent 自己的 profile**
@@ -361,32 +366,122 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
 
 * 其余配置：`browser_path`（渲染用的浏览器可执行文件，空则自动探测）、`user_agent`（两条路径共用的
   UA，空则各用默认）、`max_bytes`（HTTP 源码的字节上限，`0` 用内置 8 MiB）。
-* 转换用 `internal/utils/html_converter.go`（`Html2MdConvert`，`BaseURL` 取**重定向后的** `FinalURL`，
-  相对链接因此被补成绝对地址）。
+* 转换用 `internal/utils/html_converter.go`（`Html2MdConvert`，`BaseURL` 取**重定向后的** `FinalURL`），
+  相对链接因此有确定的基准。webfetch 打开两个转换开关：
+  * **链接写成站内路径**（`WithRelativeLinks`）：指向页面**同一个站点**（同 scheme + 同 host）的链接
+    一律写成根相对路径 —— 路径 + query + fragment，例如 `/docs/other.txt`、`/up.html?x=1#top`；
+    指向别的站点、或别的协议（`mailto:` / `tel:`）的链接保持绝对地址，纯 `#fragment` 也保持原样。
+    因此 Markdown 里不再重复本站地址，而状态行会写出**这次抓的地址**（`source: <FinalURL>`），
+    模型据此就知道相对路径是相对谁。
+  * **正文定位**（`WithMainContentSelection`）：转换器按页面自己的声明挑出正文容器（`<main>`、
+    `role="main"`、`<article>`，或 `class`/`id` 里带 `content` / `post-content` / `markdown-body` /
+    `entry-content` 等名字的块），把标记为**导航/侧栏/页脚/评论/广告/菜单**（`nav`、`sidebar`、
+    `header`、`footer`、`comment`、`ad`…）的名字排除在外；候选取文本最多的那个，并在它里面继续收窄
+    （包着一层壳的 `<main>` 取里面的 `<article>`；壳自己只多出一个标题时保留壳，标题也一起读）。
+    定位结果以 `ContentRegion`（`Located` / `Label` / `StartLine` / `LineCount` / `Markdown`）返回，
+    行号是**整篇 Markdown 里**的行号，因此能直接指到落盘文件的位置。
 * 工具返回的就是它的返回值（下面这段文本），与其他工具一样作为普通 tool 反馈记录：
 
   ```
-  Conversion succeeded. Converter warnings (if any): <html_converter 的告警，无则 none>
+  Conversion succeeded (source: <FinalURL>). Converter warnings (if any): <html_converter 的告警，无则 none>
+  [超长时追加：这一段取的是哪一部分、总行数/总字节、落盘文件路径]
   ---
 
-  <Markdown 正文，最多 max_lines 行>
+  <Markdown 正文，最多 max_lines 行；被省略的行用标记代替>
   ```
 
+  * 状态行里的 `source:` 是**这次抓取最终的地址**（重定向后），正文里的站内链接就是相对它写的。
   * 告警来自转换器（未知标签、片段包裹等），拼在同一行里。
   * 抓取失败、转换失败、内容不是网页/文本或页面没有可读内容时返回**错误结果**。
   * CLI/网页的展示行是简短一行（地址、取法、行数、字符数、耗时、取页面时的备注），不打印整篇正文。
+  * 给了 `invokejs` 且脚本报了值时，`invokejs return info:` 那一段在最前面，状态行与正文在它之后。
 
-### 反馈长度与落盘（`tools.webfetch.max_lines`）
+### 四种反馈方式（`method`）
 
-正文默认最多 `max_lines`（`200`）行，避免一次抓取把上下文塞满：
+* `fetch_as_md`（默认）：就是上面那段 —— 正文 Markdown（最多 `max_lines` 行，见下）。
+* `save_as_md`：把**整页的 Markdown**（与默认方式同一份转换结果，因此站内链接同样是根相对路径）写到工作目录的
+  `.lightagent/webfetch/<时间戳>.md`，反馈里**只有状态行**：路径、行数与字符数，正文一个字都不进上下文
+  （需要时用 `read_file_lines` 分页读）。适合"先把页面存下来、稍后再读"。
+* `save_as_html`：把这次抓到的 **HTML 原文**写到 `.lightagent/webfetch/<时间戳>.html`，反馈同样的状态行（路径 + 字符数）。
+  浏览器取法存的是**渲染后的 DOM**（含运行时生成的内容），`http` 取法存的是服务器源码 —— 就是给模型看的那份 HTML，
+  不做任何链接改写。**这一种方式不做 Markdown 转换**（因此也不会因为"没有可读正文"而失败）。
+* `ignore`：什么都不回填，只有状态行（地址、内容类型）。适合"这次调用是为了副作用"（拿脚本的值、预热登录态）。
 
-* 不超过限制：正文原样进上下文，没有任何额外说明。
-* 超过限制：只回填**前 N 行**，状态行多一句"超长"说明 —— 该页共多少行、多少字节，
-  以及整页保存的**文件路径**；整页（**Markdown 正文**，与反馈是同一份转换结果）写到**工作目录**的
-  `.lightagent/webfetch-<时间戳>.md`（同秒多次抓取自动加序号，不覆盖）。
-  模型需要全文时用 `read_file_lines` 分页读该文件即可 —— 文件正好接在反馈截断处继续，不用再转换一次。
-* `max_lines` 为**负数**表示不限长度：整页正文照原样回填，也不落盘（`max_lines` 为 `0` 用内置 200）。
-* 落盘失败（目录不可写等）时仍然只回填前 N 行，并在状态行里报告失败原因 —— 抓取结果不会被丢掉。
+四种方式都**照常处理 `invokejs`**（脚本的报告永远在反馈最前面），也都可以配 `timeout`；`save_*` 与 `ignore`
+不受 `max_lines` 影响（它们本来就不回填正文）。写出来的页面都在工作目录的 **`.lightagent/webfetch/`** 下 ——
+一个 fetch 自己的目录，与浏览器 profile（`.lightagent/browser-profile`）和会话文件分开放；文件以抓取时刻命名
+（`<时间戳>.md` / `.html`），同名同秒自动加序号，不覆盖。
+
+### `invokejs`：在页面里跑脚本
+
+`invokejs` 是一段 JavaScript，在**页面加载完成之后、抓取内容之前**执行，用来取出"只有页面自己的 JS 才拿得到"
+的东西（`document.cookie`、`localStorage` 里的 token、框架内部状态），好让后续命令用**和浏览器一样的身份**去
+下载文件、调接口。**只有浏览器取法支持**：`tools.webfetch.mode` 为 `http` 时参数直接报错（schema 里也不会列出
+这个参数），`auto` 模式在没有可用浏览器时**不退回源码**，而是把"需要浏览器来跑脚本"作为抓取失败报出来。
+
+执行约定：
+
+* 抓取前会在页面里注入一个全局函数 **`_invokejs_done(value)`**（非枚举属性：`for…in` 与 `Object.keys(window)`
+  都看不到它，页面正常遍历自己的全局不会撞上它）。脚本**必须调用它**来结束这次调用。
+* 脚本跑在一个 async 函数里，所以可以直接 `await`（例如
+  `const r = await fetch('/token'); _invokejs_done(await r.text());`），也可以 `return`（返回不影响等待）。
+* **这个模式下不再等网络空闲**（见上文那段等待）：需要什么由脚本自己去要，时间全交给脚本。
+* 等待窗口 = **这次抓取剩下的时间**（扣掉留给 DOM 序列化的 2s）；抓取本身没有超时上限时用
+  20s（`WebFetchInvokeJSWaitDefault`）。脚本一直不调用时，到点按"等待超时"反馈，页面照常抓回来。
+* 报告的值随抓取结果返回（`WebFetchResult.InvokeInfo` / `InvokeNote`），工具把它放在**反馈最前面**：
+
+  ```
+  invokejs return info:
+  <脚本报告的值>
+
+  <其余原始返回内容>
+  ```
+
+  * 值原样回填：**字符串**就是脚本写的那串字符（Cookie 头可以直接给 `exec_command` 用），
+    其他值（对象/数组/数字）是它的 JSON。
+  * `undefined`、`null` 或空串**什么都不反馈**：连 `invokejs return info:` 这行都不出现 —— 适合"脚本只做注册/预热"
+    的用法。
+  * 脚本**抛异常**时**立刻**反馈（不等窗口跑完）：
+    `invokejs return info: none — the script failed before calling _invokejs_done: <消息>`。
+  * 脚本**没调用**时到点反馈：
+    `invokejs return info: none — the script did not call _invokejs_done within <N>s`。
+  * 值会被截断到 **8 KiB**（并注明已截断），免得一个跑飞的值（整个 DOM、大型 store）把上下文冲掉。
+* 展示行会附一句 `invokejs: …`（报了值 / 超时原因），但**值本身只出现在给模型的反馈里**。
+
+### 反馈长度与正文定位（`tools.webfetch.max_lines`）
+
+**默认方式（`method=fetch_as_md`）**的正文默认最多 `max_lines`（`100`）行，避免一次抓取把上下文塞满。
+超过限制时**先试着只回填正文**（跳过导航、侧栏、页脚这些框架内容），定位不到正文才退化为回填整篇的中间一段：
+
+* **不超过限制**：正文原样进上下文，没有任何额外说明。
+* **超过限制且定位到正文**：回填正文那一段（不到 `max_lines` 行就整段回填），并在被跳过的地方
+  用标记说明省了多少行、正文从哪里开始：
+
+  ```
+  ...(above: 40 of 812 lines omitted — navigation, sidebars or banner)
+  <正文行，最多 max_lines 行>
+  ...(the main content continues: 71 of 176 lines omitted, the feedback limit is 100 lines)
+  ...(below: 636 of 812 lines omitted — footer, related links or comments)
+  ```
+
+* **超过限制且定位不到正文**（页面没声明正文，或声明的那块太小/全是链接）：回填**中间 `max_lines` 行**
+  （上下各留一半），上下的标记只写省略了多少行：
+
+  ```
+  ...(above: 356 of 812 lines omitted)
+  <中间 100 行>
+  ...(below: 356 of 812 lines omitted)
+  ```
+
+* 两种情况下状态行都追加一句"超长"说明：该页共多少行、多少字节，这次取的是哪一段（正文的
+  `标签名.类名` 与起始行号，或"中间的 N 行（第 X-Y 行）"），以及整页保存的**文件路径**。
+  整页（**Markdown 正文**，与反馈是同一份转换结果）写到**工作目录**的
+  `.lightagent/webfetch/<时间戳>.md`（同秒多次抓取自动加序号，不覆盖），
+  模型需要全文时用 `read_file_lines` 分页读该文件即可 —— 文件里的行号与状态行报的行号一致，
+  不用再转换一次。
+* `max_lines` 为**负数**表示不限长度：整页正文照原样回填，也不落盘（`max_lines` 为 `0` 用内置 100）。
+* 落盘失败（目录不可写等）时仍然只回填这一段（正文或中间几行）并带上标记，并在状态行里报告失败原因
+  —— 抓取结果不会被丢掉。
 
 ---
 

@@ -557,12 +557,7 @@ func (p *Page) Evaluate(ctx context.Context, expression string) (json.RawMessage
 		Result struct {
 			Value json.RawMessage `json:"value"`
 		} `json:"result"`
-		ExceptionDetails *struct {
-			Text      string `json:"text"`
-			Exception *struct {
-				Description string `json:"description"`
-			} `json:"exception"`
-		} `json:"exceptionDetails"`
+		ExceptionDetails *cdpExceptionDetails `json:"exceptionDetails"`
 	}
 	params := map[string]any{
 		"expression":    expression,
@@ -573,16 +568,105 @@ func (p *Page) Evaluate(ctx context.Context, expression string) (json.RawMessage
 		return nil, err
 	}
 	if result.ExceptionDetails != nil {
-		message := strings.TrimSpace(result.ExceptionDetails.Text)
-		if details := result.ExceptionDetails.Exception; details != nil && details.Description != "" {
-			message = firstLine(details.Description)
-		}
-		if message == "" {
-			message = "javascript error"
-		}
-		return nil, fmt.Errorf("javascript evaluation failed: %s", message)
+		return nil, fmt.Errorf("javascript evaluation failed: %s", result.ExceptionDetails.message())
 	}
 	return result.Result.Value, nil
+}
+
+// InvokeJSReport is the outcome of a script run by Page.InvokeJS.
+type InvokeJSReport struct {
+	// Value is the JSON of the value the script reported; it is empty (or the
+	// JSON null) when the script reported undefined.
+	Value json.RawMessage
+	// Failure is the message of the exception the script ended with, empty
+	// when it reported a value instead.
+	Failure string
+}
+
+// InvokeJS runs a script of the caller's in the page and returns what the script
+// reports through the _invokejs_done function this call defines on the window.
+//
+// The script ends the call by calling that function with a value; the value
+// travels back as JSON, so it has to be data (a string, a number, an object, an
+// array). A script that throws, or that never calls the function, leaves the
+// answer to the caller: the first reports Failure, the second only ends when the
+// context does.
+//
+// Nothing of the Runtime domain is enabled for this (see prepare): the script is
+// delivered with the Runtime.evaluate call every other read of the page already
+// uses, and the function it is handed is defined as a non-enumerable property of
+// the window, so a page that walks its own globals does not find it by accident.
+func (p *Page) InvokeJS(ctx context.Context, script string) (InvokeJSReport, error) {
+	if err := p.prepare(ctx); err != nil {
+		return InvokeJSReport{}, err
+	}
+	var answer struct {
+		Result struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"result"`
+		ExceptionDetails *cdpExceptionDetails `json:"exceptionDetails"`
+	}
+	params := map[string]any{
+		"expression":    invokeJSWrapper(script),
+		"returnByValue": true,
+		"awaitPromise":  true,
+	}
+	if err := p.call(ctx, "Runtime.evaluate", params, &answer); err != nil {
+		return InvokeJSReport{}, err
+	}
+	if answer.ExceptionDetails != nil {
+		return InvokeJSReport{}, fmt.Errorf("javascript evaluation failed: %s", answer.ExceptionDetails.message())
+	}
+	var report struct {
+		Info    json.RawMessage `json:"info"`
+		Failure string          `json:"failure"`
+	}
+	if err := json.Unmarshal(answer.Result.Value, &report); err != nil {
+		return InvokeJSReport{}, fmt.Errorf("the script reported a value that cannot be read: %w", err)
+	}
+	return InvokeJSReport{Value: report.Info, Failure: report.Failure}, nil
+}
+
+// invokeJSWrapper builds the expression InvokeJS evaluates: a promise that
+// settles when the script of the caller calls the function it is handed, or when
+// the script fails. The function is defined first and under the name the caller
+// writes (see Page.InvokeJS for how it is kept out of the way), and the script
+// runs inside an async function of its own, so it may await what it asks for and
+// may return without ending the wait — only the call to the function does that.
+// The promise settles with the failure of a script that threw, which is how such
+// a script is told apart from one that reports nothing.
+func invokeJSWrapper(script string) string {
+	return `new Promise(function (_report) {` +
+		`var _failure = function (error) { return error && error.message ? String(error.message) : String(error) };` +
+		`var _done = function (value) { Promise.resolve(value).then(function (v) {` +
+		`_report({ info: v }) }, function (error) { _report({ failure: _failure(error) }) }) };` +
+		`Object.defineProperty(window, "_invokejs_done", { value: _done, writable: true, configurable: true });` +
+		`(async function () {` + "\n" + script + "\n" + `})().catch(function (error) {` +
+		`_report({ failure: _failure(error) }) });` +
+		`})`
+}
+
+// cdpExceptionDetails is the exceptionDetails of a Runtime.evaluate answer.
+type cdpExceptionDetails struct {
+	Text      string `json:"text"`
+	Exception *struct {
+		Description string `json:"description"`
+	} `json:"exception"`
+}
+
+// message is the part of an exception that names the problem.
+func (d *cdpExceptionDetails) message() string {
+	if d == nil {
+		return ""
+	}
+	message := strings.TrimSpace(d.Text)
+	if details := d.Exception; details != nil && details.Description != "" {
+		message = firstLine(details.Description)
+	}
+	if message == "" {
+		message = "javascript error"
+	}
+	return message
 }
 
 // evaluateString runs a JavaScript expression that yields a string.

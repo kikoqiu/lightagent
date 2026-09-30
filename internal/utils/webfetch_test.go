@@ -2,6 +2,7 @@ package utils
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -319,6 +320,166 @@ func TestWebFetchSendsHeadersUserAgentAndCookies(t *testing.T) {
 	}
 }
 
+// invokeJSServer serves a page whose title and cookies are what a script of the
+// caller has to reach, plus an address that only a script asks for: the page
+// itself requests nothing, so a value that arrives from it proves the script
+// drove the fetch.
+func invokeJSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprint(w, "token-42")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: "abc123"})
+		fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Invokejs page</title></head><body>
+<h1>Invokejs page</h1>
+</body></html>`)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestWebFetchInvokesAScriptInThePage pins the script a caller can have run in
+// the loaded page: what it reports through _invokejs_done comes back as the info
+// of the result, undefined comes back as nothing, a failure of the script and a
+// script that never reports are told apart, and the page itself is still there.
+func TestWebFetchInvokesAScriptInThePage(t *testing.T) {
+	requireBrowser(t)
+	server := invokeJSServer(t)
+	t.Cleanup(func() { _ = CloseSharedBrowsers() })
+	profile := testProfileDir(t)
+
+	fetch := func(t *testing.T, script string, timeout time.Duration) WebFetchResult {
+		t.Helper()
+		result, err := WebFetch(testContext(t), server.URL+"/page",
+			WithFetchMode(FetchModeChromeHeadless),
+			WithFetchBrowser(BrowserOptions{UserDataDir: profile}),
+			WithFetchInvokeJS(script),
+			WithFetchTimeout(timeout), WithFetchSettle(200*time.Millisecond))
+		if err != nil {
+			t.Fatalf("WebFetch with invokejs %q: %v", script, err)
+		}
+		if !strings.Contains(result.HTML, "Invokejs page") {
+			t.Errorf("the page is missing from the result of %q", script)
+		}
+		return result
+	}
+
+	// A string is reported as the script wrote it, and the cookie of the page
+	// is exactly what such a script is for.
+	reported := fetch(t, `_invokejs_done(document.cookie)`, 45*time.Second)
+	if !strings.Contains(reported.InvokeInfo, "session=abc123") {
+		t.Errorf("InvokeInfo = %q, want the cookie of the page", reported.InvokeInfo)
+	}
+	if reported.InvokeNote != "" {
+		t.Errorf("InvokeNote = %q, want none for a script that reported", reported.InvokeNote)
+	}
+
+	// A script may await what it asks for: the wait for it replaces the wait
+	// for the network, so what it fetched is what it reports.
+	fetched := fetch(t, `const response = await fetch('/token'); _invokejs_done(await response.text());`,
+		45*time.Second)
+	if fetched.InvokeInfo != "token-42" {
+		t.Errorf("InvokeInfo = %q, want what the script fetched", fetched.InvokeInfo)
+	}
+
+	// Another value travels as the JSON of it.
+	object := fetch(t, `_invokejs_done({title: document.title, pressed: 1 === 1})`, 45*time.Second)
+	for _, want := range []string{`"title":"Invokejs page"`, `"pressed":true`} {
+		if !strings.Contains(object.InvokeInfo, want) {
+			t.Errorf("InvokeInfo = %q, want it to hold %s", object.InvokeInfo, want)
+		}
+	}
+
+	// The function is kept out of the way of the page: a page that walks its
+	// own globals does not run into it (the property is not enumerable).
+	hidden := fetch(t, `_invokejs_done([Object.keys(window).includes('_invokejs_done'), `+
+		`Object.getOwnPropertyDescriptor(window, '_invokejs_done').enumerable].join(','))`, 45*time.Second)
+	if hidden.InvokeInfo != "false,false" {
+		t.Errorf("the injected function must not be enumerable, got %q", hidden.InvokeInfo)
+	}
+
+	// undefined reports nothing at all.
+	empty := fetch(t, `_invokejs_done(undefined)`, 45*time.Second)
+	if empty.InvokeInfo != "" || empty.InvokeNote != "" {
+		t.Errorf("a script that reported undefined = %q / %q, want both empty",
+			empty.InvokeInfo, empty.InvokeNote)
+	}
+
+	// A script that throws says so, and does not hold the fetch for the whole
+	// window.
+	failed := fetch(t, `throw new Error('boom')`, 45*time.Second)
+	if !strings.Contains(failed.InvokeNote, "boom") {
+		t.Errorf("InvokeNote = %q, want the message of the exception", failed.InvokeNote)
+	}
+
+	// A script that never calls the function ends when the wait runs out, and
+	// the fetch still hands the page back.
+	silent := fetch(t, `window.forgot = true;`, 5*time.Second)
+	if !strings.Contains(silent.InvokeNote, "did not call _invokejs_done") {
+		t.Errorf("InvokeNote = %q, want the wait to be reported as run out", silent.InvokeNote)
+	}
+	if silent.InvokeInfo != "" {
+		t.Errorf("InvokeInfo = %q, want nothing for a script that never reported", silent.InvokeInfo)
+	}
+}
+
+// TestWebFetchWithoutABrowserRefusesAScript pins the boundary of the script: it
+// needs the page a browser builds, so a fetch that falls back to the source
+// reports the failure of the browser instead of quietly dropping the script.
+func TestWebFetchWithoutABrowserRefusesAScript(t *testing.T) {
+	server := invokeJSServer(t)
+	_, err := WebFetch(context.Background(), server.URL+"/page",
+		WithFetchChromePath(filepath.Join(t.TempDir(), "no-such-chrome")),
+		WithFetchInvokeJS(`_invokejs_done(1)`),
+		WithFetchTimeout(10*time.Second))
+	if err == nil {
+		t.Fatal("a fetch with a script and no browser must fail")
+	}
+	if !strings.Contains(err.Error(), "script") {
+		t.Errorf("error = %v, want it to name the script as the reason", err)
+	}
+}
+
+// TestInvokeInfoTextRendersWhatAScriptReported pins how a reported value travels
+// into the answer: a string stays what it is, other values are the JSON of them,
+// nothing is reported for undefined, null and an empty string, and a value that
+// ran away is cut instead of flooding the answer.
+func TestInvokeInfoTextRendersWhatAScriptReported(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"string", `"session=abc123"`, "session=abc123"},
+		{"string with escapes", `"a\nb"`, "a\nb"},
+		{"empty string", `""`, ""},
+		{"undefined", ``, ""},
+		{"null", `null`, ""},
+		{"object", `{"a":1}`, `{"a":1}`},
+		{"number", `42`, "42"},
+	}
+	for _, tc := range cases {
+		if got := invokeInfoText(json.RawMessage(tc.value)); got != tc.want {
+			t.Errorf("%s: invokeInfoText(%s) = %q, want %q", tc.name, tc.value, got, tc.want)
+		}
+	}
+
+	long := strings.Repeat("a", invokeInfoLimit+100)
+	cut := invokeInfoText(json.RawMessage(`"` + long + `"`))
+	if !strings.Contains(cut, "cut at") {
+		t.Errorf("a value beyond the limit must say that it was cut: %.60q", cut)
+	}
+	if len(cut) >= len(long) {
+		t.Errorf("the cut value must be shorter than the value itself: %d >= %d", len(cut), len(long))
+	}
+}
+
+// TestWebFetchRejectsUnusableURLs pins that an address the fetcher cannot use is
+// an error before anything is opened.
 func TestWebFetchRejectsUnusableURLs(t *testing.T) {
 	for _, raw := range []string{"", "   ", "ftp://example.com/x", "mailto:a@b.c", "http://"} {
 		if _, err := WebFetch(context.Background(), raw, WithFetchMode(FetchModeHTTP)); err == nil {

@@ -405,7 +405,7 @@ func TestWebFetchConfigDefaults(t *testing.T) {
 	if !w.Enabled || w.TimeoutSeconds != 30 {
 		t.Fatalf("webfetch defaults = %+v", w)
 	}
-	if w.MaxLines != WebFetchMaxLinesDefault || WebFetchMaxLinesDefault != 200 {
+	if w.MaxLines != WebFetchMaxLinesDefault || WebFetchMaxLinesDefault != 100 {
 		t.Fatalf("max_lines = %d, want the built-in %d", w.MaxLines, WebFetchMaxLinesDefault)
 	}
 	if w.Mode != WebFetchModeAuto || w.EffectiveMode() != WebFetchModeAuto {
