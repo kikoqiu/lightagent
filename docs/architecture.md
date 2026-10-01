@@ -57,7 +57,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
       以上「不完整答复」统一返回 `llm.IncompleteResponseError`（可用 `llm.IsIncompleteResponse`
       判定），目前一律以 `error` 结束回合；`runTurn` 的错误分支处已标注**预留的恢复挂载点**
       ——将来若要「把解析错误回喂模型、让它重发调用」，就在该处按这个判定分支（策略未定，暂不启用）。
-   6. 无 `tool_calls` 时：`finish_reason=length`（被 `max_tokens` 截断）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮（连续 3 次则停止）；否则回合结束——**但若此刻 `steerCh` 里还有消息**（流式过程中刚插入的），则本回合继续下一轮把它并入上下文，而不是结束回合。
+   6. 无 `tool_calls` 时：**回复只有思考**（可见正文 trim 后为空、无工具调用，**无论 `finish_reason` 是正常结束、`length` 截断、还是没有给出**）走「只有思考」通路——`agent.include_only_think` 决定是否记入历史，`agent.continue_only_think`（仅前者为真时生效）决定是否记一条 `info`（`the reply carried only thinking; asking the model again`）后带着这段思考再问一次模型，默认都开。其余 `finish_reason=length`（被 `max_tokens` 截断但**带了正文**）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮。**这两种自动续跑（只有思考 / `length` 截断）共用同一个连续计数**（`maxConsecutiveAutoContinues`=3）：连续 3 次即报 `error` 并结束回合，中途出现工具轮次会把计数清零。若此刻 `steerCh` 里还有消息（流式过程中刚插入的），本回合继续下一轮把它并入上下文。
    7. 逐个执行工具，发布 `tool_call` / `tool_result`，把结果作为 `tool` 消息追加；本轮结束后
       广播 `usage`（工具结果同样占用上下文），回到 2。tool 消息的正文就是工具函数的返回值
       （`res.ForLLM`），不加任何包装/信封；被中断的调用也在这条通路上记一条
@@ -91,8 +91,10 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 >     可能只含半条调用——丢弃数量以 `info`（消息已落库时写在 `interrupted` 文案里）说明；这种
 >     情况下调用是**从已记录的消息上摘掉**的，因此不会为任何调用记 tool 回答。随后发布
 >     `interrupted` 并结束回合。
->   * **正文 trim 后为空**（只流出了思考 / tool 调用）时整条 assistant 消息**不保留**：空 content
->     的消息对下一次请求毫无意义。用户消息仍留在历史里。
+>   * **正文 trim 后为空**时看 `agent.include_only_think`：开启（默认）且回复**流出了思考**时，思考作
+>     为一条 assistant 消息（`reasoning_content`，无正文）**保留**下来，其中携带的 tool 调用照旧全部
+>     丢弃；关闭、或思考也为空时整条 assistant 消息**不保留**——空 content 的消息对下一次请求毫无
+>     意义。用户消息仍留在历史里。
 >   * 连一个字符都没流出（严格处于「等模型」）：assistant 侧同样什么都不记，只发布
 >     `interrupted while waiting for the model; nothing had been produced`。
 >   * **用户消息在任何中断下都保留**：中断不会改写用户发过的东西，历史里始终留着那条 user 消息，

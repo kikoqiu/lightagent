@@ -66,6 +66,14 @@ type Agent struct {
 	// toolResultsVisible controls whether tool_result events are broadcast.
 	toolResultsVisible bool
 
+	// onlyThink handling: a reply that carried only the model's thinking (no
+	// visible text, no tool calls). includeOnlyThink keeps such a message in
+	// the history (agent.include_only_think); continueOnlyThink asks the model
+	// again instead of ending the turn (agent.continue_only_think) and only
+	// applies while includeOnlyThink is on.
+	includeOnlyThink  bool
+	continueOnlyThink bool
+
 	// cancelTurn cancels the turn in flight (nil while idle). Interrupt uses it
 	// to stop the current operation.
 	cancelTurn context.CancelFunc
@@ -124,6 +132,8 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		autoSplitWrites:    cfg.Tools.WriteFile.AutoSplit,
 		contextWindow:      contextWindow,
 		toolResultsVisible: true,
+		includeOnlyThink:   cfg.Agent.IncludeOnlyThink,
+		continueOnlyThink:  cfg.Agent.ContinueOnlyThink,
 		steerCh:            make(chan steerMessage, 64),
 	}
 	a.compactor = &compactor{
@@ -396,9 +406,13 @@ func (a *Agent) ToolResultsVisible() bool {
 	return a.toolResultsVisible
 }
 
-// maxConsecutiveTruncations bounds how many times one turn auto-continues after
-// the provider cut a response off at max_tokens (finish_reason "length").
-const maxConsecutiveTruncations = 3
+// maxConsecutiveAutoContinues bounds how many times one turn auto-continues
+// without a new user message: an only-thinking reply (while
+// agent.continue_only_think is on) and a reply the provider cut off at
+// max_tokens (finish_reason "length") share this one budget, so a model stuck
+// producing thinking alone — or never finishing inside max_tokens — cannot spin
+// the loop. A round that runs tools resets it.
+const maxConsecutiveAutoContinues = 3
 
 // userInput is one user message of a turn: its text plus the media parts it
 // carries (the files the web mirror attached to it; empty for plain input).
@@ -441,10 +455,11 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 	// message while the model call is still in flight.
 	a.bus.Publish(a.usageEvent())
 
-	// truncations counts how many responses in a row the provider cut off at
-	// max_tokens (finish_reason "length") and the loop auto-continued. A
-	// response that finishes normally resets it.
-	truncations := 0
+	// autoContinues counts the auto-continuations in a row this turn has made
+	// without a new user message: an only-thinking reply and a max_tokens
+	// truncation share the count (see maxConsecutiveAutoContinues). A tool
+	// round resets it.
+	autoContinues := 0
 	// overflowRecoveries counts how many times this turn recovered from a
 	// request the provider rejected for its size (see recoverContextOverflow).
 	overflowRecoveries := 0
@@ -520,56 +535,78 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		// history and the front-ends show the arguments that were executed.
 		continuations := a.autoSplitWriteCalls(resp.ToolCalls)
 
-		assistant := llm.Message{
-			Role:      "assistant",
-			Content:   resp.Content,
-			ToolCalls: resp.ToolCalls,
-			// Keep the thinking on the message so it is preserved in the
-			// history and sent back with the next request.
-			ReasoningContent: resp.Reasoning,
+		// A reply that carries only the model's thinking — no visible text and
+		// no tool calls — is not an answer, whatever the provider's
+		// finish_reason says (a normal stop, a cut-off at max_tokens, or no
+		// reason at all). agent.include_only_think decides whether it is
+		// recorded at all; agent.continue_only_think then decides whether the
+		// loop asks the model again, with the recorded thinking in front of it.
+		onlyThink := len(resp.ToolCalls) == 0 &&
+			strings.TrimSpace(resp.Content) == "" && strings.TrimSpace(resp.Reasoning) != ""
+
+		if !onlyThink || a.includeOnlyThink {
+			assistant := llm.Message{
+				Role:      "assistant",
+				Content:   resp.Content,
+				ToolCalls: resp.ToolCalls,
+				// Keep the thinking on the message so it is preserved in the
+				// history and sent back with the next request.
+				ReasoningContent: resp.Reasoning,
+			}
+			a.appendMessage(assistant)
+			if resp.Content != "" {
+				a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content})
+			}
+			// The assistant message just joined the context: refresh the usage so
+			// the badge reflects the provider's count plus this reply.
+			a.bus.Publish(a.usageEvent())
 		}
-		a.appendMessage(assistant)
-		if resp.Content != "" {
-			a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content})
-		}
-		// The assistant message just joined the context: refresh the usage so
-		// the badge reflects the provider's count plus this reply.
-		a.bus.Publish(a.usageEvent())
 
 		if len(resp.ToolCalls) == 0 {
-			if resp.Finish != "length" {
-				if a.steeringPending() {
-					// A steering message arrived while this reply was
-					// still streaming: the reply is not the end of the
-					// turn then, so the turn carries on. The next
-					// iteration folds the message into the context —
-					// announcing its row there, after this reply — and
-					// calls the model again.
-					continue
-				}
+			if a.steeringPending() {
+				// A steering message arrived while this reply was
+				// still streaming: the reply is not the end of the
+				// turn then, so the turn carries on. The next
+				// iteration folds the message into the context —
+				// announcing its row there, after this reply — and
+				// calls the model again.
+				continue
+			}
+			// Ask the model again without a new user message when the reply
+			// carried only thinking (and agent.continue_only_think is on) or
+			// the provider cut it off at max_tokens after some text. Both draw
+			// on the same budget: a run of such continuations stops the turn
+			// (see maxConsecutiveAutoContinues), so a model stuck producing
+			// nothing but thinking cannot spin the loop.
+			var retry string
+			switch {
+			case onlyThink && a.includeOnlyThink && a.continueOnlyThink:
+				retry = "the reply carried only thinking; asking the model again"
+			case onlyThink:
+				// Kept or dropped, the turn ends here: the configuration does
+				// not ask the model again.
+				return
+			case resp.Finish == "length":
+				retry = "response truncated at max_tokens; continuing"
+			default:
 				return
 			}
-			// The provider ran out of max_tokens, typically while the model was
-			// still thinking. The assistant message above — reasoning included,
-			// and with no new user message — stays in the history, and the
-			// model is called again so it can carry on from its own thinking.
-			truncations++
-			if truncations >= maxConsecutiveTruncations {
+			autoContinues++
+			if autoContinues >= maxConsecutiveAutoContinues {
 				a.bus.Publish(Event{
 					Type: EventError,
-					Text: fmt.Sprintf("stopped after %d consecutive truncations at max_tokens; raise openai.max_tokens",
-						truncations),
+					Text: fmt.Sprintf("stopped after %d consecutive continuations (only thinking or cut off at max_tokens); raise openai.max_tokens or turn off agent.continue_only_think",
+						autoContinues),
 				})
 				return
 			}
 			a.bus.Publish(Event{
 				Type: EventInfo,
-				Text: fmt.Sprintf("response truncated at max_tokens; continuing (%d/%d)",
-					truncations, maxConsecutiveTruncations),
+				Text: fmt.Sprintf("%s (%d/%d)", retry, autoContinues, maxConsecutiveAutoContinues),
 			})
 			continue
 		}
-		truncations = 0
+		autoContinues = 0
 
 		var pendingSplits []llm.ToolCall
 		for idx, tc := range resp.ToolCalls {
@@ -725,10 +762,10 @@ func (a *Agent) reportInterruptedTools(calls []llm.ToolCall, from int) {
 
 // finishUnstartedToolRound ends a tool round the user interrupted before its
 // first call could start. The reply keeps its text but loses every tool call it
-// carried, and the message goes too when that leaves it without text — an
-// assistant message without content has nothing to tell the next request. No tool
-// answer is recorded: the message no longer asks for anything, and the turn ends
-// here, so the model is never asked with these results.
+// carried, and the message goes too when that leaves it without text and without
+// thinking — an assistant message with nothing in it has nothing to tell the next
+// request. No tool answer is recorded: the message no longer asks for anything,
+// and the turn ends here, so the model is never asked with these results.
 func (a *Agent) finishUnstartedToolRound() {
 	dropped, messageGone := a.dropUnstartedToolCalls()
 	text := fmt.Sprintf("interrupted before any tool call started; the reply was kept without its %d tool call(s)", dropped)
@@ -739,9 +776,10 @@ func (a *Agent) finishUnstartedToolRound() {
 }
 
 // dropUnstartedToolCalls takes the tool calls off the reply the user interrupted
-// before any of them could start, and drops the message itself when it has no
-// text left. It reports how many calls were dropped and whether the message went
-// with them.
+// before any of them could start, and drops the message itself when that leaves
+// it with nothing to say: no text, and — unless agent.include_only_think keeps
+// the thinking — no reasoning either. It reports how many calls were dropped and
+// whether the message went with them.
 func (a *Agent) dropUnstartedToolCalls() (int, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -751,7 +789,8 @@ func (a *Agent) dropUnstartedToolCalls() (int, bool) {
 	}
 	dropped := len(a.history[n-1].ToolCalls)
 	a.history[n-1].ToolCalls = nil
-	if strings.TrimSpace(a.history[n-1].Content) == "" {
+	if strings.TrimSpace(a.history[n-1].Content) == "" &&
+		!(a.includeOnlyThink && strings.TrimSpace(a.history[n-1].ReasoningContent) != "") {
 		a.history = a.history[:n-1]
 		return dropped, true
 	}
@@ -764,9 +803,10 @@ func (a *Agent) dropUnstartedToolCalls() (int, bool) {
 //
 //   - text the provider had already delivered is kept as one assistant message
 //     (see keepPartialReply);
-//   - a reply whose text is empty after trimming (thinking or tool calls only) is
-//     dropped entirely, because an assistant message without content has nothing
-//     to tell the next request;
+//   - a reply whose text is empty after trimming is dropped entirely — an
+//     assistant message without content has nothing to tell the next request —
+//     unless it carried thinking and agent.include_only_think is on, in which
+//     case the thinking is kept on its own;
 //   - a reply that never arrived leaves no record at all.
 //
 // Whatever is kept travels with the next user message, never as a call of its own.
@@ -796,12 +836,17 @@ func (a *Agent) finishInterruptedModelCall(resp *llm.Response) {
 // kept, the tool calls it carried are not. None of those calls started, and the
 // reply never finished, so even a call that looks complete can be a fragment; the
 // turn ends here, which means nothing would ever run them. It reports whether a
-// message was kept — a reply whose text is empty after trimming has nothing to
-// contribute to the next request — and the kept text is published as the
-// assistant row the front-ends had been streaming, so the row is finalized live
-// and replayed from the mirror.
+// message was kept — a reply whose text is empty after trimming is only kept
+// while it carried thinking and agent.include_only_think is on, because an empty
+// message otherwise has nothing to contribute — and the kept text is published
+// as the assistant row the front-ends had been streaming, so the row is
+// finalized live and replayed from the mirror.
 func (a *Agent) keepPartialReply(resp *llm.Response) bool {
-	if resp == nil || strings.TrimSpace(resp.Content) == "" {
+	if resp == nil {
+		return false
+	}
+	if strings.TrimSpace(resp.Content) == "" &&
+		!(a.includeOnlyThink && strings.TrimSpace(resp.Reasoning) != "") {
 		return false
 	}
 	a.appendMessage(llm.Message{
@@ -809,7 +854,9 @@ func (a *Agent) keepPartialReply(resp *llm.Response) bool {
 		Content:          resp.Content,
 		ReasoningContent: resp.Reasoning,
 	})
-	a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content})
+	if resp.Content != "" {
+		a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content})
+	}
 	if n := len(resp.ToolCalls); n > 0 {
 		a.bus.Publish(Event{
 			Type: EventInfo,

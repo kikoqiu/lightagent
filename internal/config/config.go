@@ -424,6 +424,19 @@ type AgentConfig struct {
 	// section). The switch shapes the message list that is sent and nothing
 	// else.
 	SummaryInSystemPrompt bool `json:"summary_in_system_prompt"`
+	// IncludeOnlyThink keeps an assistant message that carries only the model's
+	// thinking — no visible text and no tool calls — in the history. It
+	// defaults to true; loading starts from the defaults, so an explicit false
+	// is required to turn it off. With it off such a reply is dropped, and
+	// ContinueOnlyThink below has no effect.
+	IncludeOnlyThink bool `json:"include_only_think"`
+	// ContinueOnlyThink asks the model again when its reply carried only
+	// thinking, instead of ending the turn, so a reply that carries nothing but
+	// thinking still gets an answer — whatever the provider's finish_reason
+	// (stop, a cut-off at max_tokens, or none). It defaults to true and only
+	// applies while IncludeOnlyThink is on: reasoning that was not recorded
+	// cannot be carried into a retry.
+	ContinueOnlyThink bool `json:"continue_only_think"`
 }
 
 // Default returns the built-in configuration used when no file exists yet.
@@ -474,7 +487,7 @@ func Default() *Config {
 				UseBM25:          true,
 			},
 		},
-		Agent: AgentConfig{MaxToolIterations: 200, IncludeWorkingDir: true, SummaryInSystemPrompt: false},
+		Agent: AgentConfig{MaxToolIterations: 200, IncludeWorkingDir: true, SummaryInSystemPrompt: false, IncludeOnlyThink: true, ContinueOnlyThink: true},
 		UI:    UIConfig{Markdown: true},
 	}
 }

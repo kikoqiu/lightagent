@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -401,9 +402,10 @@ drain:
 }
 
 // TestInterruptDropsATextlessReply covers a reply that was cut short before it
-// produced any text: only thinking and a tool call had arrived. Nothing of it
-// enters the history — an assistant message without content has nothing to tell
-// the next request — while the user message stays, and the turn ends there.
+// produced any text: only thinking and a tool call had arrived, and
+// agent.include_only_think is off. Nothing of it enters the history — an
+// assistant message without content has nothing to tell the next request — while
+// the user message stays, and the turn ends there.
 func TestInterruptDropsATextlessReply(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -426,6 +428,7 @@ func TestInterruptDropsATextlessReply(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	cfg := config.Default()
+	cfg.Agent.IncludeOnlyThink = false
 	cfg.OpenAI.APIBase = srv.URL
 	cfg.OpenAI.Stream = true
 	bus := NewBus()
@@ -488,6 +491,258 @@ drain:
 	}
 	if msgs[0].Role != "user" || msgs[0].Content != "think about it" {
 		t.Fatalf("history[0] = %+v, want the user message kept", msgs[0])
+	}
+}
+
+// TestInterruptKeepsAnOnlyThinkReply covers the same cut-short reply with the
+// default agent.include_only_think on: the thinking the provider had streamed is
+// kept as an assistant message of its own — the tool call it carried is still
+// dropped — so the next request can carry the model's own reasoning.
+func TestInterruptKeepsAnOnlyThinkReply(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("the test server cannot flush")
+			return
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"thinking\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" more\"}}]}\n\n")
+		flusher.Flush()
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = true
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("think about it")
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == EventReasoningDelta && ev.Text == " more" {
+				goto interrupt
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the reply never streamed its last chunk")
+		}
+	}
+
+interrupt:
+	if !a.Interrupt() {
+		t.Fatal("Interrupt reported no running turn")
+	}
+
+	var sawAssistant, sawToolCall bool
+	var markerText string
+	deadline := time.After(10 * time.Second)
+drain:
+	for {
+		select {
+		case ev := <-events:
+			switch {
+			case ev.Type == EventAssistant:
+				sawAssistant = true
+			case ev.Type == EventToolCall:
+				sawToolCall = true
+			case ev.Type == EventInterrupted:
+				markerText = ev.Text
+			case ev.Type == EventTurnDone:
+				break drain
+			}
+		case <-deadline:
+			t.Fatal("no turn_done after the interrupt")
+		}
+	}
+	if sawAssistant {
+		t.Fatal("a reply without text was finalized as an assistant row")
+	}
+	if sawToolCall {
+		t.Fatal("a tool call of the interrupted reply was announced")
+	}
+	if !strings.Contains(markerText, "kept") {
+		t.Fatalf("marker = %q, want a note that the reply was kept", markerText)
+	}
+
+	msgs := a.History()
+	if len(msgs) != 2 {
+		t.Fatalf("history = %d messages, want the user message and the kept thinking", len(msgs))
+	}
+	if msgs[0].Role != "user" || msgs[0].Content != "think about it" {
+		t.Fatalf("history[0] = %+v, want the user message kept", msgs[0])
+	}
+	if msgs[1].Role != "assistant" || msgs[1].Content != "" || msgs[1].ReasoningContent != "thinking more" ||
+		len(msgs[1].ToolCalls) != 0 {
+		t.Fatalf("history[1] = %+v, want the thinking kept without the tool call", msgs[1])
+	}
+}
+
+// TestOnlyThinkReplyPolicy pins the two switches that govern a reply carrying
+// only thinking (no visible text, no tool calls): agent.include_only_think
+// decides whether the message is recorded at all, and agent.continue_only_think
+// — only effective while the first is on — decides whether the model is asked
+// again instead of the turn ending. The policy is the same whatever the
+// provider's finish_reason says, so the cases cover stop, a max_tokens cut-off
+// and no reason at all.
+func TestOnlyThinkReplyPolicy(t *testing.T) {
+	cases := []struct {
+		name         string
+		include      bool
+		cont         bool
+		finish       string
+		wantRequests int
+		wantMsgs     int
+		wantInfo     bool
+	}{
+		{name: "recorded and continued", include: true, cont: true, finish: "stop", wantRequests: 2, wantMsgs: 3, wantInfo: true},
+		{name: "recorded but the turn ends", include: true, cont: false, finish: "stop", wantRequests: 1, wantMsgs: 2},
+		{name: "dropped and continue is ignored", include: false, cont: true, finish: "stop", wantRequests: 1, wantMsgs: 1},
+		{name: "no finish_reason given", include: true, cont: true, finish: "", wantRequests: 2, wantMsgs: 3, wantInfo: true},
+		{name: "truncated at max_tokens while thinking", include: true, cont: true, finish: "length", wantRequests: 2, wantMsgs: 3, wantInfo: true},
+		{name: "truncated and continue is off", include: true, cont: false, finish: "length", wantRequests: 1, wantMsgs: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu       sync.Mutex
+				requests int
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				requests++
+				n := requests
+				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				if n == 1 {
+					fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","reasoning_content":"let me think"},"finish_reason":%q}]}`, tc.finish)
+					return
+				}
+				fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"the answer"},"finish_reason":"stop"}]}`)
+			}))
+			defer srv.Close()
+
+			cfg := config.Default()
+			cfg.OpenAI.APIBase = srv.URL
+			cfg.OpenAI.Stream = false
+			cfg.Agent.IncludeOnlyThink = tc.include
+			cfg.Agent.ContinueOnlyThink = tc.cont
+			bus := NewBus()
+			events, cancel := bus.Subscribe()
+			defer cancel()
+			a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+			a.Submit("hi")
+
+			var sawInfo bool
+			deadline := time.After(10 * time.Second)
+		drain:
+			for {
+				select {
+				case ev := <-events:
+					if ev.Type == EventInfo && strings.Contains(ev.Text, "only thinking") {
+						sawInfo = true
+					}
+					if ev.Type == EventTurnDone {
+						break drain
+					}
+				case <-deadline:
+					t.Fatal("no turn_done")
+				}
+			}
+
+			mu.Lock()
+			asked := requests
+			mu.Unlock()
+			if asked != tc.wantRequests {
+				t.Fatalf("the model was asked %d time(s), want %d", asked, tc.wantRequests)
+			}
+			if sawInfo != tc.wantInfo {
+				t.Fatalf("saw the only-thinking info = %v, want %v", sawInfo, tc.wantInfo)
+			}
+			msgs := a.History()
+			if len(msgs) != tc.wantMsgs {
+				t.Fatalf("history = %d messages, want %d: %+v", len(msgs), tc.wantMsgs, msgs)
+			}
+			if msgs[0].Role != "user" {
+				t.Fatalf("history[0] = %+v, want the user message", msgs[0])
+			}
+			// When the only-thinking reply is recorded it sits right after the
+			// user message, and the continued model call answers after it.
+			if tc.include && (msgs[1].Role != "assistant" || msgs[1].Content != "" || msgs[1].ReasoningContent != "let me think") {
+				t.Fatalf("history[1] = %+v, want the only-thinking reply kept", msgs[1])
+			}
+			if tc.wantMsgs == 3 && (msgs[2].Role != "assistant" || msgs[2].Content != "the answer") {
+				t.Fatalf("history[2] = %+v, want the answer from the retry", msgs[2])
+			}
+		})
+	}
+}
+
+// TestOnlyThinkReplyRetryCarriesThinking verifies the retry carries the kept
+// thinking back to the provider: the point of recording an only-thinking reply is
+// that the model sees its own reasoning when it is asked again.
+func TestOnlyThinkReplyRetryCarriesThinking(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests int
+		second   string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		requests++
+		n := requests
+		if n == 2 {
+			second = string(body)
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","reasoning_content":"let me think"},"finish_reason":"stop"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"the answer"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("hi")
+	deadline := time.After(10 * time.Second)
+	for done := false; !done; {
+		select {
+		case ev := <-events:
+			if ev.Type == EventTurnDone {
+				done = true
+			}
+		case <-deadline:
+			t.Fatal("no turn_done")
+		}
+	}
+
+	mu.Lock()
+	asked := requests
+	gotSecond := second
+	mu.Unlock()
+	if asked != 2 {
+		t.Fatalf("the model was asked %d time(s), want 2", asked)
+	}
+	if !strings.Contains(gotSecond, "let me think") {
+		t.Fatalf("the retry did not carry the kept thinking: %s", gotSecond)
 	}
 }
 
@@ -2266,15 +2521,17 @@ func TestTruncatedTurnContinuesWithoutUserMessage(t *testing.T) {
 	}
 }
 
-// TestTurnStopsAfterConsecutiveTruncations covers a runaway thinking loop: after
-// three consecutive truncations the turn stops with an error instead of
-// continuing forever.
+// TestTurnStopsAfterConsecutiveTruncations covers a runaway loop of replies the
+// provider keeps cutting off at max_tokens after some text: after three
+// consecutive truncations the turn stops with an error instead of continuing
+// forever. (A reply cut off with nothing but thinking is not this path — it is
+// handled by the only-think policy, see TestOnlyThinkReplyPolicy.)
 func TestTurnStopsAfterConsecutiveTruncations(t *testing.T) {
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":\"length\"}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"part\"},\"finish_reason\":\"length\"}]}\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer srv.Close()
@@ -2289,14 +2546,55 @@ func TestTurnStopsAfterConsecutiveTruncations(t *testing.T) {
 	a.Submit("hi")
 	got := drainEvents(t, events)
 
-	if calls != maxConsecutiveTruncations {
-		t.Fatalf("model calls = %d, want %d", calls, maxConsecutiveTruncations)
+	if calls != maxConsecutiveAutoContinues {
+		t.Fatalf("model calls = %d, want %d", calls, maxConsecutiveAutoContinues)
 	}
-	if !hasEvent(got, EventError, "truncations") {
+	if !hasEvent(got, EventError, "consecutive continuations") {
 		t.Fatal("no stop error was published")
 	}
-	if hist := a.History(); len(hist) != maxConsecutiveTruncations+1 {
-		t.Fatalf("history = %d messages, want user + %d assistant", len(hist), maxConsecutiveTruncations)
+	if hist := a.History(); len(hist) != maxConsecutiveAutoContinues+1 {
+		t.Fatalf("history = %d messages, want user + %d assistant", len(hist), maxConsecutiveAutoContinues)
+	}
+}
+
+// TestOnlyThinkAndTruncationShareTheContinueBudget pins the shared budget: an
+// only-thinking reply and a max_tokens truncation are the same kind of
+// auto-continuation, so alternating them still stops the turn once
+// maxConsecutiveAutoContinues is reached.
+func TestOnlyThinkAndTruncationShareTheContinueBudget(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls%2 == 1 {
+			// An only-thinking reply that stops normally.
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":\"stop\"}]}\n\n")
+		} else {
+			// Some text, cut off at max_tokens.
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"part\"},\"finish_reason\":\"length\"}]}\n\n")
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("hi")
+	got := drainEvents(t, events)
+
+	if calls != maxConsecutiveAutoContinues {
+		t.Fatalf("model calls = %d, want %d", calls, maxConsecutiveAutoContinues)
+	}
+	if !hasEvent(got, EventError, "consecutive continuations") {
+		t.Fatal("no stop error was published")
+	}
+	if hist := a.History(); len(hist) != maxConsecutiveAutoContinues+1 {
+		t.Fatalf("history = %d messages, want user + %d assistant", len(hist), maxConsecutiveAutoContinues)
 	}
 }
 
