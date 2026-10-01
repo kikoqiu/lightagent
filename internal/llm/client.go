@@ -82,11 +82,16 @@ func (c *Client) endpoint() string {
 // visible answer, other providers never call the callback.
 func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, onDelta, onReasoning func(string)) (*Response, error) {
 	req := ChatRequest{
-		Model:       c.model,
-		Messages:    requestMessages(messages),
-		Tools:       tools,
-		Temperature: c.temperature,
-		MaxTokens:   c.maxTokens,
+		Model:     c.model,
+		Messages:  requestMessages(messages),
+		Tools:     tools,
+		MaxTokens: c.maxTokens,
+	}
+	// A negative temperature is "unset": leave the field out so the provider
+	// applies its own default. 0 and up are sent as chosen.
+	if c.temperature >= 0 {
+		temp := c.temperature
+		req.Temperature = &temp
 	}
 	if len(tools) > 0 {
 		req.ToolChoice = "auto"

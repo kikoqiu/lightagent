@@ -138,7 +138,7 @@ source <(lightagent completion bash)       # bash 补全
     "api_base": "https://api.openai.com/v1",
     "api_key": "sk-...",
     "model": "gpt-4o-mini",
-    "temperature": 0.0,
+    "temperature": -1,                      // 采样温度；负值=不发送（用服务端默认）
     "max_tokens": 4096,
     "timeout_seconds": 120,               // 空闲超时：无数据超过该秒数才中断（0=关闭）
     "stream": true,

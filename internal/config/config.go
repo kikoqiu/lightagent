@@ -445,7 +445,7 @@ func Default() *Config {
 		OpenAI: OpenAIConfig{
 			APIBase:     "https://api.openai.com/v1",
 			Model:       "gpt-4o-mini",
-			Temperature: 0.0,
+			Temperature: -1.0,
 			MaxTokens:   40960,
 			TimeoutSec:  4800,
 			Stream:      true,
@@ -811,9 +811,11 @@ func (c *Config) applyDefaults() {
 	if c.OpenAI.Model == "" {
 		c.OpenAI.Model = def.OpenAI.Model
 	}
-	if c.OpenAI.Temperature == 0 {
-		c.OpenAI.Temperature = def.OpenAI.Temperature
-	}
+	// temperature is deliberately not defaulted here: the built-in default of
+	// -1 is the "unset" sentinel (a negative value is left out of the request
+	// so the provider decides), and any value a document sets — 0 included —
+	// must survive. An omitted key already keeps -1 because decoding starts
+	// from Default().
 	if c.OpenAI.MaxTokens <= 0 {
 		c.OpenAI.MaxTokens = def.OpenAI.MaxTokens
 	}

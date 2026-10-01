@@ -65,7 +65,7 @@
         { path: 'openai.api_key', type: 'password', help: '*** keeps the stored key — paste a new one to replace it' },
         { path: 'openai.model', type: 'text', placeholder: 'gpt-4o-mini', help: 'model name' },
         { path: 'openai.stream', type: 'bool', help: 'stream the reply over SSE' },
-        { path: 'openai.temperature', type: 'slider', min: 0, max: 2, step: 0.05, fallback: 0.0, help: 'sampling temperature; 0 falls back to the default (0.0)' },
+        { path: 'openai.temperature', type: 'slider', min: -0.05, max: 2, step: 0.05, fallback: -0.05, omit: { below: 0, value: -1, label: 'omitted (provider default)' }, help: 'sampling temperature; the leftmost position omits the field so the provider uses its own default, 0 is deterministic, 2 is maximum randomness' },
         { path: 'openai.max_tokens', type: 'number', min: 1, help: 'cap per reply' },
         { path: 'openai.timeout_seconds', type: 'number', min: 0, help: 'idle timeout in seconds (waiting for headers or between stream chunks); 0 disables it' },
         { path: 'openai.media_types', type: 'list', placeholder: 'image/png, image/jpeg, audio/wav', help: 'media types this model accepts as attachments (comma separated), e.g. image/png, image/*, audio/wav, application/pdf. A family name means the whole family ("image" = "image/*"). Configuring it enables attachments: the web composer can send files and, with tools.upload_media.enabled, the model gets the upload_media tool' },
@@ -508,6 +508,19 @@
     return out;
   }
 
+  // outText is the badge shown next to a control: a slider whose lowest step is
+  // reserved for an "omit" sentinel names that state instead of the raw number,
+  // every other control shows its value (or "default" when a text field is empty).
+  function outText(field) {
+    if (field.def.type === 'slider') {
+      if (field.def.omit && Number(field.el.value) < field.def.omit.below) {
+        return field.def.omit.label;
+      }
+      return String(field.el.value);
+    }
+    return field.el.value === '' ? 'default' : String(field.el.value);
+  }
+
   // syncForm shows the document in the controls. It runs after a load and after a
   // successful save, never while the user is typing.
   function syncForm() {
@@ -537,11 +550,15 @@
         if (want && !hasOption(field.el, want)) { addOption(field.el, want); }
         if (want) { field.el.value = want; }
       } else if (field.def.type === 'slider') {
-        field.el.value = empty ? field.def.fallback : String(value);
+        var shown = empty ? field.def.fallback : value;
+        // A slider may reserve its lowest step for a sentinel (the temperature
+        // control's "omit"). A stored sentinel shows as that lowest position.
+        if (field.def.omit && Number(shown) < field.def.omit.below) { shown = field.el.min; }
+        field.el.value = String(shown);
       } else {
         field.el.value = empty ? '' : String(value);
       }
-      if (field.out) { field.out.textContent = field.el.value === '' ? 'default' : String(field.el.value); }
+      if (field.out) { field.out.textContent = outText(field); }
       clearError(field);
     }
   }
@@ -588,9 +605,12 @@
       }
       clearError(field);
     } else if (def.type === 'slider') {
-      setPath(draft, def.path, Number(field.el.value));
+      var sliderValue = Number(field.el.value);
+      // The reserved lowest step maps to the stored sentinel (e.g. -1 = omit).
+      if (def.omit && sliderValue < def.omit.below) { sliderValue = def.omit.value; }
+      setPath(draft, def.path, sliderValue);
       clearError(field);
-      if (field.out) { field.out.textContent = String(field.el.value); }
+      if (field.out) { field.out.textContent = outText(field); }
     } else if (def.type === 'select') {
       setPath(draft, def.path, field.el.value);
       clearError(field);

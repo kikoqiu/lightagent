@@ -60,6 +60,68 @@ func TestChatRequestBodyIncludesExtraBody(t *testing.T) {
 	}
 }
 
+// TestChatRequestSendsZeroTemperature verifies that an explicit 0 temperature is
+// sent: 0 is deterministic decoding, not "unset", so it must reach the provider
+// instead of being dropped from the request body.
+func TestChatRequestSendsZeroTemperature(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	client := NewClient(config.OpenAIConfig{
+		APIBase:     srv.URL,
+		APIKey:      "sk-test",
+		Model:       "test-model",
+		Temperature: 0.0,
+		MaxTokens:   16,
+	})
+	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, nil); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	temp, ok := got["temperature"].(float64)
+	if !ok {
+		t.Fatalf("temperature missing from the request body: %v", got)
+	}
+	if temp != 0 {
+		t.Fatalf("temperature = %v, want 0", temp)
+	}
+}
+
+// TestChatRequestOmitsNegativeTemperature verifies that a negative temperature
+// (the "unset" sentinel) leaves the field out of the request body, so the
+// provider applies its own default instead of receiving a temperature.
+func TestChatRequestOmitsNegativeTemperature(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	client := NewClient(config.OpenAIConfig{
+		APIBase:     srv.URL,
+		APIKey:      "sk-test",
+		Model:       "test-model",
+		Temperature: -1,
+		MaxTokens:   16,
+	})
+	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, nil); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if v, present := got["temperature"]; present {
+		t.Fatalf("temperature should be omitted for a negative value, got %v", v)
+	}
+}
+
 // TestExtraBodyFromConfigFileReachesRequest covers the path the user configures:
 // values under openai.extra_body in config.json are read back and merged into
 // the /chat/completions request body. The nested chat_template_kwargs

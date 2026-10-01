@@ -30,7 +30,7 @@
     "api_base": "https://api.openai.com/v1",
     "api_key": "sk-...",
     "model": "gpt-4o-mini",
-    "temperature": 0.0,
+    "temperature": -1.0,                   // 负值=不发送该字段（交由服务端默认）；0=确定性；>0=采样温度
     "max_tokens": 40960,
     "timeout_seconds": 4800,               // 空闲超时：无数据超过该秒数才中断（0=关闭）
     "stream": true,
@@ -104,7 +104,7 @@
 | `api_base` | string | `https://api.openai.com/v1` | 接口基址；客户端会拼接 `/chat/completions`（若已以该路径结尾则直接使用） |
 | `api_key` | string | 空 | 作为 `Authorization: Bearer <key>` 发送；为空则启动报错 |
 | `model` | string | `gpt-4o-mini` | 模型名 |
-| `temperature` | number | `0.0` | 采样温度 |
+| `temperature` | number | `-1` | 采样温度；`-1`（或任意负值）表示**不使用**——该字段不会发送，交由服务端默认；`0` 为确定性采样，`0` 以上的值会原样发送。省略该字段时即为 `-1` |
 | `max_tokens` | int | `40960` | 单次回复上限 |
 | `timeout_seconds` | int | `4800` | **空闲超时**（秒）：等待响应头、或流式过程中两个数据块之间的最大间隔；超过即中断并提示。不是整段请求的总时限，因此长回复不会被截断；`0` 关闭 |
 | `stream` | bool | `true` | 是否使用 SSE 流式输出 |
@@ -388,7 +388,7 @@ lightagent gen-agent-prompt -f     # 强制覆盖
 1. 读取 `config.json`；缺失字段使用内置默认（`config.Default()`）。
 2. **启动时自动对齐**：若文件缺失任何内置字段（或 `tools.mcp.servers` 为空），补全后写回
    `config.json`；文件本来完整时**不写回**，因此内容与修改时间都不变。
-3. 非法/越界值回退默认：`temperature=0` 视为未设置；`summarize_token_percent` 不在
+3. 非法/越界值回退默认：`summarize_token_percent` 不在
    `(0,100]` 时回退；`summarize_keep` 的 `budget_percent` 不在 `[0,100]`、`turns` 为负时回退
    （默认两者都是 0，即不保留原始消息）。
 4. 若存在 `agent.md`，覆盖 `agent.system_prompt`（文件中的 `@include` 会先展开）。

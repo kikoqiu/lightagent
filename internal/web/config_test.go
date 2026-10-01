@@ -405,6 +405,21 @@ func TestConfigEditorWiring(t *testing.T) {
 	}
 }
 
+// TestTemperatureSliderOmitsAtLowestStep pins the temperature control's sentinel
+// range: its lowest position is one step below 0 (min = 0 - step), so the slider
+// never spans the whole -1..0 gap, and that position is stored as the -1 "omit"
+// value the loader and the request builder treat as "unset".
+func TestTemperatureSliderOmitsAtLowestStep(t *testing.T) {
+	for _, want := range []string{
+		"openai.temperature', type: 'slider', min: -0.05",
+		"omit: { below: 0, value: -1,",
+	} {
+		if !strings.Contains(configJS, want) {
+			t.Errorf("the temperature control is missing %q", want)
+		}
+	}
+}
+
 // TestConfigScriptIsServed checks the page scripts are embedded and served like
 // the rest of the UI (they carry no data, so they are public: the sign-in dialog
 // has to load before there is a session).

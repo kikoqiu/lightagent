@@ -51,6 +51,63 @@ func TestLoadFileTimeoutOverride(t *testing.T) {
 	}
 }
 
+// TestLoadFileTemperatureOverride verifies that temperature tells an omitted key
+// apart from an explicit value: a missing key keeps the built-in default (-1, the
+// "unset" sentinel), while any value a document sets - 0 included and also an
+// explicit negative - survives unchanged.
+func TestLoadFileTemperatureOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+
+	// Missing key -> default.
+	if err := os.WriteFile(path, []byte(`{"openai":{"model":"m"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.OpenAI.Temperature != Default().OpenAI.Temperature {
+		t.Fatalf("temperature = %v, want the default %v", cfg.OpenAI.Temperature, Default().OpenAI.Temperature)
+	}
+
+	// Explicit 0 is kept: it means deterministic decoding.
+	if err := os.WriteFile(path, []byte(`{"openai":{"model":"m","temperature":0}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = LoadFile(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.OpenAI.Temperature != 0 {
+		t.Fatalf("temperature = %v, want 0 (must not fall back to the default)", cfg.OpenAI.Temperature)
+	}
+
+	// A set value survives unchanged.
+	if err := os.WriteFile(path, []byte(`{"openai":{"model":"m","temperature":0.3}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = LoadFile(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.OpenAI.Temperature != 0.3 {
+		t.Fatalf("temperature = %v, want 0.3", cfg.OpenAI.Temperature)
+	}
+
+	// A negative value is kept too: it is the same "unset" sentinel, just
+	// written explicitly, and the request builder reads it as "omit".
+	if err := os.WriteFile(path, []byte(`{"openai":{"model":"m","temperature":-1}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = LoadFile(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.OpenAI.Temperature != -1 {
+		t.Fatalf("temperature = %v, want -1", cfg.OpenAI.Temperature)
+	}
+}
+
 func TestSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")

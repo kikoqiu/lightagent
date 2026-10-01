@@ -215,11 +215,14 @@ type Response struct {
 
 // ChatRequest is the request body sent to /chat/completions.
 type ChatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Tools       []ToolDef `json:"tools,omitempty"`
-	ToolChoice  string    `json:"tool_choice,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
+	Model      string    `json:"model"`
+	Messages   []Message `json:"messages"`
+	Tools      []ToolDef `json:"tools,omitempty"`
+	ToolChoice string    `json:"tool_choice,omitempty"`
+	// Temperature is a pointer so the "unset" state (a negative value) can be
+	// left out of the body while 0 and up are sent verbatim; the caller only
+	// fills it for non-negative temperatures (see Client.Chat).
+	Temperature *float64 `json:"temperature,omitempty"`
+	MaxTokens   int      `json:"max_tokens,omitempty"`
+	Stream      bool     `json:"stream,omitempty"`
 }
