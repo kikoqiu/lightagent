@@ -664,6 +664,9 @@ func TestWebFetchToolBrowserProfileIsLocal(t *testing.T) {
 // path does — leaves that profile, with everything the fetch wrote into it, on
 // disk for the next fetch.
 func TestWebFetchToolRendersHeadlessOnThePersistentProfile(t *testing.T) {
+	if os.Getenv("LIGHTAGENT_TEST_BROWSER") != "1" {
+		t.Skip("browser tests are opt-in: set LIGHTAGENT_TEST_BROWSER=1 to run them")
+	}
 	if testing.Short() {
 		t.Skip("short mode: no browser is started")
 	}
@@ -708,6 +711,9 @@ func TestWebFetchToolRendersHeadlessOnThePersistentProfile(t *testing.T) {
 // a browser of its own, started fresh on the same profile — still sends that
 // cookie.
 func TestWebFetchToolKeepsCookiesAcrossFetches(t *testing.T) {
+	if os.Getenv("LIGHTAGENT_TEST_BROWSER") != "1" {
+		t.Skip("browser tests are opt-in: set LIGHTAGENT_TEST_BROWSER=1 to run them")
+	}
 	if testing.Short() {
 		t.Skip("short mode: no browser is started")
 	}

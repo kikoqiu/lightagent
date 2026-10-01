@@ -30,8 +30,9 @@ LIGHTAGENT_CONFIG=./config.json go run .
 go build ./...            # 编译全部包
 go vet ./...              # 静态检查
 gofmt -w .                # 格式化
-go test ./... -count=1    # 全部测试
+go test ./... -count=1    # 全部测试（会真的启动浏览器的用例默认跳过，见「测试」）
 go test ./internal/tools -run Exec -v   # 单个包/用例
+LIGHTAGENT_TEST_BROWSER=1 go test ./... -count=1   # 连会真的启动浏览器的用例一起跑
 ```
 
 `lightagent gen-agent-prompt [-f]`：把内置系统提示词导出为程序目录的 `agent.md`。
@@ -87,6 +88,13 @@ docs/                       本文档
 
 > 含真实子进程的用例（`exec_command`）在不同平台使用不同命令（Windows 用 PowerShell，
 > 其它用 `sh`），耗时约 2 秒。
+>
+> 「**会真的启动浏览器**」的用例（`internal/utils`、`internal/tools/webfetch_test.go` 与
+> `main_test.go` 里渲染 / 挂载页面的那些）**默认跳过**，要 `LIGHTAGENT_TEST_BROWSER=1` 才运行：
+> 启动的浏览器会触碰所在机器的网络栈与凭据存储，在启用了账户锁定策略的机器上，浏览器触发的失败
+> 登录会把跑测试的那个账户锁掉（Windows 安全日志 4625「登录失败」→ 4740「已锁定用户帐户」，
+> 调用方进程为 `chrome.exe`、登录类型 2、认证包 `Negotiate`）。设了该变量后仍会先看本机有没有
+> 可用的 Chromium（没有则跳过）；`-short` 同样会跳过这些用例。
 >
 > `TestMathRender`（`internal/web/math_test.go`）用 `node` 跑页面自己的 `math.js`（未装 node 时
 > `t.Skip`），把全部用例喂进 `protect → marked → inject` 这条真实管线，所以公式子集的改动和

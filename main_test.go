@@ -283,6 +283,9 @@ func testProfileDir(t *testing.T) string {
 // does, which is what the next run picks up. It is skipped where no browser can
 // be started, exactly like the fetcher itself skipping the browser.
 func TestRunMainClosesTheFetcherBrowser(t *testing.T) {
+	if os.Getenv("LIGHTAGENT_TEST_BROWSER") != "1" {
+		t.Skip("browser tests are opt-in: set LIGHTAGENT_TEST_BROWSER=1 to run them")
+	}
 	if testing.Short() {
 		t.Skip("short mode: no browser is started")
 	}

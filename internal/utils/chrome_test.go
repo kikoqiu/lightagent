@@ -21,10 +21,24 @@ import (
 	"time"
 )
 
-// requireBrowser skips a test when no Chromium-based browser is installed, so
-// the suite stays runnable on a machine (or a CI runner) without one.
+// browserTestsEnv is the environment variable that opts in to the tests that
+// start a real browser.
+//
+// Those tests are off by default. A launched browser reaches into the machine
+// it runs on — its network stack, its credential store — and on a host whose
+// account is subject to a lockout policy the logons a browser attempts can lock
+// the very account that runs the suite. Set the variable to 1 to run them.
+const browserTestsEnv = "LIGHTAGENT_TEST_BROWSER"
+
+// requireBrowser skips a test unless the browser tests were opted in (see
+// browserTestsEnv) and a Chromium-based browser is installed, so the default
+// suite never starts a browser and stays runnable on a machine (or a CI runner)
+// without one.
 func requireBrowser(t *testing.T) {
 	t.Helper()
+	if os.Getenv(browserTestsEnv) != "1" {
+		t.Skipf("browser tests are opt-in: set %s=1 to run them", browserTestsEnv)
+	}
 	if testing.Short() {
 		t.Skip("short mode: browser tests are skipped")
 	}
