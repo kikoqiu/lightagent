@@ -57,7 +57,7 @@
     "password": ""                         // 登录密码（明文保存）；非空时程序再补上 password_salt
   },
   "tools": {
-    "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10, "use_utf8": true },
+    "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10, "max_lines": 50, "max_lines_max": 100, "use_utf8": true },
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
@@ -153,6 +153,8 @@
 | `exec.enabled` | bool | `true` | 启用 `exec_command` 与 `manage_session` |
 | `exec.timeout_seconds` | int | `3600` | `run_timeout` 的默认硬超时 |
 | `exec.wait_seconds` | int | `10` | `wait_timeout` 的默认同步等待秒数 |
+| `exec.max_lines` | int | `50` | `exec_command` / `manage_session` 的 `max_lines` **参数的默认值**。一次回答最多带多少行。`0`/负数回退到内置 50 |
+| `exec.max_lines_max` | int | `100` | 上面那个参数的**最大值**。调用要得更多就截断到它。`0`/负数回退到内置 100。小于 `max_lines` 时把 `max_lines` 降到它 |
 | `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `exec_command` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8，Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示 |
 | `read_file_lines.enabled` | bool | `true` | 启用行读取工具 |
 | `read_file_lines.max_read_file_size` | int | `32000` | 单次读取字节预算 |
@@ -177,6 +179,12 @@
   `use_utf8` 参数可由模型按次调用覆盖。该字段与参数**只在 Windows 生效**（非 Windows 无 ANSI
   代码页可回退，始终 UTF-8）。`exec_command` 的脚本语言由 `language` 参数选择（宿主引擎
   `ps`/`sh`，以及系统存在 Python 时的 `python`），细节见 [tools.md](tools.md#exec_command)。
+
+* `exec.max_lines` / `exec.max_lines_max` 是同一对参数（默认值 / 最大值）。两者一起管
+  `exec_command` 与 `manage_session` 的 `max_lines`。省略参数时用 `max_lines`。要得比
+  `max_lines_max` 多就截断到 `max_lines_max`。两者都会写进工具 schema，模型看得见自己的预算。
+  `max_lines_max` 小于 `max_lines` 时，加载时把 `max_lines` 降到它。重要输出建议重定向到文件，
+  再用文件工具读回。
 
 * `webfetch.mode` / `browser_path` / `user_agent` / `max_bytes` / `attach_address` 只管**取页面**这一步：
   转换（HTML → Markdown）、反馈长度限制与结果格式都不受影响。工具描述按 `mode` 如实说明取法

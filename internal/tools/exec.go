@@ -16,13 +16,22 @@ import (
 // execCommandDefaultWaitSeconds is the default synchronous wait window.
 const execCommandDefaultWaitSeconds = 10
 
+// Built-in max_lines budget of the exec tools: the default of one call and the
+// most a call may ask for (tools.exec.max_lines / tools.exec.max_lines_max).
+const (
+	execCommandDefaultMaxLines = 50
+	execCommandMaxLinesCap     = 100
+)
+
 // ExecEngine spawns shell commands and tracks their sessions. It is shared by
 // exec_command and manage_session so both operate on one session pool.
 type ExecEngine struct {
-	sessions    *SessionManager
-	runTimeout  time.Duration
-	waitSeconds int
-	useUTF8     bool
+	sessions        *SessionManager
+	runTimeout      time.Duration
+	waitSeconds     int
+	maxLinesDefault int
+	maxLinesMax     int
+	useUTF8         bool
 }
 
 // NewExecEngine builds an engine. timeoutSeconds drives the default run_timeout
@@ -39,11 +48,43 @@ func NewExecEngine(timeoutSeconds, waitSeconds int, useUTF8 bool) *ExecEngine {
 		waitSeconds = execCommandDefaultWaitSeconds
 	}
 	return &ExecEngine{
-		sessions:    NewSessionManager(),
-		runTimeout:  time.Duration(timeoutSeconds) * time.Second,
-		waitSeconds: waitSeconds,
-		useUTF8:     useUTF8,
+		sessions:        NewSessionManager(),
+		runTimeout:      time.Duration(timeoutSeconds) * time.Second,
+		waitSeconds:     waitSeconds,
+		maxLinesDefault: execCommandDefaultMaxLines,
+		maxLinesMax:     execCommandMaxLinesCap,
+		useUTF8:         useUTF8,
 	}
+}
+
+// SetMaxLines configures the max_lines budget of the exec tools
+// (tools.exec.max_lines / tools.exec.max_lines_max). A call that omits the
+// parameter gets defaultLines. A call that asks for more than maxLines is
+// truncated to it. A non-positive value keeps the built-in one. A maximum
+// below the default lowers the default to it.
+func (e *ExecEngine) SetMaxLines(defaultLines, maxLines int) {
+	if maxLines <= 0 {
+		maxLines = execCommandMaxLinesCap
+	}
+	if defaultLines <= 0 {
+		defaultLines = execCommandDefaultMaxLines
+	}
+	if defaultLines > maxLines {
+		defaultLines = maxLines
+	}
+	e.maxLinesDefault = defaultLines
+	e.maxLinesMax = maxLines
+}
+
+// effectiveMaxLines resolves the max_lines argument of a call. A missing, zero
+// or negative value uses the configured default. A value above the configured
+// maximum is truncated to it.
+func (e *ExecEngine) effectiveMaxLines(args map[string]any) int {
+	lines := intArg(args, "max_lines", e.maxLinesDefault)
+	if lines <= 0 {
+		lines = e.maxLinesDefault
+	}
+	return minInt(lines, e.maxLinesMax)
 }
 
 // Sessions exposes the shared session manager.
@@ -62,6 +103,15 @@ func (e *ExecEngine) runTimeoutDefault() time.Duration {
 		return e.runTimeout
 	}
 	return time.Hour
+}
+
+// maxLinesRule states the max_lines budget of one call to the model: its
+// default, the maximum a call may ask for, and the advice to redirect output
+// that has to survive in full to a file.
+func (e *ExecEngine) maxLinesRule() string {
+	return fmt.Sprintf(" `max_lines` caps the lines one call returns (default: %d, maximum: %d, a "+
+		"larger value is truncated). Redirect important output to a file and read it back.",
+		e.maxLinesDefault, e.maxLinesMax)
 }
 
 // childCodec returns the stdio conversion used for child processes in the given
@@ -284,6 +334,7 @@ func (t *ExecCommandTool) Description() string {
 		"%d seconds). Output is cleaned and truncated by `max_lines`/`max_chars`, which bound what "+
 		"a call returns rather than the process lifetime.",
 		scriptLanguageSummary(), hostScriptLanguageID(), t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
+	description += t.engine.maxLinesRule()
 	if !useUTF8ParamAvailable() {
 		return description
 	}
@@ -334,9 +385,12 @@ func (t *ExecCommandTool) Parameters() map[string]any {
 		}
 	}
 	properties["max_lines"] = map[string]any{
-		"type":        "integer",
-		"default":     200,
-		"description": "Maximum lines this call returns (head/tail folded). The limit is per call, not over the process lifetime. Default: 200.",
+		"type":    "integer",
+		"default": t.engine.maxLinesDefault,
+		"description": fmt.Sprintf("Maximum lines this call returns (head/tail folded). The limit is per "+
+			"call, not over the process lifetime. Default: %d, maximum: %d, and a larger value is "+
+			"truncated to it. Redirect important output to a file and read it back.",
+			t.engine.maxLinesDefault, t.engine.maxLinesMax),
 	}
 	properties["max_chars"] = map[string]any{
 		"type":        "integer",
@@ -382,7 +436,7 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 			runTimeout = 0
 		}
 	}
-	maxLines := intArg(args, "max_lines", 200)
+	maxLines := t.engine.effectiveMaxLines(args)
 	maxChars := intArg(args, "max_chars", 30000)
 	cwd, _ := stringArg(args, "cwd")
 	// use_utf8 defaults to the configured stdio mode; the model may override it

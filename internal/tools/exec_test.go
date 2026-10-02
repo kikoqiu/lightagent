@@ -626,6 +626,67 @@ func TestPollFlushesPerCallAndLimitsApplyPerCall(t *testing.T) {
 	}
 }
 
+// TestExecMaxLinesBudget pins the max_lines budget shared by exec_command and
+// manage_session: the built-in pair is 50/100, both schemas advertise the
+// configured default, a request above the configured maximum is truncated to it
+// (which folds the output), and the description states the default, the maximum
+// and the advice to redirect output that must survive in full to a file.
+func TestExecMaxLinesBudget(t *testing.T) {
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+
+	if engine.maxLinesDefault != 50 || engine.maxLinesMax != 100 {
+		t.Fatalf("built-in max_lines budget = %d/%d, want 50/100", engine.maxLinesDefault, engine.maxLinesMax)
+	}
+	engine.SetMaxLines(10, 20)
+	if engine.maxLinesDefault != 10 || engine.maxLinesMax != 20 {
+		t.Fatalf("configured max_lines budget = %d/%d, want 10/20", engine.maxLinesDefault, engine.maxLinesMax)
+	}
+
+	execTool := NewExecCommandTool(engine)
+	manageTool := NewManageSessionTool(engine)
+
+	// Both schemas carry the configured default.
+	for name, tool := range map[string]Tool{"exec_command": execTool, "manage_session": manageTool} {
+		props, _ := tool.Parameters()["properties"].(map[string]any)
+		param, ok := props["max_lines"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: max_lines is missing from the parameters", name)
+		}
+		if param["default"] != 10 {
+			t.Fatalf("%s: max_lines default = %v, want the configured 10", name, param["default"])
+		}
+	}
+	// manage_session says its range equals exec_command's.
+	props, _ := manageTool.Parameters()["properties"].(map[string]any)
+	param, _ := props["max_lines"].(map[string]any)
+	if desc, _ := param["description"].(string); !strings.Contains(desc, "exec_command") {
+		t.Fatalf("manage_session max_lines does not point at exec_command's range: %s", desc)
+	}
+
+	// A request above the maximum is truncated to it, which folds the output.
+	command := "i=0; while [ $i -lt 30 ]; do i=$((i+1)); echo line$i; done"
+	if runtime.GOOS == "windows" {
+		command = "1..30 | ForEach-Object { \"line$_\" }"
+	}
+	res := execTool.Execute(context.Background(), map[string]any{"command": command, "max_lines": 1000})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	cr := commandResultFromResult(t, res.ForLLM)
+	if !cr.Truncated || cr.TotalLines != 30 {
+		t.Fatalf("a request above the maximum was not folded to the 20 line cap: %s", res.ForLLM)
+	}
+
+	// The description states the budget and the advice to redirect output.
+	description := execTool.Description()
+	for _, want := range []string{"default: 10", "maximum: 20", "Redirect important output"} {
+		if !strings.Contains(description, want) {
+			t.Fatalf("the exec_command description is missing %q: %s", want, description)
+		}
+	}
+}
+
 // repaintNumber reads the number a repainting child printed in its "<label> N"
 // line out of a tool result (-1 when the result does not carry that line).
 func repaintNumber(t *testing.T, result, label string) int {

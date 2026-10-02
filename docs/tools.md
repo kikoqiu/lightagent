@@ -55,7 +55,9 @@ type Tool interface {
   内容不会提前结束等待。**`exec_command` 就是「启动 + 一次 `poll`」**：窗口结束后的输出处理与
   `manage_session` 的 `poll` 完全一致——把缓冲区当前内容整份交给模型并清空，所以窗口内完成就直接
   返回 `exit_code` 与输出，未完成就转后台返回 `session_id` 并附上当时缓冲区的内容。`max_lines`/
-  `max_chars` 只约束**本次调用**返回的量（不跨调用、不按进程生命周期累计）。
+  `max_chars` 只约束**本次调用**返回的量（不跨调用、不按进程生命周期累计）。`max_lines` 的默认值是
+  `tools.exec.max_lines`（默认 50）。最大值是 `tools.exec.max_lines_max`（默认 100）。要得更多**自动
+  截断到最大值**。重要输出建议重定向到文件再用文件工具读回。
 * 硬超时 `run_timeout`（默认取 `exec.timeout_seconds`，3600s）到点强制结束进程；
   `run_timeout=0` 关闭硬超时。
 * 每次调用都是一个会话，会话的根进程（宿主 shell 或 Python 解释器）是它**自己进程树的根**：
@@ -89,7 +91,7 @@ type Tool interface {
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
 | `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |
-| `max_lines` | int | `200` | **本次调用**返回的行数上限（头尾折叠；不跨调用累计） |
+| `max_lines` | int | `exec.max_lines`（50） | **本次调用**返回的行数上限（头尾折叠；不跨调用累计）。最多可以给到 `exec.max_lines_max`（100），要得更多**自动截断到最大值**。重要输出建议重定向到文件（`> out.txt` / `2>&1`）再用文件工具读回 |
 | `max_chars` | int | `30000` | **本次调用**返回的字符上限（不跨调用累计） |
 
 返回（JSON 字符串）：
@@ -137,7 +139,7 @@ type Tool interface {
 | `session_id` | string | — | 目标会话（`list` 不需要） |
 | `data` | string | — | `input` 时写入 stdin 的内容 |
 | `wait_timeout` | int | `10` | `poll` 最长等待**进程退出**的秒数（中间有输出也不提前返回） |
-| `max_lines` | int | `200` | **本次调用**返回的行数上限（头尾折叠；不跨调用累计） |
+| `max_lines` | int | `exec.max_lines` | **本次调用**返回的行数上限（头尾折叠；不跨调用累计）。参数范围**与 `exec_command` 相同**（默认值与最大值都由那里配置，见 [`exec_command` 参数](#exec_command)） |
 | `max_chars` | int | `30000` | **本次调用**返回的字符上限（不跨调用累计） |
 
 行为：
@@ -148,6 +150,7 @@ type Tool interface {
   `status=completed` 且带 `exit_code`。因此进度条按每次 poll 当时的状态进入上下文，而两次 poll
   之间被覆盖掉的中间刷新不会出现。`max_lines`/`max_chars` 只约束**本次 poll** 返回的量（不跨
   poll、不按进程生命周期累计）：上限是「这一次交给模型多少」，而不是「这个进程一共交给模型多少」。
+  `max_lines` 的**参数范围与 `exec_command` 相同**（默认值与最大值同一处配置，超出自动截断）。
   等待可被**回合中断**取消：中断像 `wait_timeout` 到期一样结束等待，`warning` 说明 poll 被中断
   而进程仍在运行——poll 只是观察者，绝不去动它监视的进程；下一次 poll 继续接着读。
   **把进程的退出状态（退出前写出的输出 + `exit_code`）交出来的那一次 poll 就是该会话的终点**：

@@ -253,6 +253,60 @@ func TestExecUseUTF8DefaultAndOverride(t *testing.T) {
 	}
 }
 
+// TestExecMaxLinesDefaultsAndOverride verifies tools.exec.max_lines (the default
+// of the tools' max_lines parameter) and max_lines_max (its upper bound): both
+// start at the built-in values, a partial section keeps them, an explicit pair is
+// preserved, and a bound below the default lowers the default to it so the two
+// stay consistent.
+func TestExecMaxLinesDefaultsAndOverride(t *testing.T) {
+	def := Default().Tools.Exec
+	if def.MaxLines != ExecMaxLinesDefault || def.MaxLinesMax != ExecMaxLinesMaxDefault {
+		t.Fatalf("exec limits default to %d/%d, want %d/%d",
+			def.MaxLines, def.MaxLinesMax, ExecMaxLinesDefault, ExecMaxLinesMaxDefault)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("LIGHTAGENT_CONFIG", path)
+
+	// A partial exec section keeps both built-in values.
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"exec":{"wait_seconds":5}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Tools.Exec.MaxLines != ExecMaxLinesDefault || cfg.Tools.Exec.MaxLinesMax != ExecMaxLinesMaxDefault {
+		t.Fatalf("merged exec config = %+v, want the built-in limits", cfg.Tools.Exec)
+	}
+
+	// An explicit pair is kept as written.
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"exec":{"max_lines":30,"max_lines_max":80}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Tools.Exec.MaxLines != 30 || cfg.Tools.Exec.MaxLinesMax != 80 {
+		t.Fatalf("exec limits = %d/%d, want 30/80", cfg.Tools.Exec.MaxLines, cfg.Tools.Exec.MaxLinesMax)
+	}
+
+	// A bound below the default lowers the default to it.
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"exec":{"max_lines":90,"max_lines_max":20}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Tools.Exec.MaxLines != 20 || cfg.Tools.Exec.MaxLinesMax != 20 {
+		t.Fatalf("exec limits = %d/%d, want the default lowered to the 20 bound",
+			cfg.Tools.Exec.MaxLines, cfg.Tools.Exec.MaxLinesMax)
+	}
+}
+
 // TestLoadFileExplicitPath covers -c/--config: an explicit path is used as-is
 // and a missing file is created from defaults.
 func TestLoadFileExplicitPath(t *testing.T) {

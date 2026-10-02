@@ -155,7 +155,7 @@ source <(lightagent completion bash)       # bash 补全
     "password": ""                      // 登录密码（明文保存）；非空即要求登录，盐自动生成
   },
   "tools": {
-    "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10 },
+    "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10, "max_lines": 50, "max_lines_max": 100 },
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
@@ -363,7 +363,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 执行脚本，采用「等待后转后台」模型：同步等待最多 `wait_timeout` 秒（默认 10），
 若超时则自动转入后台并返回 `session_id`。**`exec_command` 就是「启动 + 一次 `poll`」**：
 窗口结束后的输出处理与 `manage_session` 的 `poll` 完全相同（把缓冲区当前内容整份交给模型并清空），
-`max_lines`/`max_chars` 只约束**本次调用**返回的量。硬超时由 `run_timeout`（默认取配置）限制。
+`max_lines`/`max_chars` 只约束**本次调用**返回的量。`max_lines` 的默认值是 `tools.exec.max_lines`
+（默认 50），最大值是 `tools.exec.max_lines_max`（默认 100）。要得更多**自动截断到最大值**。
+重要输出建议重定向到文件再用文件工具读回。硬超时由 `run_timeout`（默认取配置）限制。
 输出经 ANSI 清理与头尾折叠。
 
 每次调用自成一个**进程树**：结束会话、硬超时、lightagent 退出（含 Ctrl+C / SIGTERM）
@@ -382,7 +384,8 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 ### `manage_session`
 管理 `exec_command` 产生的后台会话：`poll`（轮询增量输出，支持长轮询；**不论进程是否结束，都把
 缓冲区当前内容整份交出并清空**（含被就地重画的那一行），所以每次 poll 都能看到进度条当时的状态；
-`max_lines`/`max_chars` 只约束本次调用返回的量，不跨调用累计）、
+`max_lines`/`max_chars` 只约束本次调用返回的量，不跨调用累计。`max_lines` 的**参数范围与
+`exec_command` 相同**（默认值与最大值同一处配置）。超出范围自动截断）、
 `input`（写入 stdin，支持 `ctrl-c`、`enter` 等控制键）、`kill`（结束整棵进程树并释放会话，
 连同该进程树到此刻为止的输出一起交出：仍在运行 → 成功 + `exit_code = -1` + 输出；
 **已经退出 → `failed` + 实际退出码 + 最后输出**，两者都不丢信息）、`list`。

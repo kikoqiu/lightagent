@@ -79,6 +79,7 @@ func runSession(o *options, stdout io.Writer) error {
 	reg := tools.NewRegistry()
 	if cfg.Tools.Exec.Enabled {
 		engine := tools.NewExecEngine(cfg.Tools.Exec.TimeoutSeconds, cfg.Tools.Exec.WaitSeconds, cfg.Tools.Exec.UseUTF8)
+		engine.SetMaxLines(cfg.Tools.Exec.MaxLines, cfg.Tools.Exec.MaxLinesMax)
 		defer engine.Close()
 		reg.Register(tools.NewExecCommandTool(engine))
 		reg.Register(tools.NewManageSessionTool(engine))

@@ -54,9 +54,11 @@ func (t *ManageSessionTool) Parameters() map[string]any {
 				"description": "For action='poll': max seconds to wait for the process to exit. Output arriving in the meantime does not end the wait; the buffered output is returned either way, including the line a running process is repainting. Default: 10.",
 			},
 			"max_lines": map[string]any{
-				"type":        "integer",
-				"default":     200,
-				"description": "Maximum lines this call returns (head/tail folded). The limit is per call, not over the process lifetime. Default: 200.",
+				"type":    "integer",
+				"default": t.engine.maxLinesDefault,
+				"description": "Maximum lines this call returns (head/tail folded). The limit is per call, " +
+					"not over the process lifetime. The parameter range (default and maximum) is the same as " +
+					"exec_command's `max_lines`. The range applies to action='poll'.",
 			},
 			"max_chars": map[string]any{
 				"type":        "integer",
@@ -90,7 +92,7 @@ func (t *ManageSessionTool) Execute(ctx context.Context, args map[string]any) *R
 	if waitTimeout <= 0 {
 		waitTimeout = 10 * time.Second
 	}
-	maxLines := intArg(args, "max_lines", 200)
+	maxLines := t.engine.effectiveMaxLines(args)
 	maxChars := intArg(args, "max_chars", 30000)
 
 	switch action {

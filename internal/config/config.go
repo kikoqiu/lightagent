@@ -280,11 +280,30 @@ func (c *Config) ensureMCPServer() {
 	}
 }
 
+// Built-in exec output limits: the default of the shells' max_lines parameter
+// and the most one call may ask for (tools.exec.max_lines / max_lines_max).
+const (
+	// ExecMaxLinesDefault is the default line budget of one exec_command or
+	// manage_session answer.
+	ExecMaxLinesDefault = 50
+	// ExecMaxLinesMaxDefault is the upper bound of that budget: a call that
+	// asks for more lines is truncated to it.
+	ExecMaxLinesMaxDefault = 100
+)
+
 // ExecToolConfig configures exec_command / manage_session.
 type ExecToolConfig struct {
 	Enabled        bool `json:"enabled"`
 	TimeoutSeconds int  `json:"timeout_seconds"`
 	WaitSeconds    int  `json:"wait_seconds"`
+	// MaxLines is the default of the tools' max_lines parameter. It says how
+	// many lines one answer may carry. A missing or unusable value keeps
+	// ExecMaxLinesDefault (50).
+	MaxLines int `json:"max_lines"`
+	// MaxLinesMax is the upper bound of that parameter. A call that asks for
+	// more lines is truncated to it. It defaults to ExecMaxLinesMaxDefault
+	// (100). A value below MaxLines lowers MaxLines to it.
+	MaxLinesMax int `json:"max_lines_max"`
 	// UseUTF8 makes child processes speak UTF-8 instead of the host ANSI code
 	// page: on Windows the shell script gains a UTF-8 preamble (console input /
 	// output code pages and $OutputEncoding) and PYTHONIOENCODING=utf-8 is
@@ -464,7 +483,7 @@ func Default() *Config {
 		},
 		Web: WebConfig{Host: "127.0.0.1", Port: 0, Password: ""},
 		Tools: ToolsConfig{
-			Exec:          ExecToolConfig{Enabled: true, TimeoutSeconds: 3600, WaitSeconds: 10, UseUTF8: true},
+			Exec:          ExecToolConfig{Enabled: true, TimeoutSeconds: 3600, WaitSeconds: 10, MaxLines: ExecMaxLinesDefault, MaxLinesMax: ExecMaxLinesMaxDefault, UseUTF8: true},
 			ReadFileLines: FsToolConfig{Enabled: true, MaxReadFileSize: 32000, MaxReadFileLines: 200},
 			WriteFile:     WriteToolConfig{Enabled: true, MaxLines: 200, AutoSplit: true},
 			EditFile:      ToggleToolConfig{Enabled: true},
@@ -843,6 +862,18 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Tools.Exec.WaitSeconds <= 0 {
 		c.Tools.Exec.WaitSeconds = def.Tools.Exec.WaitSeconds
+	}
+	// max_lines is the default of the shells' per-call line budget and
+	// max_lines_max its upper bound. A missing or unusable value falls back to
+	// the built-in one. A bound below the default lowers the default to it.
+	if c.Tools.Exec.MaxLinesMax <= 0 {
+		c.Tools.Exec.MaxLinesMax = def.Tools.Exec.MaxLinesMax
+	}
+	if c.Tools.Exec.MaxLines <= 0 {
+		c.Tools.Exec.MaxLines = def.Tools.Exec.MaxLines
+	}
+	if c.Tools.Exec.MaxLines > c.Tools.Exec.MaxLinesMax {
+		c.Tools.Exec.MaxLines = c.Tools.Exec.MaxLinesMax
 	}
 	if c.Tools.ReadFileLines.MaxReadFileSize <= 0 {
 		c.Tools.ReadFileLines.MaxReadFileSize = def.Tools.ReadFileLines.MaxReadFileSize
