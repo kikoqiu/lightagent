@@ -337,6 +337,20 @@
   /* The glyph is a bar plus a chevron, drawn with the copy icons' stroke. */
   .jump-btn .jump-icon { flex:0 0 auto; width:15px; height:15px; }
   .jump-btn .jump-icon path { fill:none; stroke:currentColor; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
+  /* The stack's glyphs line up in one column. Every button is stretched to the width
+     of the widest one (see .jump's align-items), so the icon keeps its place at the
+     button's left padding and the word is centred in what is left of the row beside
+     it. Centring the icon and the word together instead pushed each button's glyph in
+     by half of its own word — Previous, Fold, Expand and Latest are four different
+     widths, so the three marks ended up staggered. On a phone the word is dropped (see
+     below) and the lone glyph goes back to the middle of the circle. */
+  .jump-btn .jump-label { flex:1 1 auto; text-align:center; }
+  /* The fold switch reuses those bars: the bar alone is "−" (a click folds every
+     foldable row to its first line); with the vertical bar crossing it, it is "+"
+     (a click opens them all again). app.js swaps the class with the state, together
+     with the button's word and title. */
+  .jump-btn .jump-icon .fold-plus { display:none; }
+  .jump-btn.folded .jump-icon .fold-plus { display:block; }
 
   .row { margin:0 0 15px; word-break:break-word; animation:rise .22s ease both; }
   @keyframes rise { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
@@ -401,6 +415,32 @@
   .tool .fn { font-weight:700; color:var(--yellow); }
   .tool .arg-name { font-weight:700; color:var(--cyan); }
   .tool .arg-sep, .tool .arg-val, .tool .arg-raw { color:var(--gray); }
+
+  /* ---- folding a row to its first line ---- */
+  /* app.js marks the long, repetitive kinds as foldable (see the fold section of
+     app.js): a thinking row folds to its label, a tool call to the tool's name, a
+     tool result to one line. Folded is a state of the row itself, so the reader can
+     open one of them by hand while the rest of the transcript stays folded. The
+     whole-pixel line heights (see #log) are what make a folded height exact. */
+  .reasoning.folded .text { display:none; }
+  /* A tool call's text block has no padding of its own, so limiting its height to
+     the line height clips the argument lines exactly. */
+  .tool.folded .text { max-height:20px; overflow:hidden; }
+  /* A result's first line has to be *kept*, and its text block has a padding of its
+     own: an overflow of a height-limited box is still painted there (overflow clips
+     at the padding box), which left the top pixels of the second line showing. The
+     first line and the rest are therefore separate nodes (app.js builds them, see
+     splitFoldLine): the rest is taken out of the flow and the first line is cut at the
+     row's width instead of wrapping, so nothing overflows and the block is exactly one
+     line plus its padding — the shape a one-line result has unfolded. */
+  .result.folded .fold-tail, .error.folded .fold-tail { display:none; }
+  .result.folded .fold-head, .error.folded .fold-head {
+    display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  /* The handle is the row's first line, and the cursor says so: the label of a
+     thinking row, the name of a tool call and — once folded — the single line that
+     is left of a result. */
+  .reasoning.foldable > .role, .tool.foldable .fn, .foldable.folded { cursor:pointer; }
 
   /* ---- compressed-context summary ---- */
   /* The summary row is the point where the older messages were cut out of the

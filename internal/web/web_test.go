@@ -395,7 +395,97 @@ func TestFollowLockAndJumpButtons(t *testing.T) {
 	}
 }
 
-// TestHiddenPageSavesEnergy pins the power behaviour of the page: a desktop keeps
+// TestFoldSwitchFoldsTheLongRowParts pins the transcript's folding. A thinking row
+// folds to its label, a tool call to the tool's name and a tool result to its first
+// line; the messages themselves — what the user wrote, what the agent answered and
+// the compressed-context summary — are never folded. The +/- switch between the jump
+// buttons folds every foldable row at once, and its state is what a new row is born
+// with (new thinking, tool and result rows arrive the way the transcript is shown);
+// each row keeps its own state, so the switch is a one-off action and a row the
+// reader opens by hand stays open. The state is the page's own memory: nothing is
+// persisted anywhere.
+func TestFoldSwitchFoldsTheLongRowParts(t *testing.T) {
+	src := pageSource()
+	for _, want := range []string{
+		// The switch sits between the jump marks, with its own glyph, word and state.
+		`class="jump-btn fold-btn" id="foldToggle"`,
+		`<path class="fold-plus" d="M8 3.4v9.2"/>`,
+		`<span class="jump-label" id="foldLabel">Fold</span>`,
+		".jump-btn .jump-icon .fold-plus { display:none; }",
+		".jump-btn.folded .jump-icon .fold-plus { display:block; }",
+		// The stack's glyphs line up in one column: the icon keeps its place at the
+		// button's left padding and the word is centred in what is left of the row.
+		".jump-btn .jump-label { flex:1 1 auto; text-align:center; }",
+		"var foldEl = document.getElementById('foldToggle');",
+		"if (foldEl) { foldEl.onclick = toggleAllRows; }",
+		"function updateFoldSwitch()",
+		"foldEl.title = foldAll ? 'expand ' + FOLD_WHAT + ' again' : 'fold ' + FOLD_WHAT + ' to its first line';",
+		// The state lives in a variable (memory only), and it is what a new row is
+		// born with.
+		"var foldAll = false;",
+		"function markFoldable(row)",
+		"if (foldAll) { foldRow(row, true); }",
+		// The three kinds that fold...
+		"addRow('reasoning', 'thinking', '', MARKDOWN, null, true)",
+		"addResultRow(!!ev.is_error, ev.text);",
+		"markFoldable(row);", // the tool call row, in addToolRow
+		// ...and a result keeps its first line as its own node, so a folded row shows
+		// exactly that line: the rest is taken out of the flow, and the line is cut at
+		// the row's width instead of wrapping (a height clamp would leave the top
+		// pixels of the next line showing in the text block's own padding).
+		"function addResultRow(isError, text)",
+		"function splitFoldLine(span)",
+		"head.className = 'fold-head';",
+		"tail.className = 'fold-tail';",
+		".result.folded .fold-tail, .error.folded .fold-tail { display:none; }",
+		"display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+		// ...and the two that want the whole row's state, one row at a time.
+		"function foldRow(row, on)",
+		"row.classList.toggle('folded', !!on);",
+		"function toggleAllRows()",
+		"eachFoldableRow(function (row) { foldRow(row, foldAll); });",
+		// The first line of a row is its handle, and a click on it is the per-row
+		// switch — the whole-transcript one never locks a row.
+		"function firstLineHit(row, e)",
+		"if (row.classList.contains('folded')) { return true; }",
+		"log.addEventListener('click', function (e) {",
+		"foldRow(row, !row.classList.contains('folded'));",
+		// The folded look: the label alone, the tool's name line alone, and a result's
+		// first line alone in its block.
+		".reasoning.folded .text { display:none; }",
+		".tool.folded .text { max-height:20px; overflow:hidden; }",
+		".result.folded .fold-head, .error.folded .fold-head {",
+		".reasoning.foldable > .role, .tool.foldable .fn, .foldable.folded { cursor:pointer; }",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the folding feature is missing %q", want)
+		}
+	}
+	// The messages, the summary and the markers around them are not folded: only the
+	// thinking, the tool calls and their results are.
+	for _, reject := range []string{
+		"addRow('user', 'you', ev.text || '', false, ev.attachments, true)",
+		"addRow('assistant', 'agent', text, true, null, true)",
+		"addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, true)",
+		"addRow('result', '', '[info] ' + (ev.text || ''), false, null, true)",
+	} {
+		if strings.Contains(src, reject) {
+			t.Errorf("this row kind must not be foldable: %q", reject)
+		}
+	}
+	// The state stays in memory: no storage is touched anywhere in the folding code.
+	for _, body := range []string{"toggleAllRows", "markFoldable", "updateFoldSwitch"} {
+		if strings.Contains(functionBody(t, body), "Storage") {
+			t.Errorf("%s must keep the fold state in the page's memory only", body)
+		}
+	}
+	// A fold has to reach the rows of a snapshot that is still arriving as well: they
+	// are built but not in the log yet.
+	if !strings.Contains(functionBody(t, "eachFoldableRow"), "replayBatch.children") {
+		t.Error("a fold must reach the rows held back for an arriving snapshot")
+	}
+}
+
 // its mirror and its transcript while it is hidden (it only slows its redraws
 // down), a phone gets a grace period before it is stopped, a background page
 // redraws once a second, and a visible page is redrawn as soon as text arrives.

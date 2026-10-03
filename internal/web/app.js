@@ -37,6 +37,12 @@
   // it is inserted as a whole (see flushReplayBatch), which costs one reflow per
   // batch instead of a layout read plus a scroll write per row.
   var replayBatch = null;
+  // swapInAtEnd is true while a snapshot is rebuilding a transcript that is still
+  // on screen: its rows are held back in the batch fragment and replace the log in
+  // one insert when the snapshot is complete (see beginHistory/endHistory). A
+  // rebuild that starts from an empty log (the first load) has nothing to keep on
+  // screen, so its batches reach the log as they arrive.
+  var swapInAtEnd = false;
   // The command rail's switches (/result, /markdown) are the only commands with
   // state: the rail shows it and sends the explicit opposite, so one click
   // always lands on the state the user asked for. The values arrive with the
@@ -393,6 +399,109 @@
 
   if (jumpPrevEl) { jumpPrevEl.onclick = jumpToPrevMessage; }
   if (jumpLatestEl) { jumpLatestEl.onclick = jumpToLatest; }
+
+  // ---- folding a row to its first line ----
+  // The model's thinking, its tool calls and their results are the long, repetitive
+  // part of a transcript. Each of those rows folds to its first line — the
+  // "thinking" label, the tool's name, one line of a result — and the reader folds
+  // or unfolds one of them by clicking that line. The messages themselves are never
+  // folded: what the user wrote, what the agent answered and the compressed-context
+  // summary are the transcript's content.
+  //
+  // The +/- switch between the jump buttons folds or unfolds every such row at once,
+  // and its state is what a new row is born with: a thinking row that arrives while
+  // the transcript is folded stays folded until the reader opens it. Each row keeps
+  // that state itself, so the switch is a one-off action — a row the reader opens by
+  // hand stays open whatever the rest of the transcript does. Nothing is stored: a
+  // reload or a reconnect rebuilds the rows from the switch's state.
+  var foldAll = false;
+
+  // foldRow folds or unfolds one row. A row that cannot be folded is left alone, so
+  // the switch can walk the whole transcript.
+  function foldRow(row, on) {
+    if (!row.classList || !row.classList.contains('foldable')) { return; }
+    row.classList.toggle('folded', !!on);
+  }
+
+  // markFoldable makes a row foldable, and folds it when that is the current state.
+  function markFoldable(row) {
+    row.classList.add('foldable');
+    if (foldAll) { foldRow(row, true); }
+  }
+
+  // eachFoldableRow visits every row on screen, the batch of a snapshot being
+  // replayed included: its rows are already built, so a fold has to reach them too.
+  function eachFoldableRow(visit) {
+    var lists = replayBatch ? [log.children, replayBatch.children] : [log.children];
+    for (var l = 0; l < lists.length; l++) {
+      for (var i = 0; i < lists[l].length; i++) { visit(lists[l][i]); }
+    }
+  }
+
+  // firstLineHit reports whether a click landed on the line a row keeps when it is
+  // folded: the label of a thinking row, the name line of a tool call, or the first
+  // line of a result. A folded row is nothing but that line, so any click in it
+  // counts; on an unfolded one the click must be inside the first line's own band —
+  // measured from the text's top edge with its padding counted off, since a result's
+  // text sits in a padded block (see the folded rules in app.css). A click above the
+  // text (the label line) is inside the band too, which is what makes the label the
+  // handle of a thinking row.
+  function firstLineHit(row, e) {
+    if (row.classList.contains('folded')) { return true; }
+    var span = rowText(row);
+    if (!span) { return false; }
+    var box = span.getBoundingClientRect();
+    var pad = parseFloat(window.getComputedStyle(span).paddingTop) || 0;
+    var line = parseFloat(window.getComputedStyle(row).lineHeight) || 20;
+    return (e.clientY - box.top - pad) < line;
+  }
+
+  // A click on that line folds or unfolds the row under it. The switch never locks
+  // the rows, so this stays available however the transcript is folded. The copy
+  // icon rides in the first line of the rows that carry one and stops its own
+  // clicks (see copyControl), so it is never read as a fold.
+  log.addEventListener('click', function (e) {
+    if (e.target && e.target.closest && e.target.closest('.row-actions')) { return; }
+    var row = copyRowOf(e.target);
+    if (!row || !row.classList.contains('foldable')) { return; }
+    if (!firstLineHit(row, e)) { return; }
+    var release = holdView();
+    foldRow(row, !row.classList.contains('folded'));
+    if (release) { release(); }
+    keepBottom();
+  });
+
+  // The switch's glyph and word say what a click does, the way "Latest" is only
+  // offered while it has somewhere to go: a bar alone ("−") folds the transcript to
+  // its first lines, a crossed bar ("+") opens them all again.
+  var foldEl = document.getElementById('foldToggle');
+  var foldLabelEl = document.getElementById('foldLabel');
+  var FOLD_WHAT = 'every thinking, tool call and tool result';
+
+  function updateFoldSwitch() {
+    if (!foldEl) { return; }
+    foldEl.classList.toggle('folded', foldAll);
+    if (foldLabelEl) { foldLabelEl.textContent = foldAll ? 'Expand' : 'Fold'; }
+    foldEl.title = foldAll ? 'expand ' + FOLD_WHAT + ' again' : 'fold ' + FOLD_WHAT + ' to its first line';
+    foldEl.setAttribute('aria-label', foldEl.title);
+  }
+
+  // toggleAllRows is the switch: it takes every foldable row on screen with it,
+  // however the reader left them, and leaves the rest of the transcript alone.
+  function toggleAllRows() {
+    foldAll = !foldAll;
+    // Folding changes the height of the rows above the view — the same kind of change
+    // a markdown pass makes, so a reader who scrolled back keeps their row (see
+    // holdView) and a following one is put back on the newest row (see keepBottom).
+    var release = holdView();
+    eachFoldableRow(function (row) { foldRow(row, foldAll); });
+    if (release) { release(); }
+    updateFoldSwitch();
+    keepBottom();
+  }
+
+  if (foldEl) { foldEl.onclick = toggleAllRows; }
+  updateFoldSwitch();
 
   // The elapsed badge in the running pill times the current turn, mirroring the
   // CLI prompt (busyElapsedLocked): tenths of a second up to a minute, then
@@ -813,10 +922,12 @@
   }
 
   // buildRow creates one transcript row. attachments are the files a message
-  // carried (the page draws them under the text; see mediaList).
-  function buildRow(cls, role, text, renderMD, attachments) {
+  // carried (the page draws them under the text; see mediaList). foldable marks a row
+  // the reader may fold to its first line (see the fold section).
+  function buildRow(cls, role, text, renderMD, attachments, foldable) {
     var row = document.createElement('div');
     row.className = 'row ' + cls;
+    if (foldable) { markFoldable(row); }
     var label = null;
     if (role) {
       label = document.createElement('span');
@@ -855,8 +966,8 @@
     keepBottom();
   }
 
-  function addRow(cls, role, text, renderMD, attachments) {
-    var row = buildRow(cls, role, text, renderMD, attachments);
+  function addRow(cls, role, text, renderMD, attachments, foldable) {
+    var row = buildRow(cls, role, text, renderMD, attachments, foldable);
     placeRow(row);
     return row;
   }
@@ -892,8 +1003,13 @@
   }
 
   // appendRow puts a row at the very end of the log (the pending messages it
-  // queues behind), following it while the reader is following.
+  // queues behind), following it while the reader is following. A row raised while
+  // a snapshot is being replayed joins the batch instead: the transcript on screen
+  // is the one the snapshot replaces, and a held-back rebuild swaps the new one in
+  // whole (see flushReplayBatch/endHistory), so a row added to the log itself would
+  // be wiped away with it.
   function appendRow(row) {
+    if (replayBatch) { replayBatch.appendChild(row); return; }
     log.appendChild(row);
     // The pending row a message adds is at the very bottom, so the bottom follows
     // it the same way (see keepBottom).
@@ -954,6 +1070,9 @@
   function addToolRow(name, args) {
     var row = document.createElement('div');
     row.className = 'row tool';
+    // A tool call folds to its name: the arguments are the bulk of it (see the fold
+    // section).
+    markFoldable(row);
     var box = document.createElement('span');
     box.className = 'text';
     var fn = document.createElement('span');
@@ -1002,6 +1121,37 @@
     return row;
   }
 
+  // addResultRow draws one tool result. A result is the one foldable row whose first
+  // line stays readable while folded, so its text is built as that line plus the rest
+  // of it (splitFoldLine) — see the folded rules in app.css for why a height clamp is
+  // not enough there.
+  function addResultRow(isError, text) {
+    var row = buildRow(isError ? 'error' : 'result', '', '[result] ' + text, false, null, true);
+    splitFoldLine(rowText(row));
+    placeRow(row);
+    return row;
+  }
+
+  // splitFoldLine splits a plain-text row into the line it keeps while folded and the
+  // rest of the text. Both halves stay inline spans, so while the row is unfolded the
+  // text reads exactly as it was written (the second half opens with the newline that
+  // separated them).
+  function splitFoldLine(span) {
+    if (!span) { return; }
+    var text = span.textContent || '';
+    var cut = text.indexOf('\n');
+    var head = document.createElement('span');
+    head.className = 'fold-head';
+    head.textContent = cut < 0 ? text : text.slice(0, cut);
+    span.textContent = '';
+    span.appendChild(head);
+    if (cut < 0) { return; }
+    var tail = document.createElement('span');
+    tail.className = 'fold-tail';
+    tail.textContent = text.slice(cut);
+    span.appendChild(tail);
+  }
+
   // ---- copy ----
   // Every user message and every agent reply can leave the page on the clipboard
   // in three flavours: markdown (the message as it was written), HTML (the
@@ -1019,10 +1169,11 @@
   var copyTimer = null;
 
   // copyableRow reports whether a row carries a copy control: the messages the
-  // user wrote (a pending one too — its text is the message) and the replies the
-  // agent produced.
+  // user wrote (a pending one too — its text is the message), the replies the agent
+  // produced, and the compressed-context summary — the only copy of the messages
+  // that were cut out of the context, so it has to be copyable too.
   function copyableRow(cls) {
-    return cls === 'user' || cls === 'user pending' || cls === 'assistant';
+    return cls === 'user' || cls === 'user pending' || cls === 'assistant' || cls === 'summary';
   }
 
   // copyGlyph draws the control's icon: two overlapping sheets, stroked with the
@@ -1602,6 +1753,11 @@
   // rides back on the next connection (?since=), so a page that reconnects after
   // nothing happened is answered with history_same and does not rebuild its log.
   var historyVersion = 0;
+  // replayVersion is the version of the snapshot being replayed. It is committed to
+  // historyVersion only once the snapshot reached the log (see endHistory): a
+  // snapshot that died on the way leaves the page asking for the transcript it
+  // really has, instead of reporting one it never received.
+  var replayVersion = 0;
   // Configuration injected by the server into the page head.
   var CFG = window.__LIGHTAGENT__ || {};
   var MARKDOWN = !!CFG.markdown;
@@ -1672,7 +1828,7 @@
     if (kind === 'turn_done' || kind === 'interrupted') { setRunning(false); }
     if (kind === 'reasoning_delta') {
       if (!reasoningRow) {
-        reasoningRow = addRow('reasoning', 'thinking', '', MARKDOWN);
+        reasoningRow = addRow('reasoning', 'thinking', '', MARKDOWN, null, true);
         // A fresh row has nothing drawn yet, so its first pass is immediate.
         reasoningRenderedAt = 0;
       }
@@ -1710,7 +1866,9 @@
         if (ev.is_error) { addRow('error', '', '[result] (error)', false); }
         return;
       }
-      addRow(ev.is_error ? 'error' : 'result', '', '[result] ' + ev.text, false);
+      // A result folds to its first line (see addResultRow); an info row, which
+      // shares the class, is not a tool result and stays whole.
+      addResultRow(!!ev.is_error, ev.text);
     }
     else if (kind === 'info') { addRow('result', '', '[info] ' + (ev.text || ''), false); syncResults(ev.text || ''); }
     else if (kind === 'compacted') {
@@ -1731,19 +1889,31 @@
 
   // flushReplayBatch moves the rows collected so far into the log: one insert,
   // one reflow, and no layout read per row (the view is pinned once, when the
-  // snapshot ends).
+  // snapshot ends). A held-back rebuild (swapInAtEnd) keeps its rows in the
+  // fragment instead, and the log is replaced in one insert when the snapshot is
+  // complete (see endHistory): the reader keeps looking at the transcript they had
+  // until the new one is whole, rather than at the top of the new one while the
+  // rest of it is still on its way.
   function flushReplayBatch() {
-    if (!replayBatch) { return; }
+    if (!replayBatch || swapInAtEnd) { return; }
     if (replayBatch.childNodes.length > 0) { log.appendChild(replayBatch); }
     replayBatch = document.createDocumentFragment();
   }
 
-  // beginHistory replaces the log with an empty one and starts a replay. A
+  // beginHistory starts the replay of the snapshot the header announces. A
   // snapshot always describes the full conversation, so it replaces the log
-  // instead of appending (otherwise reconnects duplicate every message).
+  // instead of appending (otherwise reconnects duplicate every message). A
+  // transcript already on screen is replaced only when the new one is complete
+  // (swapInAtEnd, see flushReplayBatch): wiping the log here would drop the view to
+  // the top of an empty box, and a long conversation takes a visible while to
+  // arrive — the reader would watch the top of the new transcript for all of it and
+  // then see it snap to the bottom. A first load has no old transcript to hold on
+  // to and paints as its batches arrive.
   function beginHistory(ev) {
-    recordHistoryVersion(ev);
-    log.innerHTML = '';
+    // The version is only remembered here: it is committed when the whole snapshot
+    // reached the log (see endHistory).
+    if (typeof ev.version === 'number') { replayVersion = ev.version; }
+    swapInAtEnd = log.childNodes.length > 0;
     // A snapshot rebuilds the transcript from scratch: the page starts over at
     // the newest row (the replay ends pinned there) and follows it again, and the
     // rows the jump buttons pointed at are gone with the old ones.
@@ -1777,8 +1947,9 @@
   }
 
   // recordHistoryVersion remembers which transcript the log was built from, so the
-  // next connection can report it as ?since=. A frame that does not carry one (a
-  // row batch arriving without its header) leaves the value alone.
+  // next connection can report it as ?since=. The replay path does not use it: a
+  // snapshot commits its version only once it reached the log (see replayVersion
+  // and endHistory).
   function recordHistoryVersion(ev) {
     if (typeof ev.version === 'number') { historyVersion = ev.version; }
   }
@@ -1796,9 +1967,10 @@
     setRunning(!!ev.busy);
   }
 
-  // appendHistoryRows draws one batch of the snapshot and inserts it. Batches
-  // keep the browser responsive: each frame the page receives is small, and the
-  // rows reach the document in one insert.
+  // appendHistoryRows draws one batch of the snapshot and hands it to the log.
+  // Batches keep the browser responsive: each frame the page receives is small, and
+  // a batch of a first fill reaches the document in one insert. A held-back rebuild
+  // keeps the batch in the replay fragment instead (see flushReplayBatch).
   function appendHistoryRows(ev) {
     if (!replayBatch) { beginHistory(ev); }
     (ev.messages || []).forEach(function (m) {
@@ -1815,27 +1987,56 @@
     flushReplayBatch();
   }
 
-  // endHistory closes the replay: the last batch is inserted, the view is pinned
-  // to the bottom (the way a refreshed page sits) and the running indicator picks
-  // up whatever the header reported.
+  // endHistory closes the replay: the snapshot's rows reach the log, the view is
+  // pinned to the bottom (the way a refreshed page sits) and the running indicator
+  // picks up whatever the header reported. A held-back rebuild replaces the
+  // transcript in one insert (see flushReplayBatch): an empty snapshot still has to
+  // clear what is on screen, and the messages sent while the snapshot was arriving
+  // are newer than everything it carries, so they go after the last replayed row.
   function endHistory() {
     if (!replaying) { return; }
-    flushReplayBatch();
+    for (var i = 0; i < pendingRows.length; i++) {
+      if (replayBatch && pendingRows[i].el.parentNode === replayBatch) { replayBatch.appendChild(pendingRows[i].el); }
+    }
+    var swapped = swapInAtEnd;
+    if (swapped) {
+      log.innerHTML = '';
+      if (replayBatch) { log.appendChild(replayBatch); }
+    } else {
+      flushReplayBatch();
+    }
     replayBatch = null;
+    swapInAtEnd = false;
+    // The log now shows the snapshot's transcript, so a reconnect may report its
+    // version (see replayVersion).
+    if (replayVersion) { historyVersion = replayVersion; replayVersion = 0; }
     replaying = false;
     log.classList.remove('replaying');
     // The compressed-context summary is not appended here: it is one of the rows
     // replayed above, recorded exactly where the context was cut, so a reload
     // rebuilds the truncation marker in the right place.
     setRunning(historyBusy);
+    // A transcript swapped in whole is a change the page made to the view it is
+    // carrying, so the bottom goes in with the same task: a write left to the
+    // animation frame would paint the new rows once at the position the old ones
+    // left behind.
+    if (swapped && following) { writeBottom(); return; }
     pinBottom();
   }
 
-  // dropReplayState discards an unfinished replay: a socket that closed mid
-  // snapshot leaves a half-built log behind, and the next connection replaces it
-  // with a fresh snapshot anyway.
+  // dropReplayState discards an unfinished replay: a first fill that the socket
+  // closed in the middle of stays half-built (a held-back rebuild never touched the
+  // log, see flushReplayBatch), and the next connection replaces it with a fresh
+  // snapshot anyway. The transcript a held-back snapshot was going to replace is
+  // still the one on screen, so only the queued markdown upgrades of the discarded
+  // rows have to go.
   function dropReplayState() {
+    if (swapInAtEnd) { mdPending.clear(); }
+    // The snapshot never reached the log: the transcript on screen keeps its own
+    // version, so the next connection asks for a full one again (see replayVersion).
+    replayVersion = 0;
     replayBatch = null;
+    swapInAtEnd = false;
     replaying = false;
     log.classList.remove('replaying');
   }

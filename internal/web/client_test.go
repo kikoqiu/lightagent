@@ -286,6 +286,34 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 	if strings.Contains(pageSource(), "function renderHistory") {
 		t.Error("the single-frame renderHistory replay should be gone")
 	}
+	// A snapshot that rebuilds a transcript already on screen holds its rows back
+	// until the whole snapshot is in: wiping the log first would drop the view to the
+	// top of an empty box, and a long conversation takes a visible while to arrive —
+	// the reader would watch the top of the new transcript for all of it and then see
+	// it snap to the bottom. The first fill has no old transcript to hold on to, so
+	// its batches reach the log as they arrive, and a message sent while the snapshot
+	// was arriving stays behind the last replayed row.
+	for _, want := range []string{
+		"swapInAtEnd = log.childNodes.length > 0;",
+		"if (!replayBatch || swapInAtEnd) { return; }",
+		"if (swapped) {",
+		"if (replayBatch) { log.appendChild(replayBatch); }",
+		"if (swapped && following) { writeBottom(); return; }",
+		"if (replayBatch) { replayBatch.appendChild(row); return; }",
+		"if (replayBatch && pendingRows[i].el.parentNode === replayBatch) { replayBatch.appendChild(pendingRows[i].el); }",
+		// The version of a snapshot is remembered when its header arrives and
+		// committed only once the snapshot reached the log: a snapshot that died on
+		// the way must not be reported as the transcript the page shows.
+		"if (typeof ev.version === 'number') { replayVersion = ev.version; }",
+		"if (replayVersion) { historyVersion = replayVersion; replayVersion = 0; }",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	if strings.Contains(functionBody(t, "beginHistory"), "log.innerHTML") {
+		t.Error("beginHistory must not wipe the log before the new snapshot is complete")
+	}
 	// A reconnect that has nothing to report keeps the log instead of rebuilding
 	// it: the page reports the transcript version its log was built from and the
 	// mirror answers history_same when its own version still matches.

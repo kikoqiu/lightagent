@@ -128,8 +128,9 @@
          the messages the user wrote and stops the automatic follow with it; it
          is always there. "Latest" is the way back down — it resumes following,
          so app.js fades it out while the view follows already and it is only
-         offered when it is needed. A phone shows both as round icon buttons, a
-         desktop as pills with the glyph and the word. -->
+         offered when it is needed. Between the two sits the fold switch, which
+         folds every foldable row at once (see below). A phone shows them as round
+         icon buttons, a desktop as pills with the glyph and the word. -->
     <div class="stream">
       <div id="log" role="log" aria-live="polite"></div>
       <div class="jump" id="jump">
@@ -145,6 +146,21 @@
             <path d="M4.8 9.6 8 6.4l3.2 3.2"/>
           </svg>
           <span class="jump-label">Previous</span>
+        </button>
+        <!-- The fold switch, between the two jump marks: one click folds every
+             thinking, tool call and tool result to its first line, another opens
+             them all again. The glyph is the bars the jump marks are drawn from —
+             a bar alone is "−" (fold everything), a crossed bar is "+" (unfold
+             everything) — and app.js swaps it together with the word and the
+             title, since the state it leaves behind is also the state a new row
+             is born with (see the fold section of app.js). -->
+        <button class="jump-btn fold-btn" id="foldToggle" type="button"
+                title="fold every thinking, tool call and tool result to its first line" aria-label="fold every thinking, tool call and tool result to its first line">
+          <svg class="jump-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <path d="M3.4 8h9.2"/>
+            <path class="fold-plus" d="M8 3.4v9.2"/>
+          </svg>
+          <span class="jump-label" id="foldLabel">Fold</span>
         </button>
         <button class="jump-btn off" id="jumpLatest" type="button"
                 title="jump to the newest message (and follow again)" aria-label="jump to the newest message">

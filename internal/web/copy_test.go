@@ -33,16 +33,18 @@ func TestCopyMenuIsServed(t *testing.T) {
 	}
 }
 
-// TestCopyControlOnMessageRows pins the copy feature: every user message and
-// every agent reply carries a copy control, the menu offers markdown, HTML and
-// plain text, and the row's source text is remembered so the markdown flavour is
-// the message as it was written rather than what the current rendering shows.
+// TestCopyControlOnMessageRows pins the copy feature: every user message, every
+// agent reply and the compressed-context summary carries a copy control, the menu
+// offers markdown, HTML and plain text, and the row's source text is remembered so
+// the markdown flavour is the message as it was written rather than what the
+// current rendering shows. The summary is the only copy of the messages that were
+// cut out of the context, so it has to be copyable too.
 func TestCopyControlOnMessageRows(t *testing.T) {
 	src := pageSource()
 	for _, want := range []string{
-		// The two row kinds that carry the control, and the hook that adds it.
+		// The row kinds that carry the control, and the hook that adds it.
 		"function copyableRow(cls)",
-		"return cls === 'user' || cls === 'user pending' || cls === 'assistant';",
+		"return cls === 'user' || cls === 'user pending' || cls === 'assistant' || cls === 'summary';",
 		"if (copyableRow(cls)) {",
 		"(label || row).appendChild(copyControl(row))",
 		// The source text of a row, kept for the markdown flavour.
