@@ -85,8 +85,8 @@ type Tool interface {
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `command` | string | 必填 | 脚本内容，由 `language` 解释 |
-| `language` | string | 宿主引擎（`ps` / `sh`，即宿主 shell） | 脚本语言；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`ps`/`sh`、以及存在时的 `python`）；参数自带的 `description` 是固定文案，各取值含义与 Python 版本在工具描述里 |
+| `script` | string | 必填 | 脚本内容，由 `language` 选择引擎解释 |
+| `language` | string | 宿主引擎（`ps` / `sh`，即宿主 shell） | **脚本语言**：选择用哪个引擎解释 `script` 文本（是引擎选择，不是调用标签）；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`ps`/`sh`、以及存在时的 `python`）；参数自带的 `description` 是固定文案，各取值含义与 Python 版本在工具描述里 |
 | `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
@@ -113,17 +113,17 @@ type Tool interface {
 示例（转为后台）：
 
 ```json
-{ "command": "python -m http.server 8000", "wait_timeout": 3 }
+{ "script": "python -m http.server 8000", "wait_timeout": 3 }
 ```
 
 示例（宿主引擎与 Python 直接引擎）：
 
 ```json
-{ "command": "Get-ChildItem -Name", "language": "ps" }
+{ "script": "Get-ChildItem -Name", "language": "ps" }
 ```
 
 ```json
-{ "command": "import sys\nprint(sys.version)\nprint(2 ** 10)", "language": "python" }
+{ "script": "import sys\nprint(sys.version)\nprint(2 ** 10)", "language": "python" }
 ```
 
 ---

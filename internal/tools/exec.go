@@ -135,14 +135,14 @@ func childCodec(useUTF8 bool) consoleCodec {
 // proc.Reap).
 const execWaitDelay = 2 * time.Second
 
-// launch starts command and returns its session. language (see
+// launch starts script and returns its session. language (see
 // resolveScriptLanguage) selects the script engine: the host shell or a Python
 // interpreter started directly. The returned session is already registered in
 // the session manager. useUTF8 selects the child stdio mode: the bytes are
 // either passed through untouched or converted in Go with the host ANSI code
 // page; see childCodec.
-func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*ProcessSession, error) {
-	name, args, err := scriptInvocation(language, command, useUTF8)
+func (e *ExecEngine) launch(language, script, cwd string, useUTF8 bool) (*ProcessSession, error) {
+	name, args, err := scriptInvocation(language, script, useUTF8)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +163,7 @@ func (e *ExecEngine) launch(language, command, cwd string, useUTF8 bool) (*Proce
 	codec := childCodec(useUTF8)
 	session := &ProcessSession{
 		ID:        generateSessionID(),
-		Command:   command,
+		Command:   script,
 		StartTime: time.Now().Unix(),
 		Status:    "running",
 		stdin:     codec.wrapStdin(stdin),
@@ -230,23 +230,23 @@ func hostShellEnvironment() string {
 // UTF-8 preamble would garble programs that write the host code page, e.g.
 // Python on a zh-CN host) and Go converts the host code page instead. Windows
 // uses PowerShell, other hosts use "sh -c".
-func shellInvocation(command string, useUTF8 bool) (string, []string) {
+func shellInvocation(script string, useUTF8 bool) (string, []string) {
 	if runtime.GOOS != "windows" {
-		return "sh", []string{"-c", command}
+		return "sh", []string{"-c", script}
 	}
 	return resolveWindowsShell(), []string{
 		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-		"-Command", windowsCommandScript(command, useUTF8),
+		"-Command", windowsCommandScript(script, useUTF8),
 	}
 }
 
 // windowsCommandScript prepends the UTF-8 preamble to a PowerShell script when
 // UTF-8 mode is on.
-func windowsCommandScript(command string, useUTF8 bool) string {
+func windowsCommandScript(script string, useUTF8 bool) string {
 	if !useUTF8 {
-		return command
+		return script
 	}
-	return windowsUTF8Preamble + command
+	return windowsUTF8Preamble + script
 }
 
 // pythonIOEncodingEnv forces Python's stdin/stdout/stderr to UTF-8. The shell
@@ -324,8 +324,9 @@ func (t *ExecCommandTool) Name() string { return "exec_command" }
 
 // Description implements Tool.
 func (t *ExecCommandTool) Description() string {
-	description := fmt.Sprintf("Execute a script with state-aware execution. `language` selects the "+
-		"script language (available: %s; default: %s, the host shell). "+
+	description := fmt.Sprintf("Execute a script with state-aware execution. `script` holds the script "+
+		"source and `language` selects the engine that runs it (available: %s; default: %s, the host "+
+		"shell). "+
 		"Synchronously waits up to `wait_timeout` seconds (default: %d). If it finishes within "+
 		"that window, returns exit_code and output directly. If it exceeds `wait_timeout` it "+
 		"detaches to the background and returns a `session_id`: the call is a start followed by "+
@@ -351,15 +352,17 @@ func (t *ExecCommandTool) Parameters() map[string]any {
 	runDefault := int(t.engine.runTimeoutDefault() / time.Second)
 	hostLanguage := hostScriptLanguageID()
 	properties := map[string]any{
-		"command": map[string]any{
+		"script": map[string]any{
 			"type":        "string",
-			"description": "The script content to execute.",
+			"description": "The script source text to run with the engine chosen by `language`.",
 		},
 		"language": map[string]any{
-			"type":        "string",
-			"enum":        scriptLanguageIDs(),
-			"default":     hostLanguage,
-			"description": "Script language used to run `command`.",
+			"type":    "string",
+			"enum":    scriptLanguageIDs(),
+			"default": hostLanguage,
+			"description": "Script language that interprets `script`: it selects the engine that runs the " +
+				"text, not a label for the call. Omit to use the host shell. The schema enum lists the " +
+				"available engines and the tool description explains each one.",
 		},
 		"wait_timeout": map[string]any{
 			"type":        "integer",
@@ -400,7 +403,7 @@ func (t *ExecCommandTool) Parameters() map[string]any {
 	return map[string]any{
 		"type":       "object",
 		"properties": properties,
-		"required":   []string{"command"},
+		"required":   []string{"script"},
 	}
 }
 
@@ -414,9 +417,9 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 	if t.engine == nil {
 		return fail("exec_command is not configured")
 	}
-	command, _ := stringArg(args, "command")
-	if trimSpace(command) == "" {
-		return fail("command is required")
+	script, _ := stringArg(args, "script")
+	if trimSpace(script) == "" {
+		return fail("script is required")
 	}
 	rawLanguage, _ := stringArg(args, "language")
 	language, err := resolveScriptLanguage(rawLanguage)
@@ -444,9 +447,9 @@ func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Res
 	// without the parameter (see useUTF8ParamAvailable) always speak UTF-8.
 	useUTF8 := execUseUTF8(boolArgOr(args, "use_utf8", t.engine.useUTF8))
 
-	session, err := t.engine.launch(language, command, cwd, useUTF8)
+	session, err := t.engine.launch(language, script, cwd, useUTF8)
 	if err != nil {
-		return fail(fmt.Sprintf("failed to start command: %v", err))
+		return fail(fmt.Sprintf("failed to start script: %v", err))
 	}
 
 	session.startWatchdog(runTimeout)

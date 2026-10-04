@@ -229,8 +229,8 @@ func TestReadStreamAcceptsBothArgumentsShapes(t *testing.T) {
 	}{
 		{
 			name: "raw json value",
-			call: `{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":{"command":"ls","n":2}}}`,
-			want: `{"command":"ls","n":2}`,
+			call: `{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":{"script":"ls","n":2}}}`,
+			want: `{"script":"ls","n":2}`,
 		},
 		{
 			name: "null arguments",

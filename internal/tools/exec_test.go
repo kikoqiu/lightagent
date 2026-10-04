@@ -25,7 +25,7 @@ func TestExecCommandCompletes(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -59,7 +59,7 @@ func TestExecCommandCollapsesCRProgress(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -132,7 +132,7 @@ func TestExecCommandKeepsOverwrittenTail(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -155,7 +155,7 @@ func TestExecCommandBackgroundThenManageSession(t *testing.T) {
 	manageTool := NewManageSessionTool(engine)
 
 	res := execTool.Execute(context.Background(), map[string]any{
-		"command":      command,
+		"script":       command,
 		"wait_timeout": 1,
 	})
 	if res.IsError {
@@ -223,7 +223,7 @@ func TestManageSessionPollReportsTheRepaintState(t *testing.T) {
 	execTool := NewExecCommandTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
-	res := execTool.Execute(context.Background(), map[string]any{"command": command})
+	res := execTool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -292,7 +292,7 @@ func TestManageSessionPollWaitsForExit(t *testing.T) {
 	execTool := NewExecCommandTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
-	res := execTool.Execute(context.Background(), map[string]any{"command": command, "wait_timeout": 1})
+	res := execTool.Execute(context.Background(), map[string]any{"script": command, "wait_timeout": 1})
 	sessionID := sessionIDFromResult(t, res.ForLLM)
 	if sessionID == "" {
 		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
@@ -330,7 +330,7 @@ func TestManageSessionPollInterruptLeavesTheProcessRunning(t *testing.T) {
 	manageTool := NewManageSessionTool(engine)
 
 	// wait_timeout 1 backgrounds the command, which keeps printing for ~3s.
-	res := execTool.Execute(context.Background(), map[string]any{"command": command, "wait_timeout": 1})
+	res := execTool.Execute(context.Background(), map[string]any{"script": command, "wait_timeout": 1})
 	sessionID := sessionIDFromResult(t, res.ForLLM)
 	if sessionID == "" {
 		t.Fatalf("the command did not stay in the background: %s", res.ForLLM)
@@ -404,7 +404,7 @@ func TestExecCommandInterruptKillsProcess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan *Result, 1)
 	go func() {
-		done <- tool.Execute(ctx, map[string]any{"command": command, "wait_timeout": 30})
+		done <- tool.Execute(ctx, map[string]any{"script": command, "wait_timeout": 30})
 	}()
 
 	// Interrupt once the command runs and has printed its first line, so there
@@ -473,7 +473,7 @@ func TestEngineCloseKillsRunningSessions(t *testing.T) {
 
 	engine := NewExecEngine(300, 1, true)
 	tool := NewExecCommandTool(engine)
-	res := tool.Execute(context.Background(), map[string]any{"command": command, "wait_timeout": 1})
+	res := tool.Execute(context.Background(), map[string]any{"script": command, "wait_timeout": 1})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -509,7 +509,7 @@ func TestExecCommandCompletesWhenALeftoverHoldsThePipes(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -589,7 +589,7 @@ func TestPollFlushesPerCallAndLimitsApplyPerCall(t *testing.T) {
 	manageTool := NewManageSessionTool(engine)
 
 	// The child only waits for input, so its start hands over no output.
-	res := execTool.Execute(context.Background(), map[string]any{"command": command, "max_lines": 10})
+	res := execTool.Execute(context.Background(), map[string]any{"script": command, "max_lines": 10})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -669,7 +669,7 @@ func TestExecMaxLinesBudget(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		command = "1..30 | ForEach-Object { \"line$_\" }"
 	}
-	res := execTool.Execute(context.Background(), map[string]any{"command": command, "max_lines": 1000})
+	res := execTool.Execute(context.Background(), map[string]any{"script": command, "max_lines": 1000})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -725,7 +725,7 @@ func TestExecCommandDecodesLocalizedOutput(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -792,7 +792,7 @@ func TestExecCommandDecodesPythonOutput(t *testing.T) {
 		command = "& " + command
 	}
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -818,7 +818,7 @@ func TestManageSessionInputRoundTrip(t *testing.T) {
 	execTool := NewExecCommandTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
-	res := execTool.Execute(context.Background(), map[string]any{"command": command, "wait_timeout": 1})
+	res := execTool.Execute(context.Background(), map[string]any{"script": command, "wait_timeout": 1})
 	sessionID := sessionIDFromResult(t, res.ForLLM)
 	if sessionID == "" {
 		t.Skipf("the command did not stay in the background: %s", res.ForLLM)
@@ -902,7 +902,7 @@ func TestExecCommandUseUTF8Param(t *testing.T) {
 		utf8Command = "Write-Output '" + sample + "'"
 	}
 	res := utf8Tool.Execute(context.Background(), map[string]any{
-		"command": utf8Command, "use_utf8": true,
+		"script": utf8Command, "use_utf8": true,
 	})
 	if res.IsError || !strings.Contains(res.ForLLM, sample) {
 		t.Fatalf("use_utf8=true was not honoured: %s", res.ForLLM)
@@ -917,7 +917,7 @@ func TestExecCommandUseUTF8Param(t *testing.T) {
 	defer legacyEngine.Close()
 	legacyTool := NewExecCommandTool(legacyEngine)
 	res = legacyTool.Execute(context.Background(), map[string]any{
-		"command": rawCommand, "use_utf8": false,
+		"script": rawCommand, "use_utf8": false,
 	})
 	if res.IsError || !strings.Contains(res.ForLLM, sample) {
 		t.Fatalf("use_utf8=false was not honoured: %s", res.ForLLM)
@@ -961,7 +961,7 @@ func TestExecCommandUTF8ModeLocalizedOutput(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -1000,7 +1000,7 @@ func TestExecCommandUTF8ModeForcesPythonUTF8(t *testing.T) {
 		command = "& " + command
 	}
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
@@ -1174,7 +1174,7 @@ func TestExecCommandLanguageParameter(t *testing.T) {
 	// The parameter description is a plain statement: the model reads the
 	// selectable values from the enum checked above.
 	description, _ := param["description"].(string)
-	if !strings.Contains(description, "Script language used to run") {
+	if !strings.Contains(description, "Script language that interprets") {
 		t.Errorf("the language parameter has no usable description: %q", description)
 	}
 
@@ -1264,7 +1264,7 @@ func TestExecCommandRejectsUnsupportedLanguage(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": "echo hi", "language": "ruby"})
+	res := tool.Execute(context.Background(), map[string]any{"script": "echo hi", "language": "ruby"})
 	if !res.IsError || !strings.Contains(res.ForLLM, "unsupported language") {
 		t.Fatalf("result = %+v, want an unsupported language failure", res)
 	}
@@ -1290,7 +1290,7 @@ func TestExecCommandPythonLanguage(t *testing.T) {
 	// escapes into Chinese, and the whole text travels through `-c`.
 	script := "print(\"line-1\")\n" + `print("\u4e2d\u6587\u8f93\u51fa")` + "\nprint(\"line-3\")"
 	res := tool.Execute(context.Background(), map[string]any{
-		"command": script, "language": ScriptLanguagePython,
+		"script": script, "language": ScriptLanguagePython,
 	})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
@@ -1325,7 +1325,7 @@ func TestExecCommandPythonLanguageANSIMode(t *testing.T) {
 
 	script := `print("\u4e2d\u6587\u8f93\u51fa")`
 	res := tool.Execute(context.Background(), map[string]any{
-		"command": script, "language": ScriptLanguagePython, "use_utf8": false,
+		"script": script, "language": ScriptLanguagePython, "use_utf8": false,
 	})
 	if res.IsError || !strings.Contains(res.ForLLM, sample) {
 		t.Fatalf("python ANSI output was not decoded: %s", res.ForLLM)

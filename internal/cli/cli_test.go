@@ -246,7 +246,7 @@ func historyTail() []llm.Message {
 			ReasoningContent: "think about it",
 			ToolCalls: []llm.ToolCall{{
 				ID:       "1",
-				Function: llm.ToolCallFunction{Name: "exec_command", Arguments: `{"command":"ls"}`},
+				Function: llm.ToolCallFunction{Name: "exec_command", Arguments: `{"script":"ls"}`},
 			}},
 		},
 		{Role: "tool", ToolCallID: "1", Name: "exec_command", Content: historyToolResult},
@@ -269,7 +269,7 @@ func TestShowHistoryRendersTheWholeTranscript(t *testing.T) {
 	for _, want := range []string{
 		"--- history: 4 messages ---",
 		"[thinking]", "think about it",
-		"[tool]", "exec_command", "command - ls",
+		"[tool]", "exec_command", "script - ls",
 		"[result]", "Command completed.", "file1",
 		"done",
 		"--- end of history ---",
@@ -1599,8 +1599,8 @@ func TestToolRowKeepsNameAndArgs(t *testing.T) {
 	}
 
 	buf.Reset()
-	c.render(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"command":"ls","timeout_seconds":30,"flag":true}`})
-	if want := "[tool] exec_command\ncommand - ls\ntimeout_seconds - 30\nflag - true\n"; buf.String() != want {
+	c.render(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"script":"ls","timeout_seconds":30,"flag":true}`})
+	if want := "[tool] exec_command\nscript - ls\ntimeout_seconds - 30\nflag - true\n"; buf.String() != want {
 		t.Fatalf("multi-argument tool row = %q, want %q", buf.String(), want)
 	}
 
@@ -1631,8 +1631,8 @@ func TestToolRowShowsFullValues(t *testing.T) {
 	}
 
 	buf.Reset()
-	c.render(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"command":"line1\nline2"}`})
-	if got, want := buf.String(), "[tool] exec_command\ncommand\nline1\nline2\n"; got != want {
+	c.render(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"script":"line1\nline2"}`})
+	if got, want := buf.String(), "[tool] exec_command\nscript\nline1\nline2\n"; got != want {
 		t.Fatalf("multi-line value = %q, want %q", got, want)
 	}
 

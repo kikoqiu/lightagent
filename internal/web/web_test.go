@@ -661,7 +661,7 @@ func TestHistoryFrameKeepsToolRows(t *testing.T) {
 		{Role: "assistant", ToolCalls: []llm.ToolCall{{
 			ID:       "1",
 			Type:     "function",
-			Function: llm.ToolCallFunction{Name: "exec_command", Arguments: `{"command":"ls"}`},
+			Function: llm.ToolCallFunction{Name: "exec_command", Arguments: `{"script":"ls"}`},
 		}}},
 		{Role: "tool", ToolCallID: "1", Name: "exec_command", Content: `{"status":"completed","exit_code":0,"session_id":null,"output":"file1","truncated":false,"total_lines":1,"total_bytes":5,"elapsed_seconds":0.1,"warning":null}`},
 		{Role: "tool", ToolCallID: "2", Name: "mcp_echo", Content: "plain text"},
@@ -675,7 +675,7 @@ func TestHistoryFrameKeepsToolRows(t *testing.T) {
 	if got := rolesOf(rows); got != "user,tool_call,tool_result,assistant" {
 		t.Fatalf("roles = %q, want user,tool_call,tool_result,assistant", got)
 	}
-	if rows[1].Name != "exec_command" || rows[1].Args != `{"command":"ls"}` {
+	if rows[1].Name != "exec_command" || rows[1].Args != `{"script":"ls"}` {
 		t.Fatalf("tool_call row = %+v", rows[1])
 	}
 	if !strings.Contains(rows[2].Content, "Command completed.") || !strings.Contains(rows[2].Content, "file1") {
@@ -750,7 +750,7 @@ func TestScrollbackTracksLiveEvents(t *testing.T) {
 	bus.Publish(agent.Event{Type: agent.EventUser, Text: "hi"})
 	bus.Publish(agent.Event{Type: agent.EventReasoningDelta, Text: "think"})
 	bus.Publish(agent.Event{Type: agent.EventAssistant, Text: "answer"})
-	bus.Publish(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"command":"ls"}`})
+	bus.Publish(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"script":"ls"}`})
 	bus.Publish(agent.Event{Type: agent.EventToolResult, Name: "exec_command", Text: "Command completed."})
 	bus.Publish(agent.Event{Type: agent.EventInfo, Text: "note"})
 	bus.Publish(agent.Event{Type: agent.EventError, Text: "boom"})

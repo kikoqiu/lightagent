@@ -51,7 +51,7 @@ func startBackground(t *testing.T, engine *ExecEngine, command string) string {
 	t.Helper()
 	tool := NewExecCommandTool(engine)
 	res := tool.Execute(context.Background(), map[string]any{
-		"command": command, "wait_timeout": 1,
+		"script": command, "wait_timeout": 1,
 	})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
@@ -216,7 +216,7 @@ func TestExecCommandCompletionLeavesNoSession(t *testing.T) {
 	defer engine.Close()
 	tool := NewExecCommandTool(engine)
 
-	res := tool.Execute(context.Background(), map[string]any{"command": command})
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
