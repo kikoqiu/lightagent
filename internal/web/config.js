@@ -108,7 +108,7 @@
       ]
     },
     {
-      title: 'Tools · files', note: 'read_file_lines / write_file / edit_file',
+      title: 'Tools · files', note: 'read_file / write_file / edit_file',
       fields: [
         { path: 'tools.read_file_lines.enabled', type: 'bool', help: 'register the line reader' },
         { path: 'tools.read_file_lines.max_read_file_size', type: 'number', min: 1, help: 'file size cap in bytes' },

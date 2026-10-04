@@ -276,7 +276,7 @@ func (t *WebFetchTool) Parameters() map[string]any {
 				"most the configured number of lines, with the whole page saved next to it. save_as_md: " +
 				"the markdown of the whole page written to a file in the working directory — the answer " +
 				"reports the path, the line count and the size instead of the text, and you read the file " +
-				"with read_file_lines. save_as_html: the same, with the HTML the fetch got (the DOM the " +
+				"with read_file. save_as_html: the same, with the HTML the fetch got (the DOM the " +
 				"browser built, or the source over HTTP). ignore: nothing but the status line — use it " +
 				"when the call is made for its side effects (a script's value, a saved file, warming a " +
 				"session) or when the page is already known.",
@@ -457,7 +457,7 @@ func (t *WebFetchTool) answer(method webFetchMethod, page utils.WebFetchResult,
 			return "", "", fetchedAs(page, "markdown", countLines(markdown), len(markdown)), "", fmt.Sprintf(
 				"Fetch succeeded (%s) but the page could not be saved: %v", page.FinalURL, err)
 		}
-		message := fmt.Sprintf("Saved %s as markdown to %s (%d lines / %d chars); its content is not repeated here (method %s) — read it with read_file_lines if it is needed.",
+		message := fmt.Sprintf("Saved %s as markdown to %s (%d lines / %d chars); its content is not repeated here (method %s) — read it with read_file if it is needed.",
 			page.FinalURL, path, countLines(markdown), len(markdown), method)
 		return message, "", fetchedAs(page, "markdown", countLines(markdown), len(markdown)), path, ""
 
@@ -565,7 +565,7 @@ func (t *WebFetchTool) invokeJSArg(args map[string]any) (string, string) {
 // and with the middle of its markdown otherwise; either way the lines left out
 // are replaced by a marker that says how many they were, and the note — part of
 // the status line the answer carries — reports the totals, the choice and where
-// the whole page went, so the model can read it in pieces with read_file_lines
+// the whole page went, so the model can read it in pieces with read_file
 // instead of losing it; savedTo is that path, for the display line of the
 // caller. A page that fits, or a tool that asks for no limit at all, is
 // returned as it is, with an empty note.
@@ -596,7 +596,7 @@ func (t *WebFetchTool) limitFeedback(markdown string, content utils.ContentRegio
 		return body, fmt.Sprintf("%s; %s; saving the whole page failed: %v", head, choice, err), ""
 	}
 	return body, fmt.Sprintf("%s; %s. The whole page was saved as markdown to %s — "+
-		"read it with read_file_lines if the rest is needed.", head, choice, path), path
+		"read it with read_file if the rest is needed.", head, choice, path), path
 }
 
 // locatedFeedback builds the answer of a page whose main content was located:

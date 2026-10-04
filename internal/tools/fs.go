@@ -37,7 +37,7 @@ func NewReadFileLinesTool(fs FsConfig) *ReadFileLinesTool {
 }
 
 // Name implements Tool.
-func (t *ReadFileLinesTool) Name() string { return "read_file_lines" }
+func (t *ReadFileLinesTool) Name() string { return "read_file" }
 
 // Description implements Tool.
 func (t *ReadFileLinesTool) Description() string {
@@ -45,9 +45,8 @@ func (t *ReadFileLinesTool) Description() string {
 		"Rows are returned without line numbers; the header states the file line of the first "+
 		"row. CRLF is normalized to LF. start_line is 1-indexed and inclusive, max_lines is a row "+
 		"count, so one call returns [start_line, start_line + rows - 1]; continue with "+
-		"start_line = last returned file line + 1. Per-call limit: up to %d lines / %d bytes. "+
-		"encoding: 'utf8' (default) reads UTF-8 text; other charset labels (gbk, big5, "+
-		"shift_jis, euc-jp, euc-kr, windows-1252) decode each line into UTF-8 text.",
+		"start_line = last returned file line + 1. With the default 'auto' encoding the header "+
+		"also names the charset that was detected. Per-call limit: up to %d lines / %d bytes.",
 		t.fs.MaxReadFileLines, t.fs.MaxReadFileSize)
 }
 
@@ -72,8 +71,8 @@ func (t *ReadFileLinesTool) Parameters() map[string]any {
 			},
 			"encoding": map[string]any{
 				"type":        "string",
-				"default":     "utf8",
-				"description": "'utf8' (default) or a charset label (gbk, big5, shift_jis, euc-jp, euc-kr, windows-1252).",
+				"default":     contentEncodingAuto,
+				"description": "'auto' (default) sniffs the file's charset (a byte order mark, else valid UTF-8, else the host ANSI code page) and the header names what it found; 'utf8' forces UTF-8; any other value is a charset label (gbk, big5, shift_jis, euc-jp, euc-kr, windows-1252) that decodes each line into UTF-8 text.",
 			},
 		},
 		"required": []string{"path"},
@@ -100,11 +99,15 @@ func (t *ReadFileLinesTool) Execute(ctx context.Context, args map[string]any) *R
 		return Fail("limit is not supported in line mode; use max_lines")
 	}
 	encodingRaw, _ := stringArg(args, "encoding")
+	if trimSpace(encodingRaw) == "" {
+		encodingRaw = contentEncodingAuto
+	}
 	encoding := normalizeContentEncoding(encodingRaw)
+	autoDetect := encoding == contentEncodingAuto
 	if contentEncodingIsBinary(encoding) {
 		return Fail(fmt.Sprintf("encoding %q is a binary representation and cannot be applied line by line; use a charset label such as gbk, big5 or shift_jis", encoding))
 	}
-	if encoding != contentEncodingUTF8 {
+	if encoding != contentEncodingUTF8 && !autoDetect {
 		if _, encErr := lookupCharsetEncoding(encoding); encErr != nil {
 			return Fail(encErr.Error())
 		}
@@ -140,12 +143,24 @@ func (t *ReadFileLinesTool) Execute(ctx context.Context, args map[string]any) *R
 		return Fail(fmt.Sprintf("failed to read file: %v", readErr))
 	}
 	sample = sample[:n]
-	if encoding == contentEncodingUTF8 && looksBinary(sample) {
+
+	encodingName := ""
+	if autoDetect {
+		if looksBinary(sample) {
+			return Fail("file appears to be binary; pass an encoding label (e.g. gbk) if it is a legacy-encoded text file")
+		}
+		encoding = detectTextEncoding(sample, hostAnsiCharsetLabel())
+		encodingName = contentEncodingDisplayName(encoding)
+		// A byte order mark is not part of the first line.
+		if encoding == contentEncodingUTF8 && bytes.HasPrefix(sample, utf8BOM) {
+			sample = sample[len(utf8BOM):]
+		}
+	} else if encoding == contentEncodingUTF8 && looksBinary(sample) {
 		return Fail("file appears to be binary; pass an encoding label (e.g. gbk) if it is a legacy-encoded text file")
 	}
 
 	reader := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(sample), f), 64*1024)
-	content, footer, err := t.readWindow(reader, filepath.Base(path), encoding, int64(startLine), limit, sizeBudget)
+	content, footer, err := t.readWindow(reader, filepath.Base(path), encoding, encodingName, int64(startLine), limit, sizeBudget)
 	if err != nil {
 		return Fail(err.Error())
 	}
@@ -157,7 +172,7 @@ func (t *ReadFileLinesTool) Execute(ctx context.Context, args map[string]any) *R
 
 // readWindow reads [startLine, startLine+limit-1] honoring the byte budget and
 // returns the content plus a header/footer describing the window.
-func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encoding string, startLine, limit, sizeBudget int64) (string, string, error) {
+func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encoding, encodingName string, startLine, limit, sizeBudget int64) (string, string, error) {
 	lineIndex := int64(1)
 	reachedEOF := false
 
@@ -226,8 +241,12 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 
 	content := strings.Join(lines, "\n")
 	endLine := startLine + linesRead - 1
-	header := fmt.Sprintf("[file: %s | lines %d-%d | first row below = file line %d]",
+	header := fmt.Sprintf("[file: %s | lines %d-%d | first row below = file line %d",
 		displayName, startLine, endLine, startLine)
+	if encodingName != "" {
+		header += fmt.Sprintf(" | encoding: %s", encodingName)
+	}
+	header += "]"
 
 	var footer string
 	switch {
@@ -235,10 +254,10 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 		footer = fmt.Sprintf("%s\n[TRUNCATED - file line %d exceeded the %d-byte budget and was cut mid-line.]",
 			header, endLine, sizeBudget)
 	case byteTruncated:
-		footer = fmt.Sprintf("%s\n[TRUNCATED - byte budget reached; call read_file_lines start_line=%d max_lines=%d]",
+		footer = fmt.Sprintf("%s\n[TRUNCATED - byte budget reached; call read_file start_line=%d max_lines=%d]",
 			header, startLine+linesRead, limit)
 	case !reachedEOF && limit > 0 && linesRead >= limit:
-		footer = fmt.Sprintf("%s\n[PARTIAL - more content remains; call read_file_lines start_line=%d max_lines=%d]",
+		footer = fmt.Sprintf("%s\n[PARTIAL - more content remains; call read_file start_line=%d max_lines=%d]",
 			header, startLine+linesRead, limit)
 	default:
 		footer = header + "\n[END OF FILE - no further content.]"
@@ -600,14 +619,10 @@ func (t *EditFileTool) Name() string { return "edit_file" }
 
 // Description implements Tool.
 func (t *EditFileTool) Description() string {
-	return "Edit a file by locating find and writing content at that spot. mode='replace' (default): " +
-		"find is a literal that must appear exactly once and is replaced by content. mode='insert': " +
-		"unlike replace, content is prepended before the find (find is preserved, result: content + find). Note that insert is not insert line, no newline is automatically added. When find is not unique, an error will be reported, you can retry then. " +
-		"mode='regex': find is an RE2 pattern, one or many matches are allowed and every match is replaced " +
-		"by content, which may reference capture groups with $1, $2, ... ($$ = literal $). JSON escaping " +
-		"applies: \\n = newline, \\\\n = literal backslash-n. encoding: 'utf8' (default) text; 'hex'/'base64' literal byte-sequence " +
-		"edits (mode='regex' rejected); other values are charset labels (gbk, big5, shift_jis, " +
-		"windows-1252) for non-UTF-8 files."
+	return "Edit a file by locating find and writing content at that spot; the `mode` parameter says " +
+		"how find is matched and where content lands. A find that is not unique, or that matches " +
+		"nothing, is reported as an error so the call can be retried with more context. JSON escaping " +
+		"applies to the arguments: \\n is a newline and \\\\n is a literal backslash-n."
 }
 
 // Parameters implements Tool.
@@ -625,17 +640,17 @@ func (t *EditFileTool) Parameters() map[string]any {
 			},
 			"content": map[string]any{
 				"type":        "string",
-				"description": "Text written at the match: the replacement for mode='replace'/'regex' (use $1, $2, ... for capture groups), or the text inserted before the match for mode='insert'.",
+				"description": "Text written at the match: the replacement for mode='replace'/'regex', or the text inserted before the match for mode='insert'. In mode='regex' it may reference capture groups with $1, $2, ... ($$ = literal $). JSON escaping applies (\\n = newline, \\\\n = literal backslash-n).",
 			},
 			"mode": map[string]any{
 				"type":        "string",
 				"default":     "replace",
-				"description": "'replace' (default) swaps the unique literal find for content; 'insert' writes content in front of the unique literal find; 'regex' treats find as an RE2 pattern and replaces every match.",
+				"description": "'replace' (default) swaps the unique literal find for content; 'insert' writes content in front of the unique literal find (the find is kept, so the result is content + find; insert is not insert-line, no newline is added automatically); 'regex' treats find as an RE2 pattern and replaces every match.",
 			},
 			"encoding": map[string]any{
 				"type":        "string",
 				"default":     "utf8",
-				"description": "'utf8' (default) text; 'hex'/'base64' binary payloads (regex disabled); other values are charset labels (gbk, big5, shift_jis, windows-1252) for non-UTF-8 files.",
+				"description": "'utf8' (default) text; 'hex'/'base64' treat find/content as literal byte sequences (mode='regex' is rejected); other values are charset labels (gbk, big5, shift_jis, windows-1252) for non-UTF-8 files.",
 			},
 		},
 		"required": []string{"path", "find", "content"},

@@ -18,7 +18,7 @@ type Tool interface {
 不额外包装、不加信封 —— 工具反馈走的就是 OpenAI 那条正常的 tool 结果通路。
 
 工具由配置开关控制（见 [configuration.md](configuration.md)）：可用的工具有
-`exec_command`、`manage_session`、`read_file_lines`、`write_file`、`edit_file`、`webfetch`，
+`exec_command`、`manage_session`、`read_file`、`write_file`、`edit_file`、`webfetch`，
 以及需要 `openai.media_types` 与 `tools.upload_media.enabled` **同时成立**时才会出现的
 `upload_media`。
 
@@ -182,7 +182,7 @@ type Tool interface {
 
 ---
 
-## `read_file_lines`
+## `read_file`
 
 按行读取文本文件，适合源码、Markdown、日志、配置。
 
@@ -191,15 +191,18 @@ type Tool interface {
 | `path` | string | 必填 | 文件路径 |
 | `start_line` | int | `1` | 1 起算、包含的首行 |
 | `max_lines` | int | `max_read_file_lines` | 本次最多返回行数 |
-| `encoding` | string | `utf8` | 文本编码或字符集标签 |
+| `encoding` | string | `auto` | 文本编码或字符集标签 |
 
-* 输出无行号；表头给出该窗口的首行文件行号：`[file: <base> | lines X-Y | first row below = file line X]`。
+* 输出无行号；表头给出该窗口的首行文件行号（`auto` 时还会写出识别到的具体编码）：
+  `[file: <base> | lines X-Y | first row below = file line X | encoding: utf-8]`。
 * CRLF 归一化为 LF。
 * 页脚标记：`[PARTIAL - ...]`（还有内容）、`[TRUNCATED - ...]`（字节预算用尽）、
   `[END OF FILE - no further content.]`。
 * 续读：`start_line = 上次最后一行 + 1`（页脚会给出该值）。
-* `encoding`：`utf8`（默认，二进制会被拒绝）；或字符集标签（`gbk`、`big5`、`shift_jis`、
-  `euc-jp`、`euc-kr`、`windows-1252`）逐行解码为 UTF-8。`hex`/`base64` 不适用（逐行无意义）。
+* `encoding`：`auto`（默认，自动侦测）先看字节序 BOM，再看样本是否为合法 UTF-8，否则按宿主 ANSI
+  代码页（如 zh-CN 上的 `gbk`），都无法识别时按 UTF-8；表头会写出识别到的具体编码。也可显式指定
+  `utf8`，或字符集标签（`gbk`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`windows-1252`）逐行解码为
+  UTF-8；`hex`/`base64` 不适用（逐行无意义）。
 
 ---
 
@@ -281,7 +284,7 @@ type Tool interface {
   再看文件头**，任一候选被接受即通过。
 * **不是可接收类型时报错**（不上传任何内容）：返回形如
   `"x.zip" looks like application/zip, which this model does not accept; upload one of: image/png, application/pdf`，
-  模型可据此改走 `exec_command` 转换，或对纯文本改用 `read_file_lines`。
+  模型可据此改走 `exec_command` 转换，或对纯文本改用 `read_file`。
 * 其余拒绝情况：路径缺失/空、文件不存在、路径是目录、空文件、超过 `tools.upload_media.max_bytes`
   （默认 20 MiB）——全部只返回错误，**错误结果不带任何附件**。
 * 成功时的工具结果分两部分：
@@ -423,7 +426,7 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
 * `fetch_as_md`（默认）：就是上面那段 —— 正文 Markdown（最多 `max_lines` 行，见下）。
 * `save_as_md`：把**整页的 Markdown**（与默认方式同一份转换结果，因此站内链接同样是根相对路径）写到工作目录的
   `.lightagent/webfetch/<时间戳>.md`，反馈里**只有状态行**：路径、行数与字符数，正文一个字都不进上下文
-  （需要时用 `read_file_lines` 分页读）。适合"先把页面存下来、稍后再读"。
+  （需要时用 `read_file` 分页读）。适合"先把页面存下来、稍后再读"。
 * `save_as_html`：把这次抓到的 **HTML 原文**写到 `.lightagent/webfetch/<时间戳>.html`，反馈同样的状态行（路径 + 字符数）。
   浏览器取法存的是**渲染后的 DOM**（含运行时生成的内容），`http` 取法存的是服务器源码 —— 就是给模型看的那份 HTML，
   不做任何链接改写。**这一种方式不做 Markdown 转换**（因此也不会因为"没有可读正文"而失败）。
@@ -502,7 +505,7 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
   `标签名.类名` 与起始行号，或"中间的 N 行（第 X-Y 行）"），以及整页保存的**文件路径**。
   整页（**Markdown 正文**，与反馈是同一份转换结果）写到**工作目录**的
   `.lightagent/webfetch/<时间戳>.md`（同秒多次抓取自动加序号，不覆盖），
-  模型需要全文时用 `read_file_lines` 分页读该文件即可 —— 文件里的行号与状态行报的行号一致，
+  模型需要全文时用 `read_file` 分页读该文件即可 —— 文件里的行号与状态行报的行号一致，
   不用再转换一次。
 * `max_lines` 为**负数**表示不限长度：整页正文照原样回填，也不落盘（`max_lines` 为 `0` 用内置 100）。
 * 落盘失败（目录不可写等）时仍然只回填这一段（正文或中间几行）并带上标记，并在状态行里报告失败原因
@@ -582,7 +585,7 @@ tool: <真实执行结果>
 每个 server 工具被包装为 `tools.Tool`，命名为 `mcp_<server>_<tool>`（小写、非法字符归一为 `_`）；描述与参数 schema 直接取自 server。
 
 * MCP 工具**始终**以 `RegisterDeferred` 作为**锁定函数**注册，进入搜索/解锁体系；**永不出现在模型的 `tools` 声明里**。
-* 内置工具（`exec_command` / `manage_session` / `read_file_*` / `write_file` / `edit_file` / `webfetch`）不受此机制影响，始终作为核心工具暴露。
+* 内置工具（`exec_command` / `manage_session` / `read_file` / `write_file` / `edit_file` / `webfetch`）不受此机制影响，始终作为核心工具暴露。
 
 ### 系统提示词注入
 

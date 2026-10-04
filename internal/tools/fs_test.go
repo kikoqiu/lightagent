@@ -62,6 +62,111 @@ func TestReadFileLinesEOF(t *testing.T) {
 	}
 }
 
+// TestReadFileToolName pins the advertised tool name.
+func TestReadFileToolName(t *testing.T) {
+	if got := NewReadFileLinesTool(FsConfig{}).Name(); got != "read_file" {
+		t.Fatalf("tool name = %q, want read_file", got)
+	}
+}
+
+// TestReadFileAutoDetectsUTF8 pins the default encoding: without an explicit
+// encoding a UTF-8 file is read as UTF-8 and the header names the charset.
+func TestReadFileAutoDetectsUTF8(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "u8.txt", "héllo wörld\n")
+	tool := NewReadFileLinesTool(FsConfig{})
+
+	res := tool.Execute(context.Background(), map[string]any{"path": p})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "encoding: utf-8") {
+		t.Fatalf("header missing the detected encoding: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "héllo wörld") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// TestReadFileAutoStripsBOM checks that a UTF-8 byte order mark is detected (the
+// header names utf-8) and is not shown as part of the first line.
+func TestReadFileAutoStripsBOM(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "bom.txt")
+	body := append([]byte{0xEF, 0xBB, 0xBF}, []byte("first\nsecond\n")...)
+	if err := os.WriteFile(p, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadFileLinesTool(FsConfig{})
+
+	res := tool.Execute(context.Background(), map[string]any{"path": p})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "encoding: utf-8") {
+		t.Fatalf("header missing the detected encoding: %s", res.ForLLM)
+	}
+	if !strings.HasSuffix(res.ForLLM, "\nfirst\nsecond") {
+		t.Fatalf("BOM not stripped or content wrong: %q", res.ForLLM)
+	}
+}
+
+// TestReadFileAutoDetectsGBK checks the "auto" default end to end on a host
+// whose ANSI code page is GBK (zh-CN Windows): the bytes are decoded and the
+// header names the detected charset.
+func TestReadFileAutoDetectsGBK(t *testing.T) {
+	if host := hostAnsiCharsetLabel(); host != "gbk" {
+		t.Skipf("host ANSI charset is %q, not gbk", host)
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "auto-gbk.txt")
+	data, err := encodeTextToFileBytes("中文测试\n第二行", "gbk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadFileLinesTool(FsConfig{MaxReadFileSize: 65536, MaxReadFileLines: 100})
+
+	res := tool.Execute(context.Background(), map[string]any{"path": p})
+	if res.IsError {
+		t.Fatalf("read failed: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "encoding: gbk") {
+		t.Fatalf("header does not name the detected encoding: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "中文测试\n第二行") {
+		t.Fatalf("decoded content missing: %s", res.ForLLM)
+	}
+}
+
+// TestDetectTextEncoding pins the auto-detection order: valid UTF-8 (and a BOM)
+// stay UTF-8, other bytes fall to the host charset, and a host with no charset
+// still reads UTF-8.
+func TestDetectTextEncoding(t *testing.T) {
+	gbk, err := encodeTextToFileBytes("中文", "gbk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		sample []byte
+		host   string
+		want   string
+	}{
+		{"ascii", []byte("hello"), "gbk", "utf8"},
+		{"utf8", []byte("héllo"), "gbk", "utf8"},
+		{"bom", append([]byte{0xEF, 0xBB, 0xBF}, 'x'), "", "utf8"},
+		{"gbk with host", gbk, "gbk", "gbk"},
+		{"gbk without host", gbk, "", "utf8"},
+	}
+	for _, tc := range cases {
+		if got := detectTextEncoding(tc.sample, tc.host); got != tc.want {
+			t.Errorf("%s: detectTextEncoding = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestWriteFileModes(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "w.txt")

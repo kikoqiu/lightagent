@@ -26,3 +26,12 @@ func hostAnsiEncoding() encoding.Encoding {
 	})
 	return ansiEncodingVal
 }
+
+// hostAnsiCharsetLabel returns the WHATWG label of the host ANSI code page
+// (CP_ACP), or "" when the code page is UTF-8 or not one of the known legacy
+// charsets. The "auto" file reader uses it as a fallback guess for a file that
+// is not valid UTF-8.
+func hostAnsiCharsetLabel() string {
+	codePage, _, _ := procGetACP.Call()
+	return ansiCodePageCharsets[int(codePage)]
+}

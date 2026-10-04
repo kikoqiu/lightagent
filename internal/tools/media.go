@@ -334,7 +334,7 @@ func (t *UploadMediaTool) Description() string {
 		"Read a local file whose media type this model accepts and upload it as an attachment of this conversation, "+
 			"so you receive its content (the picture, the audio, the document) instead of having to read its bytes. "+
 			"Accepted types: %s. A file of any other type is refused with an error naming the accepted types; "+
-			"convert it first, or read it as text with read_file_lines when it really is text.",
+			"convert it first, or read it as text with read_file when it really is text.",
 		t.cfg.List())
 }
 

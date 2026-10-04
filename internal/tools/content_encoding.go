@@ -1,10 +1,12 @@
 package tools
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/htmlindex"
@@ -16,6 +18,9 @@ const (
 	contentEncodingUTF8   = "utf8"
 	contentEncodingHex    = "hex"
 	contentEncodingBase64 = "base64"
+	// contentEncodingAuto makes a reader sniff the charset of the bytes it is
+	// given instead of trusting a fixed label.
+	contentEncodingAuto = "auto"
 )
 
 // normalizeContentEncoding canonicalizes a user-provided encoding name.
@@ -24,10 +29,58 @@ func normalizeContentEncoding(raw string) string {
 	switch enc {
 	case "", "utf8", "utf-8", "unicode-1-1-utf-8":
 		return contentEncodingUTF8
+	case "auto":
+		return contentEncodingAuto
 	case "hex", "h":
 		return contentEncodingHex
 	case "base64", "b64":
 		return contentEncodingBase64
+	}
+	return enc
+}
+
+// utf8BOM is the UTF-8 byte order mark.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// detectTextEncoding resolves the charset of a byte sample for the "auto"
+// reading mode. A UTF-8 byte order mark wins, then a sample that is already
+// valid UTF-8, then the host ANSI code page (hostLabel, e.g. gbk on a zh-CN
+// Windows host) — and UTF-8 is the last resort when the sample matches nothing
+// else. The result is an internal encoding identifier: contentEncodingUTF8 or a
+// charset label accepted by lookupCharsetEncoding.
+func detectTextEncoding(sample []byte, hostLabel string) string {
+	if bytes.HasPrefix(sample, utf8BOM) || sampleIsUTF8(sample) {
+		return contentEncodingUTF8
+	}
+	if hostLabel != "" {
+		if _, err := lookupCharsetEncoding(hostLabel); err == nil {
+			return hostLabel
+		}
+	}
+	return contentEncodingUTF8
+}
+
+// sampleIsUTF8 reports whether a byte sample is valid UTF-8. The sample is the
+// head of a file, so a multi-byte rune may be cut at the end; an incomplete
+// trailing sequence is dropped before the check instead of making the whole
+// sample look non-UTF-8.
+func sampleIsUTF8(sample []byte) bool {
+	if utf8.Valid(sample) {
+		return true
+	}
+	for i := len(sample) - 1; i >= 0 && i > len(sample)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(sample[i]) {
+			return utf8.Valid(sample[:i])
+		}
+	}
+	return false
+}
+
+// contentEncodingDisplayName is the name an auto-detected encoding is reported
+// under in a read header.
+func contentEncodingDisplayName(enc string) string {
+	if enc == contentEncodingUTF8 {
+		return "utf-8"
 	}
 	return enc
 }

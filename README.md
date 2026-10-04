@@ -27,7 +27,7 @@
 | 5 | Web 镜像 | 配置了 web 端口即启动（`web.host` 可选绑定 IP，默认 `127.0.0.1`）；端口被占用时自动递增；**WebSocket 实时双向镜像**；页面内置配置编辑器（控件表单 + JSON 双模式，`/api/config`，**重启生效**）与**一键重启**（`/api/restart`：先保存会话，新进程自动恢复）；**登录对话框**（密码明文保存在配置里、浏览器只发送加盐摘要，HttpOnly 会话 cookie + 记住我，**改密码立即生效**） |
 | 6 | 会话记录 | **一个目录一个会话**：启动询问是否恢复历史（默认是），退出询问是否保存（默认是），运行中只存内存，`/save` 手动落盘 |
 | 7 | 命令执行 | `exec_command` / `manage_session`（脚本语言 `ps`/`sh`/`python`，后台会话、轮询、输入、终止；进程退出后保留为**僵尸**直到被 `poll` 取走最后的输出与退出码，没人取走则 24h 后清理）；`/result` 可开关结果输出 |
-| 8 | 文件操作 | `read_file_lines` / `write_file` / `edit_file`（含 GBK 等字符集转换） |
+| 8 | 文件操作 | `read_file` / `write_file` / `edit_file`（`read_file` 默认 `auto` 自动侦测编码，含 GBK 等字符集转换） |
 | 9 | 上下文压缩 | 全局唯一压缩模式：超阈值时把旧消息总结成一条摘要；**服务商报「上下文超限」时自动回退本轮消息、压缩后重发同一条消息**（最多 2 次）；`/history` 查看用量，CLI 提示行与网页徽标实时显示 |
 | 10 | 彩色 CLI | 角色区分颜色；仅在确认终端支持 ANSI 时才着色（非 TTY、`NO_COLOR`、`TERM=dumb`、旧版 Windows 控制台自动关闭） |
 | 11 | Markdown 渲染 | 助手回答与模型思考均渲染为 Markdown：CLI 转 ANSI，Web 用浏览器端 marked（GFM，含表格）+ DOMPurify，公式（`$…$` / `$$…$$`）由内嵌的 **math.js** 渲染为 MathML（浏览器原生排版，无字体文件、无第三方公式库）；`ui.markdown` 默认开启 |
@@ -405,11 +405,13 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 终点**（`exec_command` 在窗口内等到退出时则当场交出并释放），此后同一 `session_id` 报 not found。
 **24 小时内始终没人 poll 的僵尸自动清理**——所以「进程已经退出后再 poll」不再报错丢信息。
 
-### `read_file_lines`
+### `read_file`
 按行读取文本文件，1 起算的 `start_line` + `max_lines` 分页，输出带行号范围表头与
 `[PARTIAL]` / `[TRUNCATED]` / `[END OF FILE]` 标记。CRLF 归一化为 LF。
-`encoding` 默认 `utf8`，也可指定字符集标签（`gbk`、`big5`、`shift_jis`、`euc-jp`、
-`euc-kr`、`windows-1252`）逐行解码为 UTF-8。
+`encoding` 默认 `auto`：先看字节序 BOM，再判断样本是否为合法 UTF-8，否则按宿主 ANSI 代码页
+（如 zh-CN 上的 `gbk`），都无法识别时按 UTF-8，表头写出识别到的具体编码；也可显式指定
+`utf8` 或字符集标签（`gbk`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`windows-1252`）逐行解码为
+UTF-8。
 
 ### `write_file`
 写入文件，`mode`：`o` 覆盖（默认）、`a` 追加、`c` 仅新建。默认开启自动拆解
@@ -497,7 +499,7 @@ HTTP 源码的字节上限。转换用 `internal/utils/html_converter.go`：站�
 （`<article>`/`<main>`/`class=main` 之类的容器，导航、侧栏与页脚换成 `...(above/below: N of M lines omitted)`
 标记（各自独占一行），并写出正文起始行号），定位不到正文时回填整篇的**中间 100 行**；整页（Markdown
 正文）写进工作目录的 `.lightagent/webfetch/<时间>.md`，状态行说明"超长、总行数与总字节、这次取的是哪一段、
-文件路径"，需要全文时模型可用 `read_file_lines` 分页读取该文件。负数表示不限长度（此时不落盘）。
+文件路径"，需要全文时模型可用 `read_file` 分页读取该文件。负数表示不限长度（此时不落盘）。
 正文里的站内链接写成**根相对路径**（`/docs/other`），状态行给出这次抓取的地址作为基准。
 详见 [tools.md](docs/tools.md#webfetch)。
 
