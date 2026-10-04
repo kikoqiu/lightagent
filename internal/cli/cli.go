@@ -20,6 +20,7 @@ import (
 	"lightagent/internal/slash"
 	"lightagent/internal/store"
 	"lightagent/internal/termcolor"
+	"lightagent/internal/tools"
 )
 
 // SaveMode controls what happens to the session when the CLI exits.
@@ -1691,7 +1692,11 @@ func (c *CLI) writeSummaryLocked(summary string, stamp time.Time) {
 }
 
 // ShowHistory prints a resumed conversation so re-entering a session shows what
-// was said before.
+// was said before. Every message is drawn the way the live view draws it (see
+// render): a thinking block above the answer, the assistant text, one [tool] row
+// per requested call and its shown result. The restored transcript therefore
+// matches what was on screen before the session was saved instead of collapsing
+// a tool-heavy reply down to its visible answer.
 func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
 	// Everything before the last compaction is represented by the summary
 	// alone, so it is printed first: it marks where this transcript starts. A
@@ -1704,23 +1709,61 @@ func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
 		return
 	}
 	c.write(termcolor.Gray(fmt.Sprintf("--- history: %d messages ---", len(messages))) + "\n")
+	// The current /result switch decides whether stored tool results are
+	// redrawn, mirroring the live view (and the web mirror's seedHistory).
+	showResults := c.agent.ToolResultsVisible()
 	for _, m := range messages {
 		switch m.Role {
 		case "user":
+			// A resumed message has no source (the front-end that typed it is
+			// not recorded) and no start time, so it carries the plain prompt
+			// label, exactly like a line typed in this terminal.
 			c.write(userLine(m.Content) + "\n")
 		case "assistant":
-			if strings.TrimSpace(m.Content) == "" {
+			// Same order as the live transcript: the thinking block opens the
+			// reply, then its visible answer, then one [tool] row per call.
+			// render() closes the block as soon as the answer (or a tool row)
+			// starts.
+			if strings.TrimSpace(m.ReasoningContent) != "" {
+				c.render(agent.Event{Type: agent.EventReasoningDelta, Text: m.ReasoningContent})
+			}
+			if strings.TrimSpace(m.Content) != "" {
+				c.render(agent.Event{Type: agent.EventAssistant, Text: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				c.render(agent.Event{Type: agent.EventToolCall, Name: tc.Function.Name, Args: tc.Function.Arguments})
+			}
+		case "tool":
+			// The stored message keeps the tool's structured answer; its
+			// user-facing rendering is recovered the same way the web mirror
+			// does (see tools.RenderStoredResult). A result with no rendering
+			// was never shown live either, and one the user hid with /result
+			// off stays hidden.
+			if !showResults {
 				continue
 			}
-			if c.markdownOn {
-				c.write(markdown.ANSI(m.Content))
-			} else {
-				c.write(m.Content)
+			text, isErr, ok := tools.RenderStoredResult(m.Content)
+			if !ok {
+				continue
 			}
-			c.write("\n\n")
+			c.render(agent.Event{Type: agent.EventToolResult, Name: m.Name, Text: text, IsError: isErr})
 		}
+		// Each message owns its thinking block: closing it here keeps two
+		// consecutive thinking-only replies from merging into one block, the
+		// way the info rows the live view used to separate them would have.
+		c.flushHistoryReasoning()
 	}
 	c.write(termcolor.Gray("--- end of history ---") + "\n\n")
+}
+
+// flushHistoryReasoning closes a thinking block a resumed message left open (a
+// reply that carried only thinking has no following event to close it, see
+// render), so its buffered tail reaches the terminal before the transcript
+// moves on or ends.
+func (c *CLI) flushHistoryReasoning() {
+	c.mu.Lock()
+	c.flushReasoningLocked()
+	c.mu.Unlock()
 }
 
 // snapshot captures the current conversation for persistence.

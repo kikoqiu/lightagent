@@ -239,6 +239,8 @@ source <(lightagent completion bash)       # bash 补全
 * `lightagent -r`（或 `--resume`）直接恢复，不弹出询问；无文件时提示后开始新会话。
 * Web 镜像的**重启**（配置面板里的 Restart）把「保存 + 恢复」两步自动做完：先写 `session.json`，
   再由新进程用 `--resume` 载入同一会话（见 [docs/web.md](docs/web.md)）。
+* 恢复时终端把整段历史按**实时渲染**重画：思考块、工具调用行、工具结果行与可见回答都在，
+  与保存前屏幕上看到的一致（`/result off` 时工具结果行同样略去，与实时一致）。
 * 非交互（管道）输入无法询问，按默认值处理（恢复 + 保存）。
 
 ---

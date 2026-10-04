@@ -231,6 +231,75 @@ func TestShowHistoryPrintsTheSummaryFirst(t *testing.T) {
 	}
 }
 
+// historyToolResult is a persisted exec_command answer (the commandResult JSON
+// contract exec_command and manage_session store), used to check that a resumed
+// transcript recovers the tool's user-facing rendering.
+const historyToolResult = `{"status":"completed","exit_code":0,"session_id":null,"output":"file1\nfile2","truncated":false,"total_lines":2,"total_bytes":11,"elapsed_seconds":0.1,"warning":null}`
+
+// historyTail is a tool-heavy reply: a message whose only visible answer is a
+// tool round, which the old ShowHistory dropped entirely.
+func historyTail() []llm.Message {
+	return []llm.Message{
+		{Role: "user", Content: "run it"},
+		{
+			Role:             "assistant",
+			ReasoningContent: "think about it",
+			ToolCalls: []llm.ToolCall{{
+				ID:       "1",
+				Function: llm.ToolCallFunction{Name: "exec_command", Arguments: `{"command":"ls"}`},
+			}},
+		},
+		{Role: "tool", ToolCallID: "1", Name: "exec_command", Content: historyToolResult},
+		{Role: "assistant", Content: "done"},
+	}
+}
+
+// TestShowHistoryRendersTheWholeTranscript pins that a resumed conversation is
+// drawn the way the live view draws it: the thinking block, one [tool] row per
+// call and the tool's shown result are restored too, not just the visible
+// assistant text.
+func TestShowHistoryRendersTheWholeTranscript(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.ShowHistory(historyTail(), "")
+	got := buf.String()
+	for _, want := range []string{
+		"--- history: 4 messages ---",
+		"[thinking]", "think about it",
+		"[tool]", "exec_command", "command - ls",
+		"[result]", "Command completed.", "file1",
+		"done",
+		"--- end of history ---",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the resumed transcript is missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestShowHistoryHonorsTheResultSwitch pins that /result off hides stored tool
+// results on resume too, while the [tool] rows stay: the restored transcript
+// mirrors the live view's own switch.
+func TestShowHistoryHonorsTheResultSwitch(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	c.agent.SetToolResultsVisible(false)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.ShowHistory(historyTail(), "")
+	got := buf.String()
+	if strings.Contains(got, "[result]") {
+		t.Fatalf("a hidden tool result was redrawn:\n%s", got)
+	}
+	if !strings.Contains(got, "[tool]") {
+		t.Fatalf("the tool call row is missing:\n%s", got)
+	}
+}
+
 // TestInterruptAffordances covers the console interrupt markers: the interrupted
 // event renders a marker and /stop reports when there is nothing to stop.
 func TestInterruptAffordances(t *testing.T) {
