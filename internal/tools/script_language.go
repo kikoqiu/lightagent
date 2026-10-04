@@ -148,6 +148,32 @@ func scriptLanguageIDs() []string {
 	return ids
 }
 
+// scriptLanguageAllowsPowerShell reports whether PowerShell is one of the
+// selectable `language` values on this host, i.e. the host shell is PowerShell.
+// The tool description only advertises PowerShell-specific options when it is.
+func scriptLanguageAllowsPowerShell() bool {
+	for _, id := range scriptLanguageIDs() {
+		if id == ScriptLanguagePowerShell {
+			return true
+		}
+	}
+	return false
+}
+
+// powerShellFlagsHint states the interpreter flags lightagent passes to the
+// PowerShell host shell, for the exec_command description. The flags come from
+// windowsShellFlags, so the wording never drifts from the invocation. It is
+// empty unless PowerShell is a selectable language, so a host whose only engine
+// is another shell never advertises PowerShell options.
+func powerShellFlagsHint() string {
+	if !scriptLanguageAllowsPowerShell() {
+		return ""
+	}
+	return " On PowerShell the shell is started with `" + strings.Join(windowsShellFlags, " ") +
+		"`, so no profile script is loaded, the shell never waits for input, and the execution " +
+		"policy does not block the script."
+}
+
 // scriptLanguageSummary renders the selectable languages (identifier plus hint)
 // for the tool description and the `language` parameter.
 func scriptLanguageSummary() string {

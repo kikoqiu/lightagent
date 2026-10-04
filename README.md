@@ -385,7 +385,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 * `language` 选择脚本语言：Windows `ps`（PowerShell）、Unix `sh`（宿主 shell），
   以及系统装了 Python 时的 `python`（**直接以解释器为引擎**，源码经 `-c` 传入）；
   **省略该参数即用宿主 shell**。可选值按主机动态生成，Python 不存在时不出现；
-  存在时提示词里带上探测到的版本。
+  存在时提示词里带上探测到的版本。Windows 宿主 shell 以 `-NoProfile -NonInteractive
+  -ExecutionPolicy Bypass` 运行，该组参数会原样写进工具描述（**仅当 PowerShell 属于可选
+  `language` 时**才出现）。
 * 子进程 stdio 编码（仅 Windows 有 `use_utf8` 参数，默认取配置 `tools.exec.use_utf8`）：
   `true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不做转码；
   `false` 由 Go 按主机 ANSI 代码页（如 GBK）转换：输出解码为 UTF-8，输入编码为该代码页字节。

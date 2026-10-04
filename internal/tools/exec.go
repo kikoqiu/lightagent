@@ -223,6 +223,14 @@ func hostShellEnvironment() string {
 	return "sh"
 }
 
+// windowsShellFlags are the options lightagent passes to PowerShell (pwsh or
+// powershell) before `-Command`: -NoProfile loads no profile script,
+// -NonInteractive never waits for input, and -ExecutionPolicy Bypass keeps the
+// execution policy from blocking the script. The exec_command description
+// advertises them verbatim when PowerShell is a selectable language (see
+// powerShellFlagsHint).
+var windowsShellFlags = []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"}
+
 // shellInvocation resolves the shell binary and argument vector for the host
 // script language (ScriptLanguagePowerShell / ScriptLanguageShell). In UTF-8
 // mode the script gains the windowsUTF8Preamble prefix so the shell and the
@@ -234,10 +242,9 @@ func shellInvocation(script string, useUTF8 bool) (string, []string) {
 	if runtime.GOOS != "windows" {
 		return "sh", []string{"-c", script}
 	}
-	return resolveWindowsShell(), []string{
-		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-		"-Command", windowsCommandScript(script, useUTF8),
-	}
+	args := append([]string{}, windowsShellFlags...)
+	args = append(args, "-Command", windowsCommandScript(script, useUTF8))
+	return resolveWindowsShell(), args
 }
 
 // windowsCommandScript prepends the UTF-8 preamble to a PowerShell script when
@@ -336,6 +343,7 @@ func (t *ExecCommandTool) Description() string {
 		"a call returns rather than the process lifetime.",
 		scriptLanguageSummary(), hostScriptLanguageID(), t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
 	description += t.engine.maxLinesRule()
+	description += powerShellFlagsHint()
 	if !useUTF8ParamAvailable() {
 		return description
 	}

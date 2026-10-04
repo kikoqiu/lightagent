@@ -31,7 +31,9 @@ type Tool interface {
 * 脚本语言由 `language` 选择，可选值**按当前主机动态生成**（探测不到的引擎不会出现在提示词里）；
   **省略该参数时使用宿主 shell**（即下面的宿主脚本引擎，与旧版行为一致）：
   * 宿主脚本引擎：Windows 为 `ps`（PowerShell 脚本，`pwsh` 优先、回退 `powershell`，
-    以 `-NoProfile -NonInteractive -Command` 运行）；非 Windows 为 `sh`（`sh -c`）。
+    以 `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` 运行；该组参数会原样写进
+    工具描述（提示已带该参数，**仅当 PowerShell 属于可选 `language` 时**才出现）。非 Windows 为
+    `sh`（`sh -c`）。
   * `python`：**直接把 Python 解释器当作脚本引擎**（不经 shell，源码以 `-c` 传给解释器，
     因此脚本必须是自包含的 Python 程序）。仅当 PATH 上存在可用的 Python 时才可选，并把探测到的
     **版本**与解释器路径写进工具描述里的 `language` 可选值说明（参数本身的 `description` 是固定

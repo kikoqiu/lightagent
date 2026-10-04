@@ -1193,6 +1193,49 @@ func TestExecCommandLanguageParameter(t *testing.T) {
 	}
 }
 
+// TestPowerShellFlagsHint checks that the exec_command description advertises
+// the PowerShell invocation flags exactly when PowerShell is a selectable
+// language (the host shell on Windows), and never on a host that offers only
+// another engine.
+func TestPowerShellFlagsHint(t *testing.T) {
+	engine := NewExecEngine(60, 10, true)
+	defer engine.Close()
+	tool := NewExecCommandTool(engine)
+	description := tool.Description()
+
+	selectable := false
+	for _, id := range scriptLanguageIDs() {
+		if id == ScriptLanguagePowerShell {
+			selectable = true
+		}
+	}
+	if selectable != scriptLanguageAllowsPowerShell() {
+		t.Fatalf("scriptLanguageAllowsPowerShell() = %v, want %v", scriptLanguageAllowsPowerShell(), selectable)
+	}
+	const want = "-NoProfile -NonInteractive -ExecutionPolicy Bypass"
+	if selectable {
+		if hint := powerShellFlagsHint(); !strings.Contains(hint, want) {
+			t.Fatalf("the PowerShell flags hint is missing the flags: %q", hint)
+		}
+		if !strings.Contains(description, want) {
+			t.Fatalf("the description does not advertise the PowerShell flags: %s", description)
+		}
+		if runtime.GOOS == "windows" {
+			_, args := shellInvocation("echo hi", true)
+			if joined := strings.Join(args, " "); !strings.Contains(joined, want) {
+				t.Fatalf("shellInvocation args = %q, want the advertised flags %q", joined, want)
+			}
+		}
+		return
+	}
+	if hint := powerShellFlagsHint(); hint != "" {
+		t.Fatalf("a host without PowerShell produced a flags hint: %q", hint)
+	}
+	if strings.Contains(description, "-NoProfile") {
+		t.Fatalf("a host without PowerShell advertises its flags: %s", description)
+	}
+}
+
 // TestResolveScriptLanguage covers language normalization: an omitted value keeps
 // the previous behaviour (the host engine) and an unknown value is rejected with
 // the selectable list.
