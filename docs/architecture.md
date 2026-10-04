@@ -15,6 +15,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 | `internal/mcp` | MCP 客户端（纯标准库）：JSON-RPC 2.0 over stdio / Streamable HTTP / HTTP+SSE；配置驱动的 `Manager` 与 `tools.Tool` 适配器 |
 | `internal/proc` | 子进程启动与停止：**树模式**（`Start`，Windows 用 Job Object「kill-on-close」、Unix 用独立进程组 `SIGTERM`→`SIGKILL`，exec 会话用）与**单进程模式**（`StartProcess`，只停止自己启动的那个进程，stdio MCP server 用）；`Shutdown` 在主进程退出或收到信号时按各自模式停止所有仍存活的进程 |
 | `internal/store` | 单会话持久化（`CWD/.lightagent/session.json`） |
+| `internal/lock` | 目录锁（纯 `syscall`）：`<状态目录>/.lock` 上 `flock`（Unix）/ `LockFileEx`（Windows），使一个目录只运行一个实例；释放时删锁文件，目录里再没别的就删目录 |
 | `internal/cli` | 彩色 REPL、斜杠命令、Markdown 流式渲染（未完成行作为预览绘制在提示符上方，按终端宽度折行、最多 8 行，因此超出首行的文本也边收边显示）、提示区原地逐行重绘（不整块擦除，老式 Windows 控制台才不会闪屏）、`[thinking]` 思考流式块（同样应用 Markdown）、异步渲染事件 |
 | `internal/slash` | 斜杠命令表（名称 / 别名 / 参数 / 说明 / 网页是否常显）：CLI 的 `/help`、网页的 `/help` 与左侧命令栏都由此生成；同时提供命令解析（全角斜杠、别名归一）、on/off 参数解析与 `/history` 用量文案 |
 | `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown；出站流式增量按 50ms 合帧（`web.go`），后台节流、手机隐藏超时后停表断连（`app.js`） |
@@ -193,7 +194,8 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 
 ## 持久化
 
-* 状态目录：`<当前工作目录>/.lightagent/`，**首次写盘时惰性创建**：未保存会话
+* 状态目录：`<当前工作目录>/.lightagent/`，**启动时创建**（先放目录锁 `.lock`，见
+  [目录锁](#目录锁)）；**退出时若目录里只剩锁文件，整个目录一并删除**，因此未保存会话
   （`--no-save`、一次性 `-p` 运行、退出时选择不保存）不会留下任何目录或文件。
 * 会话文件：`session.json`（该目录**当前**会话）。
 * 时机：运行时**只保存在内存**（不再有每回合 persist 回调）。写盘只有两条路径：
@@ -220,6 +222,21 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
   `path`/`mime` 只存在于磁盘（与该 part 的内存结构）上，永不进入发给服务商的请求体。
 
 读写均为「写临时文件 + 原子重命名」。
+
+## 目录锁
+
+一个状态目录（默认 `<当前工作目录>/.lightagent/`）同时只允许一个实例：
+
+* `internal/lock` 在 `<状态目录>/.lock` 上加独占锁——Unix 用 `syscall.Flock(LOCK_EX|LOCK_NB)`，
+  Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`，经 `kernel32.dll`
+  的 `LazyProc` 调用），不用任何第三方库。
+* 第二个实例在同一个目录启动时立刻失败（`another lightagent instance is already running in <目录>`，
+  退出码 1），而不是等待或共用会话文件；许可目录不同（默认情形）仍可并行运行。
+* 没有原生锁原语的宿主（AIX、Plan 9、js/wasm 等）退回 `O_CREATE|O_EXCL` 独占创建。
+* 释放：正常退出与信号退出（`shutdown.go` 的钩子）都会解锁、删 `.lock`，并在目录里再没别的
+  文件/目录时把目录一起删掉；Web 重启交接也会释放，好让用 `--resume` 起的替换进程接管。
+* 锁是 advisory 的且绑定在打开的文件上：进程被强杀时操作系统会自动解锁，遗留的 `.lock`
+  文件不影响下次启动（下一次直接复用并重新加锁）。
 
 ## 上下文压缩（append_instruction 单一模式）
 

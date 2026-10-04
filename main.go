@@ -340,6 +340,8 @@ state:
   /save writes it on demand and the exit prompt asks whether to persist
   (default yes). When a saved session exists, startup asks whether to resume it
   (default yes); declining archives it with a timestamp and starts fresh.
+  one directory runs one instance at a time: .lightagent/.lock is held for the
+  whole run, so a second instance started in the same directory exits at once.
 `
 
 // commandHelp holds per-command help text.

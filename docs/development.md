@@ -49,6 +49,7 @@ internal/llm/               OpenAI 兼容客户端
 internal/agent/             回合循环、事件、压缩
 internal/tools/             工具与命令执行引擎
 internal/store/             单会话持久化（含旧会话归档）
+internal/lock/              目录锁（flock / LockFileEx，纯 syscall，一个目录一个实例）
 internal/markdown/          Markdown → ANSI 渲染（CLI）
 internal/passwd/            加盐摘要：sha256(盐+密码)，Go 与页面共用同一字节约定
 internal/slash/             斜杠命令表：CLI 的 /help、网页的 /help 与左侧命令栏共用（含命令解析）

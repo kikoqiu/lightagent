@@ -17,6 +17,7 @@ import (
 	"lightagent/internal/cli"
 	"lightagent/internal/config"
 	"lightagent/internal/llm"
+	"lightagent/internal/lock"
 	"lightagent/internal/mcp"
 	"lightagent/internal/store"
 	"lightagent/internal/tools"
@@ -74,6 +75,16 @@ func runSession(o *options, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// One instance per state directory: the lock is taken before anything else
+	// touches the directory and released on the way out. A signal exit and the
+	// restart hand-over release it through the shutdown hooks as well, so the
+	// replacement process (which resumes this session) can take it over.
+	lk, err := lock.Acquire(st.Dir())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lk.Release() }()
+	onShutdown(func() { _ = lk.Release() })
 
 	client := llm.NewClient(cfg.OpenAI)
 	reg := tools.NewRegistry()

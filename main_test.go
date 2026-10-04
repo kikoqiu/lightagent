@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"lightagent/internal/config"
+	"lightagent/internal/lock"
 	"lightagent/internal/utils"
 )
 
@@ -195,6 +196,41 @@ func TestRunOneShotJSON(t *testing.T) {
 	}
 	if res.Error == "" {
 		t.Fatalf("expected an error field, got %q", out.String())
+	}
+}
+
+// TestRunRefusesASecondInstanceInTheSameDirectory drives the wiring of the
+// directory lock: while one instance holds the state directory, a second run
+// against the same directory is refused before it reaches the model, so two
+// instances never share a session file.
+func TestRunRefusesASecondInstanceInTheSameDirectory(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfg := `{"openai":{"api_base":"http://127.0.0.1:1/v1","api_key":"x","model":"m","stream":false},"web":{"port":0}}`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A first instance already holds the directory's lock.
+	held, err := lock.Acquire(filepath.Join(dir, ".lightagent"))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	var out, errBuf bytes.Buffer
+	code := run([]string{"-c", cfgPath, "-C", dir, "-p", "hello"}, &out, &errBuf)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 (stderr = %s)", code, errBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "already running") {
+		t.Fatalf("stderr = %q, want the instance conflict named", errBuf.String())
 	}
 }
 
