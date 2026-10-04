@@ -563,9 +563,12 @@ type historyMessage struct {
 	// first streamed chunk (the model's thinking included), for a user message
 	// the moment it was submitted. The page draws it in gray beside the role
 	// label, and a reconnecting page replays it with the row, so the stamp of a
-	// message that is already on screen never changes. Empty for a row whose
-	// start is unknown (a conversation restored from a session file) and for the
-	// rows that are not a message of their own (thinking, tool calls, markers).
+	// message that is already on screen never changes. A thinking row carries the
+	// reply's start too: when the reply produces no visible answer of its own
+	// (only thinking and tool calls) that row is where the page draws it (the
+	// answer's row carries it otherwise). Empty for a row whose start is unknown
+	// (a conversation restored from a session file) and for the rows that are not
+	// a message of their own (tool calls, markers).
 	Time string `json:"time,omitempty"`
 }
 
@@ -665,7 +668,11 @@ func (s *Server) recordLocked(ev agent.Event) {
 	switch ev.Type {
 	case agent.EventReasoningDelta:
 		if !s.reasoningOpen {
-			s.history = append(s.history, historyMessage{Role: "reasoning"})
+			// The reply's start time comes with it: a reply that carries only
+			// thinking and tool calls never stamps an answer row, so the thinking
+			// row is where its start has to be drawn (see the page's
+			// finishReasoning).
+			s.history = append(s.history, historyMessage{Role: "reasoning", Time: eventTime(ev)})
 			s.reasoningOpen = true
 		}
 		if ev.Text != "" {

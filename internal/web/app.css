@@ -428,7 +428,15 @@
   .result { color:var(--fg-muted); border-left-color:var(--border); }
   .error { color:var(--red); border-left-color:var(--red); }
   .interrupted { color:var(--yellow); border-left-color:var(--yellow); }
-  .result .text, .error .text { background:rgba(8,11,17,.4); border-radius:var(--radius-sm); padding:6px 10px; }
+  /* The result's inset box is the one text with a padding of its own, and that
+     padding would push "[result] …" 10px past the shared left edge the thinking
+     and tool rows share (2px border + 12px row padding). Pulling the box back by
+     its own horizontal padding keeps the text on that edge while the background
+     still hugs it. */
+  .result .text, .error .text {
+    background:rgba(8,11,17,.4); border-radius:var(--radius-sm);
+    padding:6px 10px; margin-left:-10px;
+  }
   /* tool call: the function name, then one line per argument, none indented.
      The line breaks are carried by the text (the row is pre-wrap), so these
      rules only colour the parts and never affect the layout. The palette

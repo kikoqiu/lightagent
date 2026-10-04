@@ -23,9 +23,13 @@
   var pendingRows = [];
   var pendingRender = null;
   // reasoningRow/reasoningText stream the model's "thinking" (reasoning_delta);
-  // it is finalized before the visible answer is drawn.
+  // it is finalized before the visible answer is drawn. reasoningStamp is the
+  // reply's start time, held back for that row until the reply ends: a reply
+  // that goes on to answer stamps the answer's row instead, so the start time is
+  // drawn on exactly one row of the reply (see finishReasoning).
   var reasoningRow = null;
   var reasoningText = '';
+  var reasoningStamp = '';
   var pendingReasoningRender = null;
   // replaying is true while a snapshot rebuilds the log (history_start …
   // history_end). It suppresses live-only side effects (a replayed user row must
@@ -1046,13 +1050,20 @@
 
   // finishReasoning commits the streamed thinking row (if any) so the visible
   // answer starts in its own row. The commit is a full redraw, so the paced
-  // state of the row goes with it.
-  function finishReasoning() {
+  // state of the row goes with it. kind is the event that ended the thinking
+  // stream: when it opens a visible answer (assistant_delta, or assistant on the
+  // replay path) that answer's row carries the reply's start time, and the
+  // thinking row stays unstamped; every other kind ends a reply that produced no
+  // visible answer (only thinking and tool calls), so the thinking row is where
+  // the reply began and where the stamp belongs.
+  function finishReasoning(kind) {
     if (!reasoningRow) { return; }
     if (pendingReasoningRender) { clearTimeout(pendingReasoningRender); pendingReasoningRender = null; }
     setRow(reasoningRow, reasoningText, MARKDOWN);
+    if (kind !== 'assistant_delta' && kind !== 'assistant') { stampRow(reasoningRow, reasoningStamp); }
     reasoningRow = null;
     reasoningText = '';
+    reasoningStamp = '';
     reasoningRenderedAt = 0;
   }
 
@@ -2007,7 +2018,7 @@
     // conversation aloud).
     if (!replaying) { TTS.event(kind, ev); }
     // Any event other than a further reasoning chunk ends the thinking row.
-    if (kind !== 'reasoning_delta') { finishReasoning(); }
+    if (kind !== 'reasoning_delta') { finishReasoning(kind); }
     if (kind === 'usage') { setUsage(ev.tokens || 0, ev.context_window || 0); return; }
     // A summary row is the truncation marker itself, so it is drawn as a whole
     // block instead of an [info] line; it arrives either live with a compacted
@@ -2034,6 +2045,10 @@
     if (kind === 'reasoning_delta') {
       if (!reasoningRow) {
         reasoningRow = addRow('reasoning', 'thinking', '', MARKDOWN, null, true);
+        // The reply's start time, held back for this row until the reply ends
+        // (see finishReasoning). A reply already streaming a visible answer
+        // (current) is not one this row can stamp: its answer row has it.
+        reasoningStamp = current ? '' : stampOf(ev.time);
         // A fresh row has nothing drawn yet, so its first pass is immediate.
         reasoningRenderedAt = 0;
       }
@@ -2136,6 +2151,7 @@
     // messages are gone as well: the agent draws their rows when it sends them.
     reasoningRow = null;
     reasoningText = '';
+    reasoningStamp = '';
     reasoningRenderedAt = 0;
     if (pendingReasoningRender) { clearTimeout(pendingReasoningRender); pendingReasoningRender = null; }
     pendingRows = [];
@@ -2184,7 +2200,7 @@
     (ev.messages || []).forEach(function (m) {
       if (m.role === 'user') { render('user', { text: m.content, attachments: m.attachments, time: m.time }); }
       else if (m.role === 'assistant' && m.content) { render('assistant', { text: m.content, time: m.time }); }
-      else if (m.role === 'reasoning') { render('reasoning_delta', { text: m.content }); }
+      else if (m.role === 'reasoning') { render('reasoning_delta', { text: m.content, time: m.time }); }
       else if (m.role === 'tool_call') { render('tool_call', { name: m.name, args: m.args }); }
       else if (m.role === 'tool_result') { render('tool_result', { text: m.content, is_error: m.is_error }); }
       else if (m.role === 'info') { render('info', { text: m.content }); }

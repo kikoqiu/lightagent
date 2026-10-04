@@ -793,10 +793,51 @@ func TestPageStampsMessageTimes(t *testing.T) {
 	}
 }
 
+// TestThinkingRowCarriesTheReplyStart pins the thinking row's stamp: a reply that
+// produces no visible answer of its own (only thinking and tool calls) has no
+// agent row to carry the reply's start, so the thinking row does. The start is
+// taken from the reply's first chunk, held back while the reply runs, and drawn
+// only when the reply ends without an answer (kind is not the answer opening);
+// a reply that goes on to answer stamps the answer's row instead, so the start
+// is shown on exactly one row. The replayed reasoning row carries the time it
+// was recorded with, so a reconnect draws the same stamp.
+func TestThinkingRowCarriesTheReplyStart(t *testing.T) {
+	for _, want := range []string{
+		"var reasoningStamp = '';",
+		"reasoningStamp = current ? '' : stampOf(ev.time);",
+		"function finishReasoning(kind)",
+		"if (kind !== 'assistant_delta' && kind !== 'assistant') { stampRow(reasoningRow, reasoningStamp); }",
+		"if (kind !== 'reasoning_delta') { finishReasoning(kind); }",
+		"render('reasoning_delta', { text: m.content, time: m.time })",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+}
+
+// TestResultBoxAlignsWithTheSharedLeftEdge pins the result row's left edge: the
+// thinking and tool rows put their text at the same place (2px border + 12px row
+// padding), but a result's text sits in a box with a horizontal padding of its
+// own that would push "[result] …" past that edge. The box is pulled back by
+// exactly that padding, so the text lines up with the other rows.
+func TestResultBoxAlignsWithTheSharedLeftEdge(t *testing.T) {
+	page := pageSource()
+	for _, want := range []string{
+		".tool, .result, .error, .interrupted { border-left:2px solid transparent; padding-left:12px;",
+		"padding:6px 10px; margin-left:-10px;",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+}
+
 // TestHistoryRowsCarryTheMessageStartTime pins the time a replayed row carries:
 // the message's start, so a page that reconnects draws the stamp it had. The
-// compressed-context summary carries the moment of the compaction, while the
-// thinking row and the markers are not a message of their own and carry none.
+// compressed-context summary carries the moment of the compaction, the thinking
+// row carries the reply's start (the page draws it there when the reply has no
+// visible answer of its own; the markers, which are not a message, carry none).
 func TestHistoryRowsCarryTheMessageStartTime(t *testing.T) {
 	srv := newTestServer(t, "")
 	bus := srv.agent.Bus()
@@ -819,13 +860,14 @@ func TestHistoryRowsCarryTheMessageStartTime(t *testing.T) {
 	if rows[2].Time != want {
 		t.Fatalf("user row time = %q, want %q", rows[2].Time, want)
 	}
+	if rows[3].Time != want {
+		t.Fatalf("reasoning row time = %q, want %q", rows[3].Time, want)
+	}
 	if rows[4].Time != want {
 		t.Fatalf("assistant row time = %q, want %q", rows[4].Time, want)
 	}
-	for _, row := range []historyRow{rows[0], rows[3]} {
-		if row.Time != "" {
-			t.Fatalf("the %s row carries a time of its own: %q", row.Role, row.Time)
-		}
+	if rows[0].Time != "" {
+		t.Fatalf("the %s row carries a time of its own: %q", rows[0].Role, rows[0].Time)
 	}
 }
 
