@@ -90,10 +90,14 @@ func (a *Agent) autoSplitWriteCalls(calls []llm.ToolCall) map[int][]llm.ToolCall
 	return continuations
 }
 
-// runWriteSplits records the follow-up calls of an auto-split write, each as its
-// own assistant message followed by its tool result, so the model afterwards
-// sees a chain of completed writes. It reports whether the turn ran to the end
-// (false when the user cancelled it).
+// runWriteSplits runs the follow-up calls of an auto-split write. The parts are
+// not separate replies: attachSplitCalls adds them to the assistant message that
+// requested the write (the one the model produced), so the whole split travels as
+// a single assistant message carrying several tool calls — the shape a provider
+// expects for a reply that asks for several calls at once, and the way a
+// preserve-thinking provider such as DeepSeek keeps that message's reasoning with
+// every call of the split. It reports whether the turn ran to the end (false when
+// the user cancelled it).
 //
 // A write_file whose payload exceeds the per-call limit is simply spread over
 // several write calls, so these parts are ordinary calls of the same batch the
@@ -101,28 +105,36 @@ func (a *Agent) autoSplitWriteCalls(calls []llm.ToolCall) map[int][]llm.ToolCall
 // interrupt: the part in flight is answered with its real result and the parts
 // after it, like any call that never started, are answered as interrupted (see
 // the interrupt rules in docs/architecture.md).
-func (a *Agent) runWriteSplits(ctx context.Context, calls []llm.ToolCall) bool {
+func (a *Agent) runWriteSplits(ctx context.Context, owner int, calls []llm.ToolCall) bool {
+	if len(calls) == 0 {
+		return true
+	}
+	a.attachSplitCalls(owner, calls)
 	for i, call := range calls {
 		if ctx.Err() != nil {
-			a.reportInterruptedSplits(calls[i:])
+			a.reportInterruptedTools(calls, i)
 			return false
 		}
-		a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{call}})
 		a.dispatchToolCall(ctx, call)
 		a.bus.Publish(a.usageEvent())
 	}
 	return true
 }
 
-// reportInterruptedSplits answers the calls of an interrupted round that never
-// started: every one still gets its assistant message — a write part is recorded
-// as the call it is — together with an interrupted answer that matches it, so the
-// assistant/tool pairing stays complete in the next request.
-func (a *Agent) reportInterruptedSplits(calls []llm.ToolCall) {
-	for _, call := range calls {
-		a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{call}})
-		a.reportInterruptedTools([]llm.ToolCall{call}, 0)
+// attachSplitCalls appends the follow-up calls of an auto-split write to the
+// assistant message that owns the write, so that one message lists every call of
+// the split. The parts go after the calls the model itself made, which is the
+// order they run in (the model's batch first, then the parts), and that keeps
+// every call answered by the tool message that follows it.
+func (a *Agent) attachSplitCalls(owner int, calls []llm.ToolCall) {
+	if len(calls) == 0 {
+		return
 	}
+	a.mu.Lock()
+	if owner >= 0 && owner < len(a.history) {
+		a.history[owner].ToolCalls = append(a.history[owner].ToolCalls, calls...)
+	}
+	a.mu.Unlock()
 }
 
 // encodeWriteArgs renders one planned call's arguments back into the JSON string

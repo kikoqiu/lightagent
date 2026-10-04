@@ -886,10 +886,10 @@ func TestDropUnstartedToolCalls(t *testing.T) {
 }
 
 // TestWriteSplitsAnsweredAsInterrupted covers the write parts of a round
-// interrupted after the round's own calls had finished: the parts are ordinary
-// calls of that batch, so the ones that never started are answered like any other
-// call that never ran — one assistant/tool pair each with an interrupted answer —
-// and nothing of theirs is executed.
+// interrupted after the round's own calls had finished: the parts ride on the
+// assistant message that owns the write as extra tool calls, so the ones that
+// never started are answered like any other call that never ran — an interrupted
+// answer that matches each of them — and nothing of theirs is executed.
 func TestWriteSplitsAnsweredAsInterrupted(t *testing.T) {
 	a := newTestAgent(t)
 	events, cancel := a.Bus().Subscribe()
@@ -898,24 +898,30 @@ func TestWriteSplitsAnsweredAsInterrupted(t *testing.T) {
 	ctx, cancelTurn := context.WithCancel(context.Background())
 	cancelTurn()
 
+	owner := a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{
+		{ID: "c_part1", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
+	}})
 	calls := []llm.ToolCall{
 		{ID: "c_part2", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
 		{ID: "c_part3", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
 	}
-	if a.runWriteSplits(ctx, calls) {
+	if a.runWriteSplits(ctx, owner, calls) {
 		t.Fatal("runWriteSplits reported a completed turn")
 	}
 	msgs := a.History()
-	if len(msgs) != 4 {
-		t.Fatalf("history = %d messages, want 2 assistant/tool pairs: %+v", len(msgs), msgs)
+	if len(msgs) != 3 {
+		t.Fatalf("history = %d messages, want the owning message plus the 2 answers: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "assistant" || len(msgs[0].ToolCalls) != 3 {
+		t.Fatalf("msgs[0] = %+v, want the owning message carrying the parts", msgs[0])
 	}
 	for i, id := range []string{"c_part2", "c_part3"} {
-		call, answer := msgs[i*2], msgs[i*2+1]
-		if call.Role != "assistant" || len(call.ToolCalls) != 1 || call.ToolCalls[0].ID != id {
-			t.Fatalf("msgs[%d] = %+v, want the assistant message of %s", i*2, call, id)
+		if got := msgs[0].ToolCalls[1+i].ID; got != id {
+			t.Fatalf("part %d on the owner = %s, want %s", i+1, got, id)
 		}
+		answer := msgs[1+i]
 		if answer.Role != "tool" || answer.ToolCallID != id || !strings.Contains(answer.Content, "interrupted") {
-			t.Fatalf("msgs[%d] = %+v, want %s answered as interrupted", i*2+1, answer, id)
+			t.Fatalf("msgs[%d] = %+v, want %s answered as interrupted", 1+i, answer, id)
 		}
 	}
 	// Both answers were announced (publishing is synchronous, so everything is
@@ -969,31 +975,31 @@ func TestWriteSplitsInterruptedWhileRunning(t *testing.T) {
 	tool := &cancelOnRunTool{cancel: cancelTurn}
 	a.reg.Register(tool)
 
+	owner := a.appendMessage(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{
+		{ID: "c_part1", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
+	}})
 	calls := []llm.ToolCall{
 		{ID: "c_part2", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
 		{ID: "c_part3", Type: "function", Function: llm.ToolCallFunction{Name: writeFileToolName, Arguments: `{}`}},
 	}
-	if a.runWriteSplits(ctx, calls) {
+	if a.runWriteSplits(ctx, owner, calls) {
 		t.Fatal("runWriteSplits reported a completed turn")
 	}
 	if tool.ran != 1 {
 		t.Fatalf("the writer ran %d time(s), want 1: only the part that was in flight", tool.ran)
 	}
 	msgs := a.History()
-	if len(msgs) != 4 {
-		t.Fatalf("history = %d messages, want 2 assistant/tool pairs: %+v", len(msgs), msgs)
+	if len(msgs) != 3 {
+		t.Fatalf("history = %d messages, want the owning message plus the 2 answers: %+v", len(msgs), msgs)
 	}
-	if msgs[0].Role != "assistant" || len(msgs[0].ToolCalls) != 1 || msgs[0].ToolCalls[0].ID != "c_part2" {
-		t.Fatalf("msgs[0] = %+v, want the assistant message of the part that ran", msgs[0])
+	if msgs[0].Role != "assistant" || len(msgs[0].ToolCalls) != 3 {
+		t.Fatalf("msgs[0] = %+v, want the owning message carrying the parts", msgs[0])
 	}
 	if msgs[1].Role != "tool" || msgs[1].ToolCallID != "c_part2" || msgs[1].Content != "wrote part" {
 		t.Fatalf("msgs[1] = %+v, want the real result of the part that ran", msgs[1])
 	}
-	if msgs[2].Role != "assistant" || len(msgs[2].ToolCalls) != 1 || msgs[2].ToolCalls[0].ID != "c_part3" {
-		t.Fatalf("msgs[2] = %+v, want the assistant message of the pending part", msgs[2])
-	}
-	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "c_part3" || !strings.Contains(msgs[3].Content, "interrupted") {
-		t.Fatalf("msgs[3] = %+v, want the pending part answered as interrupted", msgs[3])
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "c_part3" || !strings.Contains(msgs[2].Content, "interrupted") {
+		t.Fatalf("msgs[2] = %+v, want the pending part answered as interrupted", msgs[2])
 	}
 	// The pending part's feedback is announced too (publishing is synchronous, so
 	// everything is already queued).
@@ -1086,10 +1092,16 @@ func TestInterruptDuringARoundWithWriteParts(t *testing.T) {
 	}
 
 	msgs := a.History()
-	if len(msgs) != 8 {
-		t.Fatalf("history = %d messages, want user + reply + 2 answers + 2 part pairs: %+v", len(msgs), msgs)
+	if len(msgs) != 6 {
+		t.Fatalf("history = %d messages, want user + one reply with four calls + four answers: %+v", len(msgs), msgs)
 	}
-	if args := msgs[1].ToolCalls[0].Function.Arguments; !strings.Contains(args, `"content":"one"`) {
+	// The reply carries the model's two calls and the two write parts it still
+	// owed, all on the one assistant message.
+	reply := msgs[1]
+	if reply.Role != "assistant" || len(reply.ToolCalls) != 4 {
+		t.Fatalf("msgs[1] = %+v, want the reply carrying all four calls", reply)
+	}
+	if args := reply.ToolCalls[0].Function.Arguments; !strings.Contains(args, `"content":"one"`) {
 		t.Fatalf("the first call's args = %s, want the first part that was executed", args)
 	}
 	if msgs[2].ToolCallID != "c1" || msgs[2].Content != "wrote a part" {
@@ -1099,12 +1111,12 @@ func TestInterruptDuringARoundWithWriteParts(t *testing.T) {
 		t.Fatalf("msgs[3] = %+v, want the real result of the call that was running", msgs[3])
 	}
 	for i, want := range []string{`"content":"two"`, `"content":"three"`} {
-		call, answer := msgs[4+i*2], msgs[5+i*2]
-		if call.Role != "assistant" || len(call.ToolCalls) != 1 || !strings.Contains(call.ToolCalls[0].Function.Arguments, want) {
-			t.Fatalf("msgs[%d] = %+v, want the assistant message of the part with %s", 4+i*2, call, want)
+		call, answer := reply.ToolCalls[2+i], msgs[4+i]
+		if !strings.Contains(call.Function.Arguments, want) {
+			t.Fatalf("the reply's call %d = %+v, want the part with %s", 2+i, call, want)
 		}
-		if answer.Role != "tool" || answer.ToolCallID != call.ToolCalls[0].ID || !strings.Contains(answer.Content, "interrupted") {
-			t.Fatalf("msgs[%d] = %+v, want the unstarted part answered as interrupted", 5+i*2, answer)
+		if answer.Role != "tool" || answer.ToolCallID != call.ID || !strings.Contains(answer.Content, "interrupted") {
+			t.Fatalf("msgs[%d] = %+v, want the unstarted part answered as interrupted", 4+i, answer)
 		}
 	}
 }

@@ -530,10 +530,12 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		a.setUsage(resp.Usage)
 
 		// An oversized write_file payload is spread over several calls: the
-		// call the model made keeps the first part and the remaining parts run
-		// after this round as follow-up rounds (see runWriteSplits). The
-		// rewrite happens before the assistant message is recorded, so the
-		// history and the front-ends show the arguments that were executed.
+		// call the model made keeps the first part and the remaining parts are
+		// appended to the same assistant message as extra tool calls (see
+		// runWriteSplits), which is the shape a provider expects for a reply
+		// that asks for several calls at once. The rewrite happens before the
+		// assistant message is recorded, so the history and the front-ends
+		// show the arguments that were executed.
 		continuations := a.autoSplitWriteCalls(resp.ToolCalls)
 
 		// A reply that carries only the model's thinking — no visible text and
@@ -545,6 +547,11 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		onlyThink := len(resp.ToolCalls) == 0 &&
 			strings.TrimSpace(resp.Content) == "" && strings.TrimSpace(resp.Reasoning) != ""
 
+		// assistantIdx points at the assistant message in the history: the
+		// auto-split write parts attach to it, so the whole split travels as
+		// one assistant message carrying several tool calls (see
+		// runWriteSplits).
+		assistantIdx := -1
 		if !onlyThink || a.includeOnlyThink {
 			assistant := llm.Message{
 				Role:      "assistant",
@@ -554,7 +561,7 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 				// history and sent back with the next request.
 				ReasoningContent: resp.Reasoning,
 			}
-			a.appendMessage(assistant)
+			assistantIdx = a.appendMessage(assistant)
 			if resp.Content != "" {
 				a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content, Time: started})
 			}
@@ -626,12 +633,15 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 				// running and that call returned on its own (a tool that
 				// cannot be cut short finishes, and so does a poll, which
 				// stops waiting). Every call that never started is answered
-				// as interrupted — the calls from this index on, and the
+				// as interrupted — the calls from this index on, then the
 				// write parts an earlier call still owes — which keeps the
 				// assistant message's tool_calls paired, and the turn ends
-				// without asking the model again.
-				a.reportInterruptedSplits(pendingSplits)
+				// without asking the model again. The batch's calls are
+				// answered first and the parts after them: the order they sit
+				// in on the assistant message.
 				a.reportInterruptedTools(resp.ToolCalls, idx)
+				a.attachSplitCalls(assistantIdx, pendingSplits)
+				a.reportInterruptedTools(pendingSplits, 0)
 				a.finishInterrupt()
 				return
 			}
@@ -663,11 +673,11 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		// size before the next round starts.
 		a.bus.Publish(a.usageEvent())
 
-		// The remaining parts of an auto-split write run as their own
-		// assistant/tool rounds right here, so the model is only asked again
-		// once the payload is on disk in order.
+		// The remaining parts of an auto-split write run right here, attached
+		// to the assistant message that requested the write, so the model is
+		// only asked again once the payload is on disk in order.
 		if len(pendingSplits) > 0 {
-			if !a.runWriteSplits(ctx, pendingSplits) {
+			if !a.runWriteSplits(ctx, assistantIdx, pendingSplits) {
 				a.finishInterrupt()
 				return
 			}
@@ -912,11 +922,15 @@ func (a *Agent) callLLM(ctx context.Context) (*llm.Response, time.Time, error) {
 	return resp, started, err
 }
 
-// appendMessage appends a message to the history.
-func (a *Agent) appendMessage(m llm.Message) {
+// appendMessage appends a message to the history and returns its index, so a
+// caller can reach the message again: the auto-split write parts attach to the
+// assistant message that requested the write (see attachSplitCalls).
+func (a *Agent) appendMessage(m llm.Message) int {
 	a.mu.Lock()
 	a.history = append(a.history, m)
+	idx := len(a.history) - 1
 	a.mu.Unlock()
+	return idx
 }
 
 // buildMessagesLocked renders the full request message list: the system message,

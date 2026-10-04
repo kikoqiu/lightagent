@@ -126,7 +126,7 @@ func newAutoSplitAgent(t *testing.T, cfg *config.Config, url string) (*Agent, <-
 
 // checkCallPairing pins the invariant every provider enforces: each entry of an
 // assistant message's tool_calls is answered by the tool message right after it,
-// in order. The synthesized follow-up rounds have to keep it.
+// in order. The follow-up write parts have to keep it.
 func checkCallPairing(t *testing.T, msgs []capturedCall) {
 	t.Helper()
 	for i := 0; i < len(msgs); i++ {
@@ -156,9 +156,11 @@ func readText(t *testing.T, path string) string {
 }
 
 // TestAutoSplitWriteRunsFollowUpRounds covers the feature end to end: a payload
-// of twelve lines under a five-line limit becomes three write calls. The model's
-// own call keeps the first part — in the history and in the request the model
-// sees next — and the remaining parts run as their own assistant/tool rounds.
+// of twelve lines under a five-line limit becomes three write calls on the one
+// assistant message. The model's own call keeps the first part — in the history
+// and in the request the model sees next — and the remaining parts ride along as
+// extra calls of that same message, each answered by the tool message that
+// follows it.
 func TestAutoSplitWriteRunsFollowUpRounds(t *testing.T) {
 	payload := numberedLines(12)
 	file := filepath.Join(t.TempDir(), "big.txt")
@@ -172,28 +174,28 @@ func TestAutoSplitWriteRunsFollowUpRounds(t *testing.T) {
 	drainEvents(t, events)
 
 	hist := a.History()
-	if len(hist) != 8 {
-		t.Fatalf("history = %d messages, want user + 3 write rounds + the reply", len(hist))
+	if len(hist) != 6 {
+		t.Fatalf("history = %d messages, want user + one reply with three calls + three answers + the final reply: %+v", len(hist), hist)
+	}
+	assistant := hist[1]
+	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 3 {
+		t.Fatalf("history[1] = %+v, want one assistant message carrying the three write calls", assistant)
 	}
 	for i, want := range []string{"c1", "c1_part2", "c1_part3"} {
-		assistant := hist[1+i*2]
-		toolMsg := hist[2+i*2]
-		if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 {
-			t.Fatalf("history[%d] = %+v, want one write call", 1+i*2, assistant)
-		}
-		call := assistant.ToolCalls[0]
+		call := assistant.ToolCalls[i]
 		if call.ID != want || call.Function.Name != writeFileToolName {
-			t.Fatalf("round %d call = %s/%s, want %s/write_file", i+1, call.ID, call.Function.Name, want)
+			t.Fatalf("call %d = %s/%s, want %s/write_file", i+1, call.ID, call.Function.Name, want)
 		}
+		toolMsg := hist[2+i]
 		if toolMsg.Role != "tool" || toolMsg.ToolCallID != want || toolMsg.Name != writeFileToolName {
-			t.Fatalf("round %d tool message = %+v, want the answer for %s", i+1, toolMsg, want)
+			t.Fatalf("answer %d = %+v, want the answer for %s", i+1, toolMsg, want)
 		}
 		if strings.Contains(toolMsg.Content, "truncated") {
-			t.Fatalf("round %d was truncated instead of split: %s", i+1, toolMsg.Content)
+			t.Fatalf("call %d was truncated instead of split: %s", i+1, toolMsg.Content)
 		}
 	}
-	if hist[7].Role != "assistant" || hist[7].Content != "done" {
-		t.Fatalf("history[7] = %+v, want the model's final reply", hist[7])
+	if hist[5].Role != "assistant" || hist[5].Content != "done" {
+		t.Fatalf("history[5] = %+v, want the model's final reply", hist[5])
 	}
 
 	// The model's own call was rewritten to the first part, and the follow-ups
@@ -205,11 +207,11 @@ func TestAutoSplitWriteRunsFollowUpRounds(t *testing.T) {
 	}
 	for i, want := range wantParts {
 		args := map[string]any{}
-		if err := json.Unmarshal([]byte(hist[1+i*2].ToolCalls[0].Function.Arguments), &args); err != nil {
-			t.Fatalf("round %d arguments: %v", i+1, err)
+		if err := json.Unmarshal([]byte(assistant.ToolCalls[i].Function.Arguments), &args); err != nil {
+			t.Fatalf("call %d arguments: %v", i+1, err)
 		}
 		if got, _ := args["content"].(string); got != want {
-			t.Fatalf("round %d content = %q, want %q", i+1, got, want)
+			t.Fatalf("call %d content = %q, want %q", i+1, got, want)
 		}
 		if i == 0 && args["mode"] != nil {
 			t.Fatalf("the model's own call gained a mode: %v", args["mode"])
@@ -244,7 +246,7 @@ func TestAutoSplitWriteRunsFollowUpRounds(t *testing.T) {
 
 // TestAutoSplitWriteKeepsOtherCalls covers one reply that mixes an ordinary call
 // with an oversized write: the ordinary call keeps its place, the write is split
-// and only the extra parts run as follow-up rounds.
+// and the extra parts join the same assistant message.
 func TestAutoSplitWriteKeepsOtherCalls(t *testing.T) {
 	payload := numberedLines(9)
 	file := filepath.Join(t.TempDir(), "mixed.txt")
@@ -270,27 +272,33 @@ func TestAutoSplitWriteKeepsOtherCalls(t *testing.T) {
 	drainEvents(t, events)
 
 	hist := a.History()
-	if len(hist) != 9 {
-		t.Fatalf("history = %d messages, want user + (2 calls + 2 answers) + 2 follow-up rounds + the reply", len(hist))
+	if len(hist) != 7 {
+		t.Fatalf("history = %d messages, want user + one reply with four calls + four answers + the final reply: %+v", len(hist), hist)
 	}
-	// The mixed round keeps both answers in the order of the calls.
-	if hist[1].Role != "assistant" || len(hist[1].ToolCalls) != 2 {
-		t.Fatalf("history[1] = %+v, want the two calls", hist[1])
+	// The reply carries the ordinary call, the write's first part and the two
+	// follow-up parts, all on the one assistant message.
+	assistant := hist[1]
+	wantIDs := []string{"s1", "c1", "c1_part2", "c1_part3"}
+	if assistant.Role != "assistant" || len(assistant.ToolCalls) != len(wantIDs) {
+		t.Fatalf("history[1] = %+v, want the four calls on one message", assistant)
 	}
-	if hist[2].ToolCallID != "s1" || hist[2].Name != "stub" {
+	for i, want := range wantIDs {
+		if got := assistant.ToolCalls[i].ID; got != want {
+			t.Fatalf("call %d = %s, want %s", i, got, want)
+		}
+		answer := hist[2+i]
+		if answer.Role != "tool" || answer.ToolCallID != want {
+			t.Fatalf("answer %d = %+v, want the answer for %s", i, answer, want)
+		}
+	}
+	if hist[2].Name != "stub" {
 		t.Fatalf("history[2] = %+v, want the stub answer first", hist[2])
 	}
-	if hist[3].ToolCallID != "c1" || hist[3].Name != writeFileToolName {
+	if hist[3].Name != writeFileToolName {
 		t.Fatalf("history[3] = %+v, want the first write part", hist[3])
 	}
-	// Two parts left, each in its own round.
-	for i, want := range []string{"c1_part2", "c1_part3"} {
-		if got := hist[4+i*2].ToolCalls[0].ID; got != want {
-			t.Fatalf("follow-up %d call = %s, want %s", i+1, got, want)
-		}
-		if hist[5+i*2].ToolCallID != want {
-			t.Fatalf("follow-up %d answer = %+v", i+1, hist[5+i*2])
-		}
+	if hist[6].Role != "assistant" || hist[6].Content != "done" {
+		t.Fatalf("history[6] = %+v, want the model's final reply", hist[6])
 	}
 	if got := readText(t, file); got != payload {
 		t.Fatalf("file content = %q, want the payload", got)
