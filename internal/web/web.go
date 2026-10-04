@@ -559,6 +559,23 @@ type historyMessage struct {
 	Args        string           `json:"args,omitempty"`
 	IsError     bool             `json:"is_error,omitempty"`
 	Attachments []llm.Attachment `json:"attachments,omitempty"`
+	// Time is when the message began, RFC 3339: for a reply the arrival of its
+	// first streamed chunk (the model's thinking included), for a user message
+	// the moment it was submitted. The page draws it in gray beside the role
+	// label, and a reconnecting page replays it with the row, so the stamp of a
+	// message that is already on screen never changes. Empty for a row whose
+	// start is unknown (a conversation restored from a session file) and for the
+	// rows that are not a message of their own (thinking, tool calls, markers).
+	Time string `json:"time,omitempty"`
+}
+
+// eventTime renders an event's start time as the row's Time, or "" when the
+// event carries none.
+func eventTime(ev agent.Event) string {
+	if ev.Time.IsZero() {
+		return ""
+	}
+	return ev.Time.Format(time.RFC3339)
 }
 
 // seedHistory fills the in-memory scrollback from the agent's current
@@ -662,10 +679,11 @@ func (s *Server) recordLocked(ev agent.Event) {
 			Role:        "user",
 			Content:     ev.Text,
 			Attachments: ev.Attachments,
+			Time:        eventTime(ev),
 		})
 	case agent.EventAssistant:
 		if strings.TrimSpace(ev.Text) != "" {
-			s.history = append(s.history, historyMessage{Role: "assistant", Content: ev.Text})
+			s.history = append(s.history, historyMessage{Role: "assistant", Content: ev.Text, Time: eventTime(ev)})
 		}
 	case agent.EventToolCall:
 		s.history = append(s.history, historyMessage{Role: "tool_call", Name: ev.Name, Args: ev.Args})
@@ -681,9 +699,10 @@ func (s *Server) recordLocked(ev agent.Event) {
 		s.history = append(s.history, historyMessage{Role: "info", Content: ev.Text})
 		// The summary is what replaced the messages that were cut out of the
 		// context, so its row is recorded right at the cut: a page connecting
-		// later replays the marker in the same place.
+		// later replays the marker in the same place. It carries the moment of
+		// the compaction, drawn like a message stamp.
 		if sum := strings.TrimSpace(ev.Summary); sum != "" {
-			s.history = append(s.history, historyMessage{Role: "summary", Content: sum})
+			s.history = append(s.history, historyMessage{Role: "summary", Content: sum, Time: eventTime(ev)})
 		}
 	case agent.EventInterrupted:
 		s.history = append(s.history, historyMessage{Role: "interrupted", Content: ev.Text})

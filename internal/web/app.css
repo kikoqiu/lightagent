@@ -370,6 +370,18 @@
     content:""; display:inline-block; width:5px; height:5px; border-radius:50%;
     background:currentColor; margin-right:6px; vertical-align:1px;
   }
+  /* The message's start time: a small gray stamp riding in the role line, next
+     to the label it belongs to — to the right of "agent", to the left of "you".
+     A user message hugs the right edge of the log, so its stamp is mirrored the
+     way its copy control is (order:-1 puts it ahead of the label; the control,
+     which is also ordered, stays ahead of the stamp so its floating icon lands
+     outside both). The stamp keeps its own color, so it never picks up the
+     accent/green of the label beside it. */
+  .role .time {
+    color:var(--fg-dim); font-weight:600; letter-spacing:.4px;
+    white-space:nowrap; margin-left:8px;
+  }
+  .user .role .time { order:-1; margin-left:0; margin-right:8px; }
   .text { display:block; white-space:pre-wrap; }
   .text.md { white-space:normal; }
   .text.md > :first-child { margin-top:0; }

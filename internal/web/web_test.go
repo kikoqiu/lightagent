@@ -573,6 +573,7 @@ type historyRow struct {
 	Args        string           `json:"args"`
 	IsError     bool             `json:"is_error"`
 	Attachments []llm.Attachment `json:"attachments"`
+	Time        string           `json:"time"`
 }
 
 // historyFrame is one frame of a history snapshot as the page consumes it: the
@@ -759,6 +760,75 @@ func TestScrollbackTracksLiveEvents(t *testing.T) {
 	}
 }
 
+// TestPageStampsMessageTimes pins the page's side of the timestamp: a gray stamp
+// rides in the role line of user and agent messages (to the right of "agent", to
+// the left of "you"), it comes from the row's own time, and it keeps the date
+// once the message is not from today.
+func TestPageStampsMessageTimes(t *testing.T) {
+	page := pageSource()
+	for _, want := range []string{
+		"function stampOf(t)",
+		"function timeSpan(stamp)",
+		"function stampRow(row, stamp)",
+		// The stamp rides in the role line of a message row.
+		"if (label && stamp && !user) { label.appendChild(timeSpan(stamp)); }",
+		"if (label && stamp && user) { label.appendChild(timeSpan(stamp)); }",
+		// The live and replayed paths both carry it.
+		"addRow('user', 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
+		"addRow('assistant', 'agent', text, true, null, false, stampOf(ev.time))",
+		"addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, false, stampOf(ev.time))",
+		"render('assistant', { text: m.content, time: m.time })",
+		"render('summary', { text: ev.summary, time: ev.time })",
+		"render('summary', { text: m.content, time: m.time })",
+		// The date is added once the message is not from today.
+		"pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + clock",
+		// The gray stamp keeps its own color inside the colored role line, and a
+		// user message mirrors it the way it mirrors its copy control.
+		".role .time {",
+		".user .role .time { order:-1; margin-left:0; margin-right:8px; }",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+}
+
+// TestHistoryRowsCarryTheMessageStartTime pins the time a replayed row carries:
+// the message's start, so a page that reconnects draws the stamp it had. The
+// compressed-context summary carries the moment of the compaction, while the
+// thinking row and the markers are not a message of their own and carry none.
+func TestHistoryRowsCarryTheMessageStartTime(t *testing.T) {
+	srv := newTestServer(t, "")
+	bus := srv.agent.Bus()
+
+	start := time.Now().Add(-time.Hour).Truncate(time.Second)
+	compact := start.Add(-time.Minute)
+	bus.Publish(agent.Event{Type: agent.EventCompacted, Text: "context compressed", Summary: "the summary", Time: compact})
+	bus.Publish(agent.Event{Type: agent.EventUser, Text: "hi", Time: start})
+	bus.Publish(agent.Event{Type: agent.EventReasoningDelta, Text: "think", Time: start})
+	bus.Publish(agent.Event{Type: agent.EventAssistant, Text: "answer", Time: start})
+
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 5 })
+	if got, want := rolesOf(rows), "info,summary,user,reasoning,assistant"; got != want {
+		t.Fatalf("roles = %q, want %q", got, want)
+	}
+	want := start.Format(time.RFC3339)
+	if rows[1].Time != compact.Format(time.RFC3339) {
+		t.Fatalf("summary row time = %q, want %q", rows[1].Time, compact.Format(time.RFC3339))
+	}
+	if rows[2].Time != want {
+		t.Fatalf("user row time = %q, want %q", rows[2].Time, want)
+	}
+	if rows[4].Time != want {
+		t.Fatalf("assistant row time = %q, want %q", rows[4].Time, want)
+	}
+	for _, row := range []historyRow{rows[0], rows[3]} {
+		if row.Time != "" {
+			t.Fatalf("the %s row carries a time of its own: %q", row.Role, row.Time)
+		}
+	}
+}
+
 // TestScrollbackSkipsEmptyToolResult pins that an empty, non-error tool result
 // produces no row, matching the live view.
 func TestScrollbackSkipsEmptyToolResult(t *testing.T) {
@@ -783,10 +853,12 @@ func TestScrollbackSkipsEmptyToolResult(t *testing.T) {
 func TestSteeringRowOrder(t *testing.T) {
 	for _, want := range []string{
 		"function addPendingRow(text)",
-		"function settlePendingRow(text, attachments)",
+		"function settlePendingRow(text, attachments, stamp)",
 		"addPendingRow(text);",
-		"settlePendingRow(ev.text || '', ev.attachments)",
-		// The files the settled message carried join its row there.
+		"settlePendingRow(ev.text || '', ev.attachments, stampOf(ev.time))",
+		// The files the settled message carried join its row there, and so does
+		// the start time it could not show while it was still pending.
+		"stampRow(row, stamp);",
 		"setRowMedia(row, attachments);",
 		// Transcript rows are inserted before the pending messages.
 		"if (anchor) { log.insertBefore(row, anchor); } else { log.appendChild(row); }",

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"lightagent/internal/config"
 	"lightagent/internal/llm"
@@ -486,12 +487,12 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 			a.compactIfNeeded(ctx)
 		}
 
-		resp, err := a.callLLM(ctx)
+		resp, started, err := a.callLLM(ctx)
 		if err != nil {
 			if turnInterrupted(ctx, err) {
 				// The reply the provider had already streamed (if any) stays
 				// in the history; the tool calls it carried do not.
-				a.finishInterruptedModelCall(resp)
+				a.finishInterruptedModelCall(resp, started)
 				return
 			}
 			// A request the provider rejected for its size is recovered
@@ -555,7 +556,7 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 			}
 			a.appendMessage(assistant)
 			if resp.Content != "" {
-				a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content})
+				a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content, Time: started})
 			}
 			// The assistant message just joined the context: refresh the usage so
 			// the badge reflects the provider's count plus this reply.
@@ -810,9 +811,9 @@ func (a *Agent) dropUnstartedToolCalls() (int, bool) {
 //   - a reply that never arrived leaves no record at all.
 //
 // Whatever is kept travels with the next user message, never as a call of its own.
-func (a *Agent) finishInterruptedModelCall(resp *llm.Response) {
+func (a *Agent) finishInterruptedModelCall(resp *llm.Response, started time.Time) {
 	switch {
-	case a.keepPartialReply(resp):
+	case a.keepPartialReply(resp, started):
 		a.bus.Publish(Event{
 			Type: EventInterrupted,
 			Text: "interrupted while the reply was streaming; the partial reply was kept",
@@ -841,7 +842,7 @@ func (a *Agent) finishInterruptedModelCall(resp *llm.Response) {
 // message otherwise has nothing to contribute — and the kept text is published
 // as the assistant row the front-ends had been streaming, so the row is
 // finalized live and replayed from the mirror.
-func (a *Agent) keepPartialReply(resp *llm.Response) bool {
+func (a *Agent) keepPartialReply(resp *llm.Response, started time.Time) bool {
 	if resp == nil {
 		return false
 	}
@@ -855,7 +856,7 @@ func (a *Agent) keepPartialReply(resp *llm.Response) bool {
 		ReasoningContent: resp.Reasoning,
 	})
 	if resp.Content != "" {
-		a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content})
+		a.bus.Publish(Event{Type: EventAssistant, Text: resp.Content, Time: started})
 	}
 	if n := len(resp.ToolCalls); n > 0 {
 		a.bus.Publish(Event{
@@ -882,19 +883,33 @@ func (a *Agent) finishInterrupt() {
 // the compaction pass calls (see livePrefixLocked): the ordinary calls and the
 // summarizing one cannot then carry heads taken from different states, so the
 // provider's cached prompt prefix stays valid across a pass.
-func (a *Agent) callLLM(ctx context.Context) (*llm.Response, error) {
+//
+// The returned start time is the moment the reply began: the arrival of its
+// first streamed chunk (the model's thinking included). With a streamed reply
+// the front-ends stamp the message with it; the whole reply carries the same
+// value, so a delta and the final assistant event cannot disagree. It stays
+// zero when nothing streamed (a non-streaming reply, or an empty answer), and
+// the caller then falls back to the moment the whole reply arrived.
+func (a *Agent) callLLM(ctx context.Context) (*llm.Response, time.Time, error) {
 	a.mu.Lock()
 	prefix := a.livePrefixLocked()
 	msgs := prefix.head(a.history)
 	a.mu.Unlock()
 
+	var started time.Time
+	var once sync.Once
+	markStart := func() time.Time {
+		once.Do(func() { started = time.Now() })
+		return started
+	}
 	onDelta := func(text string) {
-		a.bus.Publish(Event{Type: EventAssistantDelta, Text: text})
+		a.bus.Publish(Event{Type: EventAssistantDelta, Text: text, Time: markStart()})
 	}
 	onReasoning := func(text string) {
-		a.bus.Publish(Event{Type: EventReasoningDelta, Text: text})
+		a.bus.Publish(Event{Type: EventReasoningDelta, Text: text, Time: markStart()})
 	}
-	return a.client.Chat(ctx, msgs, prefix.tools, onDelta, onReasoning)
+	resp, err := a.client.Chat(ctx, msgs, prefix.tools, onDelta, onReasoning)
+	return resp, started, err
 }
 
 // appendMessage appends a message to the history.

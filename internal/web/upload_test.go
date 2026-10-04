@@ -480,8 +480,8 @@ func TestPageDrawsTheFilesOfAMessage(t *testing.T) {
 		// A picture the URL does not answer for falls back to naming the file.
 		"img.onerror = function ()",
 		// Both row paths carry the files: the replayed row and the live event.
-		"render('user', { text: m.content, attachments: m.attachments })",
-		"addRow('user', 'you', ev.text || '', false, ev.attachments)",
+		"render('user', { text: m.content, attachments: m.attachments, time: m.time })",
+		"addRow('user', 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
 		".row .attachments .media-image img",
 	} {
 		if !strings.Contains(page, want) {

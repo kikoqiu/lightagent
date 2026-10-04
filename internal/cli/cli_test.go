@@ -1641,3 +1641,138 @@ func TestBannerAlignsFields(t *testing.T) {
 		t.Fatalf("banner shows a web URL while the server is off:\n%s", buf.String())
 	}
 }
+
+// TestRenderStampsASingleLineMarkdownReply pins the flush path: with markdown on,
+// a streamed reply whose text arrives without a newline is written only when the
+// final assistant event flushes it, and the stamp has to ride on that flush
+// instead of being lost.
+func TestRenderStampsASingleLineMarkdownReply(t *testing.T) {
+	original := termcolor.Enabled()
+	termcolor.SetEnabled(false)
+	t.Cleanup(func() { termcolor.SetEnabled(original) })
+
+	c := newTestCLI(t) // markdown on, so the answer is buffered until it flushes
+	var buf strings.Builder
+	c.out = &buf
+	c.lineStart = true
+
+	start := time.Now()
+	c.render(agent.Event{Type: agent.EventAssistantDelta, Text: "one line", Time: start})
+	if buf.String() != "" {
+		t.Fatalf("an incomplete line reached the screen early: %q", buf.String())
+	}
+	c.render(agent.Event{Type: agent.EventAssistant, Text: "one line", Time: start})
+	if want := messageTimeText(start) + " one line\n\n"; buf.String() != want {
+		t.Fatalf("flushed reply = %q, want %q", buf.String(), want)
+	}
+}
+
+// TestMessageTimeText pins the stamp format: the clock time for a message from
+// today, the date in front once it is not (a session can span midnight, and
+// "00:10" alone would not say which day it belongs to), and nothing at all for a
+// message whose start is unknown.
+func TestMessageTimeText(t *testing.T) {
+	if got := messageTimeText(time.Time{}); got != "" {
+		t.Fatalf("a zero start = %q, want no stamp", got)
+	}
+	now := time.Now()
+	if got, want := messageTimeText(now), now.Format("15:04"); got != want {
+		t.Fatalf("today = %q, want %q", got, want)
+	}
+	yesterday := now.AddDate(0, 0, -1)
+	if got, want := messageTimeText(yesterday), yesterday.Format("01-02 15:04"); got != want {
+		t.Fatalf("another day = %q, want %q (the date in front)", got, want)
+	}
+}
+
+// TestRenderStampsAMessagesStartTime pins the gray stamp the CLI draws beside a
+// message: it is taken from the event's own start time and drawn once per
+// message — every chunk of one reply carries the same start, so the stamp rides
+// on the first chunk only, and a message whose start is unknown (a conversation
+// restored from a session file) is drawn without one.
+func TestRenderStampsAMessagesStartTime(t *testing.T) {
+	original := termcolor.Enabled()
+	termcolor.SetEnabled(false)
+	t.Cleanup(func() { termcolor.SetEnabled(original) })
+
+	c := newTestCLI(t)
+	// Plain text keeps the assertions exact (no markdown buffering, no preview).
+	c.markdownOn = false
+	c.md = nil
+	c.reasoningMD = nil
+	var buf strings.Builder
+	c.out = &buf
+	c.lineStart = true
+
+	start := time.Now()
+	c.render(agent.Event{Type: agent.EventUser, Text: "hi", Source: "web", Time: start})
+	if want := messageTimeText(start) + " " + messageLine("web", "hi") + "\n"; buf.String() != want {
+		t.Fatalf("user row = %q, want %q", buf.String(), want)
+	}
+
+	// A reply that never streamed is stamped on the event that carries the whole
+	// message.
+	whole := start.Add(time.Second)
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventAssistant, Text: "done", Time: whole})
+	if want := messageTimeText(whole) + " done\n\n"; buf.String() != want {
+		t.Fatalf("non-streamed reply = %q, want %q", buf.String(), want)
+	}
+
+	// A streamed reply is stamped once, on its first chunk; the chunks that
+	// follow and the final event add nothing.
+	reply := start.Add(2 * time.Second)
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventAssistantDelta, Text: "Hel", Time: reply})
+	if want := messageTimeText(reply) + " Hel"; buf.String() != want {
+		t.Fatalf("first answer chunk = %q, want %q", buf.String(), want)
+	}
+	c.lineStart = true
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventAssistantDelta, Text: "lo", Time: reply})
+	if want := "lo"; buf.String() != want {
+		t.Fatalf("later answer chunk = %q, want %q (the reply is already stamped)", buf.String(), want)
+	}
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventAssistant, Text: "Hello", Time: reply})
+	if want := "\n\n"; buf.String() != want {
+		t.Fatalf("assistant tail = %q, want %q (the stamp is not drawn again)", buf.String(), want)
+	}
+
+	// A reply that began with thinking is stamped on its [thinking] header: the
+	// message starts there, so that is the first line the stamp can ride on. The
+	// visible answer that follows does not repeat it.
+	think := start.Add(3 * time.Second)
+	c.lineStart = true
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventReasoningDelta, Text: "hmm", Time: think})
+	if want := messageTimeText(think) + " [thinking]\nhmm"; buf.String() != want {
+		t.Fatalf("thinking row = %q, want %q", buf.String(), want)
+	}
+	c.lineStart = true
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventAssistantDelta, Text: "answer", Time: think})
+	if want := "answer"; buf.String() != want {
+		t.Fatalf("answer after thinking = %q, want %q (the reply is already stamped)", buf.String(), want)
+	}
+
+	// A compressed-context summary is stamped with the moment of the compaction,
+	// on its marker line (the block's first line).
+	compact := start.Add(4 * time.Second)
+	c.lineStart = true
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventCompacted, Text: "context compressed", Summary: "the summary", Time: compact})
+	want := "[info] context compressed\n" + messageTimeText(compact) + " [summary] " + summaryMarker + "\n  the summary\n"
+	if buf.String() != want {
+		t.Fatalf("compacted block = %q, want %q", buf.String(), want)
+	}
+
+	// A message with no start time (a resumed session) is drawn without a stamp.
+	c.lineStart = true
+	buf.Reset()
+	c.render(agent.Event{Type: agent.EventUser, Text: "plain", Source: "web"})
+	if want := messageLine("web", "plain") + "\n"; buf.String() != want {
+		t.Fatalf("user row without a start = %q, want %q", buf.String(), want)
+	}
+}
+

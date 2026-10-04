@@ -3070,3 +3070,97 @@ func TestOverflowRejectionOnTheFirstCallResendsTheMessage(t *testing.T) {
 		t.Fatalf("retry message = %q, want the resubmitted user message", retry[2].Content)
 	}
 }
+
+// TestReplyStartTimeIsStampedOnItsEvents pins the timestamp a front-end draws
+// beside an agent message. Every event of one reply carries the same start time
+// — the arrival of its first streamed chunk, the model's thinking included — so
+// the thinking row, the answer's chunks and the finalized row can never disagree
+// about when the message began.
+func TestReplyStartTimeIsStampedOnItsEvents(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"why\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = true
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	a.Submit("say hi")
+
+	var reasoning, delta, assistant time.Time
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case ev := <-events:
+			switch ev.Type {
+			case EventReasoningDelta:
+				reasoning = ev.Time
+			case EventAssistantDelta:
+				delta = ev.Time
+			case EventAssistant:
+				assistant = ev.Time
+			case EventTurnDone:
+				goto done
+			}
+		case <-deadline:
+			t.Fatal("the turn never finished")
+		}
+	}
+
+done:
+	if reasoning.IsZero() || delta.IsZero() || assistant.IsZero() {
+		t.Fatalf("a reply event carried no start time: reasoning=%v delta=%v assistant=%v", reasoning, delta, assistant)
+	}
+	if !reasoning.Equal(delta) || !delta.Equal(assistant) {
+		t.Fatalf("the reply's events disagree on its start: reasoning=%v delta=%v assistant=%v", reasoning, delta, assistant)
+	}
+}
+
+// TestNonStreamedReplyIsStampedWhenItArrives pins the other half of the rule: a
+// reply that never streamed (no chunk to mark its start) is stamped with the
+// moment the whole message arrived, at the final assistant event.
+func TestNonStreamedReplyIsStampedWhenItArrives(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.OpenAI.APIBase = srv.URL
+	cfg.OpenAI.Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+
+	before := time.Now()
+	a.Submit("hi")
+
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type != EventAssistant {
+				continue
+			}
+			if ev.Time.IsZero() {
+				t.Fatal("the assistant event carried no start time")
+			}
+			if ev.Time.Before(before) {
+				t.Fatalf("start time %v is before the reply was requested (%v)", ev.Time, before)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no assistant event")
+		}
+	}
+}
+

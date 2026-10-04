@@ -921,10 +921,46 @@
     reasoningRenderedAt = 0;
   }
 
+  // stampOf renders a message's start time for the role line: the clock time,
+  // with the date in front once the message is not from today (a page left open
+  // overnight shows "00:10" and "01-02 00:10" side by side, so the reader can
+  // tell the two days apart). It returns '' for a missing or unparsable time,
+  // which is what a row restored from a session file carries — the row is then
+  // drawn without a stamp.
+  function stampOf(t) {
+    if (!t) { return ''; }
+    var d = new Date(t);
+    if (isNaN(d.getTime())) { return ''; }
+    var clock = pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+    var now = new Date();
+    var sameDay = d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+    return sameDay ? clock : pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + clock;
+  }
+
+  // timeSpan is the gray stamp of a message, drawn inside the role line.
+  function timeSpan(stamp) {
+    var el = document.createElement('span');
+    el.className = 'time';
+    el.textContent = stamp;
+    return el;
+  }
+
+  // stampRow adds the gray start stamp of a message to a row that was drawn
+  // without one (a pending row the agent has just sent). It does nothing when
+  // the row already carries the stamp.
+  function stampRow(row, stamp) {
+    if (!row || !stamp) { return; }
+    var label = row.querySelector('.role');
+    if (!label || label.querySelector('.time')) { return; }
+    label.appendChild(timeSpan(stamp));
+  }
+
   // buildRow creates one transcript row. attachments are the files a message
   // carried (the page draws them under the text; see mediaList). foldable marks a row
-  // the reader may fold to its first line (see the fold section).
-  function buildRow(cls, role, text, renderMD, attachments, foldable) {
+  // the reader may fold to its first line (see the fold section). stamp is the
+  // message's gray start time, or '' when it has none.
+  function buildRow(cls, role, text, renderMD, attachments, foldable, stamp) {
     var row = document.createElement('div');
     row.className = 'row ' + cls;
     if (foldable) { markFoldable(row); }
@@ -940,6 +976,13 @@
     row.appendChild(t);
     var media = mediaList(attachments);
     if (media) { row.appendChild(media); }
+    // The stamp sits on the role line, next to the label it belongs to: to the
+    // right of "agent", to the left of "you". A user message hugs the right edge
+    // of the log, so its stamp is mirrored to stay on the message's side — it is
+    // added after the copy control, which the CSS then orders ahead of it, and
+    // the label follows (see .user .role .time in app.css).
+    var user = cls === 'user' || cls === 'user pending';
+    if (label && stamp && !user) { label.appendChild(timeSpan(stamp)); }
     // The messages the user wrote and the replies the agent produced can be
     // copied away: their control rides in the role line, next to the label it
     // belongs to (app.css keeps it out of the flow, so the line is untouched
@@ -948,6 +991,7 @@
       if (label) { label.classList.add('with-actions'); }
       (label || row).appendChild(copyControl(row));
     }
+    if (label && stamp && user) { label.appendChild(timeSpan(stamp)); }
     return row;
   }
 
@@ -966,8 +1010,8 @@
     keepBottom();
   }
 
-  function addRow(cls, role, text, renderMD, attachments, foldable) {
-    var row = buildRow(cls, role, text, renderMD, attachments, foldable);
+  function addRow(cls, role, text, renderMD, attachments, foldable, stamp) {
+    var row = buildRow(cls, role, text, renderMD, attachments, foldable, stamp);
     placeRow(row);
     return row;
   }
@@ -987,8 +1031,9 @@
   // into an ordinary one. It reports whether a row was converted; the row keeps
   // its place, which is where the message entered the conversation. attachments
   // are the files the agent reports for it: the row was drawn from the composer's
-  // text alone, so the files it carried are added here.
-  function settlePendingRow(text, attachments) {
+  // text alone, so the files it carried are added here. stamp is the message's
+  // start time, which the row could not show while it was still pending.
+  function settlePendingRow(text, attachments, stamp) {
     for (var i = 0; i < pendingRows.length; i++) {
       if (pendingRows[i].text !== text) { continue; }
       var row = pendingRows[i].el;
@@ -996,6 +1041,7 @@
       // The pending mark rides on the class alone; the text is already the final
       // one, since it is the message the agent recorded.
       row.className = 'row user';
+      stampRow(row, stamp);
       setRowMedia(row, attachments);
       return true;
     }
@@ -1807,8 +1853,9 @@
     if (kind === 'usage') { setUsage(ev.tokens || 0, ev.context_window || 0); return; }
     // A summary row is the truncation marker itself, so it is drawn as a whole
     // block instead of an [info] line; it arrives either live with a compacted
-    // event or replayed from the history frame.
-    if (kind === 'summary') { addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN); return; }
+    // event or replayed from the history frame. It carries the moment of the
+    // compaction like any other message.
+    if (kind === 'summary') { addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, false, stampOf(ev.time)); return; }
     if (kind === 'user') {
       setRunning(true);
       // A message this page sent while the turn was running is being sent now:
@@ -1819,7 +1866,7 @@
       // replayed row reads no layout and writes nothing (see the replay path in
       // setRow/placeRow), and pendingRows is empty during one, so the settle below
       // misses anyway.
-      if (settlePendingRow(ev.text || '', ev.attachments)) {
+      if (settlePendingRow(ev.text || '', ev.attachments, stampOf(ev.time))) {
         if (queued) { queued--; tickTurn(); }
         if (!replaying) { keepBottom(); }
         return;
@@ -1838,7 +1885,10 @@
     }
     if (kind === 'assistant_delta') {
       if (!current) {
-        current = addRow('assistant', 'agent', '', false);
+        // The message's start time is the first chunk of the reply — its
+        // thinking included, so a reply that begins with thinking is stamped
+        // where it began, not where its visible text did.
+        current = addRow('assistant', 'agent', '', false, null, false, stampOf(ev.time));
         answerRenderedAt = 0;
       }
       currentText += ev.text || '';
@@ -1853,11 +1903,11 @@
     // it with the text the branches below render in full.
     if (pendingRender) { clearTimeout(pendingRender); pendingRender = null; }
     if (kind === 'turn_done') { return; }
-    if (kind === 'user') { addRow('user', 'you', ev.text || '', false, ev.attachments); }
+    if (kind === 'user') { addRow('user', 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time)); }
     else if (kind === 'assistant') {
       var text = ev.text || streamedText;
       if (streamed) { setRow(streamed, text, true); }
-      else { addRow('assistant', 'agent', text, true); }
+      else { addRow('assistant', 'agent', text, true, null, false, stampOf(ev.time)); }
     }
     else if (kind === 'tool_call') { addToolRow(ev.name, ev.args); }
     else if (kind === 'tool_result') {
@@ -1876,7 +1926,7 @@
       // what replaced it. The mirror records the same block at this point of its
       // scrollback, so a reload replays it exactly here.
       addRow('result', '', '[info] ' + (ev.text || ''), false);
-      if (ev.summary) { render('summary', { text: ev.summary }); }
+      if (ev.summary) { render('summary', { text: ev.summary, time: ev.time }); }
     }
     else if (kind === 'interrupted') { addRow('interrupted', '', '[interrupted] ' + (ev.text || ''), false); }
     else if (kind === 'error') { addRow('error', '', '[error] ' + (ev.text || ''), false); }
@@ -1974,13 +2024,13 @@
   function appendHistoryRows(ev) {
     if (!replayBatch) { beginHistory(ev); }
     (ev.messages || []).forEach(function (m) {
-      if (m.role === 'user') { render('user', { text: m.content, attachments: m.attachments }); }
-      else if (m.role === 'assistant' && m.content) { render('assistant', { text: m.content }); }
+      if (m.role === 'user') { render('user', { text: m.content, attachments: m.attachments, time: m.time }); }
+      else if (m.role === 'assistant' && m.content) { render('assistant', { text: m.content, time: m.time }); }
       else if (m.role === 'reasoning') { render('reasoning_delta', { text: m.content }); }
       else if (m.role === 'tool_call') { render('tool_call', { name: m.name, args: m.args }); }
       else if (m.role === 'tool_result') { render('tool_result', { text: m.content, is_error: m.is_error }); }
       else if (m.role === 'info') { render('info', { text: m.content }); }
-      else if (m.role === 'summary') { render('summary', { text: m.content }); }
+      else if (m.role === 'summary') { render('summary', { text: m.content, time: m.time }); }
       else if (m.role === 'error') { render('error', { text: m.content }); }
       else if (m.role === 'interrupted') { render('interrupted', { text: m.content }); }
     });

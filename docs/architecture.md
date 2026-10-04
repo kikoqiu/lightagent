@@ -36,7 +36,8 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
    3. `compactIfNeeded()`：请求用量超阈值则压缩（见下）。
    4. `callLLM()`：构造 `[system, ...history]`，附带工具定义，流式调用；模型可见回答的增量
       文本发布为 `assistant_delta`；若服务商返回思考内容（`reasoning_content` / `reasoning`），
-      其增量先发布为 `reasoning_delta`。
+      其增量先发布为 `reasoning_delta`。同一条回复的各事件共用同一个**回复开始时刻**（第一个
+      流式块到达时记下），供前端画出消息旁的时间戳（见[事件总线](#事件总线)）。
       * **调用失败**：被用户中断的走下面的「中断」分支（服务商已经流出的那部分回复会保留）；
         **服务商以「上下文超限」拒绝**
         （`llm.IsContextLengthError`，见[溢出恢复](#溢出恢复provider-拒绝后回退--摘要--重发)）时
@@ -141,6 +142,12 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 `user` 事件带 `source` 字段（`cli` / `web` 等），前端据此决定标签与是否回显自己的输入；它由
 `drainSteering()` / `startSteeringTurn()` 在消息进入对话时广播（见上），因此各端的行顺序与
 上下文里的消息顺序一致。
+每条事件都带 `time`（RFC 3339，总线在发布时补上当前时刻）：`user` 事件是消息提交的时刻，
+一条回复的 `reasoning_delta` / `assistant_delta` / 最终 `assistant` 则共用同一个**回复开始时刻**
+（`callLLM()` 在**第一个流式块到达**时记下，思考块也算；没有块的非流式回复留零值，总线在最终
+`assistant` 上补上整条消息到达的时刻），`compacted` 事件的 `time` 就是这次压缩发生的时刻。
+CLI 与 web 都用它画出消息旁的灰色时间戳（`compacted` 的摘要块也一样，见
+[web.md](web.md#消息时间)）。
 `usage` 事件带 `tokens` / `context_window`，用于上下文用量显示。它在上下文增长的每个时点
 （回合开始、每次模型回复、每轮工具执行后）广播，因此 tool 循环进行中前端也能实时刷新；
 `tokens` 以接口返回的 `usage.prompt_tokens` 为基准，再加上此后追加消息的估算。

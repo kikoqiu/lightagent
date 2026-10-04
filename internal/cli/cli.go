@@ -107,6 +107,16 @@ type CLI struct {
 	// a turn runs (and after it ends); zero means nothing was reported yet.
 	ctxTokens int
 	ctxWindow int
+	// msgStamp is the start time already drawn for a message. The events of one
+	// message all carry the same start time, so comparing against it keeps the
+	// gray stamp to once per message (see stampLocked).
+	msgStamp time.Time
+	// replyStart is the start time of the reply whose output is still streaming.
+	// A streamed answer can reach the screen only at the end (one line, no
+	// newline, so the markdown stream buffers all of it), and the stamp has to
+	// ride on that flush instead of being lost (see flushMarkdownLocked). It is
+	// overwritten by the next reply's first chunk.
+	replyStart time.Time
 }
 
 // keyKind classifies a terminal key press for the raw line editor.
@@ -305,6 +315,49 @@ func messageLine(source, text string) string {
 
 // userLine renders a message typed in this terminal with the input prompt label.
 func userLine(text string) string { return messageLine("", text) }
+
+// messageTimeText renders a message's start time for the transcript: the clock
+// time, with the date in front once the message is not from today (a
+// long-running session can span midnight, and "00:10" alone would not say which
+// day it belongs to). It returns "" for a zero time, which is what a message
+// restored from a session file carries.
+func messageTimeText(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	now := time.Now()
+	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
+		return t.Format("15:04")
+	}
+	return t.Format("01-02 15:04")
+}
+
+// stampLocked returns the gray start-time stamp of a message the first time it is
+// called for t, and "" for every later call (the events of one message share one
+// start time, see Agent.callLLM). A zero time — a message whose start is unknown,
+// e.g. one restored from a session file — never gets a stamp. The trailing space
+// makes the stamp a prefix of whatever output comes next. The caller must hold
+// c.mu.
+func (c *CLI) stampLocked(t time.Time) string {
+	if t.IsZero() || t.Equal(c.msgStamp) {
+		return ""
+	}
+	c.msgStamp = t
+	if text := messageTimeText(t); text != "" {
+		return termcolor.Gray(text) + " "
+	}
+	return ""
+}
+
+// writeStampedLocked writes s with the message's gray start stamp in front when s
+// is the first output of that message. An empty s writes nothing and leaves the
+// stamp pending, so it always lands on real text. The caller must hold c.mu.
+func (c *CLI) writeStampedLocked(s string, t time.Time) {
+	if s == "" {
+		return
+	}
+	c.outLocked(c.stampLocked(t) + s)
+}
 
 // brailleSpinnerFrames is the smooth Unicode spinner. It needs a console font
 // with braille coverage, which the legacy Windows console does not have (there
@@ -752,12 +805,18 @@ func (c *CLI) cursorBackLocked(n int) {
 // flushMarkdownLocked emits any buffered markdown text and starts a fresh
 // render state. The caller must hold c.mu. It is a no-op when markdown
 // rendering is off.
+//
+// A reply that arrived without a closing newline (a one-line answer) is only
+// written here, so the flush carries the reply's gray start stamp when it is
+// that message's first output — otherwise such a reply would appear without its
+// time. On every other call there is nothing stamped left to draw, and
+// stampLocked returns "".
 func (c *CLI) flushMarkdownLocked() {
 	c.preview = ""
 	if c.md == nil || !c.markdownOn {
 		return
 	}
-	c.outLocked(c.md.Flush())
+	c.writeStampedLocked(c.md.Flush(), c.replyStart)
 	c.md.Reset()
 }
 
@@ -767,14 +826,18 @@ func (c *CLI) flushMarkdownLocked() {
 // while it is still arriving. When markdown is on the thinking is rendered like
 // the visible answer (ANSI styling, partial line as preview); otherwise it
 // stays plain dim text. The caller must hold c.mu.
-func (c *CLI) appendReasoningLocked(chunk string) {
+func (c *CLI) appendReasoningLocked(chunk string, stamp time.Time) {
 	if chunk == "" {
 		return
 	}
 	if !c.reasoning {
 		c.flushMarkdownLocked()
 		c.endLineLocked()
-		c.outLocked(termcolor.Gray("[thinking]") + "\n")
+		// The [thinking] header opens the reply, so the reply's gray start stamp
+		// rides on it — the message began with thinking, and this is its first
+		// line. A reply without thinking is stamped on its first visible output
+		// instead (see writeStampedLocked in render).
+		c.outLocked(c.stampLocked(stamp) + termcolor.Gray("[thinking]") + "\n")
 		c.reasoning = true
 	}
 	if c.reasoningMD != nil {
@@ -1343,7 +1406,7 @@ func (c *CLI) render(ev agent.Event) {
 
 	switch ev.Type {
 	case agent.EventReasoningDelta:
-		c.appendReasoningLocked(ev.Text)
+		c.appendReasoningLocked(ev.Text, ev.Time)
 	case agent.EventUser:
 		// A user message starts a turn (or steers a running one), so mark the
 		// prompt busy: it then shows a spinner and the elapsed time until
@@ -1368,15 +1431,21 @@ func (c *CLI) render(ev agent.Event) {
 			c.settlePendingSendLocked(ev.Text)
 		}
 		c.flushMarkdownLocked()
-		c.outLocked(messageLine(ev.Source, ev.Text) + "\n")
+		c.writeStampedLocked(messageLine(ev.Source, ev.Text)+"\n", ev.Time)
 	case agent.EventAssistantDelta:
+		if !c.streaming {
+			// The reply's first chunk: remember when it began, so a flush that
+			// is the only thing to reach the screen still carries the stamp.
+			c.replyStart = ev.Time
+		}
 		if c.md != nil && c.markdownOn {
 			// Complete lines are rendered as they arrive; the partial line is
 			// carried as a preview so text shows up while it is still streaming.
-			c.outLocked(c.md.Write(ev.Text))
+			// The message's gray start stamp rides on the first complete line.
+			c.writeStampedLocked(c.md.Write(ev.Text), ev.Time)
 			c.setPreviewLocked(c.md.Pending())
 		} else {
-			c.outLocked(ev.Text)
+			c.writeStampedLocked(ev.Text, ev.Time)
 			c.preview = ""
 		}
 		c.streaming = true
@@ -1385,11 +1454,11 @@ func (c *CLI) render(ev agent.Event) {
 			if c.streaming {
 				c.flushMarkdownLocked()
 			} else {
-				c.outLocked(markdown.ANSI(ev.Text))
+				c.writeStampedLocked(markdown.ANSI(ev.Text), ev.Time)
 			}
 			c.md.Reset()
 		} else if !c.streaming {
-			c.outLocked(ev.Text)
+			c.writeStampedLocked(ev.Text, ev.Time)
 		}
 		c.outLocked("\n\n")
 		c.streaming = false
@@ -1428,7 +1497,7 @@ func (c *CLI) render(ev agent.Event) {
 		c.outLocked(termcolor.Cyan("[info] ") + ev.Text + "\n")
 		// The summary replaced the messages that were just cut out of the
 		// context, so it is printed right at the truncation point.
-		c.writeSummaryLocked(ev.Summary)
+		c.writeSummaryLocked(ev.Summary, ev.Time)
 	case agent.EventInfo:
 		c.flushMarkdownLocked()
 		c.endLineLocked()
@@ -1604,13 +1673,17 @@ const summaryMarker = "older messages are condensed into the summary below"
 // text indented under it. The summary is a model-written report, so it is
 // rendered like assistant prose (markdown when that is on, matching the page's
 // summary row) before it is indented. It is a no-op without a summary - nothing
-// was condensed, so there is nothing to mark. The caller must hold c.mu.
-func (c *CLI) writeSummaryLocked(summary string) {
+// was condensed, so there is nothing to mark. stamp is the moment the
+// compaction happened, drawn in gray in front of the marker line like every
+// other message stamp; a zero time (a summary restored from a session file,
+// which carries no moment of its own) simply draws none. The caller must hold
+// c.mu.
+func (c *CLI) writeSummaryLocked(summary string, stamp time.Time) {
 	summary = strings.TrimSpace(summary)
 	if summary == "" {
 		return
 	}
-	c.outLocked(termcolor.Cyan("[summary] ") + summaryMarker + "\n")
+	c.outLocked(c.stampLocked(stamp) + termcolor.Cyan("[summary] ") + summaryMarker + "\n")
 	if c.md != nil && c.markdownOn {
 		summary = markdown.ANSI(summary)
 	}
@@ -1621,9 +1694,11 @@ func (c *CLI) writeSummaryLocked(summary string) {
 // was said before.
 func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
 	// Everything before the last compaction is represented by the summary
-	// alone, so it is printed first: it marks where this transcript starts.
+	// alone, so it is printed first: it marks where this transcript starts. A
+	// resumed summary carries no moment of its own, so it is drawn without a
+	// stamp.
 	c.mu.Lock()
-	c.writeSummaryLocked(summary)
+	c.writeSummaryLocked(summary, time.Time{})
 	c.mu.Unlock()
 	if len(messages) == 0 {
 		return
