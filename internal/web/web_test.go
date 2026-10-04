@@ -331,7 +331,13 @@ func TestFollowLockAndJumpButtons(t *testing.T) {
 		// Reaching the very end puts the page back in charge of the position, which
 		// is what lets the next change write it in its own task (see keepBottom).
 		"pageScrollTop = top;",
-		"else if (moved < 0) { setFollowing(false); }",
+		// A position the page wrote itself is not the reader moving: the bottom is
+		// re-written on every chunk and a shrinking row leaves the browser to clamp
+		// the position, so only a scroll that is not the page's own changes the
+		// follow (a think row's redraw used to stop it through just such a scroll).
+		"var ours = pageScrollTop >= 0 && Math.abs(top - pageScrollTop) <= 1;",
+		"else if (!ours && moved < 0) { setFollowing(false); }",
+		"else if (!ours && moved > 0 && atBottom() && Date.now() - unpinnedAt > REPIN_GRACE_MS) { setFollowing(true); }",
 		// The buttons, and the state that hides the "latest" one.
 		"function updateJump()",
 		"jumpLatestEl.classList.toggle('off', following);",

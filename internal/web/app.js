@@ -289,23 +289,32 @@
   // in view", and a scroll that moved the view up means the reader is reading
   // history — whichever gesture produced it, a scrollbar drag having no wheel or
   // touch event of its own.
+  //
+  // Only a gesture may change the follow, though: the page's own writes land here
+  // too. The bottom is re-written on every chunk, and a row that gets shorter (a
+  // markdown redraw, a fold) leaves the browser to clamp the position, which the
+  // page corrects in the same task — reading either as the reader moving would
+  // stop the follow with nobody touching the page, which is exactly what a think
+  // row could do mid-stream. Such a scroll is told apart by its position: it is
+  // the one pageScrollTop holds.
   var lastScrollTop = 0;
 
   function onLogScroll() {
     var top = log.scrollTop;
     var moved = top - lastScrollTop;
     lastScrollTop = top;
+    var ours = pageScrollTop >= 0 && Math.abs(top - pageScrollTop) <= 1;
     if (pinned()) {
       // The reader reached the very end: the page carries the view again, so the
       // next change may write it in its own task (see keepBottom).
       pageScrollTop = top;
       setFollowing(true);
     }
-    else if (moved < 0) { setFollowing(false); }
+    else if (!ours && moved < 0) { setFollowing(false); }
     // Came back into the bottom band on the way down: the reader is heading for
     // the bottom, and the next output should pull them the rest of the way. Not
     // right after an unpin though — that move is the one being read.
-    else if (moved > 0 && atBottom() && Date.now() - unpinnedAt > REPIN_GRACE_MS) { setFollowing(true); }
+    else if (!ours && moved > 0 && atBottom() && Date.now() - unpinnedAt > REPIN_GRACE_MS) { setFollowing(true); }
   }
 
   log.addEventListener('scroll', onLogScroll, { passive: true });
