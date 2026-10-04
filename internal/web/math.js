@@ -1139,13 +1139,19 @@
   }
 
   // inject puts every rendered formula back, right before the caller sanitizes
-  // the HTML: markup the sanitizer would refuse never gets in.
+  // the HTML: markup the sanitizer would refuse never gets in. One pass over the
+  // HTML through a token -> markup table, rather than a split/join per formula,
+  // so a reply rich in formulas does not pay a full scan for each of them.
   function inject(html, items) {
     var out = String(html);
-    for (var i = 0; items && i < items.length; i++) {
-      out = out.split(items[i].token).join(items[i].html);
-    }
-    return out;
+    if (!items || items.length === 0) { return out; }
+    var table = {};
+    for (var i = 0; i < items.length; i++) { table[items[i].token] = items[i].html; }
+    var re = new RegExp(TOKEN + '\\d+' + TOKEN, 'g');
+    return out.replace(re, function (token) {
+      var markup = table[token];
+      return markup === undefined ? token : markup;
+    });
   }
 
   window.MathTex = {

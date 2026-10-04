@@ -384,6 +384,15 @@
   .user .role .time { order:-1; margin-left:0; margin-right:8px; }
   .text { display:block; white-space:pre-wrap; }
   .text.md { white-space:normal; }
+  /* A rendered row's markdown lives in two display:contents containers (the
+     committed blocks and the block still being typed; see streamMarkdown in
+     app.js). They add no box of their own, so the blocks lay out and their
+     margins collapse exactly as if they were the row's own children — these
+     rules keep the row's first/last block flush after that split. */
+  .text.md > .md-stable, .text.md > .md-live { display:contents; }
+  .text.md > .md-stable > :first-child { margin-top:0; }
+  .text.md > .md-stable:empty + .md-live > :first-child { margin-top:0; }
+  .text.md > .md-live > :last-child { margin-bottom:0; }
   .text.md > :first-child { margin-top:0; }
   .text.md > :last-child { margin-bottom:0; }
   .text.md pre, .text.md pre code { white-space:pre; }

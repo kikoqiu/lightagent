@@ -372,6 +372,63 @@ func TestPageFlushesPendingMarkdownWhenVisible(t *testing.T) {
 	}
 }
 
+// TestPageStreamsMarkdownIncrementally pins the incremental streaming renderer: a
+// row that only grew re-parses its trailing block alone instead of the whole reply
+// (which made one answer cost O(length^2) — marked, math.js, DOMPurify and the
+// browser's own parse of the new innerHTML all ran over the entire text on every
+// chunk). The prefix is committed once into md-stable, the tail re-renders into
+// md-live, and the two containers are display:contents so the blocks lay out and
+// their margins collapse as if they were the row's own children.
+func TestPageStreamsMarkdownIncrementally(t *testing.T) {
+	for _, want := range []string{
+		"function applyMarkdown",
+		"function streamMarkdown",
+		"function advanceStreamBoundary",
+		"function isSafeBlockStart",
+		"function ensureStreamContainers",
+		"function mdRowHTML",
+		"var mdStream = new WeakMap();",
+		"var LINK_DEF = ", // a link reference definition freezes the boundary
+		"className = 'md-stable';",
+		"className = 'md-live';",
+		"st.stableEl.innerHTML = st.committed;",     // the committed prefix is written once
+		"st.liveEl.innerHTML = tailHTML;",           // only the tail is re-parsed per redraw
+		"text.slice(0, st.text.length) === st.text", // only an appended tail is incremental
+		"if (st && st.text === text) { return; }",   // an unchanged redraw is skipped
+		"classList.contains('md')) { return mdRowHTML(span); }",
+		"marked.setOptions({ gfm: true, breaks: true })",
+		".text.md > .md-stable, .text.md > .md-live { display:contents; }",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	// A block still being typed is never committed (only complete lines are read),
+	// nothing inside a code fence is ever split, and a link reference definition
+	// stops the split for good.
+	adv := functionBody(t, "advanceStreamBoundary")
+	for _, want := range []string{
+		"text.indexOf('\\n', i)",
+		"if (nl === -1) { break; }",
+		"fence === ''",
+		"st.noSplit = true",
+	} {
+		if !strings.Contains(adv, want) {
+			t.Errorf("advanceStreamBoundary is missing %q", want)
+		}
+	}
+	// A list item, a blockquote continuation or an indented line may still belong
+	// to the block above (a loose list, a quoted paragraph), so none may open a
+	// boundary.
+	safe := functionBody(t, "isSafeBlockStart")
+	if !strings.Contains(safe, "c === ' ' || c === '\\t' || c === '>'") {
+		t.Error("isSafeBlockStart must reject an indented line and a blockquote as a boundary")
+	}
+	if !strings.Contains(safe, "[-*+]") || !strings.Contains(safe, "\\d{1,9}[.)]") {
+		t.Error("isSafeBlockStart must reject a list marker as a boundary")
+	}
+}
+
 // attachQueuedClient registers a client whose frames the test reads straight from
 // its queue instead of a socket: no writer goroutine runs, so the assertions are
 // deterministic. The connection is a pipe that is only ever closed.

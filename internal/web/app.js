@@ -654,24 +654,19 @@
     else if (/showing tool\/exec results/i.test(text)) { setSwitch('/result', true); }
   }
 
-  // mdToHTML renders markdown with the vendored marked library and sanitizes the
-  // result with DOMPurify. It returns null when rendering is disabled or the
-  // libraries failed to load, so the caller falls back to plain text.
-  function mdToHTML(text) {
-    if (!MARKDOWN) { return null; }
-    return markdownToHTML(text);
-  }
-
   // markdownToHTML is the one markdown pipeline: the formulas are lifted out of
   // the text first (marked would read _x_y_ as emphasis and eat the backslash of
   // \%, \{ and \;), the rest goes through marked, the MathML is put back where
   // the placeholders are and the whole result is sanitized. math.js owns both
-  // ends of that (protect/inject).
+  // ends of that (protect/inject). It returns null when marked is missing or the
+  // pipeline throws, so the caller falls back to plain text.
   function markdownToHTML(text) {
     if (typeof marked === 'undefined') { return null; }
     try {
       var lifted = (typeof MathTex !== 'undefined') ? MathTex.protect(text) : null;
-      var html = marked.parse(lifted ? lifted.text : text, { gfm: true, breaks: true });
+      // marked's GFM options were set once at load (see configureMarkdown); the
+      // redraw path never builds and merges an options object again.
+      var html = marked.parse(lifted ? lifted.text : text);
       if (lifted) { html = MathTex.inject(html, lifted.items); }
       if (typeof DOMPurify !== 'undefined') {
         // DOMPurify's MathML attribute list spells columnalign "columnsalign", so
@@ -706,12 +701,146 @@
   // by a reconnect copies like a fresh one.
   var rowSource = new WeakMap();
 
-  // applyMarkdown renders one row's text as markdown, falling back to plain
-  // text when rendering is off or the libraries are missing.
+  // mdStream holds the incremental markdown state of a row, keyed by its text
+  // span. A WeakMap, so a row the transcript drops frees its state with it.
+  var mdStream = new WeakMap();
+
+  // LINK_DEF matches the start of a link reference definition. Such a definition
+  // applies to the whole document, so splitting after one would strand the
+  // references that use it; the row then freezes its boundary and stays whole
+  // (rare, and never worse than re-parsing the whole reply, which is what the
+  // page did before the split).
+  var LINK_DEF = /^\s{0,3}\[[^\]\n]+\]:/;
+
+  function newStreamState() {
+    return {
+      text: '',
+      boundary: 0,     // length of the committed prefix inside the text
+      committed: '',   // sanitized HTML of that prefix
+      cursor: 0,       // scan front: the start of the next unread line
+      fence: '',       // code fence open at the cursor ('' when none is)
+      prevBlank: true, // whether the line before the cursor was blank
+      noSplit: false,  // a link reference definition froze the boundary
+      stableEl: null,
+      liveEl: null
+    };
+  }
+
+  // isSafeBlockStart reports whether a line can open a block the split may leave
+  // on the far side of the boundary. A list item, a blockquote continuation or an
+  // indented line may still belong to the block above it (a loose list, a quoted
+  // paragraph), so those keep the row whole.
+  function isSafeBlockStart(line) {
+    if (line === '') { return false; }
+    var c = line.charAt(0);
+    if (c === ' ' || c === '\t' || c === '>') { return false; }
+    if (/^([-*+]|\d{1,9}[.)])(\s|$)/.test(line)) { return false; }
+    return true;
+  }
+
+  // advanceStreamBoundary walks the complete lines that arrived since the last
+  // pass and moves st.boundary to the start of the last block, so everything
+  // before it can be committed. Only complete lines are read, so a block still
+  // being typed is never committed; the fence state is carried across calls, so
+  // nothing inside a code fence is ever split.
+  function advanceStreamBoundary(text, st) {
+    if (st.noSplit) { return; }
+    var i = st.cursor, n = text.length, fence = st.fence, prevBlank = st.prevBlank;
+    while (i < n) {
+      var nl = text.indexOf('\n', i);
+      if (nl === -1) { break; }
+      var line = text.slice(i, nl);
+      if (line.charAt(line.length - 1) === '\r') { line = line.slice(0, -1); }
+      var blank = line.trim() === '';
+      if (!blank && fence === '' && prevBlank) {
+        if (LINK_DEF.test(line)) {
+          st.noSplit = true; st.cursor = n; st.fence = fence; st.prevBlank = prevBlank;
+          return;
+        }
+        if (isSafeBlockStart(line)) { st.boundary = i; }
+      }
+      var fm = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+      if (fm) {
+        var mark = fm[1].charAt(0);
+        if (fence === '') { fence = mark; }
+        else if (mark === fence) { fence = ''; }
+      }
+      prevBlank = blank;
+      i = nl + 1;
+    }
+    st.cursor = i;
+    st.fence = fence;
+    st.prevBlank = prevBlank;
+  }
+
+  // ensureStreamContainers puts the two children the incremental render writes
+  // into on a span (display:contents, so they add no box of their own; see app.css).
+  function ensureStreamContainers(span, st) {
+    if (st.liveEl) { return; }
+    st.stableEl = document.createElement('span');
+    st.stableEl.className = 'md-stable';
+    st.liveEl = document.createElement('span');
+    st.liveEl.className = 'md-live';
+    span.className = 'text md';
+    span.textContent = '';
+    span.appendChild(st.stableEl);
+    span.appendChild(st.liveEl);
+  }
+
+  // streamMarkdown renders text into a row's containers: it commits every block
+  // the boundary has just passed (one write) and re-parses only the trailing
+  // block. It returns false when the libraries are missing or failed, so the
+  // caller can fall back to plain text.
+  function streamMarkdown(span, text, st) {
+    ensureStreamContainers(span, st);
+    var was = st.boundary;
+    advanceStreamBoundary(text, st);
+    if (st.boundary > was) {
+      var chunkHTML = markdownToHTML(text.slice(was, st.boundary));
+      if (chunkHTML === null) { return false; }
+      st.committed += chunkHTML;
+      st.stableEl.innerHTML = st.committed;
+    }
+    var tailHTML = markdownToHTML(text.slice(st.boundary));
+    if (tailHTML === null) { return false; }
+    st.liveEl.innerHTML = tailHTML;
+    return true;
+  }
+
+  // applyMarkdown renders one row's text as markdown, falling back to plain text
+  // when rendering is off or the libraries are missing. A row that only grew — a
+  // reply still streaming — is redrawn incrementally: the text is split at its
+  // last stable block boundary, everything before it was rendered once into the
+  // `md-stable` element and only the trailing block is re-parsed into the
+  // `md-live` element. Re-parsing the whole reply on every chunk made one answer
+  // cost O(length^2); now a redraw parses the trailing block alone.
   function applyMarkdown(span, text) {
-    var html = mdToHTML(text);
-    if (html !== null) { span.className = 'text md'; span.innerHTML = html; }
-    else { span.className = 'text'; span.textContent = text; }
+    // Rendering is off (or was turned off after this row was queued): show the
+    // text literally and drop any incremental state, exactly as before the split.
+    if (!MARKDOWN) {
+      span.className = 'text';
+      span.textContent = text;
+      mdStream.delete(span);
+      return;
+    }
+    var st = mdStream.get(span);
+    // A redraw that would produce the markup already on screen is skipped: a
+    // finalized row is often redrawn with the very text it already shows.
+    if (st && st.text === text) { return; }
+    if (st && text.length > st.text.length && text.slice(0, st.text.length) === st.text
+        && streamMarkdown(span, text, st)) {
+      st.text = text;
+      return;
+    }
+    var fresh = newStreamState();
+    fresh.text = text;
+    if (!streamMarkdown(span, text, fresh)) {
+      span.className = 'text';
+      span.textContent = text;
+      mdStream.delete(span);
+      return;
+    }
+    mdStream.set(span, fresh);
   }
 
   function queueMarkdown(span, text) {
@@ -850,25 +979,31 @@
     if (renderMD && replaying) {
       span.className = 'text';
       span.textContent = text;
+      mdStream.delete(span);
       queueMarkdown(span, text);
       return;
     }
     if (renderMD) { applyMarkdown(span, text); return; }
     span.className = 'text';
     span.textContent = text;
+    // A row redrawn as plain text (the /markdown switch went off mid-stream, or a
+    // library failed) drops any incremental state: the next md render must start
+    // fresh instead of treating the plain text as markup it already drew.
+    mdStream.delete(span);
   }
 
-  // A streamed row is redrawn by parsing its whole text as markdown again, so it
-  // is redrawn at most once per interval — and that interval is about what the
-  // reader can see, not about saving work at their expense:
+  // A streamed row is redrawn as the chunks arrive, each redraw re-parsing only its
+  // trailing block (see applyMarkdown), so it is redrawn at most once per interval
+  // — and that interval is about what the reader can see, not about saving work at
+  // their expense:
   //   * a visible desktop redraws as the chunks arrive (an interval of 0, which
   //     still coalesces the chunks of one burst into a single redraw),
-  //   * a visible phone caps it at RENDER_LIVE_PHONE_MS: re-parsing the whole row
-  //     costs much more there, and a tenth of a second is not visible in a stream,
+  //   * a visible phone caps it at RENDER_LIVE_PHONE_MS: even the trailing block
+  //     is not free there, and a tenth of a second is not visible in a stream,
   //   * a page in the background (which keeps working unless it was stopped)
   //     redraws once a second, since nobody is watching it.
-  // Both streams end with a full redraw (the final assistant event and
-  // finishReasoning), so a pending pass can never leave text unrendered.
+  // Both streams are finalized (the final assistant event and finishReasoning), so
+  // a pending pass can never leave text unrendered.
   var RENDER_LIVE_PHONE_MS = 100;
   var RENDER_HIDDEN_MS = 1000;
   // answerRenderedAt/reasoningRenderedAt remember when each streamed row was last
@@ -1456,10 +1591,28 @@
   // (which works while the /markdown switch is off too), and escaped text as the
   // last resort — so the entry is never empty.
   function rowHTML(span, source) {
-    if (span.classList.contains('md')) { return span.innerHTML; }
+    if (span.classList.contains('md')) { return mdRowHTML(span); }
     var html = markdownToHTML(source);
     if (html !== null) { return html; }
     return escapeHTML(source).replace(/\n/g, '<br>');
+  }
+
+  // mdRowHTML is a rendered row's markup for the clipboard. A rendered row is held
+  // in the two display:contents containers of the incremental renderer (see
+  // streamMarkdown); their own tags are not part of the message, so the inner HTML
+  // is concatenated instead of returned as-is.
+  function mdRowHTML(span) {
+    var html = '', found = false;
+    for (var i = 0; i < span.children.length; i++) {
+      var el = span.children[i];
+      if (el.classList.contains('md-stable') || el.classList.contains('md-live')) {
+        html += el.innerHTML;
+        found = true;
+      } else {
+        html += el.outerHTML;
+      }
+    }
+    return found ? html : span.innerHTML;
   }
 
   function escapeHTML(text) {
@@ -1807,6 +1960,11 @@
   // Configuration injected by the server into the page head.
   var CFG = window.__LIGHTAGENT__ || {};
   var MARKDOWN = !!CFG.markdown;
+  // marked's GFM settings are handed over once, at load, instead of being passed
+  // (and merged) on every call: a streamed reply parses one chunk per redraw.
+  if (typeof marked !== 'undefined' && typeof marked.setOptions === 'function') {
+    marked.setOptions({ gfm: true, breaks: true });
+  }
   // Sessions live in a cookie, so the WebSocket handshake authenticates itself.
   // The mirror only connects once the sign-in dialog says the browser is (or
   // need not be) signed in, and drops the socket when a session ends. The dialog
