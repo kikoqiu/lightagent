@@ -4,6 +4,7 @@ package proc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"os/exec"
@@ -37,40 +38,30 @@ var (
 	procTerminateJobObject       = jobKernel32.NewProc("TerminateJobObject")
 )
 
-// jobObjectBasicLimitInformation mirrors JOBOBJECT_BASIC_LIMIT_INFORMATION.
-type jobObjectBasicLimitInformation struct {
-	PerProcessUserTimeLimit int64
-	PerJobUserTimeLimit     int64
-	LimitFlags              uint32
-	MinimumWorkingSetSize   uintptr
-	MaximumWorkingSetSize   uintptr
-	ActiveProcessLimit      uint32
-	Affinity                uintptr
-	PriorityClass           uint32
-	SchedulingClass         uint32
+// jobExtendedLimitInformationSize is the size SetInformationJobObject expects
+// for JOBOBJECT_EXTENDED_LIMIT_INFORMATION. The structure follows the pointer
+// size of the caller, and not only in its size_t fields: its LARGE_INTEGER and
+// ULONGLONG members force 8-byte alignment, so its C size is padded up to 8
+// (144 bytes on 64-bit: 64-byte basic limits + 48-byte IO counters + 4
+// pointers; 112 bytes on 32-bit: 44-byte basic limits padded to 48 for the
+// 8-aligned IO counters + 48-byte IO counters + 4 four-byte size_t fields).
+//
+// Go's ABI pads int64/uint64 to 4 bytes on 32-bit, so the structure cannot be
+// spelled as a portable Go struct — unsafe.Sizeof would give 108 there and the
+// API rejects it with ERROR_BAD_LENGTH (only 144 succeeds on 64-bit and only
+// 112 on 32-bit). It is therefore filled by size, below.
+func jobExtendedLimitInformationSize() uintptr {
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		return 144
+	}
+	return 112
 }
 
-// jobObjectIOCounters mirrors IO_COUNTERS.
-type jobObjectIOCounters struct {
-	ReadOperationCount  uint64
-	WriteOperationCount uint64
-	OtherOperationCount uint64
-	ReadTransferCount   uint64
-	WriteTransferCount  uint64
-	OtherTransferCount  uint64
-}
-
-// jobExtendedLimitInformation mirrors
-// JOBOBJECT_EXTENDED_LIMIT_INFORMATION: the trailing memory limits are only
-// there to match the layout the API expects.
-type jobExtendedLimitInformation struct {
-	BasicLimitInformation jobObjectBasicLimitInformation
-	IOCounters            jobObjectIOCounters
-	ProcessMemoryLimit    uintptr
-	JobMemoryLimit        uintptr
-	PeakProcessMemoryUsed uintptr
-	PeakJobMemoryUsed     uintptr
-}
+// jobLimitFlagsOffset is where LimitFlags sits inside
+// JOBOBJECT_EXTENDED_LIMIT_INFORMATION: right after the two LARGE_INTEGER
+// user-time limits, which is the same offset in both layouts. It is the only
+// field this program sets, every other one staying zero.
+const jobLimitFlagsOffset = 16
 
 // jobs maps a started command to the job object that owns its tree. The handle
 // is kept open for the lifetime of the tree, so a hard termination of this
@@ -127,15 +118,17 @@ func killTree(cmd *exec.Cmd) error {
 
 // releaseTree drops the job handle of a tree whose root process has been waited
 // for. Closing the handle makes the kill-on-close limit remove whatever the
-// root left behind, so a finished session cannot leak a background program.
+// root left behind, so a finished session cannot leak a background program. A
+// tree that never made it into a job (the assignment can be refused when this
+// process already runs inside a job) has no handle to close, so taskkill is the
+// fallback, the way killTree falls back on it.
 func releaseTree(cmd *exec.Cmd) {
-	jobsMu.Lock()
-	job, ok := jobs[cmd]
-	delete(jobs, cmd)
-	jobsMu.Unlock()
+	job, ok := takeJob(cmd)
 	if ok {
 		_ = syscall.CloseHandle(job)
+		return
 	}
+	releaseTreeFallback(cmd)
 }
 
 // killProcess stops only the process that was launched (TerminateProcess); the
@@ -162,6 +155,18 @@ func jobFor(cmd *exec.Cmd) (syscall.Handle, bool) {
 	return job, ok
 }
 
+// takeJob removes and returns the job of a tracked tree, if it has one.
+func takeJob(cmd *exec.Cmd) (syscall.Handle, bool) {
+	if cmd == nil {
+		return 0, false
+	}
+	jobsMu.Lock()
+	defer jobsMu.Unlock()
+	job, ok := jobs[cmd]
+	delete(jobs, cmd)
+	return job, ok
+}
+
 // newJobObject creates a job whose members are terminated once the last handle
 // to it is closed.
 func newJobObject() (syscall.Handle, error) {
@@ -170,9 +175,7 @@ func newJobObject() (syscall.Handle, error) {
 		return 0, callErr
 	}
 	job := syscall.Handle(r)
-	info := jobExtendedLimitInformation{}
-	info.BasicLimitInformation.LimitFlags = jobLimitKillOnJobClose
-	if err := setJobInformation(job, &info); err != nil {
+	if err := setJobInformation(job); err != nil {
 		_ = syscall.CloseHandle(job)
 		return 0, err
 	}
@@ -180,12 +183,18 @@ func newJobObject() (syscall.Handle, error) {
 }
 
 // setJobInformation applies the extended limits carrying the kill-on-close flag.
-func setJobInformation(job syscall.Handle, info *jobExtendedLimitInformation) error {
+// Only LimitFlags is meaningful, so the structure is built as a zeroed buffer of
+// the size this process's layout uses (see jobExtendedLimitInformationSize)
+// with that one field written in.
+func setJobInformation(job syscall.Handle) error {
+	size := jobExtendedLimitInformationSize()
+	info := make([]byte, size)
+	binary.LittleEndian.PutUint32(info[jobLimitFlagsOffset:], jobLimitKillOnJobClose)
 	r, _, callErr := procSetInformationJobObject.Call(
 		uintptr(job),
 		uintptr(jobInfoClassExtendedLimits),
-		uintptr(unsafe.Pointer(info)),
-		uintptr(unsafe.Sizeof(*info)),
+		uintptr(unsafe.Pointer(&info[0])),
+		size,
 	)
 	if r == 0 {
 		return callErr
@@ -215,19 +224,35 @@ func terminateJob(job syscall.Handle) error {
 // the shutdown.
 const taskkillTimeout = 5 * time.Second
 
+// taskkillTree asks taskkill to stop a whole process tree.
+func taskkillTree(pid int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), taskkillTimeout)
+	defer cancel()
+	killer := exec.CommandContext(ctx, "taskkill.exe", "/T", "/F", "/PID", strconv.Itoa(pid))
+	// A console would otherwise flash a window for the helper.
+	killer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return killer.Run()
+}
+
 // killTreeFallback stops a tree that could not be assigned to a job: taskkill
 // walks the child tree, and stopping the direct process is the last resort.
 func killTreeFallback(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), taskkillTimeout)
-	defer cancel()
-	killer := exec.CommandContext(ctx, "taskkill.exe", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid))
-	// A console would otherwise flash a window for the helper.
-	killer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if err := killer.Run(); err != nil {
+	if err := taskkillTree(cmd.Process.Pid); err != nil {
 		return killProcess(cmd)
 	}
 	return nil
+}
+
+// releaseTreeFallback stops what a tree that could not be put in a job left
+// behind, matching the effort killTreeFallback makes. The root has already been
+// waited for by the time Reap runs, so taskkill usually cannot find it any more;
+// this covers the window in which it still exists.
+func releaseTreeFallback(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = taskkillTree(cmd.Process.Pid)
 }
