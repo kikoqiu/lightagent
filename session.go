@@ -179,12 +179,18 @@ func runSession(o *options, stdout io.Writer) error {
 	interactive := o.prompt == ""
 
 	// Resume handling: -r always resumes. The interactive REPL otherwise asks
-	// (default yes) and archives when declined. A one-shot run leaves an
-	// existing session untouched unless -r is given.
+	// (default yes) and starts fresh when declined. The session resumed is the
+	// directory's newest file, not necessarily session.json, so the conversation
+	// keeps the name it was saved under. A one-shot run leaves everything
+	// untouched unless -r is given.
+	latest, lerr := st.Latest()
+	if lerr != nil {
+		return fmt.Errorf("list sessions: %w", lerr)
+	}
 	resume := o.resume
-	if !resume && interactive && st.Exists() {
+	if !resume && interactive && latest != nil {
 		if cli.Interactive(os.Stdin) {
-			resume = cli.ConfirmLineTo(out, "a saved session exists for this directory; resume it? [Y/n] ", true)
+			resume = cli.ConfirmLineTo(out, fmt.Sprintf("resume the latest session %q? [Y/n] ", latest.Name), true)
 		} else {
 			resume = true
 		}
@@ -192,7 +198,11 @@ func runSession(o *options, stdout io.Writer) error {
 
 	var resumed *store.State
 	if resume {
-		cur, loadErr := st.Load()
+		path := st.Path()
+		if latest != nil {
+			path = latest.Path
+		}
+		cur, loadErr := st.LoadPath(path)
 		if loadErr != nil {
 			return fmt.Errorf("load session: %w", loadErr)
 		}
@@ -202,16 +212,13 @@ func runSession(o *options, stdout io.Writer) error {
 			// the conversation enters the loop exactly as it left it.
 			cur.Messages = llm.ResolveMedia(cur.Messages)
 			ag.Load(cur.Messages, cur.Summary)
+			// The conversation now carries this file's name: a later save (and
+			// the exit prompt) writes it back there, not to the default.
+			st.UseFile(path)
 			resumed = cur
-			info("resumed %d messages from %s\n", len(cur.Messages), st.Path())
+			info("resumed %d messages from %s\n", len(cur.Messages), path)
 		} else {
 			info("no saved session to resume; starting fresh\n")
-		}
-	} else if interactive {
-		if backup, aerr := st.Archive(time.Now()); aerr != nil {
-			return fmt.Errorf("archive previous session: %w", aerr)
-		} else if backup != "" {
-			info("archived previous session to %s\n", backup)
 		}
 	}
 

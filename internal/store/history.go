@@ -348,6 +348,30 @@ func (s *Store) Recent(n int) ([]SessionInfo, error) {
 	return infos, nil
 }
 
+// Latest returns the newest session file (the first one /list shows), or nil
+// when the directory holds none. Startup resumes it, so a directory picks up
+// where its last conversation left off whatever that file is named.
+func (s *Store) Latest() (*SessionInfo, error) {
+	infos, err := s.Recent(1)
+	if err != nil {
+		return nil, err
+	}
+	if len(infos) == 0 {
+		return nil, nil
+	}
+	return &infos[0], nil
+}
+
+// Named reports whether the current session file is a named one: anything other
+// than the default session.json. A nameless (default) session is the fresh
+// conversation that has neither been loaded nor saved under a name, and it is
+// the one whose default file a save may back up before overwriting.
+func (s *Store) Named() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.file != s.initial
+}
+
 // PruneArchives removes archived sessions, keeping the newest keep of them
 // (keep <= 0 removes every archive). The current session file is never touched.
 // It returns the removed paths.

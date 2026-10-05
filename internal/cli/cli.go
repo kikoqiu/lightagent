@@ -1280,7 +1280,7 @@ func (c *CLI) shutdown() {
 		}
 	}
 
-	path, err := c.SaveSession()
+	path, err := c.SaveOnExit()
 	if err != nil {
 		c.write(termcolor.Red("[error] ") + "failed to save session: " + err.Error() + "\n")
 		return
@@ -1805,6 +1805,47 @@ func (c *CLI) SaveSession() (string, error) {
 		return "", err
 	}
 	return c.store.Path(), nil
+}
+
+// SaveOnExit writes the conversation for the exit prompt. A session with a name
+// goes to its own file; a nameless one goes to the default session.json — and
+// the session.json already on disk is archived first when it holds a different
+// conversation, so a fresh conversation never clobbers the session it did not
+// come from.
+func (c *CLI) SaveOnExit() (string, error) {
+	if c.store.Named() {
+		return c.SaveSession()
+	}
+	prev, err := c.store.Load()
+	if err != nil {
+		return "", err
+	}
+	if !sameConversation(prev, c.snapshot()) {
+		if _, aerr := c.store.Archive(time.Now()); aerr != nil {
+			return "", aerr
+		}
+	}
+	return c.SaveSession()
+}
+
+// sameConversation reports whether a stored session holds the same conversation
+// as state, judged by its message count, its summary and its last message. It is
+// what tells a nameless save whether the default file it is about to overwrite
+// still needs backing up, so an unchanged file (a /save just before quitting) is
+// not archived again while a different conversation is.
+func sameConversation(stored *store.State, state store.State) bool {
+	if stored == nil {
+		return len(state.Messages) == 0 && strings.TrimSpace(state.Summary) == ""
+	}
+	if len(stored.Messages) != len(state.Messages) ||
+		strings.TrimSpace(stored.Summary) != strings.TrimSpace(state.Summary) {
+		return false
+	}
+	if len(state.Messages) == 0 {
+		return true
+	}
+	a, b := stored.Messages[len(stored.Messages)-1], state.Messages[len(state.Messages)-1]
+	return a.Role == b.Role && a.Content == b.Content
 }
 
 // SaveSessionAs writes the current conversation to the named session file and

@@ -109,7 +109,58 @@ func TestResolvePath(t *testing.T) {
 	}
 }
 
-// TestRecentIsNewestFirstAndLimited covers /list's data: Recent returns the
+// TestLatestAndNamed pin the pieces startup and the exit save ride on: Latest is
+// the newest file whatever its name, and Named tells the default session.json
+// from a real name.
+func TestLatestAndNamed(t *testing.T) {
+	st, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if latest, err := st.Latest(); err != nil || latest != nil {
+		t.Fatalf("Latest on an empty store = (%v, %v), want nil", latest, err)
+	}
+	if st.Named() {
+		t.Fatal("a fresh store is nameless (the default session.json)")
+	}
+
+	base := time.Date(2020, 10, 5, 12, 0, 0, 0, time.UTC)
+	oldPath, err := st.SaveAs("old", State{Messages: []llm.Message{{Role: "user", Content: "a"}}})
+	if err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	if err := os.Chtimes(oldPath, base, base); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	// SaveAs points the store at the named file.
+	if !st.Named() {
+		t.Fatal("after SaveAs the session is named")
+	}
+
+	newPath, err := st.SaveAs("new", State{Messages: []llm.Message{{Role: "user", Content: "b"}}})
+	if err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	stamp := base.Add(time.Hour)
+	if err := os.Chtimes(newPath, stamp, stamp); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	latest, err := st.Latest()
+	if err != nil || latest == nil {
+		t.Fatalf("Latest = (%v, %v)", latest, err)
+	}
+	if latest.Name != "new.json" {
+		t.Fatalf("Latest.Name = %q, want new.json", latest.Name)
+	}
+
+	// Reset points back at the default, which is nameless again.
+	st.Reset()
+	if st.Named() {
+		t.Fatal("after Reset the session is the default (nameless) again")
+	}
+}
+
 // newest n sessions, newest first, and all of them when n <= 0.
 func TestRecentIsNewestFirstAndLimited(t *testing.T) {
 	st, err := New(t.TempDir())

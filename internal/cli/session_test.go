@@ -193,3 +193,77 @@ func TestRemoveCommandIsNameOnly(t *testing.T) {
 	}
 }
 
+// TestSaveOnExitUsesTheSessionsOwnName covers the exit prompt for a named
+// session: it writes the file the conversation came from, not session.json.
+func TestSaveOnExitUsesTheSessionsOwnName(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	c.agent.Load([]llm.Message{{Role: "user", Content: "hi"}}, "")
+	if _, err := c.SaveSessionAs("notes", true); err != nil {
+		t.Fatalf("SaveSessionAs: %v", err)
+	}
+
+	path, err := c.SaveOnExit()
+	if err != nil {
+		t.Fatalf("SaveOnExit: %v", err)
+	}
+	if filepath.Base(path) != "notes.json" {
+		t.Fatalf("SaveOnExit path = %q, want notes.json", path)
+	}
+	if _, err := os.Stat(filepath.Join(c.store.Dir(), "session.json")); !os.IsNotExist(err) {
+		t.Fatalf("session.json must not be written for a named session (stat err = %v)", err)
+	}
+}
+
+// TestSaveOnExitBacksUpTheDefault covers the nameless case: the default
+// session.json it is about to overwrite holds a different conversation, so it is
+// archived first — while an unchanged default is not archived again.
+func TestSaveOnExitBacksUpTheDefault(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	// A previous anonymous session sits in session.json.
+	if err := c.store.Save(store.State{Messages: []llm.Message{{Role: "user", Content: "previous"}}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	// A fresh, nameless conversation with content of its own.
+	c.store.Reset()
+	c.agent.Load([]llm.Message{{Role: "user", Content: "fresh"}}, "")
+
+	archives := func() int {
+		infos, err := c.store.List()
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		n := 0
+		for _, info := range infos {
+			if info.Name != "session.json" {
+				n++
+			}
+		}
+		return n
+	}
+
+	path, err := c.SaveOnExit()
+	if err != nil {
+		t.Fatalf("SaveOnExit: %v", err)
+	}
+	if filepath.Base(path) != "session.json" {
+		t.Fatalf("SaveOnExit path = %q, want session.json", path)
+	}
+	if got := archives(); got != 1 {
+		t.Fatalf("archives = %d, want the previous default backed up once", got)
+	}
+	state, err := c.store.Load()
+	if err != nil || state == nil || len(state.Messages) != 1 || state.Messages[0].Content != "fresh" {
+		t.Fatalf("session.json after SaveOnExit = %+v (%v)", state, err)
+	}
+
+	// Saving again with nothing new must not archive it a second time.
+	if _, err := c.SaveOnExit(); err != nil {
+		t.Fatalf("second SaveOnExit: %v", err)
+	}
+	if got := archives(); got != 1 {
+		t.Fatalf("archives after a second no-op exit = %d, want 1", got)
+	}
+}
+
