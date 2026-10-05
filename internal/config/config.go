@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"lightagent/internal/passwd"
@@ -21,12 +22,21 @@ import (
 
 // Config is the root configuration document.
 type Config struct {
-	OpenAI  OpenAIConfig  `json:"openai"`
+	// LLMs lists the LLM providers (interfaces) the program can talk to. A run
+	// starts on the first enabled one; /switchapi picks another at runtime (in
+	// memory only — the file is not rewritten). The field is spelled "providers"
+	// in the file.
+	LLMs    []LLMConfig   `json:"providers"`
 	Context ContextConfig `json:"context"`
 	Web     WebConfig     `json:"web"`
 	Tools   ToolsConfig   `json:"tools"`
 	Agent   AgentConfig   `json:"agent"`
 	UI      UIConfig      `json:"ui"`
+	// LegacyOpenAI carries the pre-multi-interface single-endpoint block. It is
+	// read on load and folded into LLMs, then dropped; it is never written.
+	// Keeping the field (rather than ignoring the key) also lets a hand-written
+	// old document pass the strict decode the config editor uses.
+	LegacyOpenAI *OpenAIConfig `json:"openai,omitempty"`
 }
 
 // UIConfig controls how the CLI and the web mirror present output.
@@ -60,9 +70,46 @@ type OpenAIConfig struct {
 	ExtraBody map[string]any `json:"extra_body,omitempty"`
 }
 
-// ContextConfig controls context-window management.
+// LLM interface types. Only the OpenAI-compatible endpoint exists today; the
+// field is here so a future provider can be added without reshaping the file.
+const LLMTypeOpenAI = "openai"
+
+// DefaultLLMName is the name of the interface the built-in default produces and
+// the one the migration from the legacy single-endpoint block uses.
+const DefaultLLMName = "default"
+
+// LLMConfig is one LLM interface: its identity (name, type, enabled), the
+// request shape it carries and the context window of the model behind it. The
+// OpenAI-compatible fields are embedded, so an entry reads
+// {"name":"default","type":"openai","enabled":true,"api_base":...}.
+type LLMConfig struct {
+	// Name is the human identifier /switchapi and the web picker use.
+	Name string `json:"name"`
+	// Type selects the interface kind; only LLMTypeOpenAI is understood.
+	Type string `json:"type"`
+	// Enabled marks the interfaces a run may use. The first enabled one is the
+	// one a run starts with.
+	Enabled bool `json:"enabled"`
+	OpenAIConfig
+	// ContextWindow is the context window of this interface's model, in tokens.
+	// It drives compression and the usage display, so an interface with a
+	// smaller window compresses sooner. 0 (unset) takes the built-in window.
+	ContextWindow int `json:"context_window"`
+}
+
+// EffectiveType returns the interface type, defaulting to openai so a document
+// that omits the field keeps working.
+func (c LLMConfig) EffectiveType() string {
+	if t := strings.ToLower(strings.TrimSpace(c.Type)); t != "" {
+		return t
+	}
+	return LLMTypeOpenAI
+}
+
+// ContextConfig controls context-window management. The window size itself
+// lives on each interface (LLMConfig.ContextWindow), because it is a property
+// of the model behind it.
 type ContextConfig struct {
-	ContextWindow         int `json:"context_window"`
 	SummarizeTokenPercent int `json:"summarize_token_percent"`
 	// SummarizeKeep is the retention policy of the two configurable compaction
 	// passes (see SummarizeKeepPolicy).
@@ -461,16 +508,22 @@ type AgentConfig struct {
 // Default returns the built-in configuration used when no file exists yet.
 func Default() *Config {
 	return &Config{
-		OpenAI: OpenAIConfig{
-			APIBase:     "https://api.openai.com/v1",
-			Model:       "gpt-4o-mini",
-			Temperature: -1.0,
-			MaxTokens:   40960,
-			TimeoutSec:  4800,
-			Stream:      true,
-		},
+		// One OpenAI-compatible interface named "default" out of the box.
+		LLMs: []LLMConfig{{
+			Name:    DefaultLLMName,
+			Type:    LLMTypeOpenAI,
+			Enabled: true,
+			OpenAIConfig: OpenAIConfig{
+				APIBase:     "https://api.openai.com/v1",
+				Model:       "gpt-4o-mini",
+				Temperature: -1.0,
+				MaxTokens:   40960,
+				TimeoutSec:  4800,
+				Stream:      true,
+			},
+			ContextWindow: 81960,
+		}},
 		Context: ContextConfig{
-			ContextWindow:         81960,
 			SummarizeTokenPercent: 75,
 			// Both passes keep no raw message: some inference engines do not
 			// preserve the prompt cache across the rollback a retention
@@ -509,6 +562,73 @@ func Default() *Config {
 		Agent: AgentConfig{MaxToolIterations: 200, IncludeWorkingDir: true, SummaryInSystemPrompt: false, IncludeOnlyThink: true, ContinueOnlyThink: true},
 		UI:    UIConfig{Markdown: true},
 	}
+}
+
+// ActiveLLM returns the interface a run starts with: the first enabled one. It
+// falls back to the first interface when none is enabled, so a document that
+// switched them all off still has something to show; found reports whether an
+// enabled interface was picked.
+func (c *Config) ActiveLLM() (index int, api LLMConfig, found bool) {
+	for i, candidate := range c.LLMs {
+		if candidate.Enabled {
+			return i, candidate, true
+		}
+	}
+	if len(c.LLMs) > 0 {
+		return 0, c.LLMs[0], false
+	}
+	return 0, LLMConfig{}, false
+}
+
+// LLMIndex resolves a /switchapi argument — a 1-based number or an interface
+// name — to its position in LLMs. It reports ok=false when nothing matches.
+func (c *Config) LLMIndex(spec string) (int, bool) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0, false
+	}
+	if n, err := strconv.Atoi(spec); err == nil {
+		if n < 1 || n > len(c.LLMs) {
+			return 0, false
+		}
+		return n - 1, true
+	}
+	for i, api := range c.LLMs {
+		if api.Name == spec {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// APIInfo describes one interface for a front-end picker (the CLI's /switchapi
+// listing and the web mirror's model dropdown).
+type APIInfo struct {
+	// Index is the 1-based position, the number /switchapi accepts.
+	Index   int    `json:"index"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Model   string `json:"model"`
+	Enabled bool   `json:"enabled"`
+	// Active marks the interface currently in use.
+	Active bool `json:"active"`
+}
+
+// APIInfos describes every interface, marking the active one by its 0-based
+// position (the runtime selection).
+func (c *Config) APIInfos(active int) []APIInfo {
+	infos := make([]APIInfo, 0, len(c.LLMs))
+	for i, api := range c.LLMs {
+		infos = append(infos, APIInfo{
+			Index:   i + 1,
+			Name:    api.Name,
+			Type:    api.EffectiveType(),
+			Model:   api.Model,
+			Enabled: api.Enabled,
+			Active:  i == active,
+		})
+	}
+	return infos
 }
 
 // Path resolves the config file path: LIGHTAGENT_CONFIG if set, otherwise
@@ -594,6 +714,10 @@ func decode(data []byte, strict bool) (*Config, bool, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, false, errors.New("the config document is empty")
 	}
+	// A document written before the multi-interface layout carries a single
+	// "openai" block and no "providers". Read it first, so the interface it describes
+	// replaces the seeded default instead of sitting next to it.
+	legacy := probeLegacyLLM(data)
 	cfg := Default()
 	if !strict {
 		if err := json.Unmarshal(data, cfg); err != nil {
@@ -611,12 +735,70 @@ func decode(data []byte, strict bool) (*Config, bool, error) {
 			return nil, false, errors.New("the config document must be a single JSON object")
 		}
 	}
+	migrated := cfg.migrateLegacyLLM(legacy)
 	changed, err := cfg.ensureWebSalt()
 	if err != nil {
 		return nil, false, err
 	}
 	cfg.applyDefaults()
-	return cfg, changed, nil
+	return cfg, migrated || changed, nil
+}
+
+// legacyLLMInput captures the pre-multi-interface layout of a document: whether
+// a "providers" array is present at all, the raw single "openai" block, and the
+// context window that used to live under "context".
+type legacyLLMInput struct {
+	hasLLMs       bool
+	openai        json.RawMessage
+	contextWindow int
+}
+
+// probeLegacyLLM reads the legacy shape out of a raw document without touching
+// the parsed config: the caller uses it to decide whether the seeded default
+// interface has to be replaced by a migrated one.
+func probeLegacyLLM(data []byte) legacyLLMInput {
+	var probe struct {
+		LLMs    json.RawMessage `json:"providers"`
+		OpenAI  json.RawMessage `json:"openai"`
+		Context struct {
+			ContextWindow int `json:"context_window"`
+		} `json:"context"`
+	}
+	_ = json.Unmarshal(data, &probe) // a malformed document is reported by the caller
+	return legacyLLMInput{
+		hasLLMs:       len(bytes.TrimSpace(probe.LLMs)) > 0,
+		openai:        probe.OpenAI,
+		contextWindow: probe.Context.ContextWindow,
+	}
+}
+
+// migrateLegacyLLM folds a legacy single-endpoint document into cfg.LLMs. It is
+// a no-op for a document that already carries a "providers" array; a document with
+// neither keeps the default interface. It reports whether cfg changed and must
+// be written back.
+//
+// The migrated interface starts from the built-in default entry (so an omitted
+// legacy field keeps its default — the temperature -1 sentinel included) and is
+// then overlaid with the legacy "openai" block and its context window.
+func (c *Config) migrateLegacyLLM(in legacyLLMInput) bool {
+	if in.hasLLMs {
+		// A new-format document: drop any legacy block the decoder picked up.
+		if c.LegacyOpenAI != nil {
+			c.LegacyOpenAI = nil
+			return true
+		}
+		return false
+	}
+	api := Default().LLMs[0]
+	if len(bytes.TrimSpace(in.openai)) > 0 {
+		_ = json.Unmarshal(in.openai, &api.OpenAIConfig)
+	}
+	if in.contextWindow > 0 {
+		api.ContextWindow = in.contextWindow
+	}
+	c.LLMs = []LLMConfig{api}
+	c.LegacyOpenAI = nil
+	return true
 }
 
 // ensureWebSalt makes sure a password is always paired with a salt and that an
@@ -777,17 +959,25 @@ func hasMissingKeys(doc, def any) bool {
 const MaskedSecret = "***"
 
 // MaskSecrets returns a copy whose secrets are replaced by MaskedSecret, so the
-// configuration can be shown without leaking them: the api key and the web
-// password. The password salt is deliberately left visible — it is public (the
-// page asks for it before signing in) and keeping it makes the document that
-// comes back from the editor identical to the one on disk.
+// configuration can be shown without leaking them: every interface's api key
+// and the web password. The password salt is deliberately left visible — it is
+// public (the page asks for it before signing in) and keeping it makes the
+// document that comes back from the editor identical to the one on disk.
 //
-// The copy shares the nested maps (extra_body, MCP servers) with the receiver:
-// that is fine for display, but callers must not mutate them.
+// The copy owns its LLMs slice but shares the nested maps (extra_body,
+// media_types, MCP servers) with the receiver: that is fine for display, but
+// callers must not mutate them.
 func (c *Config) MaskSecrets() *Config {
 	clone := *c
-	if clone.OpenAI.APIKey != "" {
-		clone.OpenAI.APIKey = MaskedSecret
+	// The interfaces get their own slice, so masking one never writes through to
+	// the receiver. The nested maps/slices (extra_body, media_types) are still
+	// shared, which is fine for display.
+	clone.LLMs = make([]LLMConfig, len(c.LLMs))
+	copy(clone.LLMs, c.LLMs)
+	for i := range clone.LLMs {
+		if clone.LLMs[i].APIKey != "" {
+			clone.LLMs[i].APIKey = MaskedSecret
+		}
 	}
 	if clone.Web.Password != "" {
 		clone.Web.Password = MaskedSecret
@@ -824,30 +1014,47 @@ func sanitizeKeepPolicy(p, def SummarizeKeepPolicy) SummarizeKeepPolicy {
 // usable after new fields are added.
 func (c *Config) applyDefaults() {
 	def := Default()
-	if c.OpenAI.APIBase == "" {
-		c.OpenAI.APIBase = def.OpenAI.APIBase
+	// Each interface is completed on its own, so a partial entry (or one written
+	// by hand) still yields a usable endpoint.
+	defAPI := def.LLMs[0]
+	if len(c.LLMs) == 0 {
+		c.LLMs = def.LLMs
 	}
-	if c.OpenAI.Model == "" {
-		c.OpenAI.Model = def.OpenAI.Model
-	}
-	// temperature is deliberately not defaulted here: the built-in default of
-	// -1 is the "unset" sentinel (a negative value is left out of the request
-	// so the provider decides), and any value a document sets — 0 included —
-	// must survive. An omitted key already keeps -1 because decoding starts
-	// from Default().
-	if c.OpenAI.MaxTokens <= 0 {
-		c.OpenAI.MaxTokens = def.OpenAI.MaxTokens
-	}
-	// timeout_seconds is an inactivity budget: a negative value is invalid and
-	// falls back to the default, while an explicit 0 disables the timeout.
-	if c.OpenAI.TimeoutSec < 0 {
-		c.OpenAI.TimeoutSec = def.OpenAI.TimeoutSec
+	for i := range c.LLMs {
+		api := &c.LLMs[i]
+		if strings.TrimSpace(api.Type) == "" {
+			api.Type = LLMTypeOpenAI
+		}
+		if strings.TrimSpace(api.Name) == "" {
+			api.Name = fmt.Sprintf("api-%d", i+1)
+		}
+		if api.APIBase == "" {
+			api.APIBase = defAPI.APIBase
+		}
+		if api.Model == "" {
+			api.Model = defAPI.Model
+		}
+		// temperature is deliberately not defaulted here: the built-in default
+		// of -1 is the "unset" sentinel (a negative value is left out of the
+		// request so the provider decides), and any value a document sets — 0
+		// included — must survive. An omitted key already keeps -1 because
+		// decoding starts from Default().
+		if api.MaxTokens <= 0 {
+			api.MaxTokens = defAPI.MaxTokens
+		}
+		// timeout_seconds is an inactivity budget: a negative value is invalid
+		// and falls back to the default, while an explicit 0 disables it.
+		if api.TimeoutSec < 0 {
+			api.TimeoutSec = defAPI.TimeoutSec
+		}
+		// context_window is a property of the model behind the interface: 0
+		// (unset) takes the built-in window.
+		if api.ContextWindow <= 0 {
+			api.ContextWindow = defAPI.ContextWindow
+		}
 	}
 	if strings.TrimSpace(c.Web.Host) == "" {
 		c.Web.Host = def.Web.Host
-	}
-	if c.Context.ContextWindow <= 0 {
-		c.Context.ContextWindow = def.Context.ContextWindow
 	}
 	if c.Context.SummarizeTokenPercent <= 0 || c.Context.SummarizeTokenPercent > 100 {
 		c.Context.SummarizeTokenPercent = def.Context.SummarizeTokenPercent
@@ -932,8 +1139,27 @@ func (c *Config) WebEnabled() bool { return c.Web.Port > 0 }
 
 // Validate returns a human-readable problem when required fields are missing.
 func (c *Config) Validate() error {
-	if strings.TrimSpace(c.OpenAI.APIKey) == "" {
-		return fmt.Errorf("openai.api_key is empty; edit the config file and try again")
+	if len(c.LLMs) == 0 {
+		return fmt.Errorf("providers is empty; add at least one interface")
+	}
+	enabled := 0
+	for i, api := range c.LLMs {
+		if !api.Enabled {
+			continue
+		}
+		enabled++
+		switch api.EffectiveType() {
+		case LLMTypeOpenAI:
+		default:
+			return fmt.Errorf("providers[%d] (%s): type %q is not supported (want %q)",
+				i, api.Name, api.Type, LLMTypeOpenAI)
+		}
+		if strings.TrimSpace(api.APIKey) == "" {
+			return fmt.Errorf("providers[%d] (%s): api_key is empty; edit the config file and try again", i, api.Name)
+		}
+	}
+	if enabled == 0 {
+		return fmt.Errorf("no llm interface is enabled; set \"enabled\": true on one")
 	}
 	// webfetch obtains a page in one of a few ways, and only those: a typo must
 	// be reported instead of silently falling back to the default.

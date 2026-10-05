@@ -35,7 +35,7 @@ func newTestServerWithMarkdown(t *testing.T, password string, markdown bool) *Se
 	t.Helper()
 
 	cfg := config.Default()
-	client := llm.NewClient(cfg.OpenAI)
+	client := llm.NewClient(cfg.LLMs[0].OpenAIConfig)
 	reg := tools.NewRegistry()
 	bus := agent.NewBus()
 	ag := agent.New(cfg, client, reg, bus)
@@ -1659,7 +1659,7 @@ func TestHistoryFrameCarriesTheSwitches(t *testing.T) {
 // binding 0.0.0.0 still serves the page over loopback.
 func TestBindHostAllInterfaces(t *testing.T) {
 	cfg := config.Default()
-	ag := agent.New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), agent.NewBus())
+	ag := agent.New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), agent.NewBus())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

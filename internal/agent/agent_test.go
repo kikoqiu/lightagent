@@ -102,11 +102,11 @@ func TestInterruptKeepsTheUserMessage(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
+	cfg.LLMs[0].APIBase = srv.URL
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("do something")
 	select {
@@ -167,8 +167,8 @@ func TestInterruptDuringAToolRound(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
@@ -176,7 +176,7 @@ func TestInterruptDuringAToolRound(t *testing.T) {
 	defer close(block.release)
 	reg := tools.NewRegistry()
 	reg.Register(block)
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit("run block")
 	select {
@@ -260,15 +260,15 @@ func TestInterruptStopsACancelAwareTool(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
 	tool := &cancelAwareTool{started: make(chan struct{}), text: "half the work"}
 	reg := tools.NewRegistry()
 	reg.Register(tool)
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit("run it")
 	select {
@@ -328,12 +328,12 @@ func TestInterruptKeepsTheStreamedPartialReply(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = true
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = true
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("say hello")
 	// The last streamed chunk means the frames before it were assembled: the
@@ -429,12 +429,12 @@ func TestInterruptDropsATextlessReply(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.Agent.IncludeOnlyThink = false
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = true
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = true
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("think about it")
 	for {
@@ -517,12 +517,12 @@ func TestInterruptKeepsAnOnlyThinkReply(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = true
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = true
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("think about it")
 	for {
@@ -630,14 +630,14 @@ func TestOnlyThinkReplyPolicy(t *testing.T) {
 			defer srv.Close()
 
 			cfg := config.Default()
-			cfg.OpenAI.APIBase = srv.URL
-			cfg.OpenAI.Stream = false
+			cfg.LLMs[0].APIBase = srv.URL
+			cfg.LLMs[0].Stream = false
 			cfg.Agent.IncludeOnlyThink = tc.include
 			cfg.Agent.ContinueOnlyThink = tc.cont
 			bus := NewBus()
 			events, cancel := bus.Subscribe()
 			defer cancel()
-			a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+			a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 			a.Submit("hi")
 
@@ -714,12 +714,12 @@ func TestOnlyThinkReplyRetryCarriesThinking(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("hi")
 	deadline := time.After(10 * time.Second)
@@ -767,15 +767,15 @@ func TestInterruptBeforeTheFirstCallDropsTheRound(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
 	writer := &interruptingWriter{}
 	reg := tools.NewRegistry()
 	reg.Register(writer)
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 	// The planning hook runs once the reply is recorded and before the first
 	// call starts: cancelling there is exactly the window this test pins.
 	writer.interrupt = func() { a.Interrupt() }
@@ -1058,8 +1058,8 @@ func TestInterruptDuringARoundWithWriteParts(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
@@ -1073,7 +1073,7 @@ func TestInterruptDuringARoundWithWriteParts(t *testing.T) {
 	reg := tools.NewRegistry()
 	reg.Register(writer)
 	reg.Register(block)
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit("write it")
 	select {
@@ -1240,15 +1240,15 @@ func TestSteeringDuringTheToolRoundLandsAfterTheRound(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
 	reg := tools.NewRegistry()
 	tool := &blockingTool{started: make(chan struct{}), release: make(chan struct{})}
 	reg.Register(tool)
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit("ask")
 	select {
@@ -1306,11 +1306,11 @@ func TestSteeringDuringFinalReplyContinuesTheTurn(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
+	cfg.LLMs[0].APIBase = srv.URL
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("ask")
 	select {
@@ -1378,8 +1378,8 @@ func TestQueuedSteeringStartsAFollowUpTurn(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	// One iteration: it is spent on the tool round, so the queued steering
 	// message has no iteration left and the follow-up turn has to run it.
 	cfg.Agent.MaxToolIterations = 1
@@ -1388,7 +1388,7 @@ func TestQueuedSteeringStartsAFollowUpTurn(t *testing.T) {
 	defer cancel()
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "stub", desc: "stub"})
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit("ask")
 	select {
@@ -1601,17 +1601,17 @@ func TestAutoCompactionKeepsAUserMessage(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	// A tiny window with a 1% trigger compresses on every iteration; the
 	// default retention policy keeps no raw message anyway, so the whole tail
 	// is cut — the user turn included.
-	cfg.Context.ContextWindow = 100
+	cfg.LLMs[0].ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Load([]llm.Message{
 		userRunes("old ", 100),
@@ -1687,13 +1687,13 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	cfg.Agent.SystemPrompt = "custom base"
 	// A tiny window with a 1% trigger compresses on the first iteration, and the
 	// default retention policy keeps nothing raw, so the whole tail is
 	// summarized.
-	cfg.Context.ContextWindow = 100
+	cfg.LLMs[0].ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "exec_command", desc: "run a command"})
@@ -1701,7 +1701,7 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 	a.SetMCPServers([]MCPServerInfo{{
 		Server:        "playwright",
 		ToolCount:     26,
@@ -1833,18 +1833,18 @@ func TestCompactionDigestCarriesSummaryWhereTheLiveCallDoes(t *testing.T) {
 			defer srv.Close()
 
 			cfg := config.Default()
-			cfg.OpenAI.APIBase = srv.URL
-			cfg.OpenAI.Stream = false
+			cfg.LLMs[0].APIBase = srv.URL
+			cfg.LLMs[0].Stream = false
 			cfg.Agent.SummaryInSystemPrompt = inSystem
 			// A tiny window with a 1% trigger compresses on the first iteration,
 			// and the default retention policy keeps nothing raw, so the whole
 			// tail — the batch being summarized included — is compressed.
-			cfg.Context.ContextWindow = 100
+			cfg.LLMs[0].ContextWindow = 100
 			cfg.Context.SummarizeTokenPercent = 1
 			bus := NewBus()
 			events, cancel := bus.Subscribe()
 			defer cancel()
-			a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+			a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 			a.Load([]llm.Message{
 				userRunes("old ", 100),
@@ -1970,19 +1970,19 @@ func TestCompactionPassExtendsTheLiveRequestPrefix(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	// A tiny window with a 1% trigger compresses on every iteration; the
 	// default retention policy keeps nothing raw, so each pass summarizes the
 	// whole history.
-	cfg.Context.ContextWindow = 100
+	cfg.LLMs[0].ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "stub", desc: "a stub tool"})
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Load([]llm.Message{
 		userRunes("old ", 100),
@@ -2053,14 +2053,14 @@ func TestCompactionReplacesTheSummary(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	// A tiny window with a 1% trigger compresses on the first pass, and the
 	// default retention policy keeps nothing raw, so the whole history is
 	// summarized.
-	cfg.Context.ContextWindow = 100
+	cfg.LLMs[0].ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), NewBus())
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), NewBus())
 
 	a.Load([]llm.Message{
 		userRunes("old ", 100),
@@ -2109,7 +2109,7 @@ func TestCompactionTriggerUsesTheProviderReport(t *testing.T) {
 	cfg := config.Default()
 	// The window the report this behaviour came from ran with: 80% of 262144
 	// tokens is the 209715-token trigger.
-	cfg.Context.ContextWindow = 262144
+	cfg.LLMs[0].ContextWindow = 262144
 	cfg.Context.SummarizeTokenPercent = 80
 	a := New(cfg, nil, tools.NewRegistry(), NewBus())
 
@@ -2165,14 +2165,14 @@ func TestUsageEventsStreamDuringToolLoop(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "stub", desc: "stub"})
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit("go")
 
@@ -2474,11 +2474,11 @@ func TestTruncatedTurnContinuesWithoutUserMessage(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
+	cfg.LLMs[0].APIBase = srv.URL
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("hi")
 	got := drainEvents(t, events)
@@ -2549,11 +2549,11 @@ func TestTurnStopsAfterConsecutiveTruncations(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
+	cfg.LLMs[0].APIBase = srv.URL
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("hi")
 	got := drainEvents(t, events)
@@ -2590,11 +2590,11 @@ func TestOnlyThinkAndTruncationShareTheContinueBudget(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
+	cfg.LLMs[0].APIBase = srv.URL
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("hi")
 	got := drainEvents(t, events)
@@ -2627,11 +2627,11 @@ func TestIncompleteStreamedToolCallEndsTheTurnWithAnError(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
+	cfg.LLMs[0].APIBase = srv.URL
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("write it")
 	got := drainEvents(t, events)
@@ -2692,14 +2692,14 @@ func TestOverflowRejectionRollsBackTheToolRoundAndRetries(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "echo", desc: "echoes"})
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit(userText)
 	got := drainEvents(t, events)
@@ -2786,14 +2786,14 @@ func TestOverflowRejectionSummarizesTheContextAndReplaysTheMessage(t *testing.T)
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "echo", desc: "echoes"})
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Load([]llm.Message{
 		{Role: "user", Content: "first question"},
@@ -2876,12 +2876,12 @@ func TestOverflowRejectionWithoutAnythingToFreeFailsTheTurn(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("look at this picture")
 	got := drainEvents(t, events)
@@ -2951,14 +2951,14 @@ func TestOverflowRecoveryGivesUpAfterTwoAttempts(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "echo", desc: "echoes"})
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Load([]llm.Message{
 		{Role: "user", Content: "first question"},
@@ -3043,12 +3043,12 @@ func TestOverflowRejectionOnTheFirstCallResendsTheMessage(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Load([]llm.Message{
 		{Role: "user", Content: "first question"},
@@ -3097,12 +3097,12 @@ func TestReplyStartTimeIsStampedOnItsEvents(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = true
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = true
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	a.Submit("say hi")
 
@@ -3146,12 +3146,12 @@ func TestNonStreamedReplyIsStampedWhenItArrives(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
 
 	before := time.Now()
 	a.Submit("hi")

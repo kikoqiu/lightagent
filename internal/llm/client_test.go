@@ -158,12 +158,12 @@ func TestExtraBodyFromConfigFileReachesRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	kwargs, _ := cfg.OpenAI.ExtraBody["chat_template_kwargs"].(map[string]any)
+	kwargs, _ := cfg.LLMs[0].ExtraBody["chat_template_kwargs"].(map[string]any)
 	if kwargs["preserve_thinking"] != true {
-		t.Fatalf("config extra_body was not parsed: %+v", cfg.OpenAI.ExtraBody)
+		t.Fatalf("config extra_body was not parsed: %+v", cfg.LLMs[0].ExtraBody)
 	}
 
-	client := NewClient(cfg.OpenAI)
+	client := NewClient(cfg.LLMs[0].OpenAIConfig)
 	if _, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, nil); err != nil {
 		t.Fatalf("chat: %v", err)
 	}
@@ -361,8 +361,8 @@ func TestChatClassifiesProviderContextLengthRejection(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	client := NewClient(cfg.OpenAI)
+	cfg.LLMs[0].APIBase = srv.URL
+	client := NewClient(cfg.LLMs[0].OpenAIConfig)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil, nil, nil)
 	if !IsContextLengthError(err) {
 		t.Fatalf("Chat error = %v, want a context-length rejection", err)

@@ -185,7 +185,7 @@ func TestLoadFileReportsBrokenInclude(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.json")
 
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	if err := Save(cfgPath, cfg); err != nil {
 		t.Fatalf("save config: %v", err)
 	}

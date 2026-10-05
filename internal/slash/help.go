@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"lightagent/internal/agent"
+	"lightagent/internal/config"
 )
 
 // Table renders the catalogue as an aligned listing, one command per line: a
@@ -51,7 +52,9 @@ func TerminalOnly() []Command {
 func WebCommands() []Command {
 	out := make([]Command, 0, len(Commands))
 	for _, c := range Commands {
-		if c.Web {
+		// Hidden entries stay runnable from the composer but are not offered in
+		// the rail.
+		if c.Web && !c.Hidden {
 			out = append(out, c)
 		}
 	}
@@ -72,6 +75,27 @@ func UsageText(st agent.Stats) string {
 		out += fmt.Sprintf(", last api prompt %d tokens", st.UsageTokens)
 	}
 	return out
+}
+
+// APIListText renders the LLM interface list behind /switchapi with no
+// argument: the 1-based number /switchapi accepts, the interface name, the
+// model and the state (active / disabled).
+func APIListText(infos []config.APIInfo) string {
+	if len(infos) == 0 {
+		return "no llm interfaces configured"
+	}
+	var b strings.Builder
+	for _, info := range infos {
+		state := ""
+		switch {
+		case !info.Enabled:
+			state = " (disabled)"
+		case info.Active:
+			state = " (active)"
+		}
+		fmt.Fprintf(&b, "  %d. %s — %s%s\n", info.Index, info.Name, info.Model, state)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // summarySuffix reports whether a context summary is present.

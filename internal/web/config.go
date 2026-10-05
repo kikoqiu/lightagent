@@ -154,19 +154,42 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 // exact value it belongs to, and it tells a browser that a digest it stored
 // belongs to an older password (the page drops it instead of replaying it).
 func keepStoredSecrets(path string, cfg *config.Config) error {
-	key := strings.TrimSpace(cfg.OpenAI.APIKey)
 	password := strings.TrimSpace(cfg.Web.Password)
-	keepKey := key == "" || key == config.MaskedSecret
 	keepPassword := password == "" || password == config.MaskedSecret
-	if !keepKey && !keepPassword {
+	// An interface keeps the stored key when its api_key is empty or the mask
+	// the page echoes back.
+	needKeys := false
+	for _, api := range cfg.LLMs {
+		key := strings.TrimSpace(api.APIKey)
+		if key == "" || key == config.MaskedSecret {
+			needKeys = true
+			break
+		}
+	}
+	if !needKeys && !keepPassword {
 		return nil
 	}
 	stored, err := readConfigDocument(path)
 	if err != nil {
 		return err
 	}
-	if keepKey {
-		cfg.OpenAI.APIKey = stored.OpenAI.APIKey
+	if needKeys {
+		for i := range cfg.LLMs {
+			key := strings.TrimSpace(cfg.LLMs[i].APIKey)
+			if key != "" && key != config.MaskedSecret {
+				continue // a real key was typed in
+			}
+			if restored, ok := storedKeyFor(stored.LLMs, i, cfg.LLMs[i].Name); ok {
+				cfg.LLMs[i].APIKey = restored
+				continue
+			}
+			// No stored key belongs to this interface (it is new): drop the
+			// echoed mask instead of writing it as the key. Validate then reports
+			// the missing credential rather than the file keeping a literal "***".
+			if key == config.MaskedSecret {
+				cfg.LLMs[i].APIKey = ""
+			}
+		}
 	}
 	if keepPassword {
 		cfg.Web.Password = stored.Web.Password
@@ -181,6 +204,25 @@ func keepStoredSecrets(path string, cfg *config.Config) error {
 	}
 	cfg.Web.PasswordSalt = salt
 	return nil
+}
+
+// storedKeyFor finds the api key to restore for one interface: the entry that
+// carries the name, otherwise the entry at the same position. Matching on the
+// name first keeps a reorder in the form from attaching the wrong key; the
+// positional fallback covers a rename (the interface is still where it was, only
+// its label changed, and without it the echoed mask would land in the file).
+func storedKeyFor(stored []config.LLMConfig, index int, name string) (string, bool) {
+	if name != "" {
+		for _, api := range stored {
+			if api.Name == name {
+				return api.APIKey, true
+			}
+		}
+	}
+	if index < len(stored) {
+		return stored[index].APIKey, true
+	}
+	return "", false
 }
 
 // readConfigBody reads the submitted document, refusing an oversized one.

@@ -34,8 +34,8 @@ func TestLoadFileTimeoutOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.OpenAI.TimeoutSec != Default().OpenAI.TimeoutSec {
-		t.Fatalf("timeout = %d, want the default", cfg.OpenAI.TimeoutSec)
+	if cfg.LLMs[0].TimeoutSec != Default().LLMs[0].TimeoutSec {
+		t.Fatalf("timeout = %d, want the default", cfg.LLMs[0].TimeoutSec)
 	}
 
 	// Explicit 0 disables it.
@@ -46,8 +46,8 @@ func TestLoadFileTimeoutOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.OpenAI.TimeoutSec != 0 {
-		t.Fatalf("timeout = %d, want 0 (disabled)", cfg.OpenAI.TimeoutSec)
+	if cfg.LLMs[0].TimeoutSec != 0 {
+		t.Fatalf("timeout = %d, want 0 (disabled)", cfg.LLMs[0].TimeoutSec)
 	}
 }
 
@@ -66,8 +66,8 @@ func TestLoadFileTemperatureOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.OpenAI.Temperature != Default().OpenAI.Temperature {
-		t.Fatalf("temperature = %v, want the default %v", cfg.OpenAI.Temperature, Default().OpenAI.Temperature)
+	if cfg.LLMs[0].Temperature != Default().LLMs[0].Temperature {
+		t.Fatalf("temperature = %v, want the default %v", cfg.LLMs[0].Temperature, Default().LLMs[0].Temperature)
 	}
 
 	// Explicit 0 is kept: it means deterministic decoding.
@@ -78,8 +78,8 @@ func TestLoadFileTemperatureOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.OpenAI.Temperature != 0 {
-		t.Fatalf("temperature = %v, want 0 (must not fall back to the default)", cfg.OpenAI.Temperature)
+	if cfg.LLMs[0].Temperature != 0 {
+		t.Fatalf("temperature = %v, want 0 (must not fall back to the default)", cfg.LLMs[0].Temperature)
 	}
 
 	// A set value survives unchanged.
@@ -90,8 +90,8 @@ func TestLoadFileTemperatureOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.OpenAI.Temperature != 0.3 {
-		t.Fatalf("temperature = %v, want 0.3", cfg.OpenAI.Temperature)
+	if cfg.LLMs[0].Temperature != 0.3 {
+		t.Fatalf("temperature = %v, want 0.3", cfg.LLMs[0].Temperature)
 	}
 
 	// A negative value is kept too: it is the same "unset" sentinel, just
@@ -103,8 +103,8 @@ func TestLoadFileTemperatureOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.OpenAI.Temperature != -1 {
-		t.Fatalf("temperature = %v, want -1", cfg.OpenAI.Temperature)
+	if cfg.LLMs[0].Temperature != -1 {
+		t.Fatalf("temperature = %v, want -1", cfg.LLMs[0].Temperature)
 	}
 }
 
@@ -113,7 +113,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-test"
+	cfg.LLMs[0].APIKey = "sk-test"
 	cfg.Web.Port = 9000
 	if err := Save(path, cfg); err != nil {
 		t.Fatalf("save: %v", err)
@@ -130,8 +130,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if gotPath != path {
 		t.Fatalf("path = %s, want %s", gotPath, path)
 	}
-	if loaded.OpenAI.APIKey != "sk-test" {
-		t.Fatalf("api_key = %q", loaded.OpenAI.APIKey)
+	if loaded.LLMs[0].APIKey != "sk-test" {
+		t.Fatalf("api_key = %q", loaded.LLMs[0].APIKey)
 	}
 	if loaded.Web.Port != 9000 || !loaded.WebEnabled() {
 		t.Fatalf("web port = %d, enabled = %v", loaded.Web.Port, loaded.WebEnabled())
@@ -153,7 +153,7 @@ func TestLoadCreatesDefault(t *testing.T) {
 	if gotPath != path {
 		t.Fatalf("path = %s, want %s", gotPath, path)
 	}
-	if cfg.OpenAI.Model == "" || cfg.Context.ContextWindow == 0 {
+	if cfg.LLMs[0].Model == "" || cfg.LLMs[0].ContextWindow == 0 {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -174,11 +174,11 @@ func TestApplyDefaultsOnPartialFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.OpenAI.Model == "" {
+	if cfg.LLMs[0].Model == "" {
 		t.Fatal("model default not applied")
 	}
-	if cfg.Context.ContextWindow != 81960 {
-		t.Fatalf("context_window = %d, want default", cfg.Context.ContextWindow)
+	if cfg.LLMs[0].ContextWindow != 81960 {
+		t.Fatalf("context_window = %d, want default", cfg.LLMs[0].ContextWindow)
 	}
 	if cfg.Agent.MaxToolIterations == 0 {
 		t.Fatal("max_tool_iterations default not applied")
@@ -325,8 +325,8 @@ func TestLoadFileExplicitPath(t *testing.T) {
 	if filepath.Clean(got) != filepath.Clean(path) {
 		t.Fatalf("resolved path = %q, want %q", got, path)
 	}
-	if cfg.OpenAI.Model != "m1" {
-		t.Fatalf("model = %q, want m1", cfg.OpenAI.Model)
+	if cfg.LLMs[0].Model != "m1" {
+		t.Fatalf("model = %q, want m1", cfg.LLMs[0].Model)
 	}
 
 	missing := filepath.Join(dir, "sub", "new.json")
@@ -340,7 +340,7 @@ func TestLoadFileExplicitPath(t *testing.T) {
 	if filepath.Clean(got2) != filepath.Clean(missing) {
 		t.Fatalf("resolved path = %q, want %q", got2, missing)
 	}
-	if cfg2.OpenAI.Model == "" {
+	if cfg2.LLMs[0].Model == "" {
 		t.Fatal("defaults not applied")
 	}
 	if _, err := os.Stat(missing); err != nil {
@@ -386,7 +386,7 @@ func TestValidate(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected an error when api_key is empty")
 	}
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestAgentMdOverridesPrompt(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.json")
 
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	cfg.Agent.SystemPrompt = "from-config"
 	if err := Save(cfgPath, cfg); err != nil {
 		t.Fatalf("save config: %v", err)
@@ -433,7 +433,7 @@ func TestAgentMdMissingKeepsConfigPrompt(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.json")
 
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	cfg.Agent.SystemPrompt = "from-config"
 	if err := Save(cfgPath, cfg); err != nil {
 		t.Fatalf("save config: %v", err)
@@ -466,7 +466,7 @@ func TestDiscoveryConfigDefaults(t *testing.T) {
 // TestDiscoveryConfigValidate verifies mode and search-tool validation.
 func TestDiscoveryConfigValidate(t *testing.T) {
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	cfg.Tools.Discovery.Enabled = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("enabled unlock discovery should validate: %v", err)
@@ -534,7 +534,7 @@ func TestWebFetchConfigDefaults(t *testing.T) {
 // ones the fetcher implements, whatever the spelling of the value.
 func TestWebFetchConfigModeValidation(t *testing.T) {
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	modes := []string{
 		WebFetchModeAuto, WebFetchModeHeadful, WebFetchModeHeadless, WebFetchModeAttached, WebFetchModeHTTP,
 		" HTTP ",
@@ -648,7 +648,7 @@ func TestMCPServerConfigEffectiveType(t *testing.T) {
 // TestMCPConfigValidate verifies per-server transport validation.
 func TestMCPConfigValidate(t *testing.T) {
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	cfg.Tools.MCP.Enabled = true
 	cfg.Tools.MCP.Servers = map[string]MCPServerConfig{
 		"local":  {Enabled: true, Command: "node", Args: []string{"server.js"}},
@@ -788,11 +788,11 @@ func TestParseAppliesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if cfg.OpenAI.Model != Default().OpenAI.Model {
-		t.Fatalf("model = %q, want the default", cfg.OpenAI.Model)
+	if cfg.LLMs[0].Model != Default().LLMs[0].Model {
+		t.Fatalf("model = %q, want the default", cfg.LLMs[0].Model)
 	}
-	if cfg.Context.ContextWindow != Default().Context.ContextWindow {
-		t.Fatalf("context_window = %d, want the default", cfg.Context.ContextWindow)
+	if cfg.LLMs[0].ContextWindow != Default().LLMs[0].ContextWindow {
+		t.Fatalf("context_window = %d, want the default", cfg.LLMs[0].ContextWindow)
 	}
 	if _, ok := cfg.Tools.MCP.Servers[DefaultMCPServerName]; !ok {
 		t.Fatalf("the disabled MCP placeholder should be seeded: %+v", cfg.Tools.MCP.Servers)
@@ -806,8 +806,8 @@ func TestParseToleratesUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if cfg.OpenAI.APIKey != "sk-x" {
-		t.Fatalf("api_key = %q", cfg.OpenAI.APIKey)
+	if cfg.LLMs[0].APIKey != "sk-x" {
+		t.Fatalf("api_key = %q", cfg.LLMs[0].APIKey)
 	}
 }
 
@@ -842,12 +842,12 @@ func TestParseStrictRejectsUnknownFields(t *testing.T) {
 // stays visible and other fields survive.
 func TestMaskSecrets(t *testing.T) {
 	cfg := Default()
-	cfg.OpenAI.APIKey = "sk-x"
+	cfg.LLMs[0].APIKey = "sk-x"
 	cfg.Web.Password = "hunter2"
 	cfg.Web.PasswordSalt = "0123456789abcdef0123456789abcdef"
 	masked := cfg.MaskSecrets()
-	if masked.OpenAI.APIKey != MaskedSecret {
-		t.Fatalf("api_key = %q, want %q", masked.OpenAI.APIKey, MaskedSecret)
+	if masked.LLMs[0].APIKey != MaskedSecret {
+		t.Fatalf("api_key = %q, want %q", masked.LLMs[0].APIKey, MaskedSecret)
 	}
 	if masked.Web.Password != MaskedSecret {
 		t.Fatalf("password = %q, want %q", masked.Web.Password, MaskedSecret)
@@ -855,11 +855,11 @@ func TestMaskSecrets(t *testing.T) {
 	if masked.Web.PasswordSalt != cfg.Web.PasswordSalt {
 		t.Fatalf("password_salt = %q, want the public salt unchanged", masked.Web.PasswordSalt)
 	}
-	if cfg.OpenAI.APIKey != "sk-x" || cfg.Web.Password != "hunter2" {
-		t.Fatalf("the receiver must not be modified: %q / %q", cfg.OpenAI.APIKey, cfg.Web.Password)
+	if cfg.LLMs[0].APIKey != "sk-x" || cfg.Web.Password != "hunter2" {
+		t.Fatalf("the receiver must not be modified: %q / %q", cfg.LLMs[0].APIKey, cfg.Web.Password)
 	}
-	if empty := Default().MaskSecrets(); empty.OpenAI.APIKey != "" || empty.Web.Password != "" {
-		t.Fatalf("empty secrets stay empty, got %q / %q", empty.OpenAI.APIKey, empty.Web.Password)
+	if empty := Default().MaskSecrets(); empty.LLMs[0].APIKey != "" || empty.Web.Password != "" {
+		t.Fatalf("empty secrets stay empty, got %q / %q", empty.LLMs[0].APIKey, empty.Web.Password)
 	}
 	if masked.Context != cfg.Context || !masked.UI.Markdown {
 		t.Fatal("the copy must carry the other fields unchanged")
@@ -904,7 +904,7 @@ func TestLoadKeepsACredentialedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	doc := Default()
-	doc.OpenAI.APIKey = "sk-x"
+	doc.LLMs[0].APIKey = "sk-x"
 	doc.Web.Host = "127.0.0.1"
 	doc.Web.Password = "hunter2"
 	doc.Web.PasswordSalt = "0123456789abcdef0123456789abcdef"
@@ -934,7 +934,7 @@ func TestLoadDropsSaltWithoutPassword(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	doc := Default()
-	doc.OpenAI.APIKey = "sk-x"
+	doc.LLMs[0].APIKey = "sk-x"
 	doc.Web.Host = "127.0.0.1"
 	doc.Web.PasswordSalt = "0123456789abcdef0123456789abcdef"
 	doc.Tools.MCP.Servers = defaultMCPServers()
@@ -961,8 +961,8 @@ func TestParseHandlesEchoedMask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseStrict: %v", err)
 	}
-	if cfg.OpenAI.APIKey != MaskedSecret {
-		t.Fatalf("api_key = %q, want the echoed mask", cfg.OpenAI.APIKey)
+	if cfg.LLMs[0].APIKey != MaskedSecret {
+		t.Fatalf("api_key = %q, want the echoed mask", cfg.LLMs[0].APIKey)
 	}
 	if cfg.Web.Password != "" {
 		t.Fatalf("the masked password must be dropped, got %q", cfg.Web.Password)
@@ -974,8 +974,8 @@ func TestParseHandlesEchoedMask(t *testing.T) {
 // sides have to be configured before it exists.
 func TestMediaConfigDefaults(t *testing.T) {
 	cfg := Default()
-	if len(cfg.OpenAI.MediaTypes) != 0 {
-		t.Fatalf("openai.media_types = %v, want unset", cfg.OpenAI.MediaTypes)
+	if len(cfg.LLMs[0].MediaTypes) != 0 {
+		t.Fatalf("openai.media_types = %v, want unset", cfg.LLMs[0].MediaTypes)
 	}
 	if cfg.Tools.UploadMedia.Enabled {
 		t.Fatal("tools.upload_media.enabled must default to false")
@@ -1013,8 +1013,8 @@ func TestMediaConfigPartialFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(cfg.OpenAI.MediaTypes) != 2 || cfg.OpenAI.MediaTypes[0] != "image/png" {
-		t.Fatalf("media_types = %v, want the stored list (as written)", cfg.OpenAI.MediaTypes)
+	if len(cfg.LLMs[0].MediaTypes) != 2 || cfg.LLMs[0].MediaTypes[0] != "image/png" {
+		t.Fatalf("media_types = %v, want the stored list (as written)", cfg.LLMs[0].MediaTypes)
 	}
 	if !cfg.Tools.UploadMedia.Enabled || cfg.Tools.UploadMedia.MaxBytes != 4096 {
 		t.Fatalf("upload_media = %+v", cfg.Tools.UploadMedia)

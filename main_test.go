@@ -382,9 +382,9 @@ func TestMediaCapabilityRequiresBothSettings(t *testing.T) {
 	}
 	for _, tc := range cases {
 		cfg := config.Default()
-		cfg.OpenAI.MediaTypes = tc.types
+		cfg.LLMs[0].MediaTypes = tc.types
 		cfg.Tools.UploadMedia.Enabled = tc.toolOn
-		media, tool := mediaCapability(cfg)
+		media, tool := mediaCapability(cfg.LLMs[0], cfg)
 		if media.Enabled() != tc.wantEnable {
 			t.Errorf("%s: capability = %v, want %v", tc.name, media.Enabled(), tc.wantEnable)
 		}
@@ -395,9 +395,9 @@ func TestMediaCapabilityRequiresBothSettings(t *testing.T) {
 
 	// The byte cap travels from the tool's setting into the capability.
 	cfg := config.Default()
-	cfg.OpenAI.MediaTypes = []string{"image"}
+	cfg.LLMs[0].MediaTypes = []string{"image"}
 	cfg.Tools.UploadMedia.MaxBytes = 2048
-	media, _ := mediaCapability(cfg)
+	media, _ := mediaCapability(cfg.LLMs[0], cfg)
 	if media.Limit() != 2048 {
 		t.Fatalf("limit = %d, want the configured cap", media.Limit())
 	}

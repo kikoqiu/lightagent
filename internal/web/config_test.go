@@ -96,13 +96,13 @@ func TestConfigGetMasksTheKeyAndFillsDefaults(t *testing.T) {
 	if reply.Path != path {
 		t.Fatalf("path = %q, want %q", reply.Path, path)
 	}
-	if reply.Config.OpenAI.Model != "m1" {
-		t.Fatalf("model = %q, want the stored value", reply.Config.OpenAI.Model)
+	if reply.Config.LLMs[0].Model != "m1" {
+		t.Fatalf("model = %q, want the stored value", reply.Config.LLMs[0].Model)
 	}
-	if reply.Config.OpenAI.APIKey != config.MaskedSecret {
-		t.Fatalf("api_key = %q, want %q", reply.Config.OpenAI.APIKey, config.MaskedSecret)
+	if reply.Config.LLMs[0].APIKey != config.MaskedSecret {
+		t.Fatalf("api_key = %q, want %q", reply.Config.LLMs[0].APIKey, config.MaskedSecret)
 	}
-	if got, want := reply.Config.Context.ContextWindow, config.Default().Context.ContextWindow; got != want {
+	if got, want := reply.Config.LLMs[0].ContextWindow, config.Default().LLMs[0].ContextWindow; got != want {
 		t.Fatalf("context_window = %d, want the default %d", got, want)
 	}
 	if reply.PendingRestart {
@@ -129,22 +129,22 @@ func TestConfigPutWritesTheFileWithoutApplyingIt(t *testing.T) {
 	if !reply.PendingRestart {
 		t.Fatal("a saved document must be reported as pending a restart")
 	}
-	if reply.Config.OpenAI.APIKey != config.MaskedSecret {
-		t.Fatalf("the reply leaks the api key: %q", reply.Config.OpenAI.APIKey)
+	if reply.Config.LLMs[0].APIKey != config.MaskedSecret {
+		t.Fatalf("the reply leaks the api key: %q", reply.Config.LLMs[0].APIKey)
 	}
-	if reply.Config.OpenAI.Model != "m2" {
-		t.Fatalf("reply model = %q, want the saved value", reply.Config.OpenAI.Model)
+	if reply.Config.LLMs[0].Model != "m2" {
+		t.Fatalf("reply model = %q, want the saved value", reply.Config.LLMs[0].Model)
 	}
 
 	saved, err := config.Parse([]byte(readConfigString(t, path)))
 	if err != nil {
 		t.Fatalf("parse the saved config: %v", err)
 	}
-	if saved.OpenAI.Model != "m2" {
-		t.Fatalf("file model = %q, want m2", saved.OpenAI.Model)
+	if saved.LLMs[0].Model != "m2" {
+		t.Fatalf("file model = %q, want m2", saved.LLMs[0].Model)
 	}
-	if saved.OpenAI.APIKey != "sk-secret" {
-		t.Fatalf("file api_key = %q, want the stored key (the mask is never written)", saved.OpenAI.APIKey)
+	if saved.LLMs[0].APIKey != "sk-secret" {
+		t.Fatalf("file api_key = %q, want the stored key (the mask is never written)", saved.LLMs[0].APIKey)
 	}
 	if readConfigString(t, path) == seed {
 		t.Fatal("the file was not rewritten")
@@ -154,6 +154,38 @@ func TestConfigPutWritesTheFileWithoutApplyingIt(t *testing.T) {
 	// the panel keeps warning about it.
 	if _, again := callConfig(t, srv, http.MethodGet, ""); !again.PendingRestart {
 		t.Fatal("pending_restart must survive a later read")
+	}
+}
+
+// TestConfigPutKeepsTheKeyWhenAnInterfaceIsRenamed pins the secret restore for a
+// renamed interface: the page echoes the mask back and the name is the only
+// thing that changed, so the stored key must still find its entry. Without the
+// positional fallback the mask would be written to the file as the key.
+func TestConfigPutKeepsTheKeyWhenAnInterfaceIsRenamed(t *testing.T) {
+	srv := newTestServer(t, "")
+	seed := `{"providers":[{"name":"default","type":"openai","enabled":true,"api_key":"sk-secret","model":"m1"}]}`
+	path := seedConfigFile(t, srv, seed)
+
+	body := fmt.Sprintf(
+		`{"providers":[{"name":"renamed","type":"openai","enabled":true,"api_key":%q,"model":"m1"}]}`,
+		config.MaskedSecret)
+	status, reply := callConfig(t, srv, http.MethodPut, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", status, reply.Error)
+	}
+	if reply.Config.LLMs[0].APIKey != config.MaskedSecret {
+		t.Fatalf("the reply leaks the api key: %q", reply.Config.LLMs[0].APIKey)
+	}
+
+	saved, err := config.Parse([]byte(readConfigString(t, path)))
+	if err != nil {
+		t.Fatalf("parse the saved config: %v", err)
+	}
+	if saved.LLMs[0].Name != "renamed" {
+		t.Fatalf("file name = %q, want the renamed interface", saved.LLMs[0].Name)
+	}
+	if saved.LLMs[0].APIKey != "sk-secret" {
+		t.Fatalf("file api_key = %q, want the stored key (the mask is never written)", saved.LLMs[0].APIKey)
 	}
 }
 
@@ -251,8 +283,8 @@ func TestConfigPutAcceptsARealKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse the saved config: %v", err)
 	}
-	if saved.OpenAI.APIKey != "sk-new" {
-		t.Fatalf("file api_key = %q, want the submitted key", saved.OpenAI.APIKey)
+	if saved.LLMs[0].APIKey != "sk-new" {
+		t.Fatalf("file api_key = %q, want the submitted key", saved.LLMs[0].APIKey)
 	}
 }
 
@@ -375,10 +407,8 @@ func TestConfigEditorWiring(t *testing.T) {
 	// Every option of the config document must be reachable from the form: the
 	// list also documents what the form covers, so a new config field is noticed.
 	for _, path := range []string{
-		"openai.api_base", "openai.api_key", "openai.model", "openai.stream",
-		"openai.temperature", "openai.max_tokens", "openai.timeout_seconds", "openai.extra_body",
-		"openai.media_types",
-		"context.context_window", "context.summarize_token_percent",
+		"providers",
+		"context.summarize_token_percent",
 		"context.summarize_keep.auto.budget_percent", "context.summarize_keep.auto.turns",
 		"context.summarize_keep.manual.budget_percent", "context.summarize_keep.manual.turns",
 		"web.host", "web.port", "web.password",
@@ -401,22 +431,83 @@ func TestConfigEditorWiring(t *testing.T) {
 			t.Errorf("the form does not cover the %s option", path)
 		}
 	}
+	// The provider entries are edited by the providers repeater, whose per-entry
+	// keys replace the old openai.* paths.
+	for _, key := range []string{
+		"name", "type", "enabled", "api_base", "api_key", "model", "context_window",
+		"temperature", "max_tokens", "timeout_seconds", "stream", "media_types", "extra_body",
+	} {
+		if !strings.Contains(configJS, "'"+key+"'") {
+			t.Errorf("the providers form does not cover the %s field", key)
+		}
+	}
 	if strings.Contains(pageSource(), "position:fixed") {
 		t.Error("the config panel must be absolutely positioned, not fixed: a fixed overlay breaks the mobile viewport")
 	}
 }
 
-// TestTemperatureSliderOmitsAtLowestStep pins the temperature control's sentinel
-// range: its lowest position is one step below 0 (min = 0 - step), so the slider
-// never spans the whole -1..0 gap, and that position is stored as the -1 "omit"
-// value the loader and the request builder treat as "unset".
-func TestTemperatureSliderOmitsAtLowestStep(t *testing.T) {
+// TestLLMRepeaterWiring pins the providers repeater: the interface array is the
+// one control the flat path model cannot express, so its add / reorder / remove
+// controls and its per-entry fields have to be present in the editor script.
+func TestLLMRepeaterWiring(t *testing.T) {
 	for _, want := range []string{
-		"openai.temperature', type: 'slider', min: -0.05",
-		"omit: { below: 0, value: -1,",
+		"type: 'providers'",
+		"buildLLMControl",
+		"syncLLMRepeater",
+		"Add provider",
+		"move up",
+		"move down",
+		"remove this provider",
+		"key: 'api_base'",
+		"key: 'context_window'",
+		"key: 'media_types'",
 	} {
 		if !strings.Contains(configJS, want) {
-			t.Errorf("the temperature control is missing %q", want)
+			t.Errorf("the providers repeater is missing %q", want)
+		}
+	}
+	// The repeater is not a .field row: it carries its own class, and the error
+	// toggles must not rewrite className. syncForm clears every field's error
+	// after a load, so a plain className reset there demoted the repeater back
+	// to a two-column .field grid and squashed the cards to half width.
+	for _, want := range []string{"providers-block", "classList.add('invalid')", "classList.remove('invalid')"} {
+		if !strings.Contains(configJS, want) {
+			t.Errorf("the providers repeater is missing %q", want)
+		}
+	}
+	// The card is not a smaller restyle of the form: its rows keep the .field
+	// metrics (row padding and gap included), its controls the .field sizes, and
+	// its control cell stacks the way .field-control does — so a slider's value
+	// badge ("omitted (provider default)") sits under the track, and the
+	// "enabled" switch is never grown sideways.
+	for _, want := range []string{
+		".llm-field-control { display:flex; flex-direction:column;",
+		".llm-field-out { font-size:11px;",
+		"align-items:start; gap:6px 14px; min-width:0; padding:7px 0;",
+		".llm-card.collapsed .llm-grid { display:none; }",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the provider cards are missing %q", want)
+		}
+	}
+	// The per-entry explanations the flat form used to carry must survive in the
+	// card: one .field help per key became one card row each, on every card. The
+	// cards themselves fold to their title bar (the repeater owns that state).
+	for _, want := range []string{
+		"'llm-field-help'",
+		"'llm-field-err'",
+		"'json-box'",
+		"renderLLMField(entry, LLM_FIELDS[f], index)",
+		"'llm-card collapsed'",
+		"llmOpen",
+		"llmOpen.push(true)",
+		"media types this model accepts as attachments",
+		"sampling temperature; the leftmost position omits the field",
+		"idle timeout in seconds (waiting for headers or between stream chunks)",
+		"provider-specific request fields, merged into the request body",
+	} {
+		if !strings.Contains(configJS, want) {
+			t.Errorf("the providers form dropped %q", want)
 		}
 	}
 }

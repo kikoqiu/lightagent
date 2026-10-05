@@ -135,6 +135,28 @@
   }
   .meter > span.warm { background:linear-gradient(90deg, var(--yellow), #f0883e); }
   .meter > span.hot { background:linear-gradient(90deg, #ff8a3d, var(--red)); }
+  /* The context card's note: the token ratio on the left and the percentage on
+     the right of the same line (the card has no "Context window" title). */
+  .card-note.meter-note { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
+  /* The model picker at the top of the context card, disabled while a turn runs
+     (a switch is refused then anyway). It reads as a label, not an input: no
+     box and muted text, with the native arrow signalling it is a dropdown; hover
+     and focus bring it up. */
+  .card-select { display:flex; align-items:baseline; gap:8px; margin-bottom:10px; }
+  .card-select-label {
+    font-size:10px; font-weight:700; letter-spacing:1.1px; text-transform:uppercase; color:var(--fg-dim);
+  }
+  .card-select select {
+    flex:1; min-width:0; padding:2px 6px; border-radius:6px; font-size:12.5px;
+    background:transparent; color:var(--fg-muted); border:1px solid transparent;
+    cursor:pointer;
+  }
+  /* Once the picker is opened or focused it shows normal colours, and the option
+     list is never greyed (the muted label look is only for the idle state). */
+  .card-select select:hover, .card-select select:focus, .card-select select:active { color:var(--fg); }
+  .card-select select:focus { outline:none; border-color:var(--border-soft); }
+  .card-select select option { color:var(--fg); background:var(--bg-elev); }
+  .card-select select:disabled { color:var(--fg-dim); opacity:.6; cursor:not-allowed; }
   .actions { display:flex; flex-wrap:wrap; gap:8px; }
   /* ---- side-rail command list ---- */
   /* One flat list of buttons: the rail is the click-to-run form of the slash
@@ -758,9 +780,11 @@
   /* The raw document is edited as plain text: the composer's 16px/auto-grow rules
      would make JSON unreadable, so the editor overrides them. */
   #configText {
-    min-height:320px; height:auto; max-height:none;
+    display:block; /* no inline baseline gap: the box fits the pane exactly */
+    min-height:200px; height:auto; max-height:none;
     width:100%; font-size:13px; line-height:1.5;
     white-space:pre; overflow:auto; resize:vertical; tab-size:2;
+    margin:0;
   }
   /* ---- form mode: one card per section, one row per option ---- */
   .form { display:flex; flex-direction:column; gap:10px; }
@@ -837,6 +861,93 @@
   .field.invalid input:not([type=range]), .field.invalid textarea, .field.invalid select { border-color:var(--red); }
   .field.invalid .field-err { display:block; }
   .field.invalid .field-key { color:var(--red); }
+  /* The providers repeater: one card per provider. It is a plain block (not a
+     .field row), so it carries no key label and no label column — the cards take
+     the whole width. Inside a card every option is a row laid out like an
+     ordinary field (key left, control right; one column on a narrow screen). */
+  .providers-block { display:block; width:100%; padding:7px 0; }
+  .providers-control { display:block; width:100%; min-width:0; }
+  /* Fallback for a page whose config.js is older and still marks the repeater
+     "field field-wide" / "field field-providers": keep it single-column, so the
+     control is never stuck in the narrow key column. */
+  .field.field-wide, .field.field-providers { grid-template-columns:1fr; }
+  .llm-list { display:flex; flex-direction:column; gap:10px; }
+  .llm-empty { color:var(--fg-dim); font-size:11.5px; }
+  .llm-card {
+    border:1px solid var(--border-soft); border-radius:var(--radius-sm);
+    background:rgba(8,11,17,.35); padding:9px 10px;
+  }
+  .llm-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+  /* Collapsed to the title bar: a freshly opened panel folds every card (load
+     clears llmOpen) and its bar is the fold, so a long list of providers reads as
+     a short list of names until one is opened. */
+  .llm-card.collapsed .llm-head { margin-bottom:0; }
+  .llm-card.collapsed .llm-grid { display:none; }
+  /* The title bar is a fold, not a button to press: no hover highlight (the
+     global button:hover brightness is neutralized too), only the caret turning and
+     the keyboard focus ring. */
+  .llm-title {
+    flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px;
+    min-height:0; padding:3px 6px; border:0; border-radius:var(--radius-sm);
+    background:transparent; box-shadow:none; color:var(--fg);
+    font-family:inherit; font-size:12px; font-weight:600; letter-spacing:0;
+    text-align:left; cursor:pointer; transition:none;
+  }
+  .llm-title:hover { background:transparent; color:var(--fg); filter:none; }
+  .llm-title:active { transform:none; }
+  .llm-caret { flex:none; color:var(--fg-dim); font-size:10px; transition:transform .15s; }
+  .llm-card.collapsed .llm-caret { transform:rotate(-90deg); }
+  .llm-name { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .llm-tools { display:flex; gap:4px; }
+  .llm-btn { min-width:28px; padding:3px 7px; font-size:12px; line-height:1.2; }
+  .llm-grid { display:flex; flex-direction:column; gap:2px; }
+  /* A card row is an ordinary .field row: same columns, same row padding and
+     gap, so the cards keep the form's vertical rhythm. The key and its help
+     share the label column, and the control starts on the key's line. */
+  .llm-field {
+    display:grid; grid-template-columns:minmax(210px, 42%) 1fr;
+    align-items:start; gap:6px 14px; min-width:0; padding:7px 0;
+  }
+  .llm-field-label { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .llm-field-key { font-size:12px; color:var(--fg-dim); }
+  .llm-field-help { font-size:10.5px; color:var(--fg-dim); line-height:1.45; }
+  /* The control cell stacks like a .field one: the control on top and, for a
+     slider, its value badge on the line below. A row would let the long
+     "omitted (provider default)" label sit beside the track and push it aside,
+     which is exactly the misalignment the flat form never had. */
+  .llm-field-control { display:flex; flex-direction:column; gap:4px; min-width:0; }
+  /* A card's controls are the form's controls: same height, padding and font, so
+     a provider row is not a smaller variant of the .field widgets. */
+  .llm-field input[type=text], .llm-field input[type=password], .llm-field input[type=number], .llm-field select,
+  .llm-field textarea {
+    width:100%; min-height:34px; height:auto; max-height:none;
+    padding:6px 9px; font-family:inherit; font-size:12.5px; line-height:1.45;
+    color:var(--fg); background:var(--bg-elev);
+    border:1px solid var(--border); border-radius:var(--radius-sm); outline:none;
+    transition:border-color .15s, box-shadow .15s;
+  }
+  .llm-field input:focus, .llm-field select:focus, .llm-field textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(90,162,255,.16); }
+  .llm-field select { appearance:none; cursor:pointer; }
+  /* The free-form box (extra_body): taller than a row and scrollable, exactly like
+     the json boxes of the flat form (same .json-box sizing). */
+  .llm-field textarea { resize:vertical; white-space:pre; tab-size:2; }
+  .llm-field textarea.json-box { min-height:88px; font-size:11.5px; color:var(--fg-muted); }
+  /* A row the server would reject (a free-form box that does not parse): the note
+     spans both columns under the row, the way a .field-err sits under its
+     control. */
+  .llm-field-err { grid-column:1 / -1; display:none; font-size:10.5px; color:var(--red); }
+  .llm-field.invalid .llm-field-err { display:block; }
+  .llm-field.invalid input:not([type=range]), .llm-field.invalid textarea, .llm-field.invalid select { border-color:var(--red); }
+  .llm-field.invalid .llm-field-key { color:var(--red); }
+  .llm-add { align-self:flex-start; margin-top:8px; }
+  .llm-field-out { font-size:11px; color:var(--accent); }
+  .llm-field input[type=range] {
+    appearance:none; width:100%; height:22px; margin:4px 0 0; background:transparent; cursor:pointer;
+  }
+  .llm-field input[type=range]::-webkit-slider-runnable-track { height:5px; border-radius:999px; background:rgba(8,11,17,.85); border:1px solid var(--border-soft); }
+  .llm-field input[type=range]::-webkit-slider-thumb { appearance:none; margin-top:-5px; width:15px; height:15px; border-radius:50%; background:var(--accent); border:0; }
+  .llm-field input[type=range]::-moz-range-track { height:5px; border-radius:999px; background:rgba(8,11,17,.85); border:1px solid var(--border-soft); }
+  .llm-field input[type=range]::-moz-range-thumb { width:14px; height:14px; border:0; border-radius:50%; background:var(--accent); }
   .modal-foot { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   .modal-note { flex:1 1 auto; min-width:0; color:var(--fg-dim); font-size:11.5px; }
   .modal-note.ok { color:var(--green); }
@@ -958,7 +1069,7 @@
   @media (max-width: 720px) {
     .user .text { max-width:92%; }
     .assistant .text { padding-left:10px; }
-    .field { grid-template-columns:1fr; gap:4px; }
+    .field, .llm-field { grid-template-columns:1fr; gap:4px; }
     .field-help { font-size:11px; }
   }
   @media (max-width: 480px) {

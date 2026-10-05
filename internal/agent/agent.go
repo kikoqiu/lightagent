@@ -112,10 +112,15 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 	if maxIter <= 0 {
 		maxIter = 20
 	}
-	contextWindow := cfg.Context.ContextWindow
+	// The context window and the output reserve are properties of the active
+	// interface's model; SwitchLLM replaces them when the user picks another
+	// interface at runtime.
+	_, activeLLM, _ := cfg.ActiveLLM()
+	contextWindow := activeLLM.ContextWindow
 	if contextWindow <= 0 {
 		contextWindow = 131072
 	}
+	maxTokens := activeLLM.MaxTokens
 	summarizePercent := cfg.Context.SummarizeTokenPercent
 	if summarizePercent <= 0 || summarizePercent > 100 {
 		summarizePercent = 75
@@ -140,7 +145,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 	a.compactor = &compactor{
 		client:                client,
 		contextWindow:         contextWindow,
-		maxTokens:             cfg.OpenAI.MaxTokens,
+		maxTokens:             maxTokens,
 		summarizeTokenPercent: summarizePercent,
 		keepAuto:              cfg.Context.SummarizeKeep.Auto,
 		keepManual:            cfg.Context.SummarizeKeep.Manual,
@@ -150,6 +155,47 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 
 // Bus exposes the agent event bus for subscribers.
 func (a *Agent) Bus() *Bus { return a.bus }
+
+// Model returns the model name of the active interface, or "" when none is set.
+func (a *Agent) Model() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.client == nil {
+		return ""
+	}
+	return a.client.Model()
+}
+
+// SwitchLLM swaps the client and the numbers derived from the active interface
+// — its context window (compaction trigger and usage display) and its output
+// reserve. It refuses while a turn is running, so callLLM and the compactor
+// never observe a half-applied switch: a turn holds no lock across its request,
+// and this runs only when the agent is idle. It is the lightweight equivalent
+// of re-initializing the program on a new interface.
+func (a *Agent) SwitchLLM(client *llm.Client, contextWindow, maxTokens int) error {
+	if client == nil {
+		return errors.New("switch llm: no client")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.busy {
+		return errors.New("a turn is running; try again when idle")
+	}
+	a.client = client
+	if contextWindow > 0 {
+		a.contextWindow = contextWindow
+	}
+	if a.compactor != nil {
+		a.compactor.client = client
+		if contextWindow > 0 {
+			a.compactor.contextWindow = contextWindow
+		}
+		if maxTokens > 0 {
+			a.compactor.maxTokens = maxTokens
+		}
+	}
+	return nil
+}
 
 // SetMCPServers records the connected MCP servers rendered into the system
 // prompt as the per-server "MCP global info" (server name, tool count and the
@@ -904,6 +950,9 @@ func (a *Agent) callLLM(ctx context.Context) (*llm.Response, time.Time, error) {
 	a.mu.Lock()
 	prefix := a.livePrefixLocked()
 	msgs := prefix.head(a.history)
+	// The client is captured under the lock so a runtime interface switch (which
+	// also takes a.mu, and only while idle) can never race the read.
+	client := a.client
 	a.mu.Unlock()
 
 	var started time.Time
@@ -918,7 +967,10 @@ func (a *Agent) callLLM(ctx context.Context) (*llm.Response, time.Time, error) {
 	onReasoning := func(text string) {
 		a.bus.Publish(Event{Type: EventReasoningDelta, Text: text, Time: markStart()})
 	}
-	resp, err := a.client.Chat(ctx, msgs, prefix.tools, onDelta, onReasoning)
+	if client == nil {
+		return nil, started, errors.New("no llm client")
+	}
+	resp, err := client.Chat(ctx, msgs, prefix.tools, onDelta, onReasoning)
 	return resp, started, err
 }
 

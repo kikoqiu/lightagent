@@ -25,7 +25,7 @@ import (
 func newTestCLI(t *testing.T) *CLI {
 	t.Helper()
 	cfg := config.Default()
-	client := llm.NewClient(cfg.OpenAI)
+	client := llm.NewClient(cfg.LLMs[0].OpenAIConfig)
 	reg := tools.NewRegistry()
 	ag := agent.New(cfg, client, reg, agent.NewBus())
 	st, err := store.New(t.TempDir())
@@ -1055,8 +1055,8 @@ func TestInjectedSteeringLandsBetweenTheRounds(t *testing.T) {
 	defer srv.Close()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = srv.URL
-	ag := agent.New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), agent.NewBus())
+	cfg.LLMs[0].APIBase = srv.URL
+	ag := agent.New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), agent.NewBus())
 	st, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
@@ -1677,6 +1677,53 @@ func TestToolArgumentsKeepsOrderAndRawValues(t *testing.T) {
 	}
 	if got, ok := toolArguments("{}"); !ok || len(got) != 0 {
 		t.Fatalf("toolArguments({}) = %+v, %v; want empty, true", got, ok)
+	}
+}
+
+// TestSwitchAPICommand pins the CLI side of /switchapi: the listing with no
+// argument, the switch itself, and the note when no switcher is wired.
+func TestSwitchAPICommand(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	// No switcher: the command reports that it is unavailable.
+	if exit := c.handleCommand(context.Background(), "/switchapi default"); exit {
+		t.Fatal("/switchapi must not exit the CLI")
+	}
+	if !strings.Contains(buf.String(), "not available") {
+		t.Fatalf("output = %q, want the unavailable note", buf.String())
+	}
+
+	// With a switcher and a listing.
+	c.SetAPISwitcher(func(spec string) (string, error) {
+		if spec != "2" {
+			return "", fmt.Errorf("unexpected spec %q", spec)
+		}
+		return "switched to \"b\" (m2)", nil
+	})
+	c.SetAPIList(func() []config.APIInfo {
+		return []config.APIInfo{
+			{Index: 1, Name: "default", Model: "m", Enabled: true, Active: true},
+			{Index: 2, Name: "b", Model: "m2", Enabled: true},
+		}
+	})
+
+	buf.Reset()
+	if exit := c.handleCommand(context.Background(), "/switchapi"); exit {
+		t.Fatal("/switchapi must not exit the CLI")
+	}
+	if !strings.Contains(buf.String(), "default") || !strings.Contains(buf.String(), "(active)") {
+		t.Fatalf("listing output = %q", buf.String())
+	}
+
+	buf.Reset()
+	if exit := c.handleCommand(context.Background(), "/switchapi 2"); exit {
+		t.Fatal("/switchapi must not exit the CLI")
+	}
+	if !strings.Contains(buf.String(), "switched to \"b\" (m2)") {
+		t.Fatalf("switch output = %q", buf.String())
 	}
 }
 

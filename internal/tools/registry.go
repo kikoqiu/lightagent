@@ -103,6 +103,24 @@ func (r *Registry) register(t Tool, core, deferred bool) {
 	r.version++
 }
 
+// Unregister removes a tool by name. It is a no-op for a name that is not
+// registered. The discovery search cache keys off version, so the removal is
+// picked up exactly like a registration.
+func (r *Registry) Unregister(name string) {
+	if _, ok := r.byName[name]; !ok {
+		return
+	}
+	delete(r.byName, name)
+	delete(r.grants, name)
+	for i, existing := range r.order {
+		if existing == name {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
+		}
+	}
+	r.version++
+}
+
 // Get returns a callable tool by name. Deferred tools are only callable while
 // an active unlock grant exists; locked deferred tools report ok=false so the
 // caller can surface the "tool is locked" error.

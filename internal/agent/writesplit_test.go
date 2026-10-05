@@ -114,14 +114,14 @@ func numberedLines(n int) string {
 // write_file tool registered under the configured line limit.
 func newAutoSplitAgent(t *testing.T, cfg *config.Config, url string) (*Agent, <-chan Event) {
 	t.Helper()
-	cfg.OpenAI.APIBase = url
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = url
+	cfg.LLMs[0].Stream = false
 	reg := tools.NewRegistry()
 	reg.Register(tools.NewWriteFileTool(tools.FsConfig{MaxWriteLines: cfg.Tools.WriteFile.MaxLines}))
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	t.Cleanup(cancel)
-	return New(cfg, llm.NewClient(cfg.OpenAI), reg, bus), events
+	return New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus), events
 }
 
 // checkCallPairing pins the invariant every provider enforces: each entry of an
@@ -258,15 +258,15 @@ func TestAutoSplitWriteKeepsOtherCalls(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.Tools.WriteFile.MaxLines = 5
-	cfg.OpenAI.APIBase = provider.srv.URL
-	cfg.OpenAI.Stream = false
+	cfg.LLMs[0].APIBase = provider.srv.URL
+	cfg.LLMs[0].Stream = false
 	reg := tools.NewRegistry()
 	reg.Register(agentStubTool{name: "stub", desc: "stub"})
 	reg.Register(tools.NewWriteFileTool(tools.FsConfig{MaxWriteLines: 5}))
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
 	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.OpenAI), reg, bus)
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
 
 	a.Submit("go")
 	drainEvents(t, events)

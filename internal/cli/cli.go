@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"lightagent/internal/agent"
+	"lightagent/internal/config"
 	"lightagent/internal/llm"
 	"lightagent/internal/markdown"
 	"lightagent/internal/slash"
@@ -41,6 +42,11 @@ type CLI struct {
 	agent *agent.Agent
 	store *store.Store
 	model string
+	// apiSwitch switches the active LLM interface (/switchapi); nil means the
+	// command reports that it is unavailable. apiList describes the interfaces
+	// for the listing. Both are wired by the program.
+	apiSwitch func(spec string) (string, error)
+	apiList   func() []config.APIInfo
 
 	// out receives all rendered output (defaults to stdout; --log wraps it).
 	out io.Writer
@@ -218,6 +224,22 @@ func (c *CLI) SetOutput(w io.Writer) {
 
 // SetSaveMode selects the exit save behavior.
 func (c *CLI) SetSaveMode(m SaveMode) { c.saveMode = m }
+
+// SetModel updates the model name the banner and the saved session report. The
+// program calls it when the active LLM interface is switched at runtime.
+func (c *CLI) SetModel(model string) {
+	c.mu.Lock()
+	c.model = model
+	c.mu.Unlock()
+}
+
+// SetAPISwitcher registers the callback behind /switchapi, wired to the same
+// runtime selection as the web mirror's model dropdown.
+func (c *CLI) SetAPISwitcher(fn func(spec string) (string, error)) { c.apiSwitch = fn }
+
+// SetAPIList registers the callback that describes the configured LLM
+// interfaces, backing /switchapi with no argument.
+func (c *CLI) SetAPIList(fn func() []config.APIInfo) { c.apiList = fn }
 
 // Interactive reports whether in is attached to an interactive terminal.
 func Interactive(in *os.File) bool { return isInteractive(in) }
@@ -1644,6 +1666,26 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 		c.write(c.toggleToolResults(args) + "\n")
 	case "/markdown":
 		c.write(c.toggleMarkdown(args) + "\n")
+	case "/switchapi":
+		if c.apiSwitch == nil {
+			c.write(termcolor.Red("[error] ") + "switching the llm interface is not available in this run\n")
+			break
+		}
+		spec := strings.TrimSpace(strings.Join(args, " "))
+		if spec == "" {
+			var infos []config.APIInfo
+			if c.apiList != nil {
+				infos = c.apiList()
+			}
+			c.write(slash.APIListText(infos) + "\n")
+			break
+		}
+		msg, err := c.apiSwitch(spec)
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + err.Error() + "\n")
+			break
+		}
+		c.write(termcolor.Cyan("[info] ") + msg + "\n")
 	}
 	return false
 }

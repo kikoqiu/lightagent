@@ -83,8 +83,8 @@ func newBusyTestServer(t *testing.T) *Server {
 	})
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = api.URL
-	ag := agent.New(cfg, llm.NewClient(cfg.OpenAI), tools.NewRegistry(), agent.NewBus())
+	cfg.LLMs[0].APIBase = api.URL
+	ag := agent.New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), agent.NewBus())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"lightagent/internal/agent"
@@ -61,7 +62,7 @@ func runSession(o *options, stdout io.Writer) error {
 	}
 	if created {
 		info("created default config at %s\n", cfgPath)
-		info("edit it (at least openai.api_key) and run again.\n")
+		info("edit it (at least the first interface's api_key) and run again.\n")
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("%v (config: %s)", err, cfgPath)
@@ -92,7 +93,10 @@ func runSession(o *options, stdout io.Writer) error {
 		info("session migration: %v\n", err)
 	}
 
-	client := llm.NewClient(cfg.OpenAI)
+	// The interface a run starts on: the first enabled one. /switchapi picks
+	// another at runtime, in memory only (see apiRuntime).
+	activeIdx, activeAPI, _ := cfg.ActiveLLM()
+	client := llm.NewClient(activeAPI.OpenAIConfig)
 	reg := tools.NewRegistry()
 	if cfg.Tools.Exec.Enabled {
 		engine := tools.NewExecEngine(cfg.Tools.Exec.TimeoutSeconds, cfg.Tools.Exec.WaitSeconds, cfg.Tools.Exec.UseUTF8)
@@ -116,10 +120,10 @@ func runSession(o *options, stdout io.Writer) error {
 		reg.Register(tools.NewEditFileTool())
 	}
 	// The multimedia capability is configured on the model side
-	// (openai.media_types) and switched on per tool
+	// (the active interface's media_types) and switched on per tool
 	// (tools.upload_media.enabled): only the two together register the uploader,
 	// which is also the capability the web mirror's attach control offers.
-	mediaCfg, uploadTool := mediaCapability(cfg)
+	mediaCfg, uploadTool := mediaCapability(activeAPI, cfg)
 	if uploadTool {
 		reg.Register(tools.NewUploadMediaTool(mediaCfg))
 	}
@@ -176,6 +180,18 @@ func runSession(o *options, stdout io.Writer) error {
 		ag.SetToolResultsVisible(*o.result)
 	}
 
+	// Runtime interface selection for /switchapi. It swaps the agent's client
+	// at runtime and refreshes the one capability that depends on the interface
+	// (the multimedia uploader); nothing else built above does, so this is the
+	// lightweight equivalent of a reload. The front-end hooks (CLI label, web
+	// broadcast) are attached as those components appear.
+	runtime := &apiRuntime{
+		cfg:    cfg,
+		agent:  ag,
+		reg:    reg,
+		active: activeIdx,
+	}
+
 	interactive := o.prompt == ""
 
 	// Resume handling: -r always resumes. The interactive REPL otherwise asks
@@ -228,6 +244,11 @@ func runSession(o *options, stdout io.Writer) error {
 
 	c := cli.New(ag, st, client.Model(), cfg.UI.Markdown)
 	c.SetOutput(out)
+	// /switchapi reaches the same runtime selection as the web dropdown; the
+	// CLI's model label follows whatever interface becomes active.
+	runtime.onModel = c.SetModel
+	c.SetAPISwitcher(runtime.switchAPI)
+	c.SetAPIList(runtime.list)
 	// A resumed conversation belongs to the file it came from, so a save (the
 	// exit prompt included) updates that file rather than backing it up.
 	c.SetHome(resumedPath)
@@ -300,6 +321,15 @@ func runSession(o *options, stdout io.Writer) error {
 		// uploads land in (.lightagent/uploads beside the session files). They
 		// travel with the next user message.
 		srv.SetMedia(mediaCfg, filepath.Join(st.Root(), web.UploadsDirName))
+		// The model dropdown and /switchapi reach the same runtime selection;
+		// switching refreshes the attach control and tells every page which
+		// interface (and model) is active now.
+		runtime.onMedia = func(m tools.MediaConfig) {
+			srv.SetMedia(m, filepath.Join(st.Root(), web.UploadsDirName))
+		}
+		runtime.onSwitched = srv.BroadcastAPI
+		srv.SetAPISwitcher(runtime.switchAPI)
+		srv.SetAPIList(runtime.list)
 		srv.Start()
 		defer srv.Close()
 		webPort = srv.Port()
@@ -313,16 +343,96 @@ func runSession(o *options, stdout io.Writer) error {
 }
 
 // mediaCapability decides the multimedia side of a run from the two settings
-// that together make it up: the types the model accepts (openai.media_types)
-// turn the capability on, and the tool's own switch (tools.upload_media.enabled)
-// decides whether the model gets upload_media as well.
+// that together make it up: the types the interface's model accepts
+// (providers[].media_types) turn the capability on, and the tool's own switch
+// (tools.upload_media.enabled) decides whether the model gets upload_media as
+// well.
 //
 // The returned config always carries the accepted types (the web mirror's attach
 // control is offered whenever any type is configured); the second value reports
 // whether the tool itself must be registered, which needs both sides.
-func mediaCapability(cfg *config.Config) (tools.MediaConfig, bool) {
-	media := tools.NewMediaConfig(cfg.OpenAI.MediaTypes, cfg.Tools.UploadMedia.MaxBytes)
+func mediaCapability(api config.LLMConfig, cfg *config.Config) (tools.MediaConfig, bool) {
+	media := tools.NewMediaConfig(api.MediaTypes, cfg.Tools.UploadMedia.MaxBytes)
 	return media, media.Enabled() && cfg.Tools.UploadMedia.Enabled
+}
+
+// apiRuntime owns the runtime interface selection. The interfaces themselves
+// live in cfg; only the active index and the front-end hooks are kept here, and
+// none of it is written back to config.json — the selection is per run.
+//
+// A switch rebuilds the client for the chosen interface and refreshes the
+// multimedia uploader, which is the one capability besides the client that the
+// interface decides. Everything else the program built at startup is
+// interface-independent, so a switch is the lightweight equivalent of reloading
+// the program on a new interface.
+type apiRuntime struct {
+	cfg   *config.Config
+	agent *agent.Agent
+	reg   *tools.Registry
+
+	mu     sync.Mutex
+	active int
+
+	// Hooks, attached as the front-ends come up (nil when absent).
+	onModel    func(model string)
+	onMedia    func(tools.MediaConfig)
+	onSwitched func()
+}
+
+// list describes every interface, marking the active one. It backs /switchapi
+// with no argument and the web mirror's model dropdown.
+func (r *apiRuntime) list() []config.APIInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cfg.APIInfos(r.active)
+}
+
+// switchAPI makes the interface named (or numbered) by spec the active one. It
+// refuses while a turn is running. The returned message is the confirmation a
+// front-end shows.
+func (r *apiRuntime) switchAPI(spec string) (string, error) {
+	idx, ok := r.cfg.LLMIndex(spec)
+	if !ok {
+		return "", fmt.Errorf("no llm interface %q (run /switchapi with no argument to list them)", spec)
+	}
+	api := r.cfg.LLMs[idx]
+	if !api.Enabled {
+		return "", fmt.Errorf("llm interface %q is disabled", api.Name)
+	}
+	r.mu.Lock()
+	same := idx == r.active
+	r.mu.Unlock()
+	if same {
+		return fmt.Sprintf("already using %q (%s)", api.Name, api.Model), nil
+	}
+	if r.agent.Busy() {
+		return "", errors.New("a turn is running; try again when idle")
+	}
+	client := llm.NewClient(api.OpenAIConfig)
+	if err := r.agent.SwitchLLM(client, api.ContextWindow, api.MaxTokens); err != nil {
+		return "", err
+	}
+	r.mu.Lock()
+	r.active = idx
+	r.mu.Unlock()
+	// The multimedia capability is the one thing besides the client that the
+	// interface decides: keep the uploader (and the web attach control) in step.
+	media, uploadEnabled := mediaCapability(api, r.cfg)
+	if uploadEnabled {
+		r.reg.Register(tools.NewUploadMediaTool(media))
+	} else {
+		r.reg.Unregister(tools.UploadMediaToolName)
+	}
+	if r.onMedia != nil {
+		r.onMedia(media)
+	}
+	if r.onModel != nil {
+		r.onModel(api.Model)
+	}
+	if r.onSwitched != nil {
+		r.onSwitched()
+	}
+	return fmt.Sprintf("switched to %q (%s)", api.Name, api.Model), nil
 }
 
 // resolveStore builds the session store, honouring --session.
@@ -335,17 +445,23 @@ func resolveStore(o *options, workdir string) (*store.Store, error) {
 
 // applyOverrides layers command-line overrides on top of the loaded config.
 func applyOverrides(cfg *config.Config, o *options) {
-	if o.model != "" {
-		cfg.OpenAI.Model = o.model
-	}
-	if o.apiBase != "" {
-		cfg.OpenAI.APIBase = o.apiBase
-	}
-	if o.stream != nil {
-		cfg.OpenAI.Stream = *o.stream
-	}
-	if o.timeout >= 0 {
-		cfg.OpenAI.TimeoutSec = o.timeout
+	// The overrides target the interface the run starts on (the first enabled
+	// one); /switchapi still reaches every interface in memory.
+	if len(cfg.LLMs) > 0 {
+		idx, _, _ := cfg.ActiveLLM()
+		api := &cfg.LLMs[idx]
+		if o.model != "" {
+			api.Model = o.model
+		}
+		if o.apiBase != "" {
+			api.APIBase = o.apiBase
+		}
+		if o.stream != nil {
+			api.Stream = *o.stream
+		}
+		if o.timeout >= 0 {
+			api.TimeoutSec = o.timeout
+		}
 	}
 	if o.markdown != nil {
 		cfg.UI.Markdown = *o.markdown

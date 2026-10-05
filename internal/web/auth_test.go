@@ -383,8 +383,8 @@ func TestConfigPutKeepsTheStoredPassword(t *testing.T) {
 	if saved.Web.Password != "hunter2" || saved.Web.PasswordSalt != "0123456789abcdef0123456789abcdef" {
 		t.Fatalf("stored credential = %q / %q, want it untouched", saved.Web.Password, saved.Web.PasswordSalt)
 	}
-	if saved.OpenAI.Model != "m2" {
-		t.Fatalf("model = %q, want the edit to have landed", saved.OpenAI.Model)
+	if saved.LLMs[0].Model != "m2" {
+		t.Fatalf("model = %q, want the edit to have landed", saved.LLMs[0].Model)
 	}
 	if status := getJSON(t, signIn(t, srv, "hunter2"), baseURL(srv)+"/api/config", nil); status != http.StatusOK {
 		t.Fatalf("status = %d, want the password to keep working", status)

@@ -606,6 +606,10 @@
   // setRunning shows or hides the "running" indicator (and the Stop button). A
   // turn is in progress between a user message and the matching turn_done.
   function setRunning(on) {
+    // The model picker cannot be changed mid-turn (the switch is refused then),
+    // so it follows the running state even while a replay is in progress.
+    var picker = document.getElementById('modelSelect');
+    if (picker) { picker.disabled = !!on; }
     if (replaying) { return; }
     running = !!on;
     if (on) { runEl.classList.add('on'); stopEl.classList.add('on'); startTurnTimer(); }
@@ -657,6 +661,48 @@
     }
     if (pctEl) { pctEl.textContent = pct.toFixed(1) + '%'; }
     if (noteEl) { noteEl.textContent = tokens + ' / ' + win + ' tokens'; }
+  }
+
+  // apiName is the active provider's name, shown under the logo. The green dot
+  // already tells connection state apart, so that line is never
+  // "online"/"offline": it holds the last known name (and "connecting…" only
+  // until one is known).
+  var apiName = '';
+  function setAPIName(name) {
+    if (!name) { return; }
+    apiName = name;
+    if (!statusEl || stopped) { return; }
+    statusEl.textContent = name;
+    statusEl.title = name;
+  }
+
+  // buildModelSelect fills the sidebar dropdown from the interface list and
+  // wires it to /switchapi. The active interface is selected; the control is
+  // disabled while a turn runs (setRunning keeps it in step).
+  function buildModelSelect(apis) {
+    var sel = document.getElementById('modelSelect');
+    if (!sel) { return; }
+    var active = null;
+    sel.textContent = '';
+    (apis || []).forEach(function (api) {
+      var opt = document.createElement('option');
+      opt.value = String(api.index);
+      opt.textContent = api.name;
+      opt.disabled = !api.enabled;
+      if (api.active) { opt.selected = true; active = api; }
+      sel.appendChild(opt);
+    });
+    if (active) { setAPIName(active.name); }
+    sel.disabled = running;
+    if (!sel.dataset.wired) {
+      sel.dataset.wired = '1';
+      // A change sends /switchapi for the picked number; the server refuses it
+      // while a turn runs, and the select is disabled then anyway.
+      sel.addEventListener('change', function () {
+        if (running) { return; }
+        sendCommand('/switchapi', sel.value);
+      });
+    }
   }
 
   // syncResults follows the shared /result switch: the server announces every
@@ -1820,6 +1866,11 @@
       setSwitch('/markdown', s.markdown);
     }
     if (typeof s.result === 'boolean') { setSwitch('/result', s.result); }
+    // The active interface name and the list travel with the settings/history
+    // frames, so a runtime /switchapi reaches every page and the dropdown stays
+    // current.
+    if (typeof s.name === 'string') { setAPIName(s.name); }
+    if (Array.isArray(s.apis)) { buildModelSelect(s.apis); }
   }
 
   // sendCommand submits one rail click on the shared connection.
@@ -2558,14 +2609,19 @@
       restarting = false;
       dot.classList.add('on');
       dot.title = 'connected';
-      statusEl.textContent = 'online';
+      // The line under the logo is the provider name, not a connection word
+      // (the dot covers that): restore the last known one, if any, and otherwise
+      // leave "connecting…" until the snapshot arrives with the name.
+      if (apiName && !stopped) { statusEl.textContent = apiName; statusEl.title = apiName; }
       sendEl.disabled = false;
       if (cameBack) { notifyReconnected(); }
     };
     ws.onclose = function () {
       dot.classList.remove('on');
       dot.title = 'disconnected';
-      statusEl.textContent = restarting ? 'restarting…' : 'offline';
+      // Keep the model name on the line: the dot is what reports the drop, so
+      // there is no "offline" word. Only an in-flight restart says so.
+      if (restarting) { statusEl.textContent = 'restarting…'; }
       sendEl.disabled = true;
       // A socket that dropped in the middle of a snapshot leaves a half-built
       // log: drop the replay state before clearing the indicator, so the
@@ -2995,6 +3051,11 @@
   // connection is dialed. The session panels register their rows first.
   buildSessionPanels();
   buildCommands();
+  // The model picker and the name under the logo are filled from the injected
+  // interface list right away, then refreshed by every snapshot and settings
+  // frame.
+  buildModelSelect(CFG.apis || []);
+  if (CFG.name) { setAPIName(CFG.name); }
   sendEl.disabled = true;
   // Wait for the session state before dialing: the handshake fails without a
   // session, and the dialog may sign this browser in on its own with a stored

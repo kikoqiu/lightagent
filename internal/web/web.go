@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"lightagent/internal/agent"
+	"lightagent/internal/config"
 	"lightagent/internal/llm"
 	"lightagent/internal/slash"
 	"lightagent/internal/store"
@@ -110,6 +111,12 @@ type Server struct {
 	// registered by the program (SetSessionNewer); a nil one leaves /new
 	// resetting only the conversation, which is what /clear does.
 	newSession func()
+	// apiSwitch switches the active LLM interface (the page's model dropdown and
+	// /switchapi); apiList describes the interfaces. Both are registered by the
+	// program (SetAPISwitcher / SetAPIList); a nil one means the picker is
+	// unavailable.
+	apiSwitch func(spec string) (string, error)
+	apiList   func() []config.APIInfo
 	// restart starts a replacement of this program and hands the run over to it.
 	// It is registered by the program (SetRestarter) and backs the page's
 	// Restart button; the zero value means restarting is unavailable (see
@@ -234,6 +241,44 @@ func (s *Server) SetSessionRemover(fn func(name string) (string, error)) { s.rem
 // cli.CLI.NewSession. Without it /new still clears the conversation but keeps
 // the current file, exactly like /clear.
 func (s *Server) SetSessionNewer(fn func()) { s.newSession = fn }
+
+// SetAPISwitcher registers the callback behind the browser's /switchapi and its
+// model dropdown: it makes the named or numbered interface active and returns a
+// confirmation message. The program wires it to the runtime interface selection
+// (the same one the CLI's /switchapi reaches).
+func (s *Server) SetAPISwitcher(fn func(spec string) (string, error)) { s.apiSwitch = fn }
+
+// SetAPIList registers the callback that describes the configured LLM
+// interfaces, backing the page's model dropdown and /switchapi with no argument.
+func (s *Server) SetAPIList(fn func() []config.APIInfo) { s.apiList = fn }
+
+// apiInfos returns the interface list the picker shows, or nil when the mirror
+// runs without one.
+func (s *Server) apiInfos() []config.APIInfo {
+	if s.apiList == nil {
+		return nil
+	}
+	return s.apiList()
+}
+
+// activeAPIName is the name of the interface in use, shown under the logo and
+// carried by the state frames. When no picker is wired (an embedder without
+// providers) it falls back to the model name.
+func (s *Server) activeAPIName() string {
+	for _, info := range s.apiInfos() {
+		if info.Active {
+			return info.Name
+		}
+	}
+	return s.agent.Model()
+}
+
+// BroadcastAPI pushes the current interface state to every connected page, so
+// each drops the old model name and picks the new one up in its dropdown. It is
+// the settings frame the mirror already uses for its switches, which now also
+// carries the active model and the interface list.
+func (s *Server) BroadcastAPI() { s.broadcastSettings() }
+
 // Start seeds the in-memory scrollback, serves in the background and subscribes
 // to the agent event bus.
 func (s *Server) Start() {
@@ -818,6 +863,11 @@ type historyHeader struct {
 	Markdown bool   `json:"markdown"`
 	Result   bool   `json:"result"`
 	Count    int    `json:"count"`
+	// Name and APIs describe the active LLM interface, so the page shows the
+	// right interface name under the logo and fills its dropdown as soon as it
+	// connects.
+	Name string           `json:"name"`
+	APIs []config.APIInfo `json:"apis,omitempty"`
 }
 
 // historyRowsFrame is one batch of replayed rows.
@@ -839,6 +889,10 @@ type historySameFrame struct {
 	Busy     bool   `json:"busy"`
 	Markdown bool   `json:"markdown"`
 	Result   bool   `json:"result"`
+	// Name and APIs ride here too: the interface can change without the rows
+	// changing, and a reconnecting page must not keep a stale name.
+	Name string           `json:"name"`
+	APIs []config.APIInfo `json:"apis,omitempty"`
 }
 
 // sameHistoryFrame renders the "nothing new" reply from the same header the
@@ -853,6 +907,8 @@ func sameHistoryFrame(header historyHeader) []byte {
 		Busy:     header.Busy,
 		Markdown: header.Markdown,
 		Result:   header.Result,
+		Name:     header.Name,
+		APIs:     header.APIs,
 	})
 	if err != nil {
 		return nil
@@ -873,6 +929,8 @@ func (s *Server) historyHeaderLocked(rows int) historyHeader {
 		Markdown: s.markdown,
 		Result:   s.agent.ToolResultsVisible(),
 		Count:    rows,
+		Name:     s.activeAPIName(),
+		APIs:     s.apiInfos(),
 	}
 }
 
@@ -1182,6 +1240,25 @@ func (s *Server) handleCommand(text string) {
 			state = "markdown rendering on"
 		}
 		s.localInfo(state)
+	case "/switchapi":
+		if s.apiSwitch == nil {
+			s.fail("switching the llm interface is not available in this run")
+			return
+		}
+		spec := strings.TrimSpace(strings.Join(args, " "))
+		if spec == "" {
+			s.localInfo(slash.APIListText(s.apiInfos()))
+			return
+		}
+		msg, err := s.apiSwitch(spec)
+		if err != nil {
+			s.fail(err.Error())
+			return
+		}
+		// The switch already broadcast the new interface state to every page;
+		// the confirmation row goes to everyone like the other session-wide
+		// commands.
+		s.info(msg)
 	case "/exit":
 		// /exit ends the whole session — terminal included — after asking whether
 		// to save, so the page points at the terminal instead.
@@ -1396,6 +1473,11 @@ func (s *Server) settingsFrame() []byte {
 		"type":     "settings",
 		"markdown": s.markdownEnabled(),
 		"result":   s.agent.ToolResultsVisible(),
+		// The active interface name and the list ride along, so a runtime
+		// /switchapi reaches every page (and a page that missed the info row
+		// still shows the right name).
+		"name": s.activeAPIName(),
+		"apis": s.apiInfos(),
 	})
 	if err != nil {
 		return nil
@@ -1434,7 +1516,23 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_COMMANDS__", commandsJSON())
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_MEDIA__", s.mediaJSON())
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_RESTART__", strconv.FormatBool(s.canRestart()))
+	// The active interface name (shown under the logo) and the interface list
+	// (the model dropdown) travel with the page, so the header is right before
+	// the socket even opens.
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_NAME__", strconv.Quote(s.activeAPIName()))
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_APIS__", s.apiInfosJSON())
 	fmt.Fprint(w, body)
+}
+
+// apiInfosJSON is the interface list handed to the page
+// (window.__LIGHTAGENT__.apis); the model dropdown is built from it and kept in
+// step by the settings frames.
+func (s *Server) apiInfosJSON() string {
+	data, err := json.Marshal(s.apiInfos())
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
 }
 
 // mediaJSON is the media capability handed to the page: whether the composer

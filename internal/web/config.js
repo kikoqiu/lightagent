@@ -54,29 +54,23 @@
 
   // The schema: one descriptor per option of the Go struct (camelCase keys are
   // the JSON paths, dots nest). type is one of text, password, number, slider,
-  // bool, select, textarea, json, list. help is shown under the key; advanced
-  // marks free-form JSON that has no useful control shape (extra_body, servers);
-  // a list is entered as a comma separated string and saved as a JSON array.
+  // bool, select, textarea, json, list, providers. help is shown under the key;
+  // advanced marks free-form JSON that has no useful control shape (extra_body,
+  // servers); a list is entered as a comma separated string and saved as a JSON
+  // array; providers is the ordered interface array, which the flat path model
+  // cannot express and a dedicated repeater owns (see the providers repeater
+  // below).
   var SCHEMA = [
     {
-      title: 'OpenAI', note: 'endpoint, credentials, request shape', open: true,
+      title: 'Providers', note: 'one entry per endpoint; the first enabled one is used at startup', open: true,
       fields: [
-        { path: 'openai.api_base', type: 'text', help: 'base URL; the client appends /chat/completions. empty = built-in default' },
-        { path: 'openai.api_key', type: 'password', help: '*** keeps the stored key — paste a new one to replace it' },
-        { path: 'openai.model', type: 'text', placeholder: 'gpt-4o-mini', help: 'model name' },
-        { path: 'openai.stream', type: 'bool', help: 'stream the reply over SSE' },
-        { path: 'openai.temperature', type: 'slider', min: -0.05, max: 2, step: 0.05, fallback: -0.05, omit: { below: 0, value: -1, label: 'omitted (provider default)' }, help: 'sampling temperature; the leftmost position omits the field so the provider uses its own default, 0 is deterministic, 2 is maximum randomness' },
-        { path: 'openai.max_tokens', type: 'number', min: 1, help: 'cap per reply' },
-        { path: 'openai.timeout_seconds', type: 'number', min: 0, help: 'idle timeout in seconds (waiting for headers or between stream chunks); 0 disables it' },
-        { path: 'openai.media_types', type: 'list', placeholder: 'image/png, image/jpeg, audio/wav', help: 'media types this model accepts as attachments (comma separated), e.g. image/png, image/*, audio/wav, application/pdf. A family name means the whole family ("image" = "image/*"). Configuring it enables attachments: the web composer can send files and, with tools.upload_media.enabled, the model gets the upload_media tool' },
-        { path: 'openai.extra_body', type: 'json', advanced: true, rows: 5, help: 'provider-specific request fields, merged into the request body (overrides built-ins such as temperature)' }
+        { path: 'providers', type: 'providers' }
       ]
     },
     {
-      title: 'Context', note: 'window size and compression threshold', open: true,
+      title: 'Context', note: 'compression threshold and retention', open: true,
       fields: [
-        { path: 'context.context_window', type: 'number', min: 1, help: 'model context window in tokens; drives compression and the usage badge' },
-        { path: 'context.summarize_token_percent', type: 'slider', min: 1, max: 100, step: 1, fallback: 75, help: 'compress once usage reaches this % of the window' },
+        { path: 'context.summarize_token_percent', type: 'slider', min: 1, max: 100, step: 1, fallback: 75, help: 'compress once usage reaches this % of the window (the window itself is per interface — see LLM interfaces)' },
         { path: 'context.summarize_keep.auto.budget_percent', type: 'slider', min: 0, max: 100, step: 1, fallback: 0, help: 'share of the available input budget (window minus max_tokens) the automatic pass keeps raw; 0 keeps no raw message, which keeps the prompt cache valid across the rollback some engines cannot handle' },
         { path: 'context.summarize_keep.auto.turns', type: 'number', min: 0, help: 'complete turns the automatic pass keeps raw at most; 0 keeps none' },
         { path: 'context.summarize_keep.manual.budget_percent', type: 'slider', min: 0, max: 100, step: 1, fallback: 0, help: 'same for /compact' },
@@ -251,8 +245,8 @@
   function friendly(message) {
     var unknown = /unknown field "([^"]+)"/.exec(message);
     if (unknown) { return message + ' — open JSON mode and delete ' + unknown[1]; }
-    if (message === 'openai.api_key is empty; edit the config file and try again') {
-      return 'openai.api_key is empty: paste a key in the OpenAI section';
+    if (/api_key is empty/.test(message)) {
+      return message + ' — paste a key under LLM interfaces';
     }
     return message;
   }
@@ -307,15 +301,20 @@
     return { el: el, out: out };
   }
 
+  // setError / clearError toggle only the "invalid" class instead of rewriting
+  // className: a field's base class is not always "field" (the providers
+  // repeater is a "providers-block"), and syncForm clears the error of every
+  // field — a plain className reset there would demote the repeater back to a
+  // .field grid and squeeze its cards into the narrow key column.
   function setError(field, message) {
     field.bad = true;
-    field.wrap.className = 'field invalid';
+    field.wrap.classList.add('invalid');
     field.err.textContent = message;
   }
 
   function clearError(field) {
     field.bad = false;
-    field.wrap.className = 'field';
+    field.wrap.classList.remove('invalid');
     field.err.textContent = '';
   }
 
@@ -350,7 +349,14 @@
     err.className = 'field-err';
 
     var record = { def: def, wrap: wrap, err: err, bad: false };
-    if (def.type === 'secret') {
+    if (def.type === 'providers') {
+      // The provider array owns its own controls (see the providers repeater).
+      // It is not an ordinary field row: no key label, no label column and no
+      // grid, so the cards take the whole width instead of half of it.
+      wrap.className = 'providers-block';
+      control.className = 'providers-control';
+      buildLLMControl(control, record);
+    } else if (def.type === 'secret') {
       // The credential is written by its own endpoint (the server keeps the
       // plaintext and hands the browser a salt, so there is no document field to
       // edit here).
@@ -368,7 +374,8 @@
     }
     control.appendChild(err);
 
-    wrap.appendChild(label);
+    // The providers repeater is named by its section, so it carries no key label.
+    if (def.type !== 'providers') { wrap.appendChild(label); }
     wrap.appendChild(control);
     fields.push(record);
     return wrap;
@@ -440,6 +447,345 @@
       setError(field, friendly(err.message));
       setStatus('password update failed: ' + friendly(err.message), 'bad');
     });
+  }
+
+  // ---- the providers repeater ----
+  //
+  // The interfaces are an ordered array, which the flat path/field model cannot
+  // express, so this control owns the whole array: one card per entry, the
+  // arrows reorder them and the buttons add/remove. Every change writes straight
+  // into draft.providers, so the JSON mode always shows exactly what a save sends.
+  // The card edits the stored object in place, so a key the fields below do not
+  // cover (anything a future version adds) is left untouched.
+
+  // Each entry carries the same help the flat form used to show under the key;
+  // the card renders it in the row's label column (see renderLLMField).
+  var LLM_FIELDS = [
+    { key: 'name', label: 'name', type: 'text', placeholder: 'default', help: 'name of this interface: the sidebar model picker and /switchapi refer to it' },
+    { key: 'type', label: 'type', type: 'select', options: ['openai'], help: 'request shape; "openai" covers any /chat/completions-compatible endpoint' },
+    { key: 'enabled', label: 'enabled', type: 'bool', help: 'offer this interface in the model picker; a run starts on the first enabled one' },
+    { key: 'api_base', label: 'api_base', type: 'text', placeholder: 'https://api.openai.com/v1', help: 'base URL; the client appends /chat/completions. empty = built-in default' },
+    { key: 'api_key', label: 'api_key', type: 'password', placeholder: '*** keeps the stored key', help: '*** keeps the stored key — paste a new one to replace it' },
+    { key: 'model', label: 'model', type: 'text', placeholder: 'gpt-4o-mini', help: 'model name' },
+    { key: 'context_window', label: 'context_window', type: 'number', placeholder: '81960', help: 'model context window in tokens; drives compression and the usage badge' },
+    { key: 'temperature', label: 'temperature', type: 'range', min: -0.05, max: 2, step: 0.05, fallback: -0.05, omit: { below: 0, value: -1, label: 'omitted (provider default)' }, help: 'sampling temperature; the leftmost position omits the field so the provider uses its own default, 0 is deterministic, 2 is maximum randomness' },
+    { key: 'max_tokens', label: 'max_tokens', type: 'number', placeholder: '40960', help: 'cap per reply' },
+    { key: 'timeout_seconds', label: 'timeout_seconds', type: 'number', placeholder: '4800', help: 'idle timeout in seconds (waiting for headers or between stream chunks); 0 disables it' },
+    { key: 'stream', label: 'stream', type: 'bool', help: 'stream the reply over SSE' },
+    { key: 'media_types', label: 'media_types', type: 'text', placeholder: 'image/png, image/jpeg, audio/wav', help: 'media types this model accepts as attachments (comma separated), e.g. image/png, image/*, audio/wav, application/pdf. A family name means the whole family ("image" = "image/*"). Configuring it enables attachments: the web composer can send files and, with tools.upload_media.enabled, the model gets the upload_media tool' },
+    { key: 'extra_body', label: 'extra_body', type: 'json', advanced: true, rows: 5, help: 'provider-specific request fields, merged into the request body (overrides built-ins such as temperature)' }
+  ];
+
+  // buildLLMControl creates the container and the Add button once; the cards
+  // themselves are (re)built by syncLLMRepeater.
+  function buildLLMControl(control, record) {
+    var list = document.createElement('div');
+    list.className = 'llm-list';
+    record.listEl = list;
+    control.appendChild(list);
+    var add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'ghost llm-add';
+    add.textContent = 'Add provider';
+    add.onclick = function () {
+      var llms = ensureLLMs();
+      // The new card is the one about to be filled in, so it opens. The flags are
+      // padded first, so appending lands on the new card's position.
+      syncOpenFlags(llms.length);
+      llms.push({ name: 'api-' + (llms.length + 1), type: 'openai', enabled: true });
+      llmOpen.push(true);
+      touchLLM(record);
+    };
+    control.appendChild(add);
+  }
+
+  function ensureLLMs() {
+    if (!isArray(draft.providers)) { draft.providers = []; }
+    return draft.providers;
+  }
+
+  // touchLLM marks an edit as unsaved and rebuilds the cards. It is used after a
+  // structural change (add / move / remove); a keystroke only writes the
+  // document, so the focus is never lost.
+  function touchLLM(record) {
+    dirty = true;
+    setStatus('unsaved changes — Save writes them to config.json');
+    syncLLMRepeater(record);
+  }
+
+  // badLLM holds the card rows a save would have to reject (a free-form box whose
+  // text does not parse). The rows are not top-level fields, so firstBad consults
+  // this list too; every rebuild of the cards clears it, because the rows are new
+  // elements by then.
+  var badLLM = [];
+
+  function trackBad(row, bad) {
+    var at = badLLM.indexOf(row);
+    if (bad && at < 0) { badLLM.push(row); }
+    else if (!bad && at >= 0) { badLLM.splice(at, 1); }
+  }
+
+  // llmOpen mirrors draft.providers: one flag per card, so that a rebuild (a
+  // reorder, an add) keeps the cards the reader opened. load clears it, which is
+  // the folded default of a freshly opened panel.
+  var llmOpen = [];
+
+  function syncOpenFlags(count) {
+    while (llmOpen.length < count) { llmOpen.push(false); }
+    llmOpen.length = count;
+  }
+
+  // syncLLMRepeater rebuilds the cards from the document.
+  function syncLLMRepeater(record) {
+    var list = record.listEl;
+    if (!list) { return; }
+    badLLM = []; // the rows below are new elements
+    list.textContent = '';
+    var llms = isArray(draft.providers) ? draft.providers : [];
+    if (llms.length === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'llm-empty';
+      empty.textContent = 'no providers — add one';
+      list.appendChild(empty);
+      return;
+    }
+    syncOpenFlags(llms.length);
+    for (var i = 0; i < llms.length; i++) {
+      list.appendChild(renderLLMCard(record, i));
+    }
+  }
+
+  function renderLLMCard(record, index) {
+    var entry = draft.providers[index];
+    var open = llmOpen[index] === true;
+    var card = document.createElement('div');
+    card.className = open ? 'llm-card' : 'llm-card collapsed';
+    var head = document.createElement('div');
+    head.className = 'llm-head';
+    // The bar is the fold: the caret and the interface name sit on a button that
+    // opens and closes the card, while the tool buttons next to it stay put (they
+    // are siblings, so their clicks never reach the toggle).
+    var title = document.createElement('button');
+    title.type = 'button';
+    title.className = 'llm-title';
+    title.setAttribute('aria-expanded', open ? 'true' : 'false');
+    var caret = document.createElement('span');
+    caret.className = 'llm-caret';
+    caret.textContent = '▾';
+    title.appendChild(caret);
+    var name = document.createElement('span');
+    name.className = 'llm-name';
+    name.textContent = '#' + (index + 1) + ' · ' + (entry.name || '(unnamed)');
+    title.appendChild(name);
+    title.onclick = function () {
+      var folded = card.classList.toggle('collapsed');
+      llmOpen[index] = !folded;
+      title.setAttribute('aria-expanded', folded ? 'false' : 'true');
+    };
+    head.appendChild(title);
+    var tools = document.createElement('span');
+    tools.className = 'llm-tools';
+    tools.appendChild(llmButton('↑', index <= 0, 'move up', function () { moveLLM(record, index, -1); }));
+    tools.appendChild(llmButton('↓', index >= draft.providers.length - 1, 'move down', function () { moveLLM(record, index, 1); }));
+    tools.appendChild(llmButton('✕', false, 'remove this provider', function () { removeLLM(record, index); }));
+    head.appendChild(tools);
+    card.appendChild(head);
+
+    var grid = document.createElement('div');
+    grid.className = 'llm-grid';
+    for (var f = 0; f < LLM_FIELDS.length; f++) {
+      grid.appendChild(renderLLMField(entry, LLM_FIELDS[f], index));
+    }
+    card.appendChild(grid);
+    return card;
+  }
+
+  function llmButton(label, disabled, title, onclick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ghost llm-btn';
+    b.textContent = label;
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.disabled = !!disabled;
+    b.onclick = onclick;
+    return b;
+  }
+
+  // Every card carries the per-field explanations the flat form had; the cards
+  // start folded (see syncForm), so a long list of providers shows only its title
+  // bars until one is opened.
+  function renderLLMField(entry, def, index) {
+    var wrap = document.createElement('label');
+    wrap.className = 'llm-field';
+    // The key and its help share the left column, exactly like a .field row.
+    var cell = document.createElement('span');
+    cell.className = 'llm-field-label';
+    var key = document.createElement('span');
+    key.className = 'llm-field-key';
+    key.textContent = def.label;
+    cell.appendChild(key);
+    if (def.advanced) {
+      var tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = 'json';
+      cell.appendChild(tag);
+    }
+    if (def.help) {
+      var help = document.createElement('span');
+      help.className = 'llm-field-help';
+      help.textContent = def.help;
+      cell.appendChild(help);
+    }
+    wrap.appendChild(cell);
+
+    var el, out = null;
+    if (def.type === 'bool') {
+      el = document.createElement('input');
+      el.type = 'checkbox';
+      el.className = 'switch';
+      el.checked = entry[def.key] === true;
+    } else if (def.type === 'select') {
+      el = document.createElement('select');
+      (def.options || []).forEach(function (value) {
+        var opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = value;
+        el.appendChild(opt);
+      });
+      el.value = entry[def.key] || (def.options && def.options[0]) || '';
+    } else if (def.type === 'range') {
+      el = document.createElement('input');
+      el.type = 'range';
+      el.min = def.min;
+      el.max = def.max;
+      el.step = def.step;
+      var stored = entry[def.key];
+      // A value below the omit threshold (the negative sentinel) is shown by the
+      // slider's lowest position instead.
+      el.value = (typeof stored === 'number' && !(def.omit && stored < def.omit.below)) ? stored : def.fallback;
+      out = document.createElement('span');
+      out.className = 'llm-field-out';
+      out.textContent = llmRangeText(def, Number(el.value));
+    } else if (def.type === 'json') {
+      // Free-form JSON (extra_body): the whole object is the control, so it is a
+      // textarea showing the stored value pretty-printed.
+      el = document.createElement('textarea');
+      el.className = 'json-box';
+      el.rows = def.rows || 4;
+      el.spellcheck = false;
+      var raw = entry[def.key];
+      el.value = (raw === undefined || raw === null) ? '' : JSON.stringify(raw, null, 2);
+    } else {
+      el = document.createElement('input');
+      el.type = def.type === 'password' ? 'password' : (def.type === 'number' ? 'number' : 'text');
+      if (def.step !== undefined) { el.step = def.step; }
+      if (def.placeholder) { el.placeholder = def.placeholder; }
+      // A stored secret comes back as the mask; show an empty box instead (the
+      // placeholder says the mask keeps it), while a value the user typed shows
+      // through so switching to JSON shows the same document.
+      el.value = (def.type === 'password' && entry[def.key] === MASK) ? '' : llmFieldValue(entry[def.key]);
+    }
+
+    // The control (and a slider's value badge) share one cell of the row, so the
+    // key stays in the left column.
+    var ctl = document.createElement('span');
+    ctl.className = 'llm-field-control';
+    ctl.appendChild(el);
+    if (out) { ctl.appendChild(out); }
+    wrap.appendChild(ctl);
+
+    // The row's error line: a card row carries the same parts as a top-level
+    // field (wrap / err / bad and the control), so setError, clearError and the
+    // save guard treat it the same way. It spans both columns under the row.
+    var err = document.createElement('span');
+    err.className = 'llm-field-err';
+    wrap.appendChild(err);
+    var row = { def: { path: 'providers[' + (index + 1) + '].' + def.key }, wrap: wrap, err: err, el: el, bad: false };
+
+    var write = function () {
+      try {
+        writeLLMField(entry, def, el);
+      } catch (parseErr) {
+        // The text stays out of the document (the stored value is kept) and the
+        // row is marked, so a save is refused until it is fixed.
+        setError(row, friendly(parseErr.message));
+        trackBad(row, true);
+        return;
+      }
+      clearError(row);
+      trackBad(row, false);
+      if (out) { out.textContent = llmRangeText(def, Number(el.value)); }
+    };
+    el.addEventListener('input', write);
+    el.addEventListener('change', write);
+    return wrap;
+  }
+
+  // llmRangeText is the badge next to a slider: the "omit" label at the lowest
+  // position, the plain number everywhere else.
+  function llmRangeText(def, value) {
+    if (def.omit && value < def.omit.below) { return def.omit.label; }
+    return String(value);
+  }
+
+  function llmFieldValue(value) {
+    if (isArray(value)) { return value.join(', '); }
+    return value === undefined || value === null ? '' : String(value);
+  }
+
+  // writeLLMField stores one control's value into the entry: an empty box drops
+  // the key so the server's default (or the stored secret) applies again. A
+  // free-form JSON box may throw (the value does not parse): the caller reports
+  // it and leaves the document alone.
+  function writeLLMField(entry, def, el) {
+    var value;
+    if (def.type === 'bool') {
+      value = !!el.checked;
+    } else if (def.type === 'range') {
+      var slider = Number(el.value);
+      // The lowest position maps to the stored sentinel (e.g. -1 = omit).
+      value = (def.omit && slider < def.omit.below) ? def.omit.value : slider;
+    } else if (def.type === 'number') {
+      if (String(el.value).trim() === '' || isNaN(Number(el.value))) { value = undefined; }
+      else { value = Number(el.value); }
+    } else if (def.type === 'json') {
+      var text = String(el.value).trim();
+      if (text === '') {
+        value = undefined;
+      } else {
+        var parsed = JSON.parse(text);
+        if (!isObject(parsed)) { throw new Error('expected a JSON object'); }
+        value = parsed;
+      }
+    } else if (def.key === 'media_types') {
+      var items = splitList(el.value);
+      value = items.length ? items : undefined;
+    } else {
+      value = String(el.value) === '' ? undefined : String(el.value);
+    }
+    if (value === undefined) { delete entry[def.key]; }
+    else { entry[def.key] = value; }
+    dirty = true;
+    setStatus('unsaved changes — Save writes them to config.json');
+  }
+
+  function moveLLM(record, index, delta) {
+    var llms = ensureLLMs();
+    var to = index + delta;
+    if (to < 0 || to >= llms.length) { return; }
+    var item = llms.splice(index, 1)[0];
+    llms.splice(to, 0, item);
+    // The fold follows its card: a reorder must not open the card that moved into
+    // the old position.
+    if (index < llmOpen.length) { llmOpen.splice(to, 0, llmOpen.splice(index, 1)[0]); }
+    touchLLM(record);
+  }
+
+  function removeLLM(record, index) {
+    ensureLLMs().splice(index, 1);
+    if (index < llmOpen.length) { llmOpen.splice(index, 1); }
+    touchLLM(record);
   }
 
   function renderForm() {
@@ -530,7 +876,10 @@
       var field = fields[i];
       var value = getPath(draft, field.def.path);
       var empty = value === undefined || value === null;
-      if (field.def.type === 'bool') {
+      if (field.def.type === 'providers') {
+        // The interface array rebuilds its own cards from the document.
+        syncLLMRepeater(field);
+      } else if (field.def.type === 'bool') {
         field.el.checked = value === true;
       } else if (field.def.type === 'secret') {
         // The plaintext never comes back from the server, so the control only
@@ -625,12 +974,13 @@
   }
 
   // firstBad reports the first control the server would reject, so a save never
-  // sends a document the editor already knows is broken.
+  // sends a document the editor already knows is broken. A card row's free-form
+  // JSON registers in badLLM (the repeater owns those rows, see renderLLMField).
   function firstBad() {
     for (var i = 0; i < fields.length; i++) {
       if (fields[i].bad) { return fields[i]; }
     }
-    return null;
+    return badLLM.length ? badLLM[0] : null;
   }
 
   // ---- modes ----
@@ -649,6 +999,20 @@
   function setMode(next) {
     if (next === mode) { return; }
     if (next === 'json') {
+      // The raw editor takes the height the form is showing, so switching modes
+      // never resizes (or jumps) the panel. A form taller than the visible
+      // editor is capped at that height — the textarea scrolls on its own.
+      var body = form.parentNode;
+      var target = form.offsetHeight;
+      if (body) {
+        // The editor's usable height is the visible box minus its padding, so the
+        // textarea fits exactly and the scrolling pane never grows a second
+        // scrollbar.
+        var cs = window.getComputedStyle(body);
+        var inner = body.clientHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+        if (inner > 0 && target > inner) { target = inner; }
+      }
+      if (target > 0) { json.style.height = target + 'px'; }
       // The form already wrote every edit into the document, so the textarea
       // shows exactly what a save would send.
       json.value = documentText();
@@ -683,6 +1047,10 @@
     setStatus('loading…');
     fetch('/api/config', { credentials: 'same-origin' }).then(readJSON).then(function (doc) {
       if (pathEl) { pathEl.textContent = doc.path || ''; }
+      // Opening the panel folds every provider card to its title bar (llmOpen);
+      // from there the reader opens the ones they work on, and a later save keeps
+      // that (the state is per panel, not per document).
+      llmOpen = [];
       showDocument(doc.config, doc.pending_restart);
     }).catch(function (err) { setStatus('load failed: ' + friendly(err.message), 'bad'); });
   }

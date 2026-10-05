@@ -37,8 +37,8 @@ func newMediaTestServer(t *testing.T, types []string, maxBytes int64) (*Server, 
 	t.Helper()
 
 	cfg := config.Default()
-	cfg.OpenAI.APIBase = "http://127.0.0.1:1/v1"
-	client := llm.NewClient(cfg.OpenAI)
+	cfg.LLMs[0].APIBase = "http://127.0.0.1:1/v1"
+	client := llm.NewClient(cfg.LLMs[0].OpenAIConfig)
 	bus := agent.NewBus()
 	ag := agent.New(cfg, client, tools.NewRegistry(), bus)
 

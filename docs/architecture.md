@@ -50,7 +50,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
       * 工具调用的函数名为空，或参数不是合法 JSON —— 说明服务端把响应截断在调用中途
         （即便它最后发的是 `finish_reason=stop`），按「半条工具调用」报错；
       * `finish_reason=length` 且已产生 tool_calls —— 截断可能吃掉调用，提示提高
-        `openai.max_tokens`；
+        当前接口的 `providers[].max_tokens`；
       * `finish_reason=content_filter` —— 答复不完整；
       * SSE 帧以 `{` / `[` 开头却无法解析 —— 帧被截断，静默丢弃会导致内容/工具片段丢失，故报错
         （非 JSON 的心跳帧仍照旧忽略）。
@@ -176,7 +176,7 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 
 * 传输层 `ResponseHeaderTimeout`：等待响应头超过预算即失败；
 * `idleGuard`：包装响应体，每读到数据都会重置看门狗，只有在超过
-  `openai.timeout_seconds` 秒没有任何数据时才取消请求，并返回可操作的错误
+  当前接口的 `providers[].timeout_seconds` 秒没有任何数据时才取消请求，并返回可操作的错误
   （提示提高该值）。
 
 因此「慢但持续输出」的回复不会被截断，而真正停滞的连接会很快失败。该值可用
@@ -194,6 +194,20 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
   在锁外进行，因此慢/卡死的浏览器不会阻塞 Agent、CLI、其它页面或其它 HTTP 端点。
   流式增量的合帧同样只在镜像的锁内做「记录 + 合并」，写出由各连接的写协程负责
   （见 [web.md](web.md#省电移动端与隐藏页面)）。
+
+## 运行时切换 LLM 接口（`/switchapi`）
+
+`config.json` 的 `providers` 是接口数组；启动取**第一个 `enabled`** 的接口（`config.ActiveLLM`）。
+运行时可切换（CLI `/switchapi <name|序号>`、Web 侧栏模型下拉），**只改内存、不写回文件**。
+
+* `Agent.SwitchLLM(client, contextWindow, maxTokens)`：在 `Agent.mu` 下换掉客户端与由接口派生的两个数字
+  （该接口的上下文窗口、`max_tokens`）。`callLLM` 读客户端时持同一把锁，因此切换只会在空闲时发生
+  （`busy` 时拒绝），不会落在某次请求中间。压缩器与 agent 共用同一客户端与这两个数字。
+* `apiRuntime`（`session.go`）持有接口列表与当前序号、并负责切换：重建 `llm.Client`、调用
+  `SwitchLLM`、按新接口的 `media_types` **刷新多媒体附件能力**（`upload_media` 工具与 Web 附加控制），
+  然后通知前端（CLI 的模型标签、Web 的设置帧）。
+* 这等价于「在另一个接口上热重载」的最轻实现：除客户端与附件能力外，程序启动时构建的一切
+  （工具注册表、MCP 连接、会话、服务端与总线）**都与接口无关**，因此无需重建。
 
 ## 持久化
 
@@ -276,7 +290,7 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 1. **Turn 边界**：Turn = 一条 `user` 消息及其之后的全部 assistant/tool 消息，直到下一条
    `user`。保留窗口**总是从某条 user 消息开始**，因此 assistant `tool_calls` 与 `tool`
    结果永远不会被切开，窗口也不会悬挂在孤立的 tool 结果上。
-2. **token 预算**：`available = context_window - openai.max_tokens`（≤0 时回退
+2. **token 预算**：`available = context_window - max_tokens`（两者都取自当前接口，≤0 时回退
    `context_window`）；预算 = `available * budget_percent / 100`，**默认 0，即不保留任何原始消息**。
    预算按 Turn 的**下限估算**（见 [token 估算](#token-估算estimatetokens)）累加，因此保留窗口的真实
    token 可能略高于预算。

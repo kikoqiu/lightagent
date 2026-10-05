@@ -25,6 +25,11 @@ type Command struct {
 	// that only make sense in a terminal (/exit) are still described by the
 	// page's /help, but the side rail does not offer them.
 	Web bool `json:"web,omitempty"`
+	// Hidden keeps a web command out of the side rail while leaving it runnable
+	// from the page's composer (and described by /help). /switchapi uses it: the
+	// sidebar model picker already covers it, so a rail button would only add
+	// noise.
+	Hidden bool `json:"hidden,omitempty"`
 	// Primary keeps the command visible in the mirror's command rail; the other
 	// ones start folded behind the rail's title, so the rail stays short.
 	Primary bool `json:"primary,omitempty"`
@@ -48,22 +53,29 @@ func (c Command) Usage() string {
 
 // Commands is the catalogue, in the order the front-ends list it. Every
 // front-end looks commands up by their canonical name, so the aliases never
-// need a case of their own. The order is also the order of the mirror page's
-// command rail, which shows the Primary entries and folds the rest.
+// need a case of their own. The order is the order of the mirror page's command
+// rail: the Primary entries show first, then the folded ones (Hidden entries
+// never appear there at all). /compact opens the folded group and /help and
+// /stop sit at its very bottom.
 var Commands = []Command{
-	{Name: "/help", Aliases: []string{"/?"}, Summary: "show the command list", Web: true, Primary: true},
+	// The six primary commands show first in the mirror's rail; the rest start
+	// folded (with /compact opening the fold and /help and /stop closing it).
 	{Name: "/new", Summary: "start a new conversation and forget the current session file", Web: true, Primary: true},
 	{Name: "/clear", Summary: "clear the conversation but keep the current session file", Web: true, Primary: true},
 	{Name: "/save", Summary: "write the current conversation to its file now", Web: true, Primary: true},
-	{Name: "/saveas", Args: "[-f] <name>", Summary: "save the conversation under a new name", Web: true},
+	{Name: "/saveas", Args: "[-f] <name>", Summary: "save the conversation under a new name", Web: true, Primary: true},
 	{Name: "/load", Args: "[-f] <name|n>", Summary: "load a saved session by name or /list number", Web: true, Primary: true},
-	{Name: "/list", Args: "[n]", Summary: "list the last n saved sessions (default 10)", Web: true},
-	{Name: "/rm", Args: "<name>", Summary: "delete a saved session by file name", Web: true},
-	{Name: "/stop", Aliases: []string{"/interrupt"}, Summary: "interrupt the turn that is running", Web: true, Primary: true},
+	{Name: "/history", Aliases: []string{"/context"}, Summary: "show message/token usage and context usage", Web: true, Primary: true},
+	// Folded commands start here.
 	{Name: "/compact", Summary: "compress the context now", Web: true},
-	{Name: "/history", Aliases: []string{"/context"}, Summary: "show message/token usage and context usage", Web: true},
+	// Hidden: the sidebar model picker already switches the interface.
+	{Name: "/switchapi", Args: "<name|n>", Summary: "switch the active LLM interface", Web: true, Hidden: true},
 	{Name: "/result", Aliases: []string{"/results"}, Args: "[on|off]", Summary: "show or hide tool/exec results (default on)", Web: true},
 	{Name: "/markdown", Args: "[on|off]", Summary: "toggle markdown rendering", Web: true},
+	{Name: "/list", Args: "[n]", Summary: "list the last n saved sessions (default 10)", Web: true},
+	{Name: "/rm", Args: "<name>", Summary: "delete a saved session by file name", Web: true},
+	{Name: "/help", Aliases: []string{"/?"}, Summary: "show the command list", Web: true},
+	{Name: "/stop", Aliases: []string{"/interrupt"}, Summary: "interrupt the turn that is running", Web: true},
 	{Name: "/exit", Aliases: []string{"/quit", "/q"}, Summary: "quit (you are asked whether to save)"},
 }
 

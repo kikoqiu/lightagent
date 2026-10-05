@@ -10,15 +10,18 @@
   // as markdown in the browser, whether tool results are shown, the command
   // rail (the shared slash catalogue, so the page and the CLI agree), the
   // media capability (which types an attachment may have, and how large one may
-  // be) and whether the mirror can restart the program at all (the config
-  // panel's Restart needs it). Sessions are cookie based, so no token is needed
-  // here (see auth.js).
+  // be), the active interface name and the provider list (the line under the
+  // logo and the model dropdown), and whether the mirror can restart the
+  // program at all (the config panel's Restart needs it). Sessions are cookie
+  // based, so no token is needed here (see auth.js).
   window.__LIGHTAGENT__ = {
     markdown: __LIGHTAGENT_MARKDOWN__,
     result: __LIGHTAGENT_RESULT__,
     commands: __LIGHTAGENT_COMMANDS__,
     media: __LIGHTAGENT_MEDIA__,
-    restart: __LIGHTAGENT_RESTART__
+    restart: __LIGHTAGENT_RESTART__,
+    name: __LIGHTAGENT_NAME__,
+    apis: __LIGHTAGENT_APIS__
   };
 </script>
 <link rel="stylesheet" href="app.css">
@@ -44,6 +47,10 @@
             title="show the session panel" aria-label="show the session panel">
       <span class="logo" aria-hidden="true"></span>
     </button>
+    <!-- The line under the mark is the active provider's name, not a connection
+         word: the green dot already reports the connection, so app.js never
+         writes "online"/"offline" here (only connecting… / restarting… while
+         those are the whole truth). -->
     <span class="brand"><b>lightagent</b><small id="status">connecting…</small></span>
     <span class="head-right">
       <span class="run" id="run"><span class="spin"></span><span id="runText">running</span><span id="elapsed"></span></span>
@@ -77,9 +84,17 @@
        takes the focus with (see setRailOpen in app.js). -->
   <aside class="sidebar" id="sideRail" tabindex="-1" aria-label="session panel">
     <section class="card">
-      <div class="card-title"><span>Context window</span><span class="card-pct" id="meterPct">—</span></div>
+      <!-- The model card: the interface picker on top and the context meter of
+           the active interface's model below — the window belongs to the model,
+           so the two live together. The picker is disabled while a turn runs
+           (app.js setRunning). The percentage sits at the right of the token
+           ratio in the note line; there is no "Context window" title. -->
+      <label class="card-select">
+        <span class="card-select-label">Model</span>
+        <select id="modelSelect" aria-label="active LLM interface"></select>
+      </label>
       <div class="meter" role="progressbar" aria-label="context usage"><span id="meterFill"></span></div>
-      <div class="card-note" id="meterNote">waiting for usage…</div>
+      <div class="card-note meter-note"><span id="meterNote">waiting for usage…</span><span class="card-pct" id="meterPct">—</span></div>
     </section>
     <section class="card">
       <!-- The rail lists the commands this page can run, built from
@@ -93,13 +108,6 @@
       </button>
       <ul class="cmds" id="cmds"></ul>
       <div class="card-note">One click runs a command; the title folds the rest.</div>
-    </section>
-    <section class="card">
-      <div class="card-title"><span>Configuration</span></div>
-      <div class="actions">
-        <button class="ghost" type="button" data-config-open>Edit config.json</button>
-      </div>
-      <div class="card-note">Saved changes apply after a restart; the editor's Restart saves the session and loads it again.</div>
     </section>
     <section class="card">
       <div class="card-title"><span>Read aloud</span></div>

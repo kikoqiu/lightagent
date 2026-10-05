@@ -19,7 +19,7 @@ type Tool interface {
 
 工具由配置开关控制（见 [configuration.md](configuration.md)）：可用的工具有
 `exec_command`、`manage_session`、`read_file`、`write_file`、`edit_file`、`webfetch`，
-以及需要 `openai.media_types` 与 `tools.upload_media.enabled` **同时成立**时才会出现的
+以及需要当前接口的 `providers[].media_types` 与 `tools.upload_media.enabled` **同时成立**时才会出现的
 `upload_media`。
 
 ---
@@ -296,14 +296,14 @@ type Tool interface {
 ## `upload_media`
 
 把一个**本地多媒体文件**读进来并作为附件上传给模型，让模型直接拿到内容（图片、音频、文档本体），
-而不是去读它的字节。**只有当 `openai.media_types` 非空且 `tools.upload_media.enabled` 为 `true`
-时该工具才存在**（见 [configuration.md](configuration.md#openai-media_types--toolsupload_media多媒体附件)）。
+而不是去读它的字节。**只有当当前接口的 `providers[].media_types` 非空且 `tools.upload_media.enabled`
+为 `true` 时该工具才存在**（见 [configuration.md](configuration.md#providers)）。
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `path` | string | 必填 | 要上传的文件路径。参数的 `description` 里**直接列出生效的可接收类型**（来自 `openai.media_types`） |
+| `path` | string | 必填 | 要上传的文件路径。参数的 `description` 里**直接列出生效的可接收类型**（来自 `providers[].media_types`） |
 
-* **可接收类型**：由 `openai.media_types` 决定（小写；族名 = `类型/*`）。类型判定**先看扩展名、
+* **可接收类型**：由当前接口的 `providers[].media_types` 决定（小写；族名 = `类型/*`）。类型判定**先看扩展名、
   再看文件头**，任一候选被接受即通过。
 * **不是可接收类型时报错**（不上传任何内容）：返回形如
   `"x.zip" looks like application/zip, which this model does not accept; upload one of: image/png, application/pdf`，

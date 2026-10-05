@@ -20,28 +20,36 @@
 
 优先级：**命令行 flag > `LIGHTAGENT_CONFIG` > `config.json` > 内置默认**。
 
-首次运行若文件不存在，会写入一份默认配置并提示编辑（至少填写 `openai.api_key`）。
+首次运行若文件不存在，会写入一份默认配置并提示编辑（至少填写 `providers[].api_key`）。
 
 ## 完整示例
 
 ```jsonc
 {
-  "openai": {
-    "api_base": "https://api.openai.com/v1",
-    "api_key": "sk-...",
-    "model": "gpt-4o-mini",
-    "temperature": -1.0,                   // 负值=不发送该字段（交由服务端默认）；0=确定性；>0=采样温度
-    "max_tokens": 40960,
-    "timeout_seconds": 4800,               // 空闲超时：无数据超过该秒数才中断（0=关闭）
-    "stream": true,
-    "media_types": ["image/png", "image/jpeg"],  // 模型可接收的多媒体类型（留空=不启用附件能力）
-    "extra_body": {
-      "reasoning_effort": "high",
-      "top_p": 0.95
+  // LLM 接口列表：每个接口含身份（name / type / enabled）、请求形状与该模型的
+  // 上下文窗口。启动时使用**第一个 enabled** 的接口；运行时可 /switchapi 切换
+  // （只改内存，不写回文件）。type 目前只有 "openai"。
+  "providers": [
+    {
+      "name": "default",
+      "type": "openai",
+      "enabled": true,
+      "api_base": "https://api.openai.com/v1",
+      "api_key": "sk-...",
+      "model": "gpt-4o-mini",
+      "temperature": -1.0,                 // 负值=不发送该字段（交由服务端默认）；0=确定性；>0=采样温度
+      "max_tokens": 40960,
+      "timeout_seconds": 4800,             // 空闲超时：无数据超过该秒数才中断（0=关闭）
+      "stream": true,
+      "media_types": ["image/png", "image/jpeg"],  // 模型可接收的多媒体类型（留空=不启用附件能力）
+      "context_window": 131072,            // 该模型的上下文窗口（token）——它属于模型，故随接口走
+      "extra_body": {
+        "reasoning_effort": "high",
+        "top_p": 0.95
+      }
     }
-  },
+  ],
   "context": {
-    "context_window": 131072,
     "summarize_token_percent": 75,
     // 压缩时保留多少最新消息：auto = 主动压缩，manual = /compact。两者都默认 0，
     // 即不保留任何原始消息：部分推理引擎在回退（请求前缀回到更早的位置）下不保存
@@ -97,27 +105,48 @@
 
 ## 字段说明
 
-### `openai`
+### `providers`
+
+`providers` 是**接口数组**（按顺序保存，序号从 1 起）。每个元素含三个身份字段，其余为该接口的请求形状：
+
+| 身份字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `name` | string | 空 | 接口名；`/switchapi` 与 Web 侧栏的模型下拉都按它标识。空则自动补 `api-<序号>` |
+| `type` | string | 空 | 接口类型，目前只有 `"openai"`；空视作 `openai`。其它值启动报错 |
+| `enabled` | bool | `false` | 是否可用。**启动时取第一个 `enabled` 的接口**；没有启用的接口则启动报错 |
+
+单接口的请求形状字段（与旧版 `openai` 块同名）：
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `api_base` | string | `https://api.openai.com/v1` | 接口基址；客户端会拼接 `/chat/completions`（若已以该路径结尾则直接使用） |
-| `api_key` | string | 空 | 作为 `Authorization: Bearer <key>` 发送；为空则启动报错 |
+| `api_key` | string | 空 | 作为 `Authorization: Bearer <key>` 发送；启用中的接口为空则启动报错 |
 | `model` | string | `gpt-4o-mini` | 模型名 |
 | `temperature` | number | `-1` | 采样温度；`-1`（或任意负值）表示**不使用**——该字段不会发送，交由服务端默认；`0` 为确定性采样，`0` 以上的值会原样发送。省略该字段时即为 `-1` |
 | `max_tokens` | int | `40960` | 单次回复上限 |
 | `timeout_seconds` | int | `4800` | **空闲超时**（秒）：等待响应头、或流式过程中两个数据块之间的最大间隔；超过即中断并提示。不是整段请求的总时限，因此长回复不会被截断；`0` 关闭 |
 | `stream` | bool | `true` | 是否使用 SSE 流式输出 |
 | `media_types` | string[] | 空 | **本模型可接收的多媒体类型**（附件能力的总开关），如 `["image/png", "image/jpeg", "audio/wav", "application/pdf"]`。小写、可写族名（`"image"` = `"image/*"`）。留空 = 关闭附件能力：既不注册 `upload_media`，Web 输入框也没有附加按钮。非空时：Web 可附加文件，且若同时打开 `tools.upload_media.enabled` 则模型拿到上传工具（两边都为真才启用）。为空时不写入文件 |
+| `context_window` | int | `131072` | **该模型的上下文窗口**（token），用于压缩触发与保留预算。它属于模型，因此随接口走：切换接口后压缩触发点随之变化。`0`（省略）取内置窗口 |
 | `extra_body` | object | 无 | 见下节 |
+
+> **切换当前接口（只存内存）**：启动时用第一个 `enabled` 接口；运行时可用 CLI 的
+> `/switchapi <name|序号>`（无参列出接口）或 Web 侧栏的模型下拉切换。切换只更新内存中的
+> 当前接口——**不写回 `config.json`**，下次启动仍取第一个启用的接口。切换时程序会换掉
+> LLM 客户端、该接口的 `context_window` / `max_tokens`，并按新接口的 `media_types` 刷新
+> 多媒体附件能力（Web 的附加按钮与 `upload_media` 工具）；忙碌（有回合在跑）时拒绝切换。
+
+> **老版本自动迁移**：早期配置只有一个 `openai` 对象、且 `context.context_window` 在顶层。
+> 读取到这种文件时，程序把它折成 `providers` 里的一个 `default` 接口（`type=openai`、
+> `enabled=true`），并把顶层 `context_window` 搬进该接口，然后**把文件改写为新结构**，旧字段
+> 不再写回。（`openai` 这个键仍可被解析/接受，但只用于这一次迁移。）
 
 ### `context`
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `context_window` | int | `131072` | 模型上下文窗口（token），用于压缩触发与保留预算 |
-| `summarize_token_percent` | int | `75` | 用量达到 `context_window` 的该百分比触发压缩（1–100） |
-| `summarize_keep.auto.budget_percent` | int | `0` | 自动压缩保留的 token 预算占比（0–100）：可用输入预算 `context_window - openai.max_tokens` 的百分比；`0` = 不保留原始消息 |
+| `summarize_token_percent` | int | `75` | 用量达到**当前接口 `context_window`** 的该百分比触发压缩（1–100） |
+| `summarize_keep.auto.budget_percent` | int | `0` | 自动压缩保留的 token 预算占比（0–100）：可用输入预算 `context_window - max_tokens` 的百分比；`0` = 不保留原始消息 |
 | `summarize_keep.auto.turns` | int | `0` | 自动压缩最多保留几个完整 Turn；`0` = 不保留 |
 | `summarize_keep.manual.budget_percent` | int | `0` | 手动 `/compact` 的预算占比（同上） |
 | `summarize_keep.manual.turns` | int | `0` | 手动 `/compact` 最多保留几个完整 Turn |
@@ -128,7 +157,7 @@
 > 整份历史的字符估算**不再**与上报值取大——两把尺相比会让压缩在设置百分比之外提前触发。
 
 > **压缩保留多少最新消息可配置，默认一条都不留**：`context.summarize_keep.{auto,manual}` 的
-> `budget_percent`（占可用输入预算 `context_window - openai.max_tokens` 的百分比）与 `turns`
+> `budget_percent`（占可用输入预算 `context_window - max_tokens` 的百分比，二者取自当前接口）与 `turns`
 > （最多保留几个完整 Turn，谁先触顶谁停）默认都是 `0`。原因是**部分推理引擎在回退下不保存 prompt
 > 缓存**——不留原始消息时，压缩后的下一次请求就是「系统提示词 + 摘要」开头的实时前缀，缓存因此仍然
 > 有效，而被放弃的最新几轮对话本身已经写进摘要。调大只对**能跨回退保住缓存**的服务商有意义。
@@ -171,7 +200,7 @@
 | `webfetch.user_agent` | string | 空 | 覆盖两条路径的 User-Agent（浏览器渲染时由浏览器发送、HTTP 源码是请求头）；为空时各用自带默认（Go 客户端 / 浏览器自身）。为空时不写入文件 |
 | `webfetch.max_bytes` | int | `0` | HTTP 源码正文的字节上限；`0` 用内置的 8 MiB。负数回退到 `0`；为 `0` 时不写入文件 |
 | `webfetch.attach_address` | string | 空 | `chrome-attached` 挂载的 DevTools 端点，一个字符串即可：端口 `9222`（= `127.0.0.1:9222`）、`192.168.0.5:9223`、`http://…` 或 `ws://…`。为空时用内置的 `127.0.0.1:9222`；为空时不写入文件 |
-| `upload_media.enabled` | bool | `false` | 启用 `upload_media`（把本地多媒体文件上传成对话附件）。**必须与模型侧 `openai.media_types` 同时成立**：只配上类型而不打开该开关，或只打开开关而不配类型，都不会注册这个工具 |
+| `upload_media.enabled` | bool | `false` | 启用 `upload_media`（把本地多媒体文件上传成对话附件）。**必须与当前接口的 `providers[].media_types` 同时成立**：只配上类型而不打开该开关，或只打开开关而不配类型，都不会注册这个工具 |
 | `upload_media.max_bytes` | int | `0` | 单个附件文件的字节上限；`0` 用内置的 20 MiB。负数回退到 `0`；为 `0` 时不写入文件。**Web 附加按钮用同一个上限**（超限的文件在浏览器里就被拒，不发往服务端） |
 
 * `exec.use_utf8` 默认为 `true`：加载时先取默认值再合并文件，**省略该字段即保持开启**；
@@ -196,12 +225,12 @@
   `.lightagent/browser-profile` 作为 profile（agent 自己的 Cookie 与登录态，随项目走），
   不碰你自己的浏览器 profile；该目录已被 `.gitignore` 忽略。
 
-#### `openai.media_types` / `tools.upload_media`（多媒体附件）
+#### `providers[].media_types` / `tools.upload_media`（多媒体附件）
 
 多媒体能力由**两个开关**共同决定，缺一不可：
 
-1. `openai.media_types`：**本模型能读的媒体类型**（能力总开关）。它是判断"这个文件能不能交给模型"的
-   唯一依据，也决定 Web 附加按钮是否存在、文件选择器只筛哪些类型。
+1. `providers[].media_types`：**当前接口模型能读的媒体类型**（能力总开关）。它是判断"这个文件能不能交给模型"的
+   唯一依据，也决定 Web 附加按钮是否存在、文件选择器只筛哪些类型。切换接口时会按新接口的类型刷新。
 2. `tools.upload_media.enabled`：**是否把这个能力做成工具**给模型用（模型可以自己指定路径上传）。
 
 四条通路：
@@ -336,7 +365,7 @@ user:   <历史里的第一条 user>
 ## `extra_body`：OpenAI 额外请求参数
 
 不同服务商常需要额外的请求体字段（如 `reasoning_effort`、`top_p`、`response_format`、
-`chat_template_kwargs` 等）。把它们写进 `openai.extra_body`，lightagent 会在发送请求时
+`chat_template_kwargs` 等）。把它们写进某个接口的 `extra_body`（`providers[].extra_body`），lightagent 会在发送请求时
 把这些键**合并到 `/chat/completions` 请求体的顶层**。
 
 ```jsonc

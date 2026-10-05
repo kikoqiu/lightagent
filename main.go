@@ -126,7 +126,7 @@ type options struct {
 	stream   *bool
 	markdown *bool
 	result   *bool
-	timeout  int // -1 keep, otherwise openai.timeout_seconds
+	timeout  int // -1 keep, otherwise the first interface's timeout_seconds
 	webHost  string
 	webPort  int // -1 keep, 0 disable
 	noWeb    bool
@@ -319,12 +319,12 @@ options:
       --print-config      print the effective configuration and exit
 
 config overrides (flag > LIGHTAGENT_CONFIG > config.json > built-in default):
-      --model NAME        openai.model
-      --api-base URL      openai.api_base
-      --stream on|off     openai.stream
+      --model NAME        providers[].model (the first enabled interface)
+      --api-base URL      providers[].api_base
+      --stream on|off     providers[].stream
       --markdown on|off   ui.markdown
       --result on|off     show tool/exec results
-      --timeout SECONDS   openai.timeout_seconds (idle/inactivity timeout)
+      --timeout SECONDS   providers[].timeout_seconds (idle/inactivity timeout)
       --web-host IP       web.host
       --web-port N        web.port (0 disables the mirror)
       --no-web            disable the web mirror

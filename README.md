@@ -37,7 +37,7 @@
 | 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
 | 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；`method` 决定反馈放什么（`fetch_as_md` 默认 / `save_as_md` / `save_as_html` / `ignore`），正文里的站内链接写成根相对路径（`/docs/other`，状态行给出抓取的地址），反馈默认**最多 100 行**（`max_lines`，可关）且**优先只回填正文**（`<article>`/`<main>`/`class=main` 之类的容器，导航/侧栏/页脚用 `...(omitted)` 标记代替），定位不到正文时回填中间的 100 行；`invokejs` 可在**页面加载后、抓取前**在页面里跑一段脚本（浏览器取法限定），用注入的 `_invokejs_done(value)` 结束并把值放在反馈最前面（拿 Cookie/token，供后续命令用同一身份）；整页存到工作目录 `.lightagent/webfetch/<时间>.md`（Markdown 正文）并在反馈里给出路径 |
-| 18 | 多媒体附件 | 模型侧 `openai.media_types` 声明**本模型可读的媒体类型**（如 `image/png`、`image/*`、`audio/wav`、`application/pdf`）。配置后：Web 输入框出现 **📎 附加按钮**，文件上传到工作目录 `.lightagent/uploads/`，**随下一条输入一起发给模型**（发送前点 ✕ 可取消并删掉已存文件），消息行会把带的附件显示出来（上传目录里的图片直接画成图片，取不回来时退回文件名）；若同时打开 `tools.upload_media.enabled`（两边都为真才启用），模型还拿到 `upload_media` 工具，可自行指定路径上传（类型不符 / 超限 / 空文件 / 目录都只报错，参数提示里列出可接收类型）。载荷：图片走 `image_url`（data URI）、音频走 `input_audio`（wav/mp3）、其余走 `file`（文件名 + data URI）；**会话文件只记附件路径与类型，不落 base64**（恢复时按路径读回，文件没了就只留名字） |
+| 18 | 多媒体附件 | 模型侧 `providers[].media_types` 声明**本模型可读的媒体类型**（如 `image/png`、`image/*`、`audio/wav`、`application/pdf`）。配置后：Web 输入框出现 **📎 附加按钮**，文件上传到工作目录 `.lightagent/uploads/`，**随下一条输入一起发给模型**（发送前点 ✕ 可取消并删掉已存文件），消息行会把带的附件显示出来（上传目录里的图片直接画成图片，取不回来时退回文件名）；若同时打开 `tools.upload_media.enabled`（两边都为真才启用），模型还拿到 `upload_media` 工具，可自行指定路径上传（类型不符 / 超限 / 空文件 / 目录都只报错，参数提示里列出可接收类型）。载荷：图片走 `image_url`（data URI）、音频走 `input_audio`（wav/mp3）、其余走 `file`（文件名 + data URI）；**会话文件只记附件路径与类型，不落 base64**（恢复时按路径读回，文件没了就只留名字） |
 | 19 | 复制消息 | 消息**角色标签旁**的透明复制图标（`agent` 右边 / `you` 左边，镜像对称、不占布局、平时不可见）：桌面鼠标移上去显现，**触屏长按消息**（或轻点）显现；**Markdown**（写入时的原文）/ **HTML**（渲染块 + 纯文本口味，粘进富文本或纯文本都不脏）/ **Text**（屏幕上的样子）；**半透明模糊的图标菜单**（三个口味各一个图标、无文字，带升起动画，空间不足时向上翻转），刚复制的图标临时变绿、随该菜单关闭即清除；安全上下文走异步 Clipboard API，明文 HTTP（局域网里的手机）自动退化为选中 + `execCommand('copy')`（HTML 口味经 `copy` 事件写入） |
 
 ---
@@ -56,7 +56,7 @@ go build -o lightagent .         # macOS / Linux
 ./lightagent.exe -r
 ```
 
-编辑程序目录下的 `config.json`，填入 `openai.api_key`（以及必要的 `api_base` / `model`）后重新运行。
+编辑程序目录下的 `config.json`，填入 `providers[0].api_key`（以及必要的 `api_base` / `model`）后重新运行。
 
 可选：导出内置系统提示词模板并按需修改（程序目录的 `agent.md` 会自动覆盖内置提示词）：
 
@@ -95,14 +95,14 @@ lightagent [options] <command>  # 子命令
 
 配置覆盖（**优先级：flag > `LIGHTAGENT_CONFIG` > `config.json` > 内置默认**）：
 
-| 参数 | 覆盖 |
+| 参数 | 覆盖（作用在**第一个启用**的接口） |
 |------|------|
-| `--model NAME` | `openai.model` |
-| `--api-base URL` | `openai.api_base` |
-| `--stream on\|off` | `openai.stream` |
+| `--model NAME` | `providers[].model` |
+| `--api-base URL` | `providers[].api_base` |
+| `--stream on\|off` | `providers[].stream` |
 | `--markdown on\|off` | `ui.markdown` |
 | `--result on\|off` | 工具/exec 结果是否显示 |
-| `--timeout SECONDS` | `openai.timeout_seconds`（空闲超时；长回复不会被总时限截断） |
+| `--timeout SECONDS` | `providers[].timeout_seconds`（空闲超时；长回复不会被总时限截断） |
 | `--web-host IP` / `--web-port N` / `--no-web` | `web.host` / `web.port`（0=关闭） |
 
 子命令：
@@ -134,20 +134,26 @@ source <(lightagent completion bash)       # bash 补全
 
 ```jsonc
 {
-  "openai": {
-    "api_base": "https://api.openai.com/v1",
-    "api_key": "sk-...",
-    "model": "gpt-4o-mini",
-    "temperature": -1,                      // 采样温度；负值=不发送（用服务端默认）
-    "max_tokens": 4096,
-    "timeout_seconds": 120,               // 空闲超时：无数据超过该秒数才中断（0=关闭）
-    "stream": true,
-    "media_types": [],                    // 本模型可读的媒体类型，如 ["image/png", "image/*"]；留空=不启用附件
-    "extra_body": {}                     // 服务商额外请求参数，合并到请求体顶层
-  },
+  // LLM 接口数组：启动时用第一个 enabled 的接口；运行时可 /switchapi 切换（只存内存）。
+  "providers": [
+    {
+      "name": "default",
+      "type": "openai",                 // 目前只有 "openai"
+      "enabled": true,
+      "api_base": "https://api.openai.com/v1",
+      "api_key": "sk-...",
+      "model": "gpt-4o-mini",
+      "temperature": -1,                // 采样温度；负值=不发送（用服务端默认）
+      "max_tokens": 4096,
+      "timeout_seconds": 120,           // 空闲超时：无数据超过该秒数才中断（0=关闭）
+      "stream": true,
+      "media_types": [],                // 本模型可读的媒体类型，如 ["image/png", "image/*"]；留空=不启用附件
+      "context_window": 131072,          // 该模型的上下文窗口（token）——随接口走
+      "extra_body": {}                  // 服务商额外请求参数，合并到请求体顶层
+    }
+  ],
   "context": {
-    "context_window": 131072,          // 模型上下文窗口（token）
-    "summarize_token_percent": 75      // 用量超过该百分比时触发压缩
+    "summarize_token_percent": 75      // 用量超过当前接口窗口的该百分比时触发压缩
   },
   "web": {
     "host": "127.0.0.1",                // 监听地址；0.0.0.0 可对局域网开放
@@ -160,7 +166,7 @@ source <(lightagent completion bash)       # bash 补全
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
     "webfetch":        { "enabled": true, "mode": "auto", "timeout_seconds": 30, "max_lines": 100 },
-    "upload_media":    { "enabled": false, "max_bytes": 0 },  // 与 openai.media_types 同时为真才注册该工具
+    "upload_media":    { "enabled": false, "max_bytes": 0 },  // 与当前接口的 providers[].media_types 同时为真才注册该工具
     "discovery":       { "enabled": false, "mode": "unlock", "ttl": 50, "max_search_results": 10, "min_match_rate": 0.5, "use_bm25": true },
     "mcp": {
       "enabled": false,
@@ -194,7 +200,7 @@ source <(lightagent completion bash)       # bash 补全
 * `agent.md` 支持片段导入：独占一行的 `@include("路径")` 会替换为对应文件（或目录下所有文件）的内容，
   相对路径基于该文件目录，支持嵌套与绝对路径。详见
   [configuration.md](docs/configuration.md#系统提示词覆盖agentmd)。
-* `openai.extra_body` 的键会合并进 `/chat/completions` 请求体的**顶层**（可覆盖内置字段）。
+* `providers[].extra_body` 的键会合并进 `/chat/completions` 请求体的**顶层**（可覆盖内置字段）。
 * `tools.mcp`：内置纯标准库 MCP 客户端，按 `servers` 连接外部 MCP server（`stdio` / `http` / `sse`）。详见
   [configuration.md](docs/configuration.md#toolsmcpmcp-客户端)。
 * `tools.webfetch`：网页抓取工具（`url` + `timeout` 参数，另有 `method` 决定反馈放什么、`invokejs` 在页面里
@@ -268,6 +274,7 @@ source <(lightagent completion bash)       # bash 补全
 | `/load` `[-f] <name|n>` | 载入某个已保存会话（文件名的可选引号，或 `/list` 的序号）；当前会话有未保存改动时会提示用 `-f` |
 | `/list` `[n]` | 列出最近 n 条保存记录（序号 + 文件名 + 最后修改时间），默认 10 |
 | `/rm` `<name>` | 按**文件名**删除一条保存记录（不接受序号，也不会删当前会话） |
+| `/switchapi` `<name\|序号>` | 切换当前 LLM 接口（无参列出接口）；只改内存，不写回配置 |
 | `/stop` `/interrupt` | 中断正在运行的回合（模型调用或工具调用） |
 | `/compact` | 手动触发一次上下文压缩 |
 | `/history` `/context` | 显示消息条数、估算 token 与上下文用量百分比（提示行也实时显示百分比） |
@@ -365,10 +372,16 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
   （`/new`、`/clear`、`/save`、`/stop`、`/compact`、`/history`、`/result`）通过事件总线广播，终端与所有网页
   看到同一条反馈；只属于当前页面的命令（`/help` 列表、`/markdown` 渲染开关、拼错的命令）只出现在网页里。
   `/exit` 只在终端生效（网页会提示关闭标签页）；未知命令与 CLI 一样被本地拒绝，不会发给模型。
-* 桌面端左侧栏有 **Commands** 命令栏：默认只列 `/help`、`/new`、`/clear`、`/save`、`/stop`（命令表中标为
-  `primary` 的那些），其余命令折叠在标题之后 —— **点击标题展开/收起**，标题右侧 `+N` 是折叠数量；
-  **点击即执行**，`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态。
-* 右上角 **⚙**（桌面端侧栏 “Configuration” 卡片）打开配置编辑器，右上角可在 **Form / JSON** 两种模式间切换：
+* 桌面端左侧栏有 **Commands** 命令栏：默认列 6 条 —— `/new`、`/clear`、`/save`、`/saveas`、`/load`、
+  `/history`（命令表中标为 `primary` 的那些），其余命令折叠在标题之后 —— **点击标题展开/收起**，
+  标题右侧 `+N` 是折叠数量（`/switchapi` 不在命令栏里，切换接口用上面的模型下拉，也可在输入框里打该命令）；
+  折叠组以 `/compact` 开头、以 `/help` / `/stop` 收尾；**点击即执行**，`/result` 与 `/markdown`
+  显示 on / off 状态，点击切换另一状态。
+* 左侧栏的 **模型卡片**（在上方）：一个接口下拉（**只显示接口名**，**忙时不可改**，样式像
+  label 而非输入框）+ 上下文进度条；下拉即 `/switchapi`，进度条说明行显示 `tokens / window` 与
+  右侧百分比。标题栏 logo 下的小字显示**当前接口名**（连接状态由右侧绿点表示，不再显示
+  `online` / `offline`）。
+* 右上角 **⚙** 打开配置编辑器（左侧栏不再有 Configuration 卡片），右上角可在 **Form / JSON** 两种模式间切换：
   Form 是分段控件表单（文本框 / 开关 / 滑杆 / 下拉 / 多行文本，按 `config.json` 的键逐项列出，留空即用内置默认），
   JSON 是整份文档原文；两者同步，改动实时写入将提交的文档。保存前两端都会校验（控件行内报错 + 服务端规则），
   **写回文件后重启生效**；`api_key` 打码回显（原样回传即保留原密钥），因此文件始终可启动。

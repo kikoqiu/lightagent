@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"lightagent/internal/agent"
+	"lightagent/internal/config"
 )
 
 // TestCatalogueIntegrity pins that the catalogue is usable as a lookup table:
@@ -213,8 +214,10 @@ func TestWebCommandsOffersEveryRunnableCommand(t *testing.T) {
 		}
 	}
 	for _, c := range Commands {
-		if c.Web != seen[c.Name] {
-			t.Errorf("command %s: Web = %v but listed = %v", c.Name, c.Web, seen[c.Name])
+		// A Hidden command is runnable from the composer but stays out of the
+		// rail, so the two do not have to agree for it.
+		if want := c.Web && !c.Hidden; want != seen[c.Name] {
+			t.Errorf("command %s: offered in the rail = %v, want %v", c.Name, seen[c.Name], want)
 		}
 	}
 	if primary == 0 || primary == len(web) {
@@ -224,7 +227,7 @@ func TestWebCommandsOffersEveryRunnableCommand(t *testing.T) {
 	// the list the page already shows.
 	var want []string
 	for _, c := range Commands {
-		if c.Web {
+		if c.Web && !c.Hidden {
 			want = append(want, c.Name)
 		}
 	}
@@ -253,5 +256,79 @@ func TestUsageText(t *testing.T) {
 	}
 	if !strings.Contains(UsageText(agent.Stats{Summary: "sum"}), "compressed summary present") {
 		t.Error("a present summary should be reported")
+	}
+}
+
+// TestRailOrderAndSwitchAPICatalogue pins the command order the mirror's rail
+// draws from: the primary commands first, then /compact opening the folded group
+// and /help and /stop at its very bottom. /switchapi stays out of the rail (the
+// model picker covers it) though it is still a web command.
+func TestRailOrderAndSwitchAPICatalogue(t *testing.T) {
+	web := WebCommands()
+	var names, primary []string
+	for _, c := range web {
+		names = append(names, c.Name)
+		if c.Primary {
+			primary = append(primary, c.Name)
+		}
+	}
+	if len(primary) == 0 || len(primary) == len(names) {
+		t.Fatalf("primary = %v of %v, want a split list", primary, names)
+	}
+	// The rail shows six commands before folding the rest.
+	if len(primary) != 6 {
+		t.Fatalf("primary = %v, want 6 commands shown before the fold", primary)
+	}
+	folded := names[len(primary):]
+	if folded[0] != "/compact" {
+		t.Fatalf("the folded group starts with %q, want /compact", folded[0])
+	}
+	if last := names[len(names)-1]; last != "/stop" {
+		t.Fatalf("the last command is %q, want /stop", last)
+	}
+	if prev := names[len(names)-2]; prev != "/help" {
+		t.Fatalf("the second to last command is %q, want /help", prev)
+	}
+	// /saveas is one of the primary entries.
+	hasSaveAs := false
+	for _, name := range primary {
+		if name == "/saveas" {
+			hasSaveAs = true
+		}
+	}
+	if !hasSaveAs {
+		t.Fatalf("primary = %v, want /saveas among them", primary)
+	}
+	// /switchapi is not offered in the rail.
+	for _, name := range names {
+		if name == "/switchapi" {
+			t.Fatal("/switchapi must stay out of the rail (it is Hidden)")
+		}
+	}
+	var sw *Command
+	for i := range Commands {
+		if Commands[i].Name == "/switchapi" {
+			sw = &Commands[i]
+		}
+	}
+	if sw == nil || !sw.Web || !sw.Hidden || sw.Args == "" {
+		t.Fatalf("/switchapi = %+v, want a web command hidden from the rail with an argument hint", sw)
+	}
+}
+
+// TestAPIListText renders the interface listing behind /switchapi.
+func TestAPIListText(t *testing.T) {
+	got := APIListText([]config.APIInfo{
+		{Index: 1, Name: "default", Model: "gpt-4o-mini", Enabled: true, Active: true},
+		{Index: 2, Name: "backup", Model: "m2", Enabled: false},
+	})
+	if !strings.Contains(got, "1. default — gpt-4o-mini (active)") {
+		t.Fatalf("listing = %q", got)
+	}
+	if !strings.Contains(got, "2. backup — m2 (disabled)") {
+		t.Fatalf("listing = %q", got)
+	}
+	if got := APIListText(nil); got != "no llm interfaces configured" {
+		t.Fatalf("empty listing = %q", got)
 	}
 }

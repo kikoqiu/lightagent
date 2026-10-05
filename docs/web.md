@@ -69,7 +69,7 @@ CLI 与网页（可同时多个）都能输入；Agent 的事件通过 **WebSock
 | PUT | `/api/config` | 校验并写回 `config.json`（**重启后生效**）（**需要会话**） |
 | POST | `/api/password` | 设置/清除登录密码（**立即生效**）（**需要会话**） |
 | POST | `/api/restart` | 保存当前会话并重启 lightagent：新进程自动 `--resume` 恢复它（**需要会话**） |
-| POST | `/api/upload` | 上传一个附件文件（`multipart/form-data`，字段 `file`），返回其 id；未配置 `openai.media_types` 时 404（**需要会话**） |
+| POST | `/api/upload` | 上传一个附件文件（`multipart/form-data`，字段 `file`），返回其 id；当前接口未配置 `providers[].media_types` 时 404（**需要会话**） |
 | DELETE | `/api/upload?id=…` | 删除一个已上传的附件（页面里取消附加时调用）（**需要会话**） |
 | GET | `/api/media?id=…` | 取回一个已上传的附件本体：页面用它把消息里带的图片画成图片；id 不在上传目录内 400、文件已不在 404（**需要会话**） |
 | GET | `/app.css` | 页面样式（内嵌），公开 |
@@ -106,24 +106,37 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 
 ## 配置编辑（`/api/config`）
 
-**入口**：页头右上角的 **⚙**（手机端同样可见），或桌面端侧栏的 “Configuration” 卡片。
-面板里对 `config.json` 提供两种编辑模式，右上角的 **Form / JSON** 标签切换：
+**入口**：页头右上角的 **⚙**（手机端同样可见）。面板里对 `config.json` 提供两种编辑模式，
+右上角的 **Form / JSON** 标签切换：
 
 * **Form（表单）**：按段展开的控件表单，每项一行——左侧是配置键名 + 说明，右侧是控件：
   文本框、密码框、数字框、开关、滑杆（带实时数值）、下拉、多行文本。
-  段落为 OpenAI / Context / Web mirror / Tools · shell / Tools · files / Tools · web /
-  Tools · discovery / Tools · MCP / Agent / UI（`▸` 可折叠，OpenAI、Context、Web 默认展开）。
+  段落为 Providers / Context / Web mirror / Tools · shell / Tools · files / Tools · web /
+  Tools · discovery / Tools · MCP / Agent / UI（`▸` 可折叠，Providers、Context、Web 默认展开）。
   控件改动**立刻写进当前文档**，所以切到 JSON 看到的就是将要提交的内容。
-  留空表示“用内置默认”（保存时该项直接从文件中移除）；`extra_body` 与 `tools.mcp.servers`
-  是这两个 map 型字段的 JSON 文本框（标有 `json` 标签）。
+  留空表示“用内置默认”（保存时该项直接从文件中移除）；`tools.mcp.servers` 是该 map 型字段的
+  JSON 文本框（标有 `json` 标签）。
+* **Providers 段**是接口数组的重复控件：`providers` 这个字段**不显示键名标签**，卡片占满整宽
+  （避免一个空标签列把内容挤住）。每张卡片一个 provider，**默认折叠到标题栏**（`▾ #序号 · 名字`）：
+  点击标题栏展开/收起，展开后每个子项**按普通字段排版**——键在左（含说明）、控件在右，窄屏自动
+  叠成两行。**Add provider**（新增）、**↑ / ↓**（排序）与 **✕**（删除）始终留在标题栏上，不展开
+  也能操作；**新增的卡片会自动展开**（它就是你要填的那张），排序/删除后每张卡片的展开状态跟着
+  自己的卡片走，只有重新打开面板（重新载入文档）才回到全部折叠。
+  子项是 name / type / enabled / api_base / api_key / model / context_window /
+  temperature（**滑杆**，最左端 = 不发送该字段，交由服务端默认）/ max_tokens / timeout_seconds /
+  stream / media_types / extra_body。每张卡的 `api_key` 只显示掩码，留空即沿用文件里原有的值。
+  `extra_body`（该接口的额外请求参数，map）用 **JSON 文本框**编辑（标有 `json` 标签）：内容非法时
+  该行标红并在行下给出原因，保存会被拒（非法内容不会写进文档）。
 * **JSON**：整份文档原文编辑，适合复制粘贴或表单没覆盖的场景。切回表单时以文本框内容为准；
   若 JSON 非法，则**留在 JSON 模式**并提示错误，不会丢掉已输入的内容。
+  切到 JSON 时文本框自动取**当前表单的高度**（表单更高时以可视高度为上限），两种模式来回切换
+  面板不会忽高忽低。
 
 **保存前会在两端校验**：
 
 * 客户端：数字项非数字/超范围、JSON 文本框解析失败 → 行内红字 + 该行高亮，**Save 被阻止**并提示
   是哪个字段；
-* 服务端：未知字段（拼写错误）、缺少 `openai.api_key`、启用的 MCP server 缺 `command`/`url` 等 → `400`，
+* 服务端：未知字段（拼写错误）、启用中的接口缺 `api_key`、启用的 MCP server 缺 `command`/`url` 等 → `400`，
   状态行显示服务端原文（未知字段会额外提示去 JSON 模式删除）。
 
 成功保存后状态行显示 `saved — restart lightagent to apply it`。**保存只写文件，运行中的进程继续
@@ -144,8 +157,8 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 ```
 
 * 返回的文档已按**启动时的规则**合并默认值（缺失字段显示默认值、`tools.mcp.servers` 会补上占位 server），
-  且 `openai.api_key` 与 `web.password` **打码为 `***`**（与 `--print-config` 一致）。保存时若这两个字段为 `***` 或空，
-  服务端沿用文件里原有的值，因此改模型等其它字段无需重新输入；要换密钥/密码直接粘贴新值即可
+  且每个接口的 `api_key` 与 `web.password` **打码为 `***`**（与 `--print-config` 一致）。保存时若这些字段为 `***` 或空，
+  服务端按接口名/位置沿用文件里原有的值，因此改模型等其它字段无需重新输入；要换密钥/密码直接粘贴新值即可
   （新密码会**立即生效**并轮换盐，见[登录与鉴权](#登录与鉴权)）。`web.password_salt` 是公开值，按原样回显
   （为空时不出现）。
 * `web.password` 那一行是**密码控件**（`Set` / `Remove` + 状态行），走 `POST /api/password`：
@@ -170,7 +183,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
    `--no-save` 也不传递（重启后的退出仍应保存），其余开关（`-c`、`--model`、`--session`、`--web-port` …）原样保留，
    所以新进程和旧进程是同一个运行配置。
 3. **页面自己回来**：旧进程在退出前**交出监听地址**（`ReleaseListener`：只关监听套接字，不关已有连接，所以正在写的这个
-   响应照常送达），新进程随后绑定**同一个地址**，页面按既有重连逻辑接回（页头把这段时间显示为 `restarting…` 而不是 `offline`），
+   响应照常送达），新进程随后绑定**同一个地址**，页面按既有重连逻辑接回（页头把这段时间显示为 `restarting…`），
    并用完整快照重建日志区——回放的正是刚恢复的那份会话。只有新开标签页的那一刻可能撞上换进程的窗口。
 
 细节：新进程**不是**旧进程的子进程，因此不受退出清理（exec 会话、stdio MCP server）影响；终端在交接前已恢复原状，
@@ -191,7 +204,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 在解析+重建期间整段卡住（这正是超长会话停在 `Waiting for messages…` 的原因）：
 
 ```json
-{ "type": "history_start", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "count": 812 }
+{ "type": "history_start", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "count": 812, "model": "gpt-4o-mini", "apis": [ { "index": 1, "name": "default", "type": "openai", "model": "gpt-4o-mini", "enabled": true, "active": true } ] }
 { "type": "history_rows", "messages": [ { "role": "user", "content": "..." } ] }
 { "type": "history_rows", "messages": [ ... ] }
 { "type": "history_end" }
@@ -199,7 +212,8 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 
 * `history_start` 是表头：`tokens`/`window` 用于顶部上下文用量徽标，`busy` 让运行中连上的页面也
   显示转圈指示，`markdown` / `result` 是当前的渲染开关与工具结果开关（重连的标签页据此与其它
-  标签页或 CLI 的改动保持一致），`count` 是本次快照的行数，`version` 是这批行对应的**回滚版本**
+  标签页或 CLI 的改动保持一致），`name` 是**当前接口名**（画在 logo 下）、`apis` 是接口列表
+  （页面用它填侧栏的模型下拉），`count` 是本次快照的行数，`version` 是这批行对应的**回滚版本**
   （页面先记下、等快照**收齐**才提交为「自己这份日志的版本」，中途断线时下一次连接仍按手上那份日志的
   版本发 `?since=`，不会把没收到的快照当成自己的）。
 * `history_rows` 每帧一个**批次**：至多 200 行，或累计文本达到 256 KB 就提前切批（单行过大时自己
@@ -219,10 +233,10 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 服务端只回：
 
 ```json
-{ "type": "history_same", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true }
+{ "type": "history_same", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ] }
 ```
 
-* 页面收到它**不动日志区**，只把表头里的状态（用量、`busy`、开关）应用上去——这正是手机停工后
+* 页面收到它**不动日志区**，只把表头里的状态（用量、`busy`、开关、当前模型与接口列表）应用上去——这正是手机停工后
   切回前台不刷新长会话的关键（否则每次回来都要重建整段回滚）。
 * 它只出现在**真的重连**时（停工后回来、断线重连、刷新页面）：隐藏未满宽限期时页面不会断连，
   也就不会有这一步；而"到底重建不重建"只由重连时的版本是否仍一致决定。
@@ -265,7 +279,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "usage", "tokens": 1234, "context_window": 131072 }
 { "type": "user", "text": "某客户端发送的消息", "source": "web" }
 { "type": "turn_done" }
-{ "type": "settings", "markdown": true, "result": true }
+{ "type": "settings", "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ] }
 ```
 
 * `compacted` 携带 `summary`：累计摘要（总结失败时退化为丢弃消息，此时它可能为空/未变）。
@@ -381,6 +395,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 | `/load` `[-f] <name\|n>` | 通过 `SetSessionLoader` 回调载入（文件名或 `/list` 序号），并**重建网页日志区**；当前会话有未保存改动时未加 `-f` 会被拒绝 |
 | `/list` `[n]` | 通过 `SetSessionLister` 取最近 n 条（默认 10），**只写进网页日志区**（终端有自己的 `/list`）；网页把它画成**网格表格**（序号 / 文件名 / 时间三列），因此文件名含中文时列也能对齐（纯文本靠空格补位做不到——浏览器里 CJK 回退字体的宽度未必正好等于两个等宽字符） |
 | `/rm` `<name>` | 通过 `SetSessionRemover` 回调按文件名删除（不接受序号、不删当前会话） |
+| `/switchapi` `<name\|序号>` | 通过 `SetAPISwitcher` 回调切换当前 LLM 接口（无参列出接口）；只改内存，切换成功后广播 `settings` 帧（侧栏模型下拉也走同一条）。**命令表里标了 `Hidden`**：不出现在命令栏，但在输入框里可用 |
 | `/stop` `/interrupt` | 中断当前回合（与 CLI 共享） |
 | `/compact` | 手动压缩上下文；回合运行中会拒绝 |
 | `/history` `/context` | 上下文用量文案（与 CLI 共用同一份实现） |
@@ -429,7 +444,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   自动退回文件名标签。行数据由服务端给出 `{name, type, url}`：只有上传目录里的文件带 `url`
   （`/api/media?id=…`），模型自己 `upload_media` 的任意本地文件只给名字 —— 镜像不会把一个它没存过的路径
   交给浏览器（见 `internal/web/pageAttachments`）。
-* **只在配置了 `openai.media_types` 时才有这个按钮**（未配置时 `/api/upload` 直接 404）。
+* **只在当前接口配置了 `providers[].media_types` 时才有这个按钮**（未配置时 `/api/upload` 直接 404）。切换接口会按新接口的类型刷新它。
   选择器的 `accept` 就是配置的类型列表，服务端对类型与大小再校验一次（超限 413、类型不符 415，
   错误文案直接显示在标签上）；上限是 `tools.upload_media.max_bytes`（默认 20 MiB）。
 * 页面始终知道当前能力：服务端把 `{enabled, types, accept, max_bytes}` 注入 `window.__LIGHTAGENT__.media`。
@@ -445,7 +460,8 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   （触屏键盘没有 Ctrl+Enter，长提示会被截断）；完整快捷键说明始终在输入框的 `title` 里。
 * 顶部右侧徽标实时显示上下文用量：`ctx` + 百分比 + `tokens/window`（标签与 CLI 提示行的 `[ctx 12.3%]` 对齐，
   占用升高时变黄/变红）；手机窄屏只留百分比数字（`ctx` 与 token 数都隐藏），完整文案在徽标的 `title` 里。
-* 标题栏左侧状态文字（`online` / `offline`）与右侧圆点反映 WebSocket 连接状态；
+* 标题栏 logo 下的小字显示**当前接口名**（来自快照帧/设置帧；连接状态由右侧圆点表示，因此这里
+  **不再显示 `online` / `offline`**，只有握手前显示 `connecting…`、重启时显示 `restarting…`）；
   断线时发送按钮禁用，并自动重连（退避 1.5s → 3s → … → 最多 60s，带抖动，握手成功即归零；
   重连前先向 `/api/session` 确认会话还有效，已失效则改为弹出登录对话框）。
   未登录（且配置了密码）时不会建立连接；**页面隐藏时不重连**（见[省电](#省电移动端与隐藏页面)）。
@@ -468,10 +484,12 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   开合是 **160ms 的一次快速滑动**（`visibility` 延迟到滑动结束才切换，因此收起时会完整滑出去；
   系统开启「减弱动态效果」时不动）。抽屉宽 `min(292px, 86vw)`，遮罩只盖第二行（banner 保持可交互）；
   跨 1000px 断点（旋转、改窗口大小）自动回落为关闭；宽屏下 logo 只是装饰（不进 Tab 顺序、指针穿透）。
-  桌面（宽屏 ≥1000px）在 banner 下方展开固定信息栏：上下文进度条（随占用变黄/变红）、
-  **Commands 命令栏**（默认只列 `primary` 的那些命令，其余折叠在标题后，点击标题展开/收起；
-  点击即执行；`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态）、
-  配置编辑器入口与 **Read aloud** 朗读卡片（自带的启用开关 + **Voice settings** 面板入口；
+  桌面（宽屏 ≥1000px）在 banner 下方展开固定信息栏：**模型卡片**（顶部的模型/接口下拉 ——
+  下拉即 `/switchapi`，忙时禁用；下面是上下文进度条（随占用变黄/变红），说明行左侧 `tokens / window`、
+  右侧百分比，**不再有 “Context window” 标题**）、
+  **Commands 命令栏**（默认列 6 条 `primary` 命令 `/new`、`/clear`、`/save`、`/saveas`、`/load`、`/history`，其余折叠在标题后，点击标题展开/收起（`/switchapi` 标注 `Hidden`，不出现在命令栏里，但仍可在输入框里执行）；
+  点击即执行；折叠组以 `/compact` 开头、以 `/help` / `/stop` 收尾；`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态）、
+  **Read aloud** 朗读卡片（自带的启用开关 + **Voice settings** 面板入口；
   页头 **🔊** 打开同一个面板，手机端也能用），
   右侧为聊天主区（日志区右下角悬浮**上一条用户消息**与**最新消息**两个按钮，见下文）。
 * 布局用 `100dvh` 动态视口高度 + 安全区（含顶部刘海与横屏左右内边距）适配手机；
@@ -820,8 +838,8 @@ Agent 在服务端运行，页面只是镜像，所以"没人看"时页面没有
   断线发生在快照回放中途时，页面会丢弃这次半成品回放，
   下一条连接用完整快照重建（因此日志区可能短暂只有一部分行，属正常）。
 * **重启**（见[重启](#重启apirestart)）走的就是这条路径：面板确认重启后把页头状态改成 `restarting…` 并把退避清零，
-  旧进程退出、新进程绑定同一地址，页面通常 1~2 秒内重连成功并回放恢复后的会话；新进程起不来时提示的是 `offline`，
-  而页面会一直按退避重试（此时可在终端里看到失败原因）。
+  旧进程退出、新进程绑定同一地址，页面通常 1~2 秒内重连成功并回放恢复后的会话；新进程起不来时页头不再写 `offline`
+  （只保留模型名、绿点熄灭表示断线），而页面会一直按退避重试（此时可在终端里看到失败原因）。
 * **每个连接有自己的发送队列与写协程**（`internal/web/client.go`）：注册连接与取快照在 `s.mu`
   内完成，**但序列化与 socket 写入都在锁外、在该连接自己的协程里**。所以一个
   卡住不读的浏览器（休眠的笔记本、断点停住的调试器）不会拖住镜像：不会阻塞其它页面、
