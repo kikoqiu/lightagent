@@ -20,6 +20,7 @@ import (
 	"lightagent/internal/agent"
 	"lightagent/internal/llm"
 	"lightagent/internal/slash"
+	"lightagent/internal/store"
 	"lightagent/internal/tools"
 )
 
@@ -96,6 +97,14 @@ type Server struct {
 	// save writes the conversation to the session file and returns the path. It
 	// is registered by the program (SetSessionSaver) and backs /save.
 	save func() (string, error)
+	// saveAs, load, list and remove back /saveas, /load, /list and /rm. They
+	// are registered by the program (SetSessionSaver... group) and reach the
+	// CLI, so the browser drives exactly what a terminal command would; a nil
+	// one means the command reports that it is unavailable.
+	saveAs func(name string, force bool) (string, error)
+	load   func(name string, force bool) (string, error)
+	list   func(n int) ([]store.SessionInfo, error)
+	remove func(name string) (string, error)
 	// restart starts a replacement of this program and hands the run over to it.
 	// It is registered by the program (SetRestarter) and backs the page's
 	// Restart button; the zero value means restarting is unavailable (see
@@ -194,6 +203,25 @@ func (s *Server) Port() int { return s.port }
 // driven from the page persists exactly what a terminal /save would; without it
 // /save reports that saving is unavailable.
 func (s *Server) SetSessionSaver(fn func() (string, error)) { s.save = fn }
+
+// SetSessionSaverAs registers the callback behind the browser's /saveas: it
+// writes the conversation under a new file name (force overwrites an existing
+// one) and returns the path. The program wires it to the CLI.
+func (s *Server) SetSessionSaverAs(fn func(name string, force bool) (string, error)) { s.saveAs = fn }
+
+// SetSessionLoader registers the callback behind the browser's /load: it
+// replaces the conversation with the saved session named name (or its /list
+// number) and returns the path. force discards unsaved changes. The program
+// wires it to the CLI.
+func (s *Server) SetSessionLoader(fn func(name string, force bool) (string, error)) { s.load = fn }
+
+// SetSessionLister registers the callback behind the browser's /list and the
+// /api/sessions endpoint: it returns the newest n saved sessions.
+func (s *Server) SetSessionLister(fn func(n int) ([]store.SessionInfo, error)) { s.list = fn }
+
+// SetSessionRemover registers the callback behind the browser's /rm: it deletes
+// the saved session named name and returns its path.
+func (s *Server) SetSessionRemover(fn func(name string) (string, error)) { s.remove = fn }
 
 // Start seeds the in-memory scrollback, serves in the background and subscribes
 // to the agent event bus.
@@ -476,6 +504,7 @@ func (s *Server) routes() http.Handler {
 	// The agent's own endpoints.
 	mux.Handle("/ws", s.requireSession(http.HandlerFunc(s.handleWS)))
 	mux.Handle("/api/config", s.requireSession(http.HandlerFunc(s.handleConfig)))
+	mux.Handle("/api/sessions", s.requireSession(http.HandlerFunc(s.handleSessions)))
 	mux.Handle("/api/restart", s.requireSession(http.HandlerFunc(s.handleRestart)))
 	mux.Handle("/api/password", s.requireSession(http.HandlerFunc(s.handlePassword)))
 	// Attachments: the composer uploads a file here before sending, and drops
@@ -559,6 +588,10 @@ type historyMessage struct {
 	Args        string           `json:"args,omitempty"`
 	IsError     bool             `json:"is_error,omitempty"`
 	Attachments []llm.Attachment `json:"attachments,omitempty"`
+	// Sessions carries the /list table when Role is "sessions". The page draws it
+	// as a grid (the same rows the load picker uses) rather than padded text, so
+	// the columns stay lined up whatever width the font gives a CJK file name.
+	Sessions []sessionJSON `json:"sessions,omitempty"`
 	// Time is when the message began, RFC 3339: for a reply the arrival of its
 	// first streamed chunk (the model's thinking included), for a user message
 	// the moment it was submitted. The page draws it in gray beside the role
@@ -1006,6 +1039,77 @@ func (s *Server) handleCommand(text string) {
 			return
 		}
 		s.info("session saved to " + path)
+	case "/saveas":
+		if s.saveAs == nil {
+			s.fail("saving is not available in this run")
+			return
+		}
+		force, name := slash.ForceFlag(args)
+		if name == "" {
+			s.fail("usage: /saveas [-f] <name>")
+			return
+		}
+		path, err := s.saveAs(name, force)
+		if err != nil {
+			s.fail(err.Error())
+			return
+		}
+		s.info("session saved to " + path)
+	case "/load":
+		if s.load == nil {
+			s.fail("loading is not available in this run")
+			return
+		}
+		if s.agent.Busy() {
+			s.fail("a turn is running; try again when idle")
+			return
+		}
+		force, name := slash.ForceFlag(args)
+		if name == "" {
+			s.fail("usage: /load [-f] <name|number>")
+			return
+		}
+		path, err := s.load(name, force)
+		if err != nil {
+			s.fail(err.Error())
+			return
+		}
+		// The page has to redraw the whole transcript the load replaced.
+		s.rebuildScrollback()
+		s.info("loaded session " + path)
+	case "/list":
+		if s.list == nil {
+			s.fail("listing is not available in this run")
+			return
+		}
+		n := 10
+		if v, err := strconv.Atoi(argAt(args, 0)); err == nil && v > 0 {
+			n = v
+		}
+		infos, err := s.list(n)
+		if err != nil {
+			s.fail(err.Error())
+			return
+		}
+		// The page draws the table itself (as a grid), so the columns line up
+		// whatever the font does with CJK glyphs; the CLI writes the padded text.
+		s.localSessions(infos)
+	case "/rm":
+		if s.remove == nil {
+			s.fail("removing is not available in this run")
+			return
+		}
+		name := strings.Join(args, " ")
+		if strings.TrimSpace(name) == "" {
+			s.fail("usage: /rm <name>")
+			return
+		}
+		path, err := s.remove(name)
+		if err != nil {
+			s.fail(err.Error())
+			return
+		}
+		s.info("removed session " + path)
 	case "/compact":
 		if s.agent.Busy() {
 			s.fail("a turn is running; try again when idle")
@@ -1055,6 +1159,51 @@ func (s *Server) handleCommand(text string) {
 		// to save, so the page points at the terminal instead.
 		s.localInfo("/exit quits the terminal; just close the tab to leave the mirror")
 	}
+}
+
+// sessionPickerLimit is how many sessions the page's /load picker is offered
+// (and how many /api/sessions returns), newest first.
+const sessionPickerLimit = 50
+
+// sessionJSON is one row of the /api/sessions response. Index is the same
+// 1-based number /list prints, so the picker addresses /load exactly like the
+// terminal does.
+type sessionJSON struct {
+	Index    int    `json:"index"`
+	Name     string `json:"name"`
+	Modified string `json:"modified"`
+	Current  bool   `json:"current"`
+	Messages int    `json:"messages"`
+}
+
+// handleSessions serves the load picker's list: the newest sessions (up to
+// sessionPickerLimit), newest first, with the index /list would print.
+func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.list == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "listing is not available in this run")
+		return
+	}
+	infos, err := s.list(sessionPickerLimit)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]sessionJSON, 0, len(infos))
+	for i, info := range infos {
+		out = append(out, sessionJSON{
+			Index:    i + 1,
+			Name:     info.Name,
+			Modified: info.ModTime.Format("2006-01-02 15:04:05"),
+			Current:  info.Current,
+			Messages: info.Messages,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": out})
 }
 
 // helpNotes appends the page-specific hints to the shared command table.
@@ -1123,6 +1272,36 @@ func (s *Server) localError(text string) {
 	s.localRow(historyMessage{Role: "error", Content: text}, agent.Event{Type: agent.EventError, Text: text})
 }
 
+// localSessions records the /list table as a page-only row the browser draws as
+// a grid, so its columns stay lined up whatever width the font gives a CJK file
+// name (space padding in a text block cannot promise that). It mirrors localRow
+// but builds its frame directly: the table has no room in a generic agent event.
+// The live frame and the replayed row carry the same rows.
+func (s *Server) localSessions(infos []store.SessionInfo) {
+	rows := make([]sessionJSON, 0, len(infos))
+	for i, info := range infos {
+		rows = append(rows, sessionJSON{
+			Index:    i + 1,
+			Name:     info.Name,
+			Modified: info.ModTime.Format("2006-01-02 15:04:05"),
+			Current:  info.Current,
+			Messages: info.Messages,
+		})
+	}
+	frame, err := json.Marshal(map[string]any{"type": "sessions", "sessions": rows})
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeReasoningLocked()
+	s.history = append(s.history, historyMessage{Role: "sessions", Sessions: rows})
+	// This path does not go through recordLocked, so it bumps the transcript
+	// version itself: a page holding the previous version has to replay this row.
+	s.touchHistoryLocked()
+	s.broadcastLocked(frame)
+}
+
 // clearScrollback drops the mirror's rows and pushes the now empty snapshot, so
 // every open page forgets the conversation that was just discarded. The frames
 // are built under the lock: the snapshot is empty here, so it is cheap, and
@@ -1140,6 +1319,29 @@ func (s *Server) clearScrollback() {
 	s.touchHistoryLocked()
 	rows, header := s.historySnapshotLocked()
 	s.broadcastFramesLocked(chunkHistory(rows, header))
+}
+
+// rebuildScrollback replaces the mirror's rows with the agent's current
+// conversation and pushes the whole snapshot, so a browser forgets the
+// transcript /load replaced and redraws the loaded one. It rebuilds the same
+// rows seedHistory does, under one lock so no event can slip between the
+// rebuild and the broadcast.
+func (s *Server) rebuildScrollback() {
+	s.mu.Lock()
+	dir := s.uploadsDir
+	s.mu.Unlock()
+	rows := messageRows(s.agent.History(), s.agent.ToolResultsVisible(), dir)
+	if sum := strings.TrimSpace(s.agent.Summary()); sum != "" {
+		rows = append([]historyMessage{{Role: "summary", Content: sum}}, rows...)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropDeltaLocked()
+	s.history = rows
+	s.reasoningOpen = false
+	s.touchHistoryLocked()
+	snapshot, header := s.historySnapshotLocked()
+	s.broadcastFramesLocked(chunkHistory(snapshot, header))
 }
 
 // markdownEnabled reports the page's markdown switch.

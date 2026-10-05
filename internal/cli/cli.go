@@ -20,6 +20,7 @@ import (
 	"lightagent/internal/slash"
 	"lightagent/internal/store"
 	"lightagent/internal/termcolor"
+	"lightagent/internal/textwidth"
 	"lightagent/internal/tools"
 )
 
@@ -635,51 +636,15 @@ func (c *CLI) rowLimit() int {
 }
 
 // displayColumns approximates the terminal columns s occupies: East Asian wide
-// runes count as two, control characters as zero.
-func displayColumns(s string) int {
-	cols := 0
-	for _, r := range s {
-		cols += runeColumns(r)
-	}
-	return cols
-}
+// runes count as two, control characters as zero. The measurement itself lives
+// in internal/textwidth, shared with the session listing's column padding.
+func displayColumns(s string) int { return textwidth.Width(s) }
 
 // runeColumns returns the column width of a single rune.
-func runeColumns(r rune) int {
-	switch {
-	case r == '\t':
-		// A tab advances to the next tab stop, at most 8 columns. Measuring the
-		// widest step keeps a measured row at least as wide as it draws, so a
-		// row that is measured to fit is never wrapped by the console.
-		return 8
-	case r < 0x20, r == 0x7f:
-		return 0
-	case isWideRune(r):
-		return 2
-	}
-	return 1
-}
+func runeColumns(r rune) int { return textwidth.RuneColumns(r) }
 
 // isWideRune reports whether r renders as a double-width glyph.
-func isWideRune(r rune) bool {
-	switch {
-	case r >= 0x1100 && r <= 0x115f, // Hangul Jamo
-		r == 0x2329, r == 0x232a,
-		r >= 0x2e80 && r <= 0x303e, // CJK radicals, Kangxi
-		r >= 0x3041 && r <= 0x33ff, // kana, CJK symbols
-		r >= 0x3400 && r <= 0x4dbf, // CJK extension A
-		r >= 0x4e00 && r <= 0x9fff, // CJK unified ideographs
-		r >= 0xa000 && r <= 0xa4cf, // Yi
-		r >= 0xac00 && r <= 0xd7a3, // Hangul syllables
-		r >= 0xf900 && r <= 0xfaff, // CJK compatibility
-		r >= 0xfe30 && r <= 0xfe6f, // CJK compatibility forms
-		r >= 0xff00 && r <= 0xff60, // fullwidth forms
-		r >= 0xffe0 && r <= 0xffe6,
-		r >= 0x20000 && r <= 0x3fffd:
-		return true
-	}
-	return false
-}
+func isWideRune(r rune) bool { return textwidth.IsWide(r) }
 
 // maxPreviewRows bounds how many rows the region gives to the still-arriving
 // partial line. A line that keeps growing without a newline then scrolls through
@@ -1585,6 +1550,7 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 		return true
 	case "/new":
 		c.agent.Reset()
+		c.store.Reset()
 		c.write(termcolor.Cyan("[info] ") + "started a new conversation (in memory; /save to persist)\n")
 	case "/save":
 		path, err := c.SaveSession()
@@ -1593,6 +1559,59 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 			break
 		}
 		c.write(termcolor.Cyan("[info] ") + "session saved to " + path + "\n")
+	case "/saveas":
+		force, name := slash.ForceFlag(args)
+		if name == "" {
+			c.write(termcolor.Red("[error] ") + "usage: /saveas [-f] <name>\n")
+			break
+		}
+		path, err := c.SaveSessionAs(name, force)
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + err.Error() + "\n")
+			break
+		}
+		c.write(termcolor.Cyan("[info] ") + "session saved to " + path + "\n")
+	case "/load":
+		force, name := slash.ForceFlag(args)
+		if name == "" {
+			c.write(termcolor.Red("[error] ") + "usage: /load [-f] <name|number>\n")
+			break
+		}
+		if c.agent.Busy() {
+			c.write(termcolor.Red("[error] ") + "a turn is running; try again when idle\n")
+			break
+		}
+		path, err := c.LoadSession(name, force)
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + err.Error() + "\n")
+			break
+		}
+		c.write(termcolor.Cyan("[info] ") + "loaded session " + path + "\n")
+	case "/list":
+		n := 10
+		if len(args) > 0 {
+			if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+				n = v
+			}
+		}
+		infos, err := c.ListSessions(n)
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + err.Error() + "\n")
+			break
+		}
+		c.write(slash.SessionList(infos) + "\n")
+	case "/rm":
+		name := strings.Join(args, " ")
+		if strings.TrimSpace(name) == "" {
+			c.write(termcolor.Red("[error] ") + "usage: /rm <name>\n")
+			break
+		}
+		path, err := c.RemoveSession(name)
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + err.Error() + "\n")
+			break
+		}
+		c.write(termcolor.Cyan("[info] ") + "removed session " + path + "\n")
 	case "/compact":
 		if c.agent.Busy() {
 			c.write(termcolor.Red("[error] ") + "a turn is running; try again when idle\n")
@@ -1786,6 +1805,129 @@ func (c *CLI) SaveSession() (string, error) {
 		return "", err
 	}
 	return c.store.Path(), nil
+}
+
+// SaveSessionAs writes the current conversation to the named session file and
+// makes it the current session file (a later SaveSession updates it). Without
+// force it refuses to clobber an existing file, so the caller re-runs with -f.
+// It backs /saveas in both front-ends.
+func (c *CLI) SaveSessionAs(name string, force bool) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("usage: /saveas [-f] <name>")
+	}
+	if !force {
+		if path := c.store.ResolvePath(name); fileExists(path) {
+			return "", fmt.Errorf("%s already exists; use /saveas -f %s to overwrite", path, name)
+		}
+	}
+	return c.store.SaveAs(name, c.snapshot())
+}
+
+// LoadSession replaces the conversation with the saved session named name (a
+// file name, or a /list number when it is an integer). When force is false and
+// the current conversation has unsaved changes it refuses, telling the user to
+// re-run with -f, so an accidental /load cannot silently discard work. It
+// returns the path that was loaded and prints the restored transcript.
+func (c *CLI) LoadSession(name string, force bool) (string, error) {
+	path, err := c.resolveSession(name)
+	if err != nil {
+		return "", err
+	}
+	if !force && c.hasUnsaved() {
+		return "", fmt.Errorf("current conversation has unsaved changes; use /load -f %s to discard them and load", name)
+	}
+	state, err := c.store.LoadPath(path)
+	if err != nil {
+		return "", err
+	}
+	if state == nil {
+		return "", fmt.Errorf("no session file at %s", path)
+	}
+	messages := llm.ResolveMedia(state.Messages)
+	c.agent.Load(messages, state.Summary)
+	c.store.UseFile(path)
+	c.ShowHistory(messages, state.Summary)
+	return path, nil
+}
+
+// ListSessions returns up to n saved sessions, newest first (n <= 0 means ten).
+// It backs /list in both front-ends (the page also builds its load picker from
+// the same listing through /api/sessions), so the indices they print address
+// /load identically.
+func (c *CLI) ListSessions(n int) ([]store.SessionInfo, error) {
+	if n <= 0 {
+		n = 10
+	}
+	return c.store.Recent(n)
+}
+
+// RemoveSession deletes the saved session named name. The command is
+// name-only: a number is refused, so a typo cannot delete the wrong file, and
+// the current session file is never removed (use /new first).
+func (c *CLI) RemoveSession(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("usage: /rm <name>")
+	}
+	if _, err := strconv.Atoi(name); err == nil {
+		return "", fmt.Errorf("/rm takes a file name, not a /list number")
+	}
+	path := c.store.ResolvePath(name)
+	if path == c.store.Path() {
+		return "", fmt.Errorf("refusing to remove the current session; use /new first")
+	}
+	if !fileExists(path) {
+		return "", fmt.Errorf("no session file at %s", path)
+	}
+	if err := c.store.Remove(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// resolveSession maps a /load argument to a session file path: an integer is a
+// 1-based /list index, anything else a file name in the sessions directory.
+func (c *CLI) resolveSession(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("usage: /load [-f] <name|number>")
+	}
+	if n, err := strconv.Atoi(name); err == nil {
+		infos, lerr := c.store.Recent(n)
+		if lerr != nil {
+			return "", lerr
+		}
+		if n < 1 || n > len(infos) {
+			return "", fmt.Errorf("no session at index %d (see /list)", n)
+		}
+		return infos[n-1].Path, nil
+	}
+	return c.store.ResolvePath(name), nil
+}
+
+// hasUnsaved reports whether the in-memory conversation differs from what the
+// current session file holds, so /load can refuse to discard it silently. The
+// count and summary are compared rather than the whole transcript: every turn
+// appends messages and a compaction changes the summary, so the two catch the
+// ways a conversation grows.
+func (c *CLI) hasUnsaved() bool {
+	state, err := c.store.Load()
+	if err != nil {
+		return true
+	}
+	hist := c.agent.History()
+	summary := strings.TrimSpace(c.agent.Summary())
+	if state == nil {
+		return len(hist) > 0 || summary != ""
+	}
+	return len(hist) != len(state.Messages) || summary != strings.TrimSpace(state.Summary)
+}
+
+// fileExists reports whether path is a regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // helpText lists the available commands. Command names are colored so they stand

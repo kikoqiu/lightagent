@@ -53,7 +53,11 @@ func (c Command) Usage() string {
 var Commands = []Command{
 	{Name: "/help", Aliases: []string{"/?"}, Summary: "show the command list", Web: true, Primary: true},
 	{Name: "/new", Summary: "start a new conversation (clears the session)", Web: true, Primary: true},
-	{Name: "/save", Summary: "write the current conversation to disk now", Web: true, Primary: true},
+	{Name: "/save", Summary: "write the current conversation to its file now", Web: true, Primary: true},
+	{Name: "/saveas", Args: "[-f] <name>", Summary: "save the conversation under a new name", Web: true},
+	{Name: "/load", Args: "[-f] <name|n>", Summary: "load a saved session by name or /list number", Web: true, Primary: true},
+	{Name: "/list", Args: "[n]", Summary: "list the last n saved sessions (default 10)", Web: true},
+	{Name: "/rm", Args: "<name>", Summary: "delete a saved session by file name", Web: true},
 	{Name: "/stop", Aliases: []string{"/interrupt"}, Summary: "interrupt the turn that is running", Web: true, Primary: true},
 	{Name: "/compact", Summary: "compress the context now", Web: true},
 	{Name: "/history", Aliases: []string{"/context"}, Summary: "show message/token usage and context usage", Web: true},
@@ -92,15 +96,72 @@ func Canonical(name string) (string, bool) {
 }
 
 // Split parses one submitted slash line into the canonical command name and its
-// arguments. ok is false for a command the catalogue does not know; the name is
-// then the normalized spelling the user typed.
+// arguments. Arguments are split on whitespace, but a double- or single-quoted
+// run keeps its spaces as one argument (so `/saveas "my notes.json"` names a
+// file with a space); the quotes are removed. ok is false for a command the
+// catalogue does not know; the name is then the normalized spelling the user
+// typed.
 func Split(line string) (name string, args []string, ok bool) {
-	fields := strings.Fields(line)
+	fields := splitArgs(line)
 	if len(fields) == 0 {
 		return "", nil, false
 	}
 	name, ok = Canonical(fields[0])
 	return name, fields[1:], ok
+}
+
+// ForceFlag pulls an optional -f/--force switch out of a command's arguments.
+// It reports whether the switch was present and returns the rest joined by a
+// space, so a quoted file name stays one argument and an unquoted multi-word
+// one is rejoined into the name the user meant.
+func ForceFlag(args []string) (force bool, rest string) {
+	kept := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "-f" || a == "--force" {
+			force = true
+			continue
+		}
+		kept = append(kept, a)
+	}
+	return force, strings.Join(kept, " ")
+}
+
+// splitArgs splits line on unquoted whitespace, honouring '...' and "...". A
+// quote may open mid-token (foo"bar baz"), matching the shell-like reading a
+// user expects; an empty quoted argument ("") is kept.
+func splitArgs(line string) []string {
+	var (
+		args  []string
+		cur   strings.Builder
+		quote rune
+		open  bool
+	)
+	flush := func() {
+		if open || cur.Len() > 0 {
+			args = append(args, cur.String())
+			cur.Reset()
+			open = false
+		}
+	}
+	for _, r := range line {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			cur.WriteRune(r)
+		case r == '"' || r == '\'':
+			quote = r
+			open = true
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+	return args
 }
 
 // ToggleArg interprets one on/off argument of a switch command (/result,

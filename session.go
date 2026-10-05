@@ -79,12 +79,18 @@ func runSession(o *options, stdout io.Writer) error {
 	// touches the directory and released on the way out. A signal exit and the
 	// restart hand-over release it through the shutdown hooks as well, so the
 	// replacement process (which resumes this session) can take it over.
-	lk, err := lock.Acquire(st.Dir())
+	lk, err := lock.Acquire(st.Root())
 	if err != nil {
 		return err
 	}
 	defer func() { _ = lk.Release() }()
 	onShutdown(func() { _ = lk.Release() })
+	// An earlier layout kept the session files directly in .lightagent/; move
+	// them into sessions/ so a resumed conversation is still found. A failure
+	// is reported but not fatal: the run simply starts without them.
+	if err := st.MigrateLegacy(); err != nil {
+		info("session migration: %v\n", err)
+	}
 
 	client := llm.NewClient(cfg.OpenAI)
 	reg := tools.NewRegistry()
@@ -257,8 +263,13 @@ func runSession(o *options, stdout io.Writer) error {
 		// its public salt are all the mirror needs.
 		srv.SetPassword(cfg.Web.Password, cfg.Web.PasswordSalt)
 		// The page's /save writes through the CLI, so the browser and the
-		// terminal persist exactly the same session.
+		// terminal persist exactly the same session. The session commands
+		// (/saveas, /load, /list, /rm) reach the same CLI methods too.
 		srv.SetSessionSaver(c.SaveSession)
+		srv.SetSessionSaverAs(c.SaveSessionAs)
+		srv.SetSessionLoader(c.LoadSession)
+		srv.SetSessionLister(c.ListSessions)
+		srv.SetSessionRemover(c.RemoveSession)
 		// The page's Restart button saves the session (the endpoint does that,
 		// so the conversation is on disk before anything is given up) and then
 		// hands the run over to a fresh process, which resumes it: the same
@@ -268,15 +279,15 @@ func runSession(o *options, stdout io.Writer) error {
 		// it on their own.
 		srv.SetRestarter(func() error { return restartProgram(srv.ReleaseListener) })
 		// Attachments: the accepted media types plus the directory the browser
-		// uploads land in (.lightagent/uploads beside the session file). They
+		// uploads land in (.lightagent/uploads beside the session files). They
 		// travel with the next user message.
-		srv.SetMedia(mediaCfg, filepath.Join(st.Dir(), web.UploadsDirName))
+		srv.SetMedia(mediaCfg, filepath.Join(st.Root(), web.UploadsDirName))
 		srv.Start()
 		defer srv.Close()
 		webPort = srv.Port()
 	}
 
-	c.Banner(cfgPath, st.Dir(), webHost, webPort)
+	c.Banner(cfgPath, st.Root(), webHost, webPort)
 	if resumed != nil {
 		c.ShowHistory(resumed.Messages, resumed.Summary)
 	}
@@ -361,6 +372,9 @@ func runSessions(o *options, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Bring an older layout's session files under sessions/ as well, so
+	// `sessions list` shows them (best effort; the run holds no lock here).
+	_ = st.MigrateLegacy()
 
 	switch args[0] {
 	case "list", "ls":

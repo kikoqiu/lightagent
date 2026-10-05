@@ -99,7 +99,49 @@ func TestSplit(t *testing.T) {
 	}
 }
 
-// TestToggleArg covers the on/off argument shared by /result and /markdown.
+// TestSplitHonoursQuotes checks that a quoted file name stays one argument, so
+// /saveas "my notes.json" names a file with a space rather than two arguments.
+func TestSplitHonoursQuotes(t *testing.T) {
+	cases := []struct {
+		line string
+		args []string
+	}{
+		{`/saveas "my notes.json"`, []string{"my notes.json"}},
+		{`/saveas 'my notes'`, []string{"my notes"}},
+		{`/load -f "a b"`, []string{"-f", "a b"}},
+		{`/rm plain.json`, []string{"plain.json"}},
+		{`/load ""`, []string{""}},
+	}
+	for _, tc := range cases {
+		_, args, ok := Split(tc.line)
+		if !ok || strings.Join(args, "\x00") != strings.Join(tc.args, "\x00") {
+			t.Errorf("Split(%q) args = %q, want %q", tc.line, args, tc.args)
+		}
+	}
+}
+
+// TestForceFlagPullsTheSwitchOut checks the shared -f/--force parsing used by
+// /saveas and /load.
+func TestForceFlagPullsTheSwitchOut(t *testing.T) {
+	cases := []struct {
+		args  []string
+		force bool
+		rest  string
+	}{
+		{nil, false, ""},
+		{[]string{"notes"}, false, "notes"},
+		{[]string{"-f", "notes"}, true, "notes"},
+		{[]string{"notes", "--force"}, true, "notes"},
+		{[]string{"-f", "my", "notes"}, true, "my notes"},
+	}
+	for _, tc := range cases {
+		force, rest := ForceFlag(tc.args)
+		if force != tc.force || rest != tc.rest {
+			t.Errorf("ForceFlag(%q) = (%v, %q), want (%v, %q)", tc.args, force, rest, tc.force, tc.rest)
+		}
+	}
+}
+
 func TestToggleArg(t *testing.T) {
 	cases := []struct {
 		arg     string
@@ -138,9 +180,10 @@ func TestTableListsEveryCommand(t *testing.T) {
 		}
 	}
 	// The styled variant replaces the names in place; the plain one carries no
-	// markup at all.
-	styled := Table(func(name, rest string) string { return "<" + name + ">" + rest })
-	if strings.Contains(text, "<") || !strings.Contains(styled, "</help, /?>") {
+	// markup at all. («…» keeps the check independent of the argument hints,
+	// which legitimately contain angle brackets.)
+	styled := Table(func(name, rest string) string { return "«" + name + "»" + rest })
+	if strings.Contains(text, "«") || !strings.Contains(styled, "«/help, /?»") {
 		t.Errorf("styled table = %q", styled)
 	}
 }

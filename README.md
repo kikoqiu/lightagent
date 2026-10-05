@@ -219,8 +219,12 @@ source <(lightagent completion bash)       # bash 补全
 <当前工作目录>/
   .lightagent/
     .lock                        # 目录锁（启动即创建并锁定，退出时删除）
-    session.json                 # 当前会话（/save 或退出确认保存时写入）
-    session-20260912-153000.json # 选择不恢复历史时归档的旧会话（带归档时间）
+    sessions/
+      session.json               # 当前会话（/save 或退出确认保存时写入）
+      notes.json                 # /saveas 另存的会话
+      session-20260912-153000.json # 选择不恢复历史时归档的旧会话（带归档时间）
+    uploads/                     # Web 附加文件
+    browser-profile/             # webfetch 的浏览器 profile
 ```
 
 * **目录锁**：启动时在 `.lightagent/.lock` 上加独占锁（Unix 用 `flock`、Windows 用
@@ -233,11 +237,14 @@ source <(lightagent completion bash)       # bash 补全
 * 会话只在**内存**中维护：对话过程中不会写盘，`/save` 可随时手动保存一次。
 * `.lightagent/` 目录**启动时创建**（放锁文件），**退出时若目录里只剩锁文件，整个目录一并删除**：
   `--no-save`、一次性 `-p` 运行或退出时选择不保存都不会留下 `.lightagent/`。
+* **会话文件都在 `.lightagent/sessions/` 下**：当前会话是 `session.json`，`/saveas` 另存的文件与
+  归档的旧会话都放在同一目录（`/list` 列出的就是这里的内容）。旧布局（会话文件直接放在
+  `.lightagent/`）会在启动时自动移入 `sessions/`。
 * 退出（`/exit`、Ctrl+C 空输入、stdin EOF）时会询问 **是否保存**（默认是）。
 * 启动时若已有 `session.json`，会询问 **是否恢复历史**（默认是）；选择否时把旧会话
   重命名为 `session-<归档时间>.json` 归档，再开始新会话。
 * `lightagent -r`（或 `--resume`）直接恢复，不弹出询问；无文件时提示后开始新会话。
-* Web 镜像的**重启**（配置面板里的 Restart）把「保存 + 恢复」两步自动做完：先写 `session.json`，
+* Web 镜像的**重启**（配置面板里的 Restart）把「保存 + 恢复」两步自动做完：先写当前会话文件，
   再由新进程用 `--resume` 载入同一会话（见 [docs/web.md](docs/web.md)）。
 * 恢复时终端把整段历史按**实时渲染**重画：思考块、工具调用行、工具结果行与可见回答都在，
   与保存前屏幕上看到的一致（`/result off` 时工具结果行同样略去，与实时一致）。
@@ -250,8 +257,12 @@ source <(lightagent completion bash)       # bash 补全
 | 命令 | 作用 |
 |------|------|
 | `/help` `/?` | 显示帮助 |
-| `/new` | 清空当前会话（仅内存，`/save` 才落盘） |
-| `/save` | 立即把当前会话写入 `.lightagent/session.json` |
+| `/new` | 清空当前会话（仅内存，`/save` 才落盘），并把当前会话文件指回 `session.json` |
+| `/save` | 立即把当前会话写入它的文件（新建会话 → `session.json`；`/saveas`、`/load` 过的则更新那个文件） |
+| `/saveas` `[-f] <name>` | 把当前会话另存为 `name`（自动补 `.json`），并把它设为当前文件；已存在时提示用 `-f` 覆盖 |
+| `/load` `[-f] <name|n>` | 载入某个已保存会话（文件名的可选引号，或 `/list` 的序号）；当前会话有未保存改动时会提示用 `-f` |
+| `/list` `[n]` | 列出最近 n 条保存记录（序号 + 文件名 + 最后修改时间），默认 10 |
+| `/rm` `<name>` | 按**文件名**删除一条保存记录（不接受序号，也不会删当前会话） |
 | `/stop` `/interrupt` | 中断正在运行的回合（模型调用或工具调用） |
 | `/compact` | 手动触发一次上下文压缩 |
 | `/history` `/context` | 显示消息条数、估算 token 与上下文用量百分比（提示行也实时显示百分比） |

@@ -23,7 +23,7 @@ lightagent/
     llm/                   OpenAI 兼容客户端（流式 / 工具调用 / extra_body）
     agent/                 回合循环、steering、事件总线、上下文压缩
     tools/                 exec_command / manage_session / read_file / write_file / edit_file / webfetch
-    store/                 单会话持久化（CWD/.lightagent/session.json）
+    store/                 多会话持久化（CWD/.lightagent/sessions/session.json）
     markdown/              Markdown → ANSI 渲染（CLI，按行流式）
     cli/                   彩色 REPL + Markdown 渲染
     web/                   WebSocket 实时镜像（流式增量合帧）+ config 编辑接口（/api/config）

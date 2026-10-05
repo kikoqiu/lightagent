@@ -14,13 +14,14 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 | `internal/utils` | HTML → Markdown 转换器（纯标准库 + `x/net/html`：标题/段落/列表/表格/代码块/公式/布局启发式，**可选把站内链接写成根相对路径**与**正文定位**（`<article>`/`<main>`/`class=main` 等容器，可按行号报告））；网页抓取（HTTP 源码 / 可见 / 无头 / 挂载浏览器四种取法 + 字符集、Cookie 与 profile，**在渲染好的页面里执行调用方给的脚本**（`Page.InvokeJS`：注入非枚举的 `_invokejs_done`，等待其回调或脚本失败））；浏览器池与 stealth |
 | `internal/mcp` | MCP 客户端（纯标准库）：JSON-RPC 2.0 over stdio / Streamable HTTP / HTTP+SSE；配置驱动的 `Manager` 与 `tools.Tool` 适配器 |
 | `internal/proc` | 子进程启动与停止：**树模式**（`Start`，Windows 用 Job Object「kill-on-close」、Unix 用独立进程组 `SIGTERM`→`SIGKILL`，exec 会话用）与**单进程模式**（`StartProcess`，只停止自己启动的那个进程，stdio MCP server 用）；`Shutdown` 在主进程退出或收到信号时按各自模式停止所有仍存活的进程 |
-| `internal/store` | 单会话持久化（`CWD/.lightagent/session.json`） |
+| `internal/store` | 多会话持久化（会话文件在 `CWD/.lightagent/sessions/`，当前会话为 `session.json`） |
 | `internal/lock` | 目录锁（纯 `syscall`）：`<状态目录>/.lock` 上 `flock`（Unix）/ `LockFileEx`（Windows），使一个目录只运行一个实例；释放时删锁文件，目录里再没别的就删目录 |
 | `internal/cli` | 彩色 REPL、斜杠命令、Markdown 流式渲染（未完成行作为预览绘制在提示符上方，按终端宽度折行、最多 8 行，因此超出首行的文本也边收边显示）、提示区原地逐行重绘（不整块擦除，老式 Windows 控制台才不会闪屏）、`[thinking]` 思考流式块（同样应用 Markdown）、异步渲染事件 |
 | `internal/slash` | 斜杠命令表（名称 / 别名 / 参数 / 说明 / 网页是否常显）：CLI 的 `/help`、网页的 `/help` 与左侧命令栏都由此生成；同时提供命令解析（全角斜杠、别名归一）、on/off 参数解析与 `/history` 用量文案 |
 | `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown；出站流式增量按 50ms 合帧（`web.go`），后台节流、手机隐藏超时后停表断连（`app.js`） |
 | `internal/markdown` | 无依赖的 Markdown → ANSI 渲染（CLI 用），按行流式输出并暴露未完成行（`Pending`）供预览 |
 | `internal/termcolor` | ANSI 彩色封装（检测到终端支持才着色） |
+| `internal/textwidth` | 终端列宽测量：东亚宽字符算 2 列、制表符算最宽跳位、控制符算 0；CLI 的提示区折行与 `/list` 的列对齐共用它，含按列右补空格的 `PadRight` |
 
 ## Agent 回合循环
 
@@ -199,9 +200,13 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 * 状态目录：`<当前工作目录>/.lightagent/`，**启动时创建**（先放目录锁 `.lock`，见
   [目录锁](#目录锁)）；**退出时若目录里只剩锁文件，整个目录一并删除**，因此未保存会话
   （`--no-save`、一次性 `-p` 运行、退出时选择不保存）不会留下任何目录或文件。
-* 会话文件：`session.json`（该目录**当前**会话）。
+* 会话文件放在 `.lightagent/sessions/`：当前会话是 `session.json`，`/saveas` 另存的文件与
+  归档的旧会话也在同一目录（`/list` 列出的即这里的内容）。旧布局把会话文件直接放在
+  `.lightagent/`，启动时（持锁后）会**自动移入 `sessions/`**，老会话不会丢。`--session PATH`
+  仍用指定文件所在的目录，不建 `sessions/` 子目录。当前会话文件是**可变**的：`/saveas`、`/load`
+  把它指向别处，之后的 `/save` 更新那个文件，`/new` 指回默认的 `session.json`。
 * 时机：运行时**只保存在内存**（不再有每回合 persist 回调）。写盘只有两条路径：
-  `/save` 命令，或退出时询问「是否保存」并确认（默认是）。
+  `/save` 命令，或退出时询问「是否保存」并确认（默认是）；`/saveas` 则写到新文件。
 * 启动时若 `session.json` 存在，会询问是否恢复（默认是）；选择「否」时把它重命名为
   `session-<YYYYmmdd-HHMMSS>.json` 归档（同名冲突时追加序号），再开始新会话。
   `-r`/`--resume` 直接恢复且不再询问；非交互 stdin 无法询问，按默认值处理。

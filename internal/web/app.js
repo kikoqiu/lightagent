@@ -1353,6 +1353,51 @@
     span.appendChild(tail);
   }
 
+  // addSessionsRow draws the /list table. It is a CSS grid (the same rows the
+  // load picker uses) rather than padded text: a file name with CJK glyphs would
+  // push space-padded columns out of line, because the font's CJK advance is not
+  // promised to be exactly two monospace cells.
+  function addSessionsRow(sessions) {
+    var row = document.createElement('div');
+    row.className = 'row sessions';
+    var note = document.createElement('span');
+    note.className = 'sessions-note';
+    note.textContent = sessions.length
+      ? '[info] ' + sessions.length + (sessions.length === 1 ? ' session' : ' sessions')
+      : '[info] no saved sessions';
+    row.appendChild(note);
+    if (sessions.length) {
+      var list = document.createElement('ul');
+      list.className = 'session-list';
+      sessions.forEach(function (s) {
+        var li = document.createElement('li');
+        li.className = 'session-row' + (s.current ? ' current' : '');
+        var idx = document.createElement('span');
+        idx.className = 'session-index';
+        idx.textContent = s.index;
+        var name = document.createElement('span');
+        name.className = 'session-name';
+        name.textContent = s.name;
+        var meta = document.createElement('span');
+        meta.className = 'session-meta';
+        meta.textContent = s.modified;
+        // The "(current)" mark is its own cell: kept in the stamp cell it would
+        // widen that cell for its row alone and break the column with the rest.
+        var flag = document.createElement('span');
+        flag.className = 'session-flag';
+        flag.textContent = s.current ? '(current)' : '';
+        li.appendChild(idx);
+        li.appendChild(name);
+        li.appendChild(meta);
+        li.appendChild(flag);
+        list.appendChild(li);
+      });
+      row.appendChild(list);
+    }
+    placeRow(row);
+    return row;
+  }
+
   // ---- copy ----
   // Every user message and every agent reply can leave the page on the clipboard
   // in three flavours: markdown (the message as it was written), HTML (the
@@ -1818,6 +1863,10 @@
     btn.title = hint;
 
     btn.onclick = function () {
+      // The session commands that take a file name (or a picker) open a panel
+      // instead of sending the bare word; the panel then sends the exact line a
+      // terminal would type.
+      if (SESSION_PANELS[cmd.name]) { SESSION_PANELS[cmd.name](); return; }
       // A stateful switch sends the opposite of what the rail shows, so the
       // click always lands where the user aimed.
       if (switchKeys[cmd.name]) {
@@ -1864,6 +1913,173 @@
     setCommandsOpen(false);
     setSwitch('/result', !!CFG.result);
     setSwitch('/markdown', MARKDOWN);
+  }
+
+  // ---- session panels (save as / load / remove) ----
+  // The session commands that take a file name — or, for /load, a picker — can
+  // not run from a bare rail click, so their rows open a panel instead. A panel
+  // sends the very line a terminal would type (/saveas -f name), and the load
+  // picker reads the list the server publishes at /api/sessions, so the number
+  // it shows is the one /list prints and /load accepts.
+
+  // SESSION_PANELS maps a rail command name to the function its row opens. It
+  // is filled by buildSessionPanels below, before the rail is built.
+  var SESSION_PANELS = {};
+
+  function openSessionModal(modal, panel) {
+    if (!modal) { return; }
+    modal.hidden = false;
+    if (panel) { panel.focus(); }
+  }
+
+  function closeSessionModal(modal, statusEl) {
+    if (!modal || modal.hidden) { return; }
+    modal.hidden = true;
+    if (statusEl) { statusEl.textContent = ''; }
+  }
+
+  // wireSessionCloses closes a panel from its own ✕ / backdrop / Cancel
+  // controls (all carrying the data-<name>-close attribute).
+  function wireSessionCloses(modal, attr, onClose) {
+    if (!modal) { return; }
+    var els = modal.querySelectorAll('[' + attr + ']');
+    for (var i = 0; i < els.length; i++) { els[i].onclick = onClose; }
+  }
+
+  function buildSaveAsPanel() {
+    var modal = document.getElementById('saveAsModal');
+    var panel = document.getElementById('saveAsPanel');
+    var nameEl = document.getElementById('saveAsName');
+    var forceEl = document.getElementById('saveAsForce');
+    var statusEl = document.getElementById('saveAsStatus');
+    var saveEl = document.getElementById('saveAsSave');
+    if (!modal || !nameEl || !saveEl) { return; }
+    var submit = function () {
+      var name = nameEl.value.trim();
+      if (!name) { statusEl.textContent = 'enter a file name'; return; }
+      sendCommand('/saveas', (forceEl && forceEl.checked ? '-f ' : '') + name);
+      closeSessionModal(modal, statusEl);
+      nameEl.value = '';
+    };
+    saveEl.onclick = submit;
+    nameEl.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+    wireSessionCloses(modal, 'data-saveas-close', function () { closeSessionModal(modal, statusEl); });
+    SESSION_PANELS['/saveas'] = function () {
+      openSessionModal(modal, panel);
+      nameEl.focus();
+      nameEl.select();
+    };
+  }
+
+  function buildRmPanel() {
+    var modal = document.getElementById('rmModal');
+    var panel = document.getElementById('rmPanel');
+    var nameEl = document.getElementById('rmName');
+    var statusEl = document.getElementById('rmStatus');
+    var removeEl = document.getElementById('rmRemove');
+    if (!modal || !nameEl || !removeEl) { return; }
+    var submit = function () {
+      var name = nameEl.value.trim();
+      if (!name) { statusEl.textContent = 'enter a file name'; return; }
+      sendCommand('/rm', name);
+      closeSessionModal(modal, statusEl);
+      nameEl.value = '';
+    };
+    removeEl.onclick = submit;
+    nameEl.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+    wireSessionCloses(modal, 'data-rm-close', function () { closeSessionModal(modal, statusEl); });
+    SESSION_PANELS['/rm'] = function () {
+      openSessionModal(modal, panel);
+      nameEl.focus();
+      nameEl.select();
+    };
+  }
+
+  function buildLoadPanel() {
+    var modal = document.getElementById('loadModal');
+    var panel = document.getElementById('loadPanel');
+    var listEl = document.getElementById('loadList');
+    var statusEl = document.getElementById('loadStatus');
+    var forceEl = document.getElementById('loadForce');
+    if (!modal || !listEl) { return; }
+
+    function row(session) {
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'session-row ghost' + (session.current ? ' current' : '');
+      var idx = document.createElement('span');
+      idx.className = 'session-index';
+      idx.textContent = session.index;
+      var name = document.createElement('span');
+      name.className = 'session-name';
+      name.textContent = session.name;
+      var meta = document.createElement('span');
+      meta.className = 'session-meta';
+      meta.textContent = session.modified + '  ·  ' + session.messages + ' msgs' + (session.current ? '  ·  current' : '');
+      btn.appendChild(idx);
+      btn.appendChild(name);
+      btn.appendChild(meta);
+      btn.onclick = function () {
+        sendCommand('/load', (forceEl && forceEl.checked ? '-f ' : '') + session.index);
+        closeSessionModal(modal, statusEl);
+      };
+      li.appendChild(btn);
+      return li;
+    }
+
+    function render(sessions) {
+      listEl.textContent = '';
+      if (!sessions.length) {
+        var empty = document.createElement('li');
+        empty.className = 'session-empty';
+        empty.textContent = 'no saved sessions yet';
+        listEl.appendChild(empty);
+        return;
+      }
+      for (var i = 0; i < sessions.length; i++) { listEl.appendChild(row(sessions[i])); }
+    }
+
+    function refresh() {
+      statusEl.textContent = 'loading…';
+      fetch('/api/sessions', { credentials: 'same-origin' })
+        .then(function (res) {
+          if (res.status === 401 && window.AUTH) { window.AUTH.unauthorized(); }
+          return res.json().catch(function () { return {}; });
+        })
+        .then(function (body) {
+          if (body && body.error) { statusEl.textContent = body.error; return; }
+          statusEl.textContent = '';
+          render((body && body.sessions) || []);
+        })
+        .catch(function (err) {
+          statusEl.textContent = 'could not read the session list: ' + err.message;
+        });
+    }
+
+    wireSessionCloses(modal, 'data-load-close', function () { closeSessionModal(modal, statusEl); });
+    SESSION_PANELS['/load'] = function () {
+      openSessionModal(modal, panel);
+      refresh();
+    };
+  }
+
+  // buildSessionPanels wires the three panels and registers their rail rows.
+  // Escape closes whichever is open.
+  function buildSessionPanels() {
+    buildSaveAsPanel();
+    buildLoadPanel();
+    buildRmPanel();
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape' && e.keyCode !== 27) { return; }
+      closeSessionModal(document.getElementById('saveAsModal'), document.getElementById('saveAsStatus'));
+      closeSessionModal(document.getElementById('loadModal'), document.getElementById('loadStatus'));
+      closeSessionModal(document.getElementById('rmModal'), document.getElementById('rmStatus'));
+    });
   }
 
   // ---- the rail as a drawer (phones) ----
@@ -2102,16 +2318,17 @@
       // shares the class, is not a tool result and stays whole.
       addResultRow(!!ev.is_error, ev.text);
     }
-    else if (kind === 'info') { addRow('result', '', '[info] ' + (ev.text || ''), false); syncResults(ev.text || ''); }
+    else if (kind === 'info') { addRow('result marked', '', '[info] ' + (ev.text || ''), false); syncResults(ev.text || ''); }
     else if (kind === 'compacted') {
       // The info row counts what was compressed away; the summary block shows
       // what replaced it. The mirror records the same block at this point of its
       // scrollback, so a reload replays it exactly here.
-      addRow('result', '', '[info] ' + (ev.text || ''), false);
+      addRow('result marked', '', '[info] ' + (ev.text || ''), false);
       if (ev.summary) { render('summary', { text: ev.summary, time: ev.time }); }
     }
-    else if (kind === 'interrupted') { addRow('interrupted', '', '[interrupted] ' + (ev.text || ''), false); }
-    else if (kind === 'error') { addRow('error', '', '[error] ' + (ev.text || ''), false); }
+    else if (kind === 'interrupted') { addRow('interrupted marked', '', '[interrupted] ' + (ev.text || ''), false); }
+    else if (kind === 'error') { addRow('error marked', '', '[error] ' + (ev.text || ''), false); }
+    else if (kind === 'sessions') { addSessionsRow(ev.sessions || []); }
   }
 
   // The snapshot's header carries whether a turn is already running; the
@@ -2216,6 +2433,7 @@
       else if (m.role === 'summary') { render('summary', { text: m.content, time: m.time }); }
       else if (m.role === 'error') { render('error', { text: m.content }); }
       else if (m.role === 'interrupted') { render('interrupted', { text: m.content }); }
+      else if (m.role === 'sessions') { render('sessions', { sessions: m.sessions }); }
     });
     flushReplayBatch();
   }
@@ -2774,7 +2992,8 @@
   });
 
   // The rail only mirrors the shared catalogue, so it is built once, before the
-  // connection is dialed.
+  // connection is dialed. The session panels register their rows first.
+  buildSessionPanels();
   buildCommands();
   sendEl.disabled = true;
   // Wait for the session state before dialing: the handshake fails without a

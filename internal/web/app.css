@@ -437,6 +437,15 @@
     background:rgba(8,11,17,.4); border-radius:var(--radius-sm);
     padding:6px 10px; margin-left:-10px;
   }
+  /* A marker row (app.js adds .marked) keeps its "[info] "/"[error] " label on the
+     first line and hangs everything after it under the label, so a multi-line
+     body — the /list table — lines its columns up with the first line instead of
+     restarting at the row's left edge. The indent is the label's own width, so a
+     single line reads exactly as before (the negative text-indent cancels the
+     padding on that first line). */
+  .result.marked .text { padding-left:calc(10px + 7ch); text-indent:-7ch; }
+  .error.marked .text { padding-left:calc(10px + 8ch); text-indent:-8ch; }
+  .interrupted.marked .text { padding-left:14ch; text-indent:-14ch; }
   /* tool call: the function name, then one line per argument, none indented.
      The line breaks are carried by the text (the row is pre-wrap), so these
      rules only colour the parts and never affect the layout. The palette
@@ -484,6 +493,24 @@
   .summary .role { color:var(--yellow); }
   .summary .text { color:var(--fg); }
   .summary .text:not(.md) { color:var(--fg-muted); font-style:italic; }
+
+  /* ---- the /list table ---- */
+  /* The session table is a grid (the rows the load picker uses, see .session-list
+     in the session-panel rules), not padded text: a CJK file name keeps the
+     columns lined up whatever width the font gives its glyphs. The whole list is
+     one grid with the rows spilled into it (display:contents), so every row
+     shares the same column widths; "(current)" is a column of its own, since
+     left in the stamp cell it would widen that cell for its row alone. The picker
+     stacks its stamp under the name; here the cells sit on one line, like the CLI. */
+  .row.sessions { border-left:2px solid var(--border); padding-left:12px; color:var(--fg-muted); font-size:12.5px; line-height:20px; }
+  .row.sessions .sessions-note { color:var(--fg-dim); }
+  .row.sessions .session-list { margin:4px 0 0; display:grid; grid-template-columns:3ch minmax(0, 1fr) auto auto; gap:2px 10px; }
+  .row.sessions .session-row { display:contents; }
+  .row.sessions .session-index { grid-row:auto; grid-column:auto; min-width:0; text-align:right; font-weight:700; }
+  .row.sessions .session-name { grid-column:auto; color:var(--fg); overflow-wrap:anywhere; }
+  .row.sessions .session-meta { grid-column:auto; }
+  .row.sessions .session-flag { grid-column:auto; }
+  .row.sessions .session-row.current .session-name { color:var(--fg); font-weight:700; }
 
   /* ---- markdown ---- */
   .row p { margin:0 0 8px; }
@@ -818,6 +845,27 @@
   /* Three actions (Restart / Reload / Save) have to be able to drop to a second
      line on a phone-width panel; the note shrinks first. */
   .modal-actions { margin-left:auto; display:flex; flex-wrap:wrap; gap:8px; }
+
+  /* ---- session panels (save as / load / remove) ---- */
+  /* The load picker lists the newest sessions, newest first: each row is one
+     button (the whole line is the tap target) carrying the /list index, the file
+     name and its last-modified stamp. */
+  .session-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:4px; }
+  .session-empty { padding:16px 4px; color:var(--fg-dim); font-size:12.5px; text-align:center; }
+  .session-row {
+    display:grid; grid-template-columns:auto minmax(0, 1fr); gap:2px 10px;
+    width:100%; min-height:44px; padding:8px 12px; text-align:left; align-items:center;
+  }
+  .session-row .session-index { grid-row:1 / span 2; min-width:22px; color:var(--accent); font-size:12.5px; font-weight:700; text-align:right; }
+  .session-row .session-name { grid-column:2; color:var(--fg); font-size:12.5px; overflow-wrap:anywhere; }
+  .session-row .session-meta { grid-column:2; color:var(--fg-dim); font-size:11px; }
+  .session-row.current { border-color:rgba(90,162,255,.5); color:var(--fg); }
+  /* The -f switch sits in the footer, before Cancel. */
+  .session-force { margin:0; align-items:center; }
+  .session-force input:disabled + span { opacity:.5; }
+  /* Remove is destructive, so it reads red. */
+  .modal-actions button.danger { background:rgba(8,11,17,.5); border-color:rgba(248,81,73,.5); color:var(--red); box-shadow:none; }
+  .modal-actions button.danger:hover { border-color:var(--red); }
 
   /* ---- read-aloud (TTS) panel ---- */
   /* The header button and the rail card both open the panel; both light up while

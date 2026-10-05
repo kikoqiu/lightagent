@@ -580,6 +580,7 @@ type historyRow struct {
 	IsError     bool             `json:"is_error"`
 	Attachments []llm.Attachment `json:"attachments"`
 	Time        string           `json:"time"`
+	Sessions    []sessionJSON    `json:"sessions"`
 }
 
 // historyFrame is one frame of a history snapshot as the page consumes it: the

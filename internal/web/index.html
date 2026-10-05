@@ -227,6 +227,93 @@
       </div>
     </div>
   </div>
+  <!-- Save-as: the file name for /saveas. The check box maps to the command's
+       -f switch (overwrite an existing file). -->
+  <div class="modal" id="saveAsModal" hidden>
+    <div class="modal-backdrop" data-saveas-close></div>
+    <div class="modal-panel" id="saveAsPanel" role="dialog" aria-modal="true" aria-labelledby="saveAsTitle" tabindex="-1">
+      <div class="modal-head">
+        <span class="modal-title"><b id="saveAsTitle">Save as</b><small>the conversation is written under the sessions directory</small></span>
+        <button class="ghost" type="button" data-saveas-close aria-label="close the save-as panel">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form">
+          <div class="field">
+            <label class="field-label" for="saveAsName">
+              <span class="field-key">File name</span>
+              <span class="field-help">A bare name lives in the sessions directory; a .json suffix is added when missing. A name with a path keeps it as written.</span>
+            </label>
+            <div class="field-control"><input type="text" id="saveAsName" autocomplete="off" spellcheck="false" placeholder="notes"></div>
+          </div>
+          <div class="field">
+            <span class="field-label"><span class="field-key">Overwrite</span><span class="field-help">Without this an existing file is refused (the command's -f).</span></span>
+            <div class="field-control">
+              <label class="card-switch"><input class="switch" type="checkbox" id="saveAsForce"><span>Replace the file if it already exists</span></label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-note" id="saveAsStatus"></span>
+        <span class="modal-actions">
+          <button class="ghost" type="button" data-saveas-close>Cancel</button>
+          <button id="saveAsSave" type="button">Save</button>
+        </span>
+      </div>
+    </div>
+  </div>
+  <!-- Load picker: the newest sessions (up to 50), the index matching /list.
+       Clicking a row loads it; the check box maps to the -f switch (discard
+       unsaved changes). -->
+  <div class="modal" id="loadModal" hidden>
+    <div class="modal-backdrop" data-load-close></div>
+    <div class="modal-panel" id="loadPanel" role="dialog" aria-modal="true" aria-labelledby="loadTitle" tabindex="-1">
+      <div class="modal-head">
+        <span class="modal-title"><b id="loadTitle">Load a session</b><small>newest first — the number matches /list</small></span>
+        <button class="ghost" type="button" data-load-close aria-label="close the load panel">✕</button>
+      </div>
+      <div class="modal-body">
+        <ul class="session-list" id="loadList"></ul>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-note" id="loadStatus"></span>
+        <span class="modal-actions">
+          <label class="card-switch session-force" title="load even when the current conversation has unsaved changes (the command's -f)">
+            <input class="switch" type="checkbox" id="loadForce"><span>Discard unsaved changes (-f)</span>
+          </label>
+          <button class="ghost" type="button" data-load-close>Cancel</button>
+        </span>
+      </div>
+    </div>
+  </div>
+  <!-- Remove: the file name for /rm (name only; the number form is refused). -->
+  <div class="modal" id="rmModal" hidden>
+    <div class="modal-backdrop" data-rm-close></div>
+    <div class="modal-panel" id="rmPanel" role="dialog" aria-modal="true" aria-labelledby="rmTitle" tabindex="-1">
+      <div class="modal-head">
+        <span class="modal-title"><b id="rmTitle">Remove a session</b><small>by file name, never by number</small></span>
+        <button class="ghost" type="button" data-rm-close aria-label="close the remove panel">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form">
+          <div class="field">
+            <label class="field-label" for="rmName">
+              <span class="field-key">File name</span>
+              <span class="field-help">The current session cannot be removed (start a new one first). A .json suffix is added when missing.</span>
+            </label>
+            <div class="field-control"><input type="text" id="rmName" autocomplete="off" spellcheck="false" placeholder="notes"></div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-note" id="rmStatus"></span>
+        <span class="modal-actions">
+          <button class="ghost" type="button" data-rm-close>Cancel</button>
+          <button id="rmRemove" type="button" class="danger">Remove</button>
+        </span>
+      </div>
+    </div>
+  </div>
   <div class="modal" id="ttsModal" hidden>
     <div class="modal-backdrop" data-tts-close></div>
     <div class="modal-panel" id="ttsPanel" role="dialog" aria-modal="true" aria-labelledby="ttsTitle" tabindex="-1">

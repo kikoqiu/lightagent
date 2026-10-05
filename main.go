@@ -355,8 +355,8 @@ file is kept unless -f/--force is given.
 `,
 	"sessions": `lightagent sessions <list|show|prune> [options]
 
-Manage the session files in the state directory (.lightagent/, or the directory
-of --session).
+Manage the session files in the sessions directory (.lightagent/sessions/, or the
+directory of --session).
 
   list                     list sessions (current first, then archives)
   show [--file NAME]       print a saved conversation
