@@ -52,7 +52,8 @@ func (c Command) Usage() string {
 // command rail, which shows the Primary entries and folds the rest.
 var Commands = []Command{
 	{Name: "/help", Aliases: []string{"/?"}, Summary: "show the command list", Web: true, Primary: true},
-	{Name: "/new", Summary: "start a new conversation (clears the session)", Web: true, Primary: true},
+	{Name: "/new", Summary: "start a new conversation and forget the current session file", Web: true, Primary: true},
+	{Name: "/clear", Summary: "clear the conversation but keep the current session file", Web: true, Primary: true},
 	{Name: "/save", Summary: "write the current conversation to its file now", Web: true, Primary: true},
 	{Name: "/saveas", Args: "[-f] <name>", Summary: "save the conversation under a new name", Web: true},
 	{Name: "/load", Args: "[-f] <name|n>", Summary: "load a saved session by name or /list number", Web: true, Primary: true},

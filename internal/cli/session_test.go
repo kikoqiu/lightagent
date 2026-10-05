@@ -79,10 +79,54 @@ func TestSaveAsMakesTheNewFileCurrent(t *testing.T) {
 	}
 
 	// /new points back at the default file (session.json under sessions/).
+	// (/clear would keep notes.json; see TestClearCommandKeepsTheCurrentFile.)
 	buf.Reset()
 	c.handleCommand(context.Background(), "/new")
 	if got := c.store.Path(); filepath.Base(got) != "session.json" {
 		t.Fatalf("after /new, current file = %q, want session.json", got)
+	}
+}
+
+// TestClearCommandKeepsTheCurrentFile covers /clear: it drops the conversation
+// but leaves the file it belongs to in place, so a later /save updates that file
+// (unlike /new, which forgets it and writes the default session.json).
+func TestClearCommandKeepsTheCurrentFile(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.agent.Load([]llm.Message{{Role: "user", Content: "hi"}}, "")
+
+	c.handleCommand(context.Background(), "/saveas notes")
+	notes := filepath.Join(c.store.Dir(), "notes.json")
+	if got := c.store.Path(); got != notes {
+		t.Fatalf("after /saveas, current file = %q, want %q", got, notes)
+	}
+
+	// /clear keeps the file the conversation belongs to and empties it.
+	buf.Reset()
+	if exit := c.handleCommand(context.Background(), "/clear"); exit {
+		t.Fatal("/clear must not exit")
+	}
+	if got := c.store.Path(); got != notes {
+		t.Fatalf("after /clear, current file = %q, want %q (unchanged)", got, notes)
+	}
+	if len(c.agent.History()) != 0 {
+		t.Fatal("the conversation should be empty after /clear")
+	}
+	if !strings.Contains(buf.String(), "cleared the conversation") {
+		t.Fatalf("/clear = %q, want a confirmation", buf.String())
+	}
+
+	// A later /save updates that same file rather than the default.
+	buf.Reset()
+	c.agent.Load([]llm.Message{{Role: "user", Content: "after"}}, "")
+	c.handleCommand(context.Background(), "/save")
+	if got := c.store.Path(); got != notes {
+		t.Fatalf("after /save, current file = %q, want %q", got, notes)
+	}
+	if !strings.Contains(buf.String(), notes) {
+		t.Fatalf("/save = %q, want it to name %q", buf.String(), notes)
 	}
 }
 
@@ -193,9 +237,9 @@ func TestRemoveCommandIsNameOnly(t *testing.T) {
 	}
 }
 
-// TestSaveOnExitUsesTheSessionsOwnName covers the exit prompt for a named
-// session: it writes the file the conversation came from, not session.json.
-func TestSaveOnExitUsesTheSessionsOwnName(t *testing.T) {
+// TestSaveSessionUsesTheSessionsOwnName covers saving a named session: /save and
+// the exit prompt write the file the conversation came from, not session.json.
+func TestSaveSessionUsesTheSessionsOwnName(t *testing.T) {
 	noColors(t)
 	c := newTestCLI(t)
 	c.agent.Load([]llm.Message{{Role: "user", Content: "hi"}}, "")
@@ -203,22 +247,23 @@ func TestSaveOnExitUsesTheSessionsOwnName(t *testing.T) {
 		t.Fatalf("SaveSessionAs: %v", err)
 	}
 
-	path, err := c.SaveOnExit()
+	path, err := c.SaveSession()
 	if err != nil {
-		t.Fatalf("SaveOnExit: %v", err)
+		t.Fatalf("SaveSession: %v", err)
 	}
 	if filepath.Base(path) != "notes.json" {
-		t.Fatalf("SaveOnExit path = %q, want notes.json", path)
+		t.Fatalf("SaveSession path = %q, want notes.json", path)
 	}
 	if _, err := os.Stat(filepath.Join(c.store.Dir(), "session.json")); !os.IsNotExist(err) {
 		t.Fatalf("session.json must not be written for a named session (stat err = %v)", err)
 	}
 }
 
-// TestSaveOnExitBacksUpTheDefault covers the nameless case: the default
-// session.json it is about to overwrite holds a different conversation, so it is
-// archived first — while an unchanged default is not archived again.
-func TestSaveOnExitBacksUpTheDefault(t *testing.T) {
+// TestSaveSessionBacksUpTheDefault covers a nameless save: the default
+// session.json it overwrites holds a different conversation, so it is archived
+// first — and a conversation that now lives in session.json is not archived
+// again by a later save.
+func TestSaveSessionBacksUpTheDefault(t *testing.T) {
 	noColors(t)
 	c := newTestCLI(t)
 	// A previous anonymous session sits in session.json.
@@ -243,27 +288,56 @@ func TestSaveOnExitBacksUpTheDefault(t *testing.T) {
 		return n
 	}
 
-	path, err := c.SaveOnExit()
+	path, err := c.SaveSession()
 	if err != nil {
-		t.Fatalf("SaveOnExit: %v", err)
+		t.Fatalf("SaveSession: %v", err)
 	}
 	if filepath.Base(path) != "session.json" {
-		t.Fatalf("SaveOnExit path = %q, want session.json", path)
+		t.Fatalf("SaveSession path = %q, want session.json", path)
 	}
 	if got := archives(); got != 1 {
 		t.Fatalf("archives = %d, want the previous default backed up once", got)
 	}
 	state, err := c.store.Load()
 	if err != nil || state == nil || len(state.Messages) != 1 || state.Messages[0].Content != "fresh" {
-		t.Fatalf("session.json after SaveOnExit = %+v (%v)", state, err)
+		t.Fatalf("session.json after SaveSession = %+v (%v)", state, err)
 	}
 
-	// Saving again with nothing new must not archive it a second time.
-	if _, err := c.SaveOnExit(); err != nil {
-		t.Fatalf("second SaveOnExit: %v", err)
+	// The conversation belongs to session.json now: a later save updates it in
+	// place instead of archiving it again.
+	c.agent.Load([]llm.Message{{Role: "user", Content: "fresh"}, {Role: "assistant", Content: "more"}}, "")
+	if _, err := c.SaveSession(); err != nil {
+		t.Fatalf("second SaveSession: %v", err)
 	}
 	if got := archives(); got != 1 {
-		t.Fatalf("archives after a second no-op exit = %d, want 1", got)
+		t.Fatalf("archives after a second save = %d, want 1", got)
+	}
+}
+
+// TestSaveSessionKeepsTheLoadedDefault covers a conversation resumed from
+// session.json itself: its saves update that file in place and never archive it,
+// even though the conversation has grown past what the file holds.
+func TestSaveSessionKeepsTheLoadedDefault(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	// session.json holds the conversation the run was resumed from.
+	if err := c.store.Save(store.State{Messages: []llm.Message{{Role: "user", Content: "loaded"}}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	c.agent.Load([]llm.Message{{Role: "user", Content: "loaded"}}, "")
+	c.SetHome(c.store.Default()) // as the startup resume does
+	// The conversation grows past what the file holds.
+	c.agent.Load([]llm.Message{{Role: "user", Content: "loaded"}, {Role: "assistant", Content: "more"}}, "")
+
+	if _, err := c.SaveSession(); err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	infos, err := c.store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Name != "session.json" {
+		t.Fatalf("a session resumed from session.json must not be archived: %+v", infos)
 	}
 }
 

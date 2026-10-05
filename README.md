@@ -240,9 +240,10 @@ source <(lightagent completion bash)       # bash 补全
 * **会话文件都在 `.lightagent/sessions/` 下**：每个会话有自己的文件名（`/saveas` 起的名字），
   `session.json` 只是**没有名字**的新会话的默认名。`/list` 列出的就是这里的内容。旧布局
   （会话文件直接放在 `.lightagent/`）会在启动时自动移入 `sessions/`。
-* 退出（`/exit`、Ctrl+C 空输入、stdin EOF）时会询问 **是否保存**（默认是）：保存时**写回会话自己的
-  文件名**；新会话没有名字，则写成 `session.json`，并先把已存在的 `session.json` 归档为
-  `session-<归档时间>.json` 备份（同一个会话再次保存不会重复备份）。
+* `/save` 与退出保存（`/exit`、Ctrl+C 空输入、stdin EOF 时询问「是否保存」，默认是）都**写回会话自己
+  的文件名**；新会话没有名字，则写成 `session.json`，并先把已存在的 `session.json` 归档为
+  `session-<归档时间>.json` 备份——除非这个会话本来就住在 `session.json` 里（由它恢复，或上一次已保存
+  到它），那就就地更新、不再备份。
 * 启动时**载入目录里最新的会话文件**（按修改时间，不再固定 `session.json`），询问 **是否恢复**
   （默认是）；恢复后这个会话就带着它的文件名，之后的保存都写回该文件。选择否时旧会话原样留在
   磁盘上（下次仍可恢复），本次是一个没有名字的新会话。
@@ -260,7 +261,8 @@ source <(lightagent completion bash)       # bash 补全
 | 命令 | 作用 |
 |------|------|
 | `/help` `/?` | 显示帮助 |
-| `/new` | 清空当前会话（仅内存，`/save` 才落盘），并把当前会话文件指回 `session.json` |
+| `/new` | 清空当前会话（仅内存，`/save` 才落盘），并**忘掉当前会话文件**（之后的 `/save` 写成默认的 `session.json`） |
+| `/clear` | 清空当前会话（仅内存，`/save` 才落盘），**保留当前会话文件**（之后的 `/save` 覆盖同一个文件） |
 | `/save` | 立即把当前会话写入它的文件（新建会话 → `session.json`；`/saveas`、`/load` 过的则更新那个文件） |
 | `/saveas` `[-f] <name>` | 把当前会话另存为 `name`（自动补 `.json`），并把它设为当前文件；已存在时提示用 `-f` 覆盖 |
 | `/load` `[-f] <name|n>` | 载入某个已保存会话（文件名的可选引号，或 `/list` 的序号）；当前会话有未保存改动时会提示用 `-f` |
@@ -360,10 +362,10 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 * 网页里发送 `/result off`（或 `on`）可开关工具（exec）结果输出，与 CLI 共享同一开关。
 * **网页与 CLI 共用同一套斜杠命令**：命令表（名称、别名、参数、说明、分组）由 `internal/slash` 统一提供，
   CLI 的 `/help` 与网页的左侧栏、`/help` 都从它生成，因此不会各自漂移。共享状态的命令
-  （`/new`、`/save`、`/stop`、`/compact`、`/history`、`/result`）通过事件总线广播，终端与所有网页
+  （`/new`、`/clear`、`/save`、`/stop`、`/compact`、`/history`、`/result`）通过事件总线广播，终端与所有网页
   看到同一条反馈；只属于当前页面的命令（`/help` 列表、`/markdown` 渲染开关、拼错的命令）只出现在网页里。
   `/exit` 只在终端生效（网页会提示关闭标签页）；未知命令与 CLI 一样被本地拒绝，不会发给模型。
-* 桌面端左侧栏有 **Commands** 命令栏：默认只列 `/help`、`/new`、`/save`、`/stop`（命令表中标为
+* 桌面端左侧栏有 **Commands** 命令栏：默认只列 `/help`、`/new`、`/clear`、`/save`、`/stop`（命令表中标为
   `primary` 的那些），其余命令折叠在标题之后 —— **点击标题展开/收起**，标题右侧 `+N` 是折叠数量；
   **点击即执行**，`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态。
 * 右上角 **⚙**（桌面端侧栏 “Configuration” 卡片）打开配置编辑器，右上角可在 **Form / JSON** 两种模式间切换：

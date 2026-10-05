@@ -105,6 +105,11 @@ type Server struct {
 	load   func(name string, force bool) (string, error)
 	list   func(n int) ([]store.SessionInfo, error)
 	remove func(name string) (string, error)
+	// newSession backs /new: it resets the conversation and forgets the current
+	// session file, so a later /save writes a fresh default session.json. It is
+	// registered by the program (SetSessionNewer); a nil one leaves /new
+	// resetting only the conversation, which is what /clear does.
+	newSession func()
 	// restart starts a replacement of this program and hands the run over to it.
 	// It is registered by the program (SetRestarter) and backs the page's
 	// Restart button; the zero value means restarting is unavailable (see
@@ -223,6 +228,12 @@ func (s *Server) SetSessionLister(fn func(n int) ([]store.SessionInfo, error)) {
 // the saved session named name and returns its path.
 func (s *Server) SetSessionRemover(fn func(name string) (string, error)) { s.remove = fn }
 
+// SetSessionNewer registers the callback behind the browser's /new: it resets
+// the conversation and forgets the current session file, so a later /save
+// writes a fresh default session.json. The program wires it to
+// cli.CLI.NewSession. Without it /new still clears the conversation but keeps
+// the current file, exactly like /clear.
+func (s *Server) SetSessionNewer(fn func()) { s.newSession = fn }
 // Start seeds the in-memory scrollback, serves in the background and subscribes
 // to the agent event bus.
 func (s *Server) Start() {
@@ -1024,10 +1035,27 @@ func (s *Server) handleCommand(text string) {
 			s.localError("a turn is running; try again when idle")
 			return
 		}
-		s.agent.Reset()
+		// Forget the current session file too, so a later /save writes a fresh
+		// default: resetting the conversation alone would leave it bound to the
+		// file it was loaded from.
+		if s.newSession != nil {
+			s.newSession()
+		} else {
+			s.agent.Reset()
+		}
 		// The page has to forget the rows of the conversation /new dropped.
 		s.clearScrollback()
 		s.info("started a new conversation (in memory; /save to persist)")
+	case "/clear":
+		if s.agent.Busy() {
+			s.localError("a turn is running; try again when idle")
+			return
+		}
+		// Only the conversation goes: the current session file is kept, so a
+		// later /save updates the same file (unlike /new, which forgets it).
+		s.agent.Reset()
+		s.clearScrollback()
+		s.info("cleared the conversation (in memory; /save to persist)")
 	case "/save":
 		if s.save == nil {
 			s.fail("saving is not available in this run")

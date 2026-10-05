@@ -49,6 +49,11 @@ type CLI struct {
 	termWidth func() int
 	// saveMode decides what happens on exit.
 	saveMode SaveMode
+	// homeFile is the session file the current conversation belongs to: the file
+	// it was loaded from or last saved to (see the home method). It is empty for
+	// a conversation /new started, which has no file of its own yet. Guarded by
+	// mu, because the mirror can drive a save concurrently.
+	homeFile string
 	// batch is true for non-interactive one-shot runs (no prompt is drawn).
 	batch bool
 
@@ -1280,7 +1285,7 @@ func (c *CLI) shutdown() {
 		}
 	}
 
-	path, err := c.SaveOnExit()
+	path, err := c.SaveSession()
 	if err != nil {
 		c.write(termcolor.Red("[error] ") + "failed to save session: " + err.Error() + "\n")
 		return
@@ -1549,9 +1554,13 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 		c.write(termcolor.Gray("bye") + "\n")
 		return true
 	case "/new":
-		c.agent.Reset()
-		c.store.Reset()
+		c.NewSession()
 		c.write(termcolor.Cyan("[info] ") + "started a new conversation (in memory; /save to persist)\n")
+	case "/clear":
+		// /clear keeps the current session file: a later /save updates the file
+		// the conversation already belongs to, whereas /new forgets it.
+		c.agent.Reset()
+		c.write(termcolor.Cyan("[info] ") + "cleared the conversation (in memory; /save to persist)\n")
 	case "/save":
 		path, err := c.SaveSession()
 		if err != nil {
@@ -1796,43 +1805,81 @@ func (c *CLI) snapshot() store.State {
 	}
 }
 
-// SaveSession writes the current conversation to the session file and returns
-// the path it was written to. It backs /save in both front-ends: the mirror
-// registers it through web.Server.SetSessionSaver, so a save from the browser
-// writes exactly what the terminal would write.
+// SaveSession writes the current conversation to its session file and returns
+// the path it was written to. It backs /save in both front-ends and the exit
+// prompt: the mirror registers it through web.Server.SetSessionSaver, so a save
+// from the browser writes exactly what the terminal would write.
+//
+// A nameless session is written to the default session.json, whose previous
+// content is archived first when it holds a different conversation: a fresh
+// conversation must not clobber the session it did not come from. The archive is
+// skipped when that file is where the conversation already lives — it was
+// resumed from session.json, or an earlier save wrote it there — so a session
+// that belongs to session.json is only ever updated in place.
 func (c *CLI) SaveSession() (string, error) {
+	if err := c.backUpDefault(); err != nil {
+		return "", err
+	}
 	if err := c.store.Save(c.snapshot()); err != nil {
 		return "", err
 	}
-	return c.store.Path(), nil
+	path := c.store.Path()
+	c.setHome(path)
+	return path, nil
 }
 
-// SaveOnExit writes the conversation for the exit prompt. A session with a name
-// goes to its own file; a nameless one goes to the default session.json — and
-// the session.json already on disk is archived first when it holds a different
-// conversation, so a fresh conversation never clobbers the session it did not
-// come from.
-func (c *CLI) SaveOnExit() (string, error) {
-	if c.store.Named() {
-		return c.SaveSession()
+// backUpDefault archives the default session.json before a nameless save
+// overwrites it. A named session never writes the default, and a conversation
+// whose home is the default is updated in place, so neither is archived.
+func (c *CLI) backUpDefault() error {
+	if c.store.Named() || c.home() == c.store.Default() {
+		return nil
 	}
 	prev, err := c.store.Load()
 	if err != nil {
-		return "", err
+		return err
 	}
-	if !sameConversation(prev, c.snapshot()) {
-		if _, aerr := c.store.Archive(time.Now()); aerr != nil {
-			return "", aerr
-		}
+	if sameConversation(prev, c.snapshot()) {
+		return nil
 	}
-	return c.SaveSession()
+	_, err = c.store.Archive(time.Now())
+	return err
+}
+
+// home returns the session file the current conversation belongs to.
+func (c *CLI) home() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.homeFile
+}
+
+func (c *CLI) setHome(path string) {
+	c.mu.Lock()
+	c.homeFile = path
+	c.mu.Unlock()
+}
+
+// SetHome records the file the run's conversation was resumed from at startup,
+// or "" when nothing was resumed. The program calls it right after building the
+// CLI, because the resume happens before the CLI exists.
+func (c *CLI) SetHome(path string) { c.setHome(path) }
+
+// NewSession starts a fresh conversation that no longer belongs to any session
+// file: the conversation is cleared and the current file is forgotten, so the
+// next save writes the default session.json. It backs /new in both front-ends
+// (the mirror clears its own log area around the call). /clear resets only the
+// conversation and leaves the file the conversation belongs to in place.
+func (c *CLI) NewSession() {
+	c.agent.Reset()
+	c.store.Reset()
+	c.setHome("")
 }
 
 // sameConversation reports whether a stored session holds the same conversation
 // as state, judged by its message count, its summary and its last message. It is
 // what tells a nameless save whether the default file it is about to overwrite
-// still needs backing up, so an unchanged file (a /save just before quitting) is
-// not archived again while a different conversation is.
+// still needs backing up, so an unchanged file is not archived while a different
+// conversation is.
 func sameConversation(stored *store.State, state store.State) bool {
 	if stored == nil {
 		return len(state.Messages) == 0 && strings.TrimSpace(state.Summary) == ""
@@ -1862,7 +1909,12 @@ func (c *CLI) SaveSessionAs(name string, force bool) (string, error) {
 			return "", fmt.Errorf("%s already exists; use /saveas -f %s to overwrite", path, name)
 		}
 	}
-	return c.store.SaveAs(name, c.snapshot())
+	path, err := c.store.SaveAs(name, c.snapshot())
+	if err != nil {
+		return "", err
+	}
+	c.setHome(path)
+	return path, nil
 }
 
 // LoadSession replaces the conversation with the saved session named name (a
@@ -1888,6 +1940,7 @@ func (c *CLI) LoadSession(name string, force bool) (string, error) {
 	messages := llm.ResolveMedia(state.Messages)
 	c.agent.Load(messages, state.Summary)
 	c.store.UseFile(path)
+	c.setHome(path)
 	c.ShowHistory(messages, state.Summary)
 	return path, nil
 }

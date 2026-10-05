@@ -374,7 +374,8 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 | 命令 | 网页侧行为 |
 |------|------------|
 | `/help` `/?` | 列出命令表与网页说明；**只在网页里**（终端有自己的 `/help`） |
-| `/new` | 清空会话，并清空网页日志区；回合运行中会拒绝，避免误点丢弃正在进行的对话 |
+| `/new` | 清空会话，并清空网页日志区，同时通过 `SetSessionNewer` 回调（接到 `cli.CLI.NewSession`）**忘掉当前会话文件**（之后 `/save` 写成默认 `session.json`）；回合运行中会拒绝，避免误点丢弃正在进行的对话 |
+| `/clear` | 清空会话，并清空网页日志区，但**保留当前会话文件**（之后 `/save` 覆盖同一个文件）；回合运行中同样会拒绝 |
 | `/save` | 通过 `SetSessionSaver` 回调落盘（程序把它接到 `cli.CLI.SaveSession`，与终端 `/save` 写同一份文件） |
 | `/saveas` `[-f] <name>` | 通过 `SetSessionSaverAs` 回调另存为 `name`（自动补 `.json`）并把它设为当前文件；已存在时未加 `-f` 会被拒绝（`cli.SaveSessionAs`） |
 | `/load` `[-f] <name\|n>` | 通过 `SetSessionLoader` 回调载入（文件名或 `/list` 序号），并**重建网页日志区**；当前会话有未保存改动时未加 `-f` 会被拒绝 |
@@ -388,7 +389,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 | `/exit` `/quit` `/q` | 只提示「请在终端退出」：它会结束整个会话（含终端） |
 | 其它 `/xxx` | 与 CLI 一致地报 `unknown command`，**不发给模型** |
 
-共享状态的命令（`/new`、`/save`、`/saveas`、`/load`、`/rm`、`/stop`、`/compact`、`/history`、`/result`）的结果通过**事件总线**
+共享状态的命令（`/new`、`/clear`、`/save`、`/saveas`、`/load`、`/rm`、`/stop`、`/compact`、`/history`、`/result`）的结果通过**事件总线**
 广播，因此终端与所有网页看到同一条反馈；只属于当前页面的命令（上面的 `/help`、`/list`、`/markdown`、
 未知命令）只写进网页日志区，不会污染终端回滚。
 

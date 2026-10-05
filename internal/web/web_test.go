@@ -1462,6 +1462,50 @@ func TestNewCommandClearsTheMirrorScrollback(t *testing.T) {
 	}
 }
 
+// TestNewCommandForgetsTheSessionFile pins that /new resets the file association
+// through the registered callback: a page-only reset would leave the conversation
+// bound to the file it was loaded from, so a later /save would write it back
+// there instead of the default session.json.
+func TestNewCommandForgetsTheSessionFile(t *testing.T) {
+	srv := newTestServer(t, "")
+	reset := 0
+	srv.SetSessionNewer(func() { reset++ })
+
+	srv.handleClientMessage([]byte(`{"text":"/new"}`))
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 1 })
+	if rows[0].Role != "info" || !strings.Contains(rows[0].Content, "new conversation") {
+		t.Fatalf("rows = %+v, want a new-conversation info", rows)
+	}
+	if reset != 1 {
+		t.Fatalf("the /new callback ran %d times, want 1", reset)
+	}
+}
+
+// TestClearCommandKeepsTheSessionFile pins that /clear drops the conversation
+// without touching the current session file: the callback behind /new must not
+// run, so a later /save updates the same file.
+func TestClearCommandKeepsTheSessionFile(t *testing.T) {
+	srv := newTestServer(t, "")
+	reset := 0
+	srv.SetSessionNewer(func() { reset++ })
+	bus := srv.agent.Bus()
+	bus.Publish(agent.Event{Type: agent.EventUser, Text: "hi"})
+	bus.Publish(agent.Event{Type: agent.EventAssistant, Text: "hello"})
+	waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 2 })
+
+	srv.handleClientMessage([]byte(`{"text":"/clear"}`))
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 1 })
+	if rows[0].Role != "info" || !strings.Contains(rows[0].Content, "cleared the conversation") {
+		t.Fatalf("rows = %+v, want a cleared-conversation info", rows)
+	}
+	if reset != 0 {
+		t.Fatalf("the /new callback ran %d times on /clear, want 0", reset)
+	}
+	if len(srv.agent.History()) != 0 {
+		t.Fatal("the conversation should be empty after /clear")
+	}
+}
+
 // TestMarkdownSwitchIsPageOnly pins that /markdown flips the browser's rendering
 // without announcing it on the shared bus: the terminal renders markdown with its
 // own switch, so the mirror must not claim a change it did not make.

@@ -138,7 +138,8 @@ func (s *Store) UseFile(path string) {
 }
 
 // Reset points the store back at its default session file (/new starts a fresh
-// conversation that saves where a run without /saveas or /load would).
+// conversation that saves where a run without /saveas or /load would; /clear,
+// which keeps the current file, does not call it).
 func (s *Store) Reset() {
 	s.mu.Lock()
 	s.file = s.initial
@@ -371,6 +372,11 @@ func (s *Store) Named() bool {
 	defer s.mu.Unlock()
 	return s.file != s.initial
 }
+
+// Default returns the default session file path: session.json (or the --session
+// file). It is the name a nameless conversation is saved under, and the file
+// whose previous content a nameless save may back up.
+func (s *Store) Default() string { return s.initial }
 
 // PruneArchives removes archived sessions, keeping the newest keep of them
 // (keep <= 0 removes every archive). The current session file is never touched.

@@ -197,6 +197,9 @@ func runSession(o *options, stdout io.Writer) error {
 	}
 
 	var resumed *store.State
+	// resumedPath is the file the conversation was loaded from; the CLI is told
+	// it so a later save knows it belongs to that file (see cli.CLI.SetHome).
+	resumedPath := ""
 	if resume {
 		path := st.Path()
 		if latest != nil {
@@ -215,6 +218,7 @@ func runSession(o *options, stdout io.Writer) error {
 			// The conversation now carries this file's name: a later save (and
 			// the exit prompt) writes it back there, not to the default.
 			st.UseFile(path)
+			resumedPath = path
 			resumed = cur
 			info("resumed %d messages from %s\n", len(cur.Messages), path)
 		} else {
@@ -224,6 +228,9 @@ func runSession(o *options, stdout io.Writer) error {
 
 	c := cli.New(ag, st, client.Model(), cfg.UI.Markdown)
 	c.SetOutput(out)
+	// A resumed conversation belongs to the file it came from, so a save (the
+	// exit prompt included) updates that file rather than backing it up.
+	c.SetHome(resumedPath)
 	// A signal-triggered exit happens while the editor is still running, so
 	// runRaw's deferred terminal restore would never run; the shutdown hook
 	// covers that path.
@@ -277,6 +284,10 @@ func runSession(o *options, stdout io.Writer) error {
 		srv.SetSessionLoader(c.LoadSession)
 		srv.SetSessionLister(c.ListSessions)
 		srv.SetSessionRemover(c.RemoveSession)
+		// /new resets the conversation and forgets the current session file
+		// through the CLI, so the page's next /save writes the same default
+		// file a terminal /new + /save would.
+		srv.SetSessionNewer(c.NewSession)
 		// The page's Restart button saves the session (the endpoint does that,
 		// so the conversation is on disk before anything is given up) and then
 		// hands the run over to a fresh process, which resumes it: the same
