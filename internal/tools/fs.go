@@ -11,7 +11,14 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/text/transform"
 )
+
+// readSampleSize is how many leading bytes are sniffed to pick an encoding. It
+// has to be big enough for the byte order mark-less wide heuristic to see a
+// stable NUL pattern.
+const readSampleSize = 4096
 
 // FsConfig carries the file-tool limits.
 type FsConfig struct {
@@ -46,7 +53,8 @@ func (t *ReadFileLinesTool) Description() string {
 		"row. CRLF is normalized to LF. start_line is 1-indexed and inclusive, max_lines is a row "+
 		"count, so one call returns [start_line, start_line + rows - 1]; continue with "+
 		"start_line = last returned file line + 1. With the default 'auto' encoding the header "+
-		"also names the charset that was detected. Per-call limit: up to %d lines / %d bytes.",
+		"also names the charset that was detected (UTF-8, UTF-16/UTF-32, or a legacy code page). "+
+		"Per-call limit: up to %d lines / %d bytes.",
 		t.fs.MaxReadFileLines, t.fs.MaxReadFileSize)
 }
 
@@ -72,7 +80,12 @@ func (t *ReadFileLinesTool) Parameters() map[string]any {
 			"encoding": map[string]any{
 				"type":        "string",
 				"default":     contentEncodingAuto,
-				"description": "'auto' (default) sniffs the file's charset (a byte order mark, else valid UTF-8, else the host ANSI code page) and the header names what it found; 'utf8' forces UTF-8; any other value is a charset label (gbk, big5, shift_jis, euc-jp, euc-kr, windows-1252) that decodes each line into UTF-8 text.",
+				"description": "'auto' (default) sniffs the file's charset (a byte order mark, a byte order mark-less UTF-16/UTF-32 pattern, else valid UTF-8, else the host ANSI code page) and the header names what it found and whether the file has a byte order mark; 'utf8' forces UTF-8; 'utf-8-sig' is UTF-8 with a byte order mark; any other value is a charset label that decodes the bytes into UTF-8 text: a Unicode form (utf-16, utf-16le, utf-16be, utf-32, utf-32le, utf-32be; aliases like utf16/unicode/ucs-2 are accepted) or a legacy label (gbk, big5, shift_jis, euc-jp, euc-kr, windows-1252).",
+			},
+			"keep_bom": map[string]any{
+				"type":        "boolean",
+				"default":     false,
+				"description": "Keep a leading byte order mark (U+FEFF) in the first row. Default: false (the mark is dropped — it is not content). The header's bom field reports whether the file has one either way.",
 			},
 		},
 		"required": []string{"path"},
@@ -137,7 +150,9 @@ func (t *ReadFileLinesTool) Execute(ctx context.Context, args map[string]any) *R
 		return Fail(fmt.Sprintf("failed to open file: path is a directory: %s", path))
 	}
 
-	sample := make([]byte, 512)
+	// The encoding has to be known before anything is decoded, so the sniffing
+	// runs on the raw head of the file.
+	sample := make([]byte, readSampleSize)
 	n, readErr := f.Read(sample)
 	if readErr != nil && readErr != io.EOF {
 		return Fail(fmt.Sprintf("failed to read file: %v", readErr))
@@ -146,21 +161,36 @@ func (t *ReadFileLinesTool) Execute(ctx context.Context, args map[string]any) *R
 
 	encodingName := ""
 	if autoDetect {
-		if looksBinary(sample) {
-			return Fail("file appears to be binary; pass an encoding label (e.g. gbk) if it is a legacy-encoded text file")
-		}
 		encoding = detectTextEncoding(sample, hostAnsiCharsetLabel())
 		encodingName = contentEncodingDisplayName(encoding)
-		// A byte order mark is not part of the first line.
-		if encoding == contentEncodingUTF8 && bytes.HasPrefix(sample, utf8BOM) {
-			sample = sample[len(utf8BOM):]
+	}
+	// A byte order mark sits at the very start of the file, so the sniffed head
+	// already knows whether the file carries one (a UTF-8 BOM and a BOM-less UTF-8
+	// file otherwise both read as "utf-8").
+	_, bomLen := bomEncoding(sample)
+	hasBOM := bomLen > 0
+
+	// Content is refused as binary only when it still looks non-textual after
+	// the sniffing above: a wide (UTF-16/UTF-32) stream is judged through its
+	// decoder, a narrow one by the raw NUL scan as before. A byte order mark or
+	// a wide guess therefore no longer trips the old "looks binary" test.
+	if autoDetect || encoding == contentEncodingUTF8 {
+		if sampleLooksBinaryForEncoding(encoding, sample) {
+			return Fail(binaryReadHint())
 		}
-	} else if encoding == contentEncodingUTF8 && looksBinary(sample) {
-		return Fail("file appears to be binary; pass an encoding label (e.g. gbk) if it is a legacy-encoded text file")
 	}
 
-	reader := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(sample), f), 64*1024)
-	content, footer, err := t.readWindow(reader, filepath.Base(path), encoding, encodingName, int64(startLine), limit, sizeBudget)
+	// Decode the whole byte stream into UTF-8 first, then split lines in the
+	// decoded text. Splitting the raw bytes on 0x0A would cut a UTF-16 code unit
+	// in half (its newline is 0A 00 / 00 0A) and garble every line after the
+	// first, and a byte budget could halve a multi-byte character. The terminator
+	// is therefore always looked for in the decoded text — never in the file's
+	// own bytes. Do not "optimize" this back into a per-byte split.
+	reader, err := decodeStream(encoding, sample, f)
+	if err != nil {
+		return Fail(err.Error())
+	}
+	content, footer, err := t.readWindow(reader, filepath.Base(path), encodingName, int64(startLine), limit, sizeBudget, !boolArgOr(args, "keep_bom", false), hasBOM)
 	if err != nil {
 		return Fail(err.Error())
 	}
@@ -170,20 +200,45 @@ func (t *ReadFileLinesTool) Execute(ctx context.Context, args map[string]any) *R
 	return OK(footer + "\n\n" + content)
 }
 
+// decodeStream wraps the raw file bytes in a streaming decoder that turns them
+// into UTF-8, so the line reader above only ever sees text: the decoded stream
+// is where line terminators are safe to look for. The consumed sample is
+// replayed ahead of the open file so no byte is read twice.
+func decodeStream(encoding string, sample []byte, f *os.File) (*bufio.Reader, error) {
+	codec, err := lookupCharsetEncoding(encoding)
+	if err != nil {
+		return nil, err
+	}
+	var src io.Reader = io.MultiReader(bytes.NewReader(sample), f)
+	if codec != nil {
+		src = transform.NewReader(src, codec.NewDecoder())
+	}
+	return bufio.NewReaderSize(src, 64*1024), nil
+}
+
+// binaryReadHint is the actionable message for content that still looks binary
+// after encoding detection.
+func binaryReadHint() string {
+	return "file appears to be binary; if it is a UTF-16/UTF-32 text file pass encoding=utf-16 (or utf-32), " +
+		"otherwise pass a charset label (e.g. gbk) if it is a legacy-encoded text file"
+}
+
 // readWindow reads [startLine, startLine+limit-1] honoring the byte budget and
-// returns the content plus a header/footer describing the window.
-func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encoding, encodingName string, startLine, limit, sizeBudget int64) (string, string, error) {
+// returns the content plus a header/footer describing the window. Every line
+// number here counts decoded lines.
+func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodingName string, startLine, limit, sizeBudget int64, stripBOM, hasBOM bool) (string, string, error) {
+	lr := newLineReader(reader, int(sizeBudget), stripBOM)
 	lineIndex := int64(1)
 	reachedEOF := false
 
 	for lineIndex < startLine {
-		_, rerr := readLine(reader)
-		if rerr == io.EOF {
+		_, _, _, err := lr.next()
+		if err == io.EOF {
 			reachedEOF = true
 			break
 		}
-		if rerr != nil {
-			return "", "", fmt.Errorf("failed to read file content: %v", rerr)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to read file content: %v", err)
 		}
 		lineIndex++
 	}
@@ -194,6 +249,7 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	var lines []string
 	var outputBytes, linesRead int64
 	var byteTruncated, lineTruncated bool
+	var lf, crlf, cr int
 
 	for (limit < 0 || linesRead < limit) && !reachedEOF {
 		remaining := sizeBudget - outputBytes
@@ -201,36 +257,36 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 			byteTruncated = true
 			break
 		}
-		raw, rerr := readLine(reader)
-		if rerr != nil && rerr != io.EOF {
-			return "", "", fmt.Errorf("failed to read file content: %v", rerr)
-		}
-		if rerr == io.EOF && raw == "" {
+		line, term, truncated, err := lr.next()
+		if err == io.EOF {
 			reachedEOF = true
 			break
 		}
-		display := strings.TrimSuffix(raw, "\r")
-		if encoding != contentEncodingUTF8 {
-			decoded, derr := decodeFileBytesToText([]byte(raw), encoding)
-			if derr != nil {
-				return "", "", derr
-			}
-			display = strings.TrimSuffix(decoded, "\r")
+		if err != nil {
+			return "", "", fmt.Errorf("failed to read file content: %v", err)
 		}
-		line := display
+		switch term {
+		case termLF:
+			lf++
+		case termCRLF:
+			crlf++
+		case termCR:
+			cr++
+		}
+		// The line reader already capped the line at sizeBudget on a rune
+		// boundary; a shorter cut happens when the budget has shrunk after
+		// earlier lines, and is kept rune-safe too.
 		if int64(len(line)) > remaining {
-			lines = append(lines, line[:remaining])
-			byteTruncated = true
-			lineTruncated = true
-			linesRead++
-			break
+			line = cutToRuneBoundary(line[:remaining])
+			truncated = true
 		}
 		lines = append(lines, line)
 		outputBytes += int64(len(line))
 		linesRead++
 		lineIndex++
-		if rerr == io.EOF {
-			reachedEOF = true
+		if truncated {
+			byteTruncated = true
+			lineTruncated = true
 			break
 		}
 	}
@@ -246,7 +302,8 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	if encodingName != "" {
 		header += fmt.Sprintf(" | encoding: %s", encodingName)
 	}
-	header += "]"
+	header += fmt.Sprintf(" | bom: %s", yesNo(hasBOM))
+	header += fmt.Sprintf(" | eol: %s]", lineEndingLabel(lf, crlf, cr))
 
 	var footer string
 	switch {
@@ -265,18 +322,151 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	return content, footer, nil
 }
 
-// readLine reads one line, stripping the trailing newline.
-func readLine(r *bufio.Reader) (string, error) {
-	s, err := r.ReadString('\n')
-	if err != nil {
-		return s, err
-	}
-	return strings.TrimSuffix(s, "\n"), nil
+// lineTerm is how a decoded line ended.
+type lineTerm int
+
+const (
+	termNone lineTerm = iota // the final line had no terminator
+	termLF
+	termCRLF
+	termCR
+)
+
+// lineReader splits a decoded UTF-8 stream into lines. Terminators are LF, CRLF
+// and lone CR; the terminator is not part of the returned line. Because the
+// source is already decoded text, a terminator can never fall inside a
+// multi-byte character — which is the whole point of decoding before splitting.
+//
+// A single line longer than maxBytes is cut at a rune boundary and the rest of
+// it is dropped, so a runaway line cannot pull the whole file into memory. When
+// stripBOM is set, the first line also has a leading U+FEFF (a byte order mark a
+// codec left in place) removed: a mark is not content.
+type lineReader struct {
+	r        *bufio.Reader
+	maxBytes int
+	stripBOM bool
+	atStart  bool
 }
 
-// looksBinary reports whether a byte sample looks like binary content.
-func looksBinary(sample []byte) bool {
-	return bytes.IndexByte(sample, 0) >= 0
+func newLineReader(r *bufio.Reader, maxBytes int, stripBOM bool) *lineReader {
+	return &lineReader{r: r, maxBytes: maxBytes, stripBOM: stripBOM, atStart: true}
+}
+
+// next returns the next line, the terminator it was ended by and whether it was
+// cut because it exceeded maxBytes. io.EOF is returned after the last line (the
+// last line itself is still delivered first).
+func (lr *lineReader) next() (string, lineTerm, bool, error) {
+	line, term, truncated, err := lr.readRaw()
+	if err != nil {
+		return "", termNone, false, err
+	}
+	if lr.atStart {
+		lr.atStart = false
+		if lr.stripBOM {
+			line = strings.TrimPrefix(line, "\uFEFF")
+		}
+	}
+	return line, term, truncated, nil
+}
+
+func (lr *lineReader) readRaw() (string, lineTerm, bool, error) {
+	var buf []byte
+	for {
+		b, err := lr.r.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				if len(buf) == 0 {
+					return "", termNone, false, io.EOF
+				}
+				return string(buf), termNone, false, nil
+			}
+			return "", termNone, false, err
+		}
+		switch b {
+		case '\n':
+			return string(buf), termLF, false, nil
+		case '\r':
+			term := termCR
+			if nb, perr := lr.r.Peek(1); perr == nil && len(nb) == 1 && nb[0] == '\n' {
+				lr.r.ReadByte()
+				term = termCRLF
+			}
+			return string(buf), term, false, nil
+		}
+		buf = append(buf, b)
+		if lr.maxBytes > 0 && len(buf) >= lr.maxBytes {
+			term, derr := lr.discardToTerminator()
+			if derr != nil && derr != io.EOF {
+				return "", termNone, false, derr
+			}
+			// Cut on a rune boundary: maxBytes is a byte count, but the tail of
+			// the line must never be a half-encoded character.
+			return cutToRuneBoundary(string(buf)), term, true, nil
+		}
+	}
+}
+
+// discardToTerminator consumes and drops bytes up to and including the next line
+// terminator, so the tail of a truncated line does not leak into the next one.
+func (lr *lineReader) discardToTerminator() (lineTerm, error) {
+	for {
+		b, err := lr.r.ReadByte()
+		if err != nil {
+			return termNone, err
+		}
+		switch b {
+		case '\n':
+			return termLF, nil
+		case '\r':
+			if nb, perr := lr.r.Peek(1); perr == nil && len(nb) == 1 && nb[0] == '\n' {
+				lr.r.ReadByte()
+				return termCRLF, nil
+			}
+			return termCR, nil
+		}
+	}
+}
+
+// cutToRuneBoundary drops a trailing partial UTF-8 sequence left by a byte cap.
+func cutToRuneBoundary(s string) string {
+	for len(s) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(s); r != utf8.RuneError || size > 1 {
+			break
+		}
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// yesNo renders a boolean as the read header reports it.
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+// lineEndingLabel names the line ending of the returned window: the single kind
+// that occurred, "mixed" when several did, or "none" when no line ended.
+func lineEndingLabel(lf, crlf, cr int) string {
+	kinds := 0
+	for _, n := range []int{lf, crlf, cr} {
+		if n > 0 {
+			kinds++
+		}
+	}
+	switch {
+	case kinds == 0:
+		return "none"
+	case kinds > 1:
+		return "mixed"
+	case crlf > 0:
+		return "CRLF"
+	case cr > 0:
+		return "CR"
+	default:
+		return "LF"
+	}
 }
 
 // AutoSplitWriteTool is implemented by a write tool that can spread a payload
@@ -340,7 +530,7 @@ func (t *WriteFileTool) Parameters() map[string]any {
 			"encoding": map[string]any{
 				"type":        "string",
 				"default":     "utf8",
-				"description": "'utf8' (default) writes text; 'hex'/'base64' decode an encoded binary payload; other values are charset labels (gbk, big5, shift_jis, windows-1252) that encode the text into that charset.",
+				"description": "'utf8' (default) writes text without a byte order mark; 'utf-8-sig' writes UTF-8 with one; 'hex'/'base64' decode an encoded binary payload; a Unicode form (utf-16, utf-16le, utf-16be, utf-32, utf-32le, utf-32be) or a legacy label (gbk, big5, shift_jis, euc-jp, euc-kr, windows-1252) encodes the text into that charset. A generic utf-16/utf-32 writes a byte order mark, the explicit little-/big-endian forms do not. mode='a' never writes a byte order mark, so an existing file's mark is left untouched.",
 			},
 		},
 		"required": []string{"path", "content"},
@@ -399,11 +589,18 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	if err != nil {
 		return Fail(err.Error())
 	}
+	// A byte order mark belongs at the very start of a file: append writes the
+	// same codec without one, so the mark the create/overwrite call laid down is
+	// left untouched.
+	writeEnc := encoding
+	if appendMode {
+		writeEnc = appendEncodingNoBOM(encoding)
+	}
 
 	var note string
 	var data []byte
 	if contentEncodingIsBinary(encoding) {
-		data, err = decodeContentPayload(content, encoding)
+		data, err = decodeContentPayload(content, writeEnc)
 		if err != nil {
 			return Fail(fmt.Sprintf("failed to decode %s content: %v", encoding, err))
 		}
@@ -417,7 +614,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		case kept != "" && !strings.HasSuffix(kept, "\n"):
 			note = noFinalNewlineNote()
 		}
-		data, err = decodeContentPayload(kept, encoding)
+		data, err = decodeContentPayload(kept, writeEnc)
 		if err != nil {
 			return Fail(fmt.Sprintf("failed to encode %s content: %v", encoding, err))
 		}

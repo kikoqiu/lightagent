@@ -27,7 +27,7 @@
 | 5 | Web 镜像 | 配置了 web 端口即启动（`web.host` 可选绑定 IP，默认 `127.0.0.1`）；端口被占用时自动递增；**WebSocket 实时双向镜像**；页面内置配置编辑器（控件表单 + JSON 双模式，`/api/config`，**重启生效**）与**一键重启**（`/api/restart`：先保存会话，新进程自动恢复）；**登录对话框**（密码明文保存在配置里、浏览器只发送加盐摘要，HttpOnly 会话 cookie + 记住我，**改密码立即生效**） |
 | 6 | 会话记录 | **一个目录一个会话**：启动询问是否恢复历史（默认是），退出询问是否保存（默认是），运行中只存内存，`/save` 手动落盘 |
 | 7 | 命令执行 | `exec_command` / `manage_session`（脚本语言 `ps`/`sh`/`python`，后台会话、轮询、输入、终止；进程退出后保留为**僵尸**直到被 `poll` 取走最后的输出与退出码，没人取走则 24h 后清理）；`/result` 可开关结果输出 |
-| 8 | 文件操作 | `read_file` / `write_file` / `edit_file`（`read_file` 默认 `auto` 自动侦测编码，含 GBK 等字符集转换） |
+| 8 | 文件操作 | `read_file` / `write_file` / `edit_file`（`read_file` 默认 `auto` 自动侦测编码，含 UTF-16/UTF-32 与 GBK 等字符集转换，先解码再切行） |
 | 9 | 上下文压缩 | 全局唯一压缩模式：超阈值时把旧消息总结成一条摘要；**服务商报「上下文超限」时自动回退本轮消息、压缩后重发同一条消息**（最多 2 次）；`/history` 查看用量，CLI 提示行与网页徽标实时显示 |
 | 10 | 彩色 CLI | 角色区分颜色；仅在确认终端支持 ANSI 时才着色（非 TTY、`NO_COLOR`、`TERM=dumb`、旧版 Windows 控制台自动关闭） |
 | 11 | Markdown 渲染 | 助手回答与模型思考均渲染为 Markdown：CLI 转 ANSI，Web 用浏览器端 marked（GFM，含表格）+ DOMPurify，公式（`$…$` / `$$…$$`）由内嵌的 **math.js** 渲染为 MathML（浏览器原生排版，无字体文件、无第三方公式库）；`ui.markdown` 默认开启 |
@@ -409,11 +409,20 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 
 ### `read_file`
 按行读取文本文件，1 起算的 `start_line` + `max_lines` 分页，输出带行号范围表头与
-`[PARTIAL]` / `[TRUNCATED]` / `[END OF FILE]` 标记。CRLF 归一化为 LF。
-`encoding` 默认 `auto`：先看字节序 BOM，再判断样本是否为合法 UTF-8，否则按宿主 ANSI 代码页
-（如 zh-CN 上的 `gbk`），都无法识别时按 UTF-8，表头写出识别到的具体编码；也可显式指定
-`utf8` 或字符集标签（`gbk`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`windows-1252`）逐行解码为
-UTF-8。
+`[PARTIAL]` / `[TRUNCATED]` / `[END OF FILE]` 标记；表头还给出识别到的编码、文件是否带 BOM 与窗口内的
+行尾类型（`LF`/`CRLF`/`CR`/`mixed`/`none`）。CRLF/CR 归一化为 LF。
+读取顺序是**先解码、再切行**：字节先按编码解码成文本，再在解码后的文本上切行、按 `rune` 边界截断
+（UTF-16 的换行是 `0A 00`/`00 0A`，按原始字节切行会把编码单元切断，第 2 行起全乱码）。
+`encoding` 默认 `auto`：先看字节序 BOM（`FF FE`→utf-16le、`FE FF`→utf-16be、`FF FE 00 00`→utf-32le、
+`00 00 FE FF`→utf-32be、`EF BB BF`→utf-8；先判 UTF-32 再判 UTF-16），再看无 BOM 的 UTF-16/UTF-32
+启发式（NUL 按固定字节奇偶规律出现即判定字节序；奇偶都有 NUL 时用「解码后是否像文本」的打分择优），
+再判断样本是否为合法 UTF-8，否则按宿主 ANSI 代码页（如 zh-CN 上的 `gbk`），都无法识别时按 UTF-8，表头写出
+识别到的具体编码。也可显式指定 `utf8`、`utf-8-sig`（UTF-8 + BOM）、Unicode 形式
+（`utf-16`/`utf16`、`utf-16le`、`utf-16be`、`utf-32`、`utf-32le`、`utf-32be`，别名 `unicode`/`ucs-2`
+等，大小写与连字符不敏感）或字符集标签（`gbk`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`windows-1252`）
+逐行解码为 UTF-8；BOM 在解码后被剥离（`keep_bom=true` 可保留，表头 `bom:` 报出有无），二进制仍被拒
+（提示「像 UTF-16/UTF-32 就传 `encoding=utf-16`」）。无 BOM 的纯 CJK UTF-16 与遗留双字节编码无法区分，
+自动侦测可能落到宿主代码页，此时请显式传 `encoding=utf-16`。
 
 ### `write_file`
 写入文件，`mode`：`o` 覆盖（默认）、`a` 追加、`c` 仅新建。默认开启自动拆解
@@ -425,7 +434,9 @@ UTF-8。
 `[truncated: N of M lines written; continue with mode='a']` 与续写要求，随后**从截断处原样**列出
 后续内容直到 2 行非空行（恰好为空的行输出空行，纯空白行按原样输出并计入）或内容结束，最后以
 `...` 收尾。
-`encoding`：`utf8`（默认）写文本；`hex`/`base64` 解码二进制载荷；其它标签按字符集编码。
+`encoding`：`utf8`（默认，无 BOM）写文本、`utf-8-sig` 写 UTF-8 + BOM；泛化 `utf-16`/`utf-32` 写 BOM、
+显式 `utf-16le`/`utf-16be`/`utf-32le`/`utf-32be` 不写；`mode='a'` **一律不写 BOM**（不改变已有文件的 BOM）；
+`hex`/`base64` 解码二进制载荷；其它标签按字符集编码。
 行尾按原样写入，系统不会自动补换行；因此写入的文本不以换行结尾时，成功反馈后面会追加一条
 `[no trailing newline: the system never adds one. If the next call appends (mode='a'), start its content
 with one newline: \n, or \r\n for a CRLF file.]`（下一步要 `mode='a'` 续写就得在内容最前面自己加一个换行）。

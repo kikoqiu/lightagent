@@ -193,18 +193,36 @@ type Tool interface {
 | `path` | string | 必填 | 文件路径 |
 | `start_line` | int | `1` | 1 起算、包含的首行 |
 | `max_lines` | int | `max_read_file_lines` | 本次最多返回行数 |
-| `encoding` | string | `auto` | 文本编码或字符集标签 |
+| `encoding` | string | `auto` | 文本编码或字符集标签（含 `utf-16`/`utf-32` 等 Unicode 形式） |
+| `keep_bom` | bool | `false` | 是否保留行首的字节序 BOM（默认剥离，不作为正文） |
 
-* 输出无行号；表头给出该窗口的首行文件行号（`auto` 时还会写出识别到的具体编码）：
-  `[file: <base> | lines X-Y | first row below = file line X | encoding: utf-8]`。
-* CRLF 归一化为 LF。
-* 页脚标记：`[PARTIAL - ...]`（还有内容）、`[TRUNCATED - ...]`（字节预算用尽）、
+* 输出无行号；表头给出该窗口的首行文件行号、`auto` 时识别到的具体编码、文件是否带字节序 BOM，以及窗口
+  内的行尾类型（`LF`/`CRLF`/`CR`/`mixed`/`none`）：
+  `[file: <base> | lines X-Y | first row below = file line X | encoding: utf-8 | bom: no | eol: LF]`。
+  （`encoding` 只在 `auto` 时出现；`bom` 与 `eol` 始终出现。）
+* **先解码、再切行**：字节先按识别或指定的编码解码成文本，再在**解码后的文本**上按 `\n`、`\r\n`、`\r`
+  切行，字节预算的截断也落在 `rune` 边界——UTF-16 的换行是 `0A 00`/`00 0A`，按原始字节切行会把编
+  码单元切断，第 2 行起全乱码（单行文件恰好躲过该 bug）。
+* CRLF/CR 归一化为 `LF` 输出。
+* 页脚标记：`[PARTIAL - ...]`（还有内容）、`[TRUNCATED - ...]`（字节预算用尽或单行超预算被截断）、
   `[END OF FILE - no further content.]`。
 * 续读：`start_line = 上次最后一行 + 1`（页脚会给出该值）。
-* `encoding`：`auto`（默认，自动侦测）先看字节序 BOM，再看样本是否为合法 UTF-8，否则按宿主 ANSI
-  代码页（如 zh-CN 上的 `gbk`），都无法识别时按 UTF-8；表头会写出识别到的具体编码。也可显式指定
-  `utf8`，或字符集标签（`gbk`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`windows-1252`）逐行解码为
-  UTF-8；`hex`/`base64` 不适用（逐行无意义）。
+* `encoding`：`auto`（默认，自动侦测）依次看：
+  1. 字节序 BOM（先判 UTF-32 再判 UTF-16）：`FF FE 00 00`→`utf-32le`、`00 00 FE FF`→`utf-32be`、
+     `FF FE`→`utf-16le`、`FE FF`→`utf-16be`、`EF BB BF`→`utf-8`；
+  2. 无 BOM 的 UTF-16/UTF-32 启发式：NUL 按固定字节奇偶出现即判定字节序（ASCII/空格/换行会带来这种
+     NUL）；若 NUL 在两奇偶上都有（如含 `一` 的 CJK 文本），再用「解码后是否像文本」的打分在两个字节序
+     间择优；
+  3. 合法 UTF-8；4. 宿主 ANSI 代码页（如 zh-CN 上的 `gbk`）；都不像时按 UTF-8。
+  表头会写出识别到的具体编码与是否带 BOM。也可显式指定 `utf8`、`utf-8-sig`（UTF-8 + BOM）、Unicode 形式
+  （`utf-16`/`utf16`、`utf-16le`、`utf-16be`、`utf-32`、`utf-32le`、`utf-32be`；别名 `unicode`、`ucs-2`、
+  `unicodefeff` 等，大小写与连字符不敏感），或字符集标签（`gbk`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、
+  `windows-1252`）逐行解码为 UTF-8；`hex`/`base64` 不适用（逐行无意义）。
+* BOM 在解码后被剥离，不作为正文返回（`keep_bom=true` 可保留）；表头以 `bom: yes/no` 报出。`auto` 仍不像
+  文本时判为二进制并被拒，错误信息会提示「看起来像 UTF-16/UTF-32 就传 `encoding=utf-16`」，显式传入不支持
+  的标签则报错并列出支持的编码（含 `utf-16`/`utf-32`）。
+* 无 BOM 的纯 CJK UTF-16 缺少判据（这类字节与遗留双字节 CJK 编码无法区分），自动侦测可能落到宿主代码页：
+  此时请显式传 `encoding=utf-16`。
 
 ---
 
@@ -215,8 +233,11 @@ type Tool interface {
 | `path` | string | 必填 | 文件路径 |
 | `content` | string | 必填 | 写入内容 |
 | `mode` | string | `o` | `o` 覆盖、`a` 追加、`c` 仅新建（互斥） |
-| `encoding` | string | `utf8` | `utf8` 文本；`hex`/`base64` 二进制载荷；其它为字符集标签 |
+| `encoding` | string | `utf8` | 写文本的编码：`utf8`（无 BOM）、`utf-8-sig`（UTF-8 + BOM）、Unicode 形式（`utf-16`/`utf-16le`/`utf-16be`/`utf-32`/…）、字符集标签（`gbk` 等）或 `hex`/`base64` 二进制载荷 |
 
+* **BOM 规则**：新建/覆盖时，`utf-8-sig` 与**泛化** `utf-16`/`utf-32` 会在文件开头写字节序 BOM，`utf8` 与显式
+  `utf-16le`/`utf-16be`/`utf-32le`/`utf-32be` 不写；`mode='a'` **一律不写 BOM**（BOM 只属于文件开头，追加不得
+  在原文件中间插入一个），因此已有文件的 BOM 不会被追加改动。
 * **自动拆解（`tools.write_file.auto_split`，默认开启）**：模型一次给出的文本超过 `max_lines` 时，
   agent 不再把超限提示交回模型，而是自动拆成 n 次写入——模型自己那次调用只保留第一段（历史、前端展示
   与后续请求回传的参数都只有第一段），其余分段由引擎**追加到同一条 assistant 消息上**（作为它额外的
