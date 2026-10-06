@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Script language identifiers accepted by exec_command's `language` parameter.
+// Script language identifiers accepted by run_script's `language` parameter.
 const (
 	// ScriptLanguagePowerShell runs the script through the host shell on
 	// Windows: PowerShell, with the UTF-8 preamble when UTF-8 mode is on.
@@ -161,7 +161,7 @@ func scriptLanguageAllowsPowerShell() bool {
 }
 
 // powerShellFlagsHint states the interpreter flags lightagent passes to the
-// PowerShell host shell, for the exec_command description. The flags come from
+// PowerShell host shell, for the run_script description. The flags come from
 // windowsShellFlags, so the wording never drifts from the invocation. It is
 // empty unless PowerShell is a selectable language, so a host whose only engine
 // is another shell never advertises PowerShell options.
@@ -223,13 +223,13 @@ func scriptInvocation(language, script string, useUTF8 bool) (string, []string, 
 	return "", nil, fmt.Errorf("unsupported language %q; available: %s", language, strings.Join(scriptLanguageIDs(), ", "))
 }
 
-// useUTF8ParamAvailable reports whether exec_command offers the `use_utf8`
+// useUTF8ParamAvailable reports whether run_script offers the `use_utf8`
 // parameter. Only Windows has an ANSI code page to fall back to, so the
 // parameter is Windows-only and every other host always speaks UTF-8.
 func useUTF8ParamAvailable() bool { return runtime.GOOS == "windows" }
 
 // execUseUTF8 resolves the effective child stdio mode: Windows honours the
-// configured value (and exec_command's `use_utf8` parameter), every other host
+// configured value (and run_script's `use_utf8` parameter), every other host
 // always speaks UTF-8, because the parameter is not offered there and there is no
 // ANSI code page to convert.
 func execUseUTF8(requested bool) bool {

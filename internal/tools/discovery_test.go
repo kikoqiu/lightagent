@@ -36,7 +36,7 @@ func (s stubTool) Execute(_ context.Context, args map[string]any) *Result {
 
 const (
 	deferredName = "mcp_github_create_issue"
-	coreName     = "exec_command"
+	coreName     = "run_script"
 )
 
 // newDiscoveryRegistry builds a registry with one core tool and one deferred

@@ -26,7 +26,7 @@
 | 4 | CLI 工具循环 | 彩色 REPL，循环期间可继续输入插入用户消息 |
 | 5 | Web 镜像 | 配置了 web 端口即启动（`web.host` 可选绑定 IP，默认 `127.0.0.1`）；端口被占用时自动递增；**WebSocket 实时双向镜像**；页面内置配置编辑器（控件表单 + JSON 双模式，`/api/config`，**重启生效**）与**一键重启**（`/api/restart`：先保存会话，新进程自动恢复）；**登录对话框**（密码明文保存在配置里、浏览器只发送加盐摘要，HttpOnly 会话 cookie + 记住我，**改密码立即生效**） |
 | 6 | 会话记录 | **一个目录一个会话**：启动询问是否恢复历史（默认是），退出询问是否保存（默认是），运行中只存内存，`/save` 手动落盘 |
-| 7 | 命令执行 | `exec_command` / `manage_session`（脚本语言 `ps`/`sh`/`python`，后台会话、轮询、输入、终止；进程退出后保留为**僵尸**直到被 `poll` 取走最后的输出与退出码，没人取走则 24h 后清理）；`/result` 可开关结果输出 |
+| 7 | 命令执行 | `run_script` / `manage_session`（脚本语言 `ps`/`sh`/`python`，后台会话、轮询、输入、终止；进程退出后保留为**僵尸**直到被 `poll` 取走最后的输出与退出码，没人取走则 24h 后清理）；`/result` 可开关结果输出 |
 | 8 | 文件操作 | `read_file` / `write_file` / `edit_file`（`read_file` 默认 `auto` 自动侦测编码，含 UTF-16/UTF-32 与 GBK 等字符集转换，先解码再切行） |
 | 9 | 上下文压缩 | 全局唯一压缩模式：超阈值时把旧消息总结成一条摘要；**服务商报「上下文超限」时自动回退本轮消息、压缩后重发同一条消息**（最多 2 次）；`/history` 查看用量，CLI 提示行与网页徽标实时显示 |
 | 10 | 彩色 CLI | 角色区分颜色；仅在确认终端支持 ANSI 时才着色（非 TTY、`NO_COLOR`、`TERM=dumb`、旧版 Windows 控制台自动关闭） |
@@ -335,7 +335,7 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 * 正在等模型（思考/流式）时中断 → **丢弃这条记录**：刚提交的用户消息不进入历史，
   下一条消息重新开始；控制台/网页显示 `[interrupted]`。
 * 正在执行工具时中断 → 该工具调用反馈 **`interrupted by user`**，已产生的记录保留
-  （`exec_command` 的进程会被直接结束）；模型下一回合能看到这次中断。
+  （`run_script` 的进程会被直接结束）；模型下一回合能看到这次中断。
 * 中断后 Agent 回到空闲，**等下一条用户消息再继续**。
 
 ---
@@ -401,9 +401,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 
 ## 工具
 
-### `exec_command`
+### `run_script`
 执行脚本，采用「等待后转后台」模型：同步等待最多 `wait_timeout` 秒（默认 10），
-若超时则自动转入后台并返回 `session_id`。**`exec_command` 就是「启动 + 一次 `poll`」**：
+若超时则自动转入后台并返回 `session_id`。**`run_script` 就是「启动 + 一次 `poll`」**：
 窗口结束后的输出处理与 `manage_session` 的 `poll` 完全相同（把缓冲区当前内容整份交给模型并清空），
 `max_lines`/`max_chars` 只约束**本次调用**返回的量。`max_lines` 的默认值是 `tools.exec.max_lines`
 （默认 50），最大值是 `tools.exec.max_lines_max`（默认 100）。要得更多**自动截断到最大值**。
@@ -426,17 +426,17 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
   非 Windows 主机始终 UTF-8。
 
 ### `manage_session`
-管理 `exec_command` 产生的后台会话：`poll`（轮询增量输出，支持长轮询；**不论进程是否结束，都把
+管理 `run_script` 产生的后台会话：`poll`（轮询增量输出，支持长轮询；**不论进程是否结束，都把
 缓冲区当前内容整份交出并清空**（含被就地重画的那一行），所以每次 poll 都能看到进度条当时的状态；
 `max_lines`/`max_chars` 只约束本次调用返回的量，不跨调用累计。`max_lines` 的**参数范围与
-`exec_command` 相同**（默认值与最大值同一处配置）。超出范围自动截断）、
+`run_script` 相同**（默认值与最大值同一处配置）。超出范围自动截断）、
 `input`（写入 stdin，支持 `ctrl-c`、`enter` 等控制键）、`kill`（结束整棵进程树并释放会话，
 连同该进程树到此刻为止的输出一起交出：仍在运行 → 成功 + `exit_code = -1` + 输出；
 **已经退出 → `failed` + 实际退出码 + 最后输出**，两者都不丢信息）、`list`。
 
 **进程退出后不立即清理**：退出前写出的输出与 `exit_code` 留在会话池里等 `poll`（或 `kill`）取走，
 `list` 里这样的会话状态是 `zombie`（僵尸，只有状态没有进程）；**交出退出状态的那次调用就是会话的
-终点**（`exec_command` 在窗口内等到退出时则当场交出并释放），此后同一 `session_id` 报 not found。
+终点**（`run_script` 在窗口内等到退出时则当场交出并释放），此后同一 `session_id` 报 not found。
 **24 小时内始终没人 poll 的僵尸自动清理**——所以「进程已经退出后再 poll」不再报错丢信息。
 
 ### `read_file`
@@ -491,7 +491,7 @@ CRLF 文件按 LF 匹配、写回时恢复 CRLF。
 抓取网页 → 转成 Markdown 交给模型。`url` 必填，`timeout`（秒）默认取
 `tools.webfetch.timeout_seconds`（30）。工具 schema 里直接写出配置的秒数与下限：**实际超时不会小于 30 秒**，
 更小的配置值或参数值都会被抬到 30 秒。**只支持网页与文本内容**：地址返回二进制内容（PDF、图片、
-压缩包等）时直接返回错误，并提示改用 `exec_command` 下载/转换。
+压缩包等）时直接返回错误，并提示改用 `run_script` 下载/转换。
 
 `method` 决定反馈里放什么（默认 `fetch_as_md`）：
 

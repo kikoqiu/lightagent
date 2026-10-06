@@ -75,7 +75,7 @@ func TestEstimateMessageTokens(t *testing.T) {
 		Content: "x",
 		ToolCalls: []llm.ToolCall{{
 			ID: "call_1", Type: "function",
-			Function: llm.ToolCallFunction{Name: "exec_command", Arguments: "{}"},
+			Function: llm.ToolCallFunction{Name: "run_script", Arguments: "{}"},
 		}},
 	}
 	if got, plain := EstimateMessageTokens(withCall), EstimateMessageTokens(llm.Message{Role: "assistant", Content: "x"}); got <= plain {
@@ -314,7 +314,7 @@ func TestSummarizeTailCutRetainsWholeTurnIncludingToolRows(t *testing.T) {
 		{Role: "user", Content: "new question"},
 		{Role: "assistant", ToolCalls: []llm.ToolCall{{
 			ID: "call_new", Type: "function",
-			Function: llm.ToolCallFunction{Name: "exec_command", Arguments: "{}"},
+			Function: llm.ToolCallFunction{Name: "run_script", Arguments: "{}"},
 		}}},
 		{Role: "tool", ToolCallID: "call_new", Content: "tool output"},
 	}

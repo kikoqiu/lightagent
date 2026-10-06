@@ -91,12 +91,12 @@
   // readable literal.
   SCHEMA.push(
     {
-      title: 'Tools · shell', note: 'exec_command / manage_session',
+      title: 'Tools · shell', note: 'run_script / manage_session',
       fields: [
         { path: 'tools.exec.enabled', type: 'bool', help: 'register the shell tools' },
         { path: 'tools.exec.timeout_seconds', type: 'number', min: 1, help: 'hard limit for one command' },
         { path: 'tools.exec.wait_seconds', type: 'number', min: 1, help: 'how long to wait before a command moves to a background session' },
-        { path: 'tools.exec.max_lines', type: 'number', min: 1, help: 'default of the max_lines parameter of exec_command and manage_session: lines one answer may carry' },
+        { path: 'tools.exec.max_lines', type: 'number', min: 1, help: 'default of the max_lines parameter of run_script and manage_session: lines one answer may carry' },
         { path: 'tools.exec.max_lines_max', type: 'number', min: 1, help: 'upper bound of that parameter: a call that asks for more lines is truncated to it' },
         { path: 'tools.exec.use_utf8', type: 'bool', help: 'Windows: let the child speak UTF-8; off = convert via the host code page' }
       ]

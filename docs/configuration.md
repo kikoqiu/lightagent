@@ -179,12 +179,12 @@
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `exec.enabled` | bool | `true` | 启用 `exec_command` 与 `manage_session` |
+| `exec.enabled` | bool | `true` | 启用 `run_script` 与 `manage_session` |
 | `exec.timeout_seconds` | int | `3600` | `run_timeout` 的默认硬超时 |
 | `exec.wait_seconds` | int | `10` | `wait_timeout` 的默认同步等待秒数 |
-| `exec.max_lines` | int | `50` | `exec_command` / `manage_session` 的 `max_lines` **参数的默认值**。一次回答最多带多少行。`0`/负数回退到内置 50 |
+| `exec.max_lines` | int | `50` | `run_script` / `manage_session` 的 `max_lines` **参数的默认值**。一次回答最多带多少行。`0`/负数回退到内置 50 |
 | `exec.max_lines_max` | int | `100` | 上面那个参数的**最大值**。调用要得更多就截断到它。`0`/负数回退到内置 100。小于 `max_lines` 时把 `max_lines` 降到它 |
-| `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `exec_command` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8，Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示 |
+| `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `run_script` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8，Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示 |
 | `read_file_lines.enabled` | bool | `true` | 启用行读取工具 |
 | `read_file_lines.max_read_file_size` | int | `32000` | 单次读取字节预算 |
 | `read_file_lines.max_read_file_lines` | int | `200` | 单次读取行数预算 |
@@ -204,13 +204,13 @@
 | `upload_media.max_bytes` | int | `0` | 单个附件文件的字节上限；`0` 用内置的 20 MiB。负数回退到 `0`；为 `0` 时不写入文件。**Web 附加按钮用同一个上限**（超限的文件在浏览器里就被拒，不发往服务端） |
 
 * `exec.use_utf8` 默认为 `true`：加载时先取默认值再合并文件，**省略该字段即保持开启**；
-  需要旧的 ANSI 代码页转换时显式写 `"use_utf8": false`。它只是默认值——`exec_command` 的
+  需要旧的 ANSI 代码页转换时显式写 `"use_utf8": false`。它只是默认值——`run_script` 的
   `use_utf8` 参数可由模型按次调用覆盖。该字段与参数**只在 Windows 生效**（非 Windows 无 ANSI
-  代码页可回退，始终 UTF-8）。`exec_command` 的脚本语言由 `language` 参数选择（宿主引擎
-  `ps`/`sh`，以及系统存在 Python 时的 `python`），细节见 [tools.md](tools.md#exec_command)。
+  代码页可回退，始终 UTF-8）。`run_script` 的脚本语言由 `language` 参数选择（宿主引擎
+  `ps`/`sh`，以及系统存在 Python 时的 `python`），细节见 [tools.md](tools.md#run_script)。
 
 * `exec.max_lines` / `exec.max_lines_max` 是同一对参数（默认值 / 最大值）。两者一起管
-  `exec_command` 与 `manage_session` 的 `max_lines`。省略参数时用 `max_lines`。要得比
+  `run_script` 与 `manage_session` 的 `max_lines`。省略参数时用 `max_lines`。要得比
   `max_lines_max` 多就截断到 `max_lines_max`。两者都会写进工具 schema，模型看得见自己的预算。
   `max_lines_max` 小于 `max_lines` 时，加载时把 `max_lines` 降到它。重要输出建议重定向到文件，
   再用文件工具读回。
@@ -220,7 +220,7 @@
   （`http` 时不会声称会渲染浏览器，`chrome-headless` 时不会说会开窗口），
   实际走的那条路由抓取结果里的 `Method` / `Notes` 报告，CLI 与网页的展示行也会带上。
 * `webfetch` **只抓网页与文本**：地址返回二进制内容（PDF、图片、压缩包等）时直接返回错误结果并提示
-  改用 `exec_command`，HTTP 路径在读取正文前就按 `Content-Type` 拒绝。
+  改用 `run_script`，HTTP 路径在读取正文前就按 `Content-Type` 拒绝。
 * 启动浏览器的模式（`auto` / `chrome-headful` / `chrome-headless`）用**工作目录下**
   `.lightagent/browser-profile` 作为 profile（agent 自己的 Cookie 与登录态，随项目走），
   不碰你自己的浏览器 profile；该目录已被 `.gitignore` 忽略。

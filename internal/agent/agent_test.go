@@ -42,7 +42,7 @@ func (t *blockingTool) Execute(ctx context.Context, _ map[string]any) *tools.Res
 }
 
 // cancelAwareTool stops as soon as the turn is cancelled and answers with what it
-// has, the way exec_command terminates its process (reporting the output it had
+// has, the way run_script terminates its process (reporting the output it had
 // produced) and manage_session poll stops waiting.
 type cancelAwareTool struct {
 	started chan struct{}
@@ -237,7 +237,7 @@ drain:
 }
 
 // TestInterruptStopsACancelAwareTool covers the other half of a tool round: a tool
-// that reacts to the cancellation — exec_command terminates its process and
+// that reacts to the cancellation — run_script terminates its process and
 // reports what it had printed, manage_session poll stops waiting — answers with
 // what it has, and that answer is what its call records. The call after it, which
 // never started, is still answered as interrupted, and the answers are not sent
@@ -1702,7 +1702,7 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 	cfg.LLMs[0].ContextWindow = 100
 	cfg.Context.SummarizeTokenPercent = 1
 	reg := tools.NewRegistry()
-	reg.Register(agentStubTool{name: "exec_command", desc: "run a command"})
+	reg.Register(agentStubTool{name: "run_script", desc: "run a command"})
 	reg.RegisterDeferred(agentStubTool{name: "mcp_github_create_issue", desc: "Create a GitHub issue"})
 	bus := NewBus()
 	events, cancel := bus.Subscribe()
@@ -1791,7 +1791,7 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 	if string(digest.Tools) != string(live.Tools) {
 		t.Fatalf("the summarizing call declares different tools:\ndigest: %s\nlive: %s", digest.Tools, live.Tools)
 	}
-	if !strings.Contains(string(digest.Tools), `"exec_command"`) {
+	if !strings.Contains(string(digest.Tools), `"run_script"`) {
 		t.Fatalf("the declared tools were not captured: %s", digest.Tools)
 	}
 
@@ -2252,7 +2252,7 @@ func TestContextSwitchesRefreshUsage(t *testing.T) {
 func TestSystemPromptUnlockRule(t *testing.T) {
 	// Core tools only: no rule.
 	core := tools.NewRegistry()
-	core.Register(agentStubTool{name: "exec_command", desc: "run a command"})
+	core.Register(agentStubTool{name: "run_script", desc: "run a command"})
 	plainAgent := New(config.Default(), nil, core, NewBus())
 	plainAgent.mu.Lock()
 	plain := plainAgent.buildMessagesLocked()[0].Content
@@ -2263,7 +2263,7 @@ func TestSystemPromptUnlockRule(t *testing.T) {
 
 	// With a locked function the rule appears exactly once.
 	reg := tools.NewRegistry()
-	reg.Register(agentStubTool{name: "exec_command", desc: "run a command"})
+	reg.Register(agentStubTool{name: "run_script", desc: "run a command"})
 	reg.RegisterDeferred(agentStubTool{name: "mcp_github_create_issue", desc: "Create a GitHub issue"})
 	a := New(config.Default(), nil, reg, NewBus())
 
@@ -2361,7 +2361,7 @@ func TestSystemPromptSectionOrder(t *testing.T) {
 	cfg := config.Default()
 	cfg.Agent.SystemPrompt = "custom base"
 	reg := tools.NewRegistry()
-	reg.Register(agentStubTool{name: "exec_command", desc: "run a command"})
+	reg.Register(agentStubTool{name: "run_script", desc: "run a command"})
 	reg.RegisterDeferred(agentStubTool{name: "mcp_github_create_issue", desc: "Create a GitHub issue"})
 	a := New(cfg, nil, reg, NewBus())
 	a.SetMCPServers([]MCPServerInfo{{Server: "playwright", ToolCount: 26}})

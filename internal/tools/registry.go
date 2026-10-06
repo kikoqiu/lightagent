@@ -1,5 +1,5 @@
 // Package tools implements the built-in tools exposed to the model:
-// exec_command, manage_session, read_file, write_file and edit_file.
+// run_script, manage_session, read_file, write_file and edit_file.
 package tools
 
 import (

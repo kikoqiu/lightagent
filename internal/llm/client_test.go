@@ -229,7 +229,7 @@ func TestReadStreamAcceptsBothArgumentsShapes(t *testing.T) {
 	}{
 		{
 			name: "raw json value",
-			call: `{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":{"script":"ls","n":2}}}`,
+			call: `{"index":0,"id":"call_1","type":"function","function":{"name":"run_script","arguments":{"script":"ls","n":2}}}`,
 			want: `{"script":"ls","n":2}`,
 		},
 		{
@@ -423,7 +423,7 @@ func TestReadStreamToolCallWithoutNameFails(t *testing.T) {
 // setting to raise instead of running a possibly incomplete call.
 func TestReadStreamLengthWithToolCallsFails(t *testing.T) {
 	stream := strings.Join([]string{
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{\"command\":\"ls\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run_script","arguments":"{\"command\":\"ls\"}"}}]}}]}`,
 		`data: {"choices":[{"delta":{},"finish_reason":"length"}]}`,
 		`data: [DONE]`,
 		``,
@@ -481,12 +481,12 @@ func TestReadStreamContentFilterFails(t *testing.T) {
 // TestReadJSONIncompleteToolCallFails checks the non-streaming path applies the
 // same completeness rules as the streamed one.
 func TestReadJSONIncompleteToolCallFails(t *testing.T) {
-	body := `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"exec_command","arguments":"{\"command\":"}}]},"finish_reason":"stop"}]}`
+	body := `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"run_script","arguments":"{\"command\":"}}]},"finish_reason":"stop"}]}`
 
 	client := &Client{}
 	if _, err := client.readJSON(strings.NewReader(body), nil); err == nil {
 		t.Fatal("expected the incomplete tool call to fail")
-	} else if !strings.Contains(err.Error(), "exec_command") {
+	} else if !strings.Contains(err.Error(), "run_script") {
 		t.Fatalf("error = %v, want the tool name in the message", err)
 	}
 }
@@ -612,7 +612,7 @@ func TestChatAbortsStalledStream(t *testing.T) {
 // TestReadJSONParsesResponse verifies non-streaming parsing of content, tool
 // calls and usage.
 func TestReadJSONParsesResponse(t *testing.T) {
-	body := `{"choices":[{"message":{"role":"assistant","content":"hi","tool_calls":[{"id":"c1","type":"function","function":{"name":"exec_command","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":42}}`
+	body := `{"choices":[{"message":{"role":"assistant","content":"hi","tool_calls":[{"id":"c1","type":"function","function":{"name":"run_script","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":42}}`
 
 	client := &Client{}
 	resp, err := client.readJSON(strings.NewReader(body), nil)
@@ -625,7 +625,7 @@ func TestReadJSONParsesResponse(t *testing.T) {
 	if resp.Finish != "tool_calls" {
 		t.Fatalf("finish = %q", resp.Finish)
 	}
-	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Function.Name != "exec_command" {
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Function.Name != "run_script" {
 		t.Fatalf("tool calls = %+v", resp.ToolCalls)
 	}
 	if resp.Usage.TotalTokens != 42 {

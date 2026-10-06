@@ -37,7 +37,7 @@ func TestWorkingDirectoryInfoEmpty(t *testing.T) {
 
 // TestDefaultSystemPromptHasNoHostState verifies the built-in template carries no
 // host-specific data, so an agent.md exported from it stays valid on another
-// machine. It still has to point the model at the exec_command language
+// machine. It still has to point the model at the run_script language
 // parameter and at non-interactive execution.
 func TestDefaultSystemPromptHasNoHostState(t *testing.T) {
 	prompt := DefaultSystemPrompt()
@@ -45,7 +45,7 @@ func TestDefaultSystemPromptHasNoHostState(t *testing.T) {
 		t.Fatalf("built-in prompt must not embed the runtime line:\n%s", prompt)
 	}
 	if !strings.Contains(prompt, "language") {
-		t.Fatalf("built-in prompt must mention the exec_command language parameter:\n%s", prompt)
+		t.Fatalf("built-in prompt must mention the run_script language parameter:\n%s", prompt)
 	}
 	if !strings.Contains(prompt, "non-interactive") {
 		t.Fatalf("built-in prompt must ask for non-interactive commands:\n%s", prompt)

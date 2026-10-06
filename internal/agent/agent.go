@@ -791,7 +791,7 @@ func (a *Agent) dispatchToolCall(ctx context.Context, tc llm.ToolCall) *tools.Re
 
 // executeTool runs one tool call and waits for its answer. The turn context
 // travels with the call, so the tools that can observe an interrupt return early
-// on their own: exec_command terminates its process tree and reports the output
+// on their own: run_script terminates its process tree and reports the output
 // the process had produced until then, manage_session poll stops waiting and
 // reports the output it has (the process keeps running). A tool that cannot be
 // cut short is simply allowed to finish — abandoning it would throw its work

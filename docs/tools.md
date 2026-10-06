@@ -18,13 +18,13 @@ type Tool interface {
 不额外包装、不加信封 —— 工具反馈走的就是 OpenAI 那条正常的 tool 结果通路。
 
 工具由配置开关控制（见 [configuration.md](configuration.md)）：可用的工具有
-`exec_command`、`manage_session`、`read_file`、`write_file`、`edit_file`、`webfetch`，
+`run_script`、`manage_session`、`read_file`、`write_file`、`edit_file`、`webfetch`，
 以及需要当前接口的 `providers[].media_types` 与 `tools.upload_media.enabled` **同时成立**时才会出现的
 `upload_media`。
 
 ---
 
-## `exec_command`
+## `run_script`
 
 执行脚本，采用「等待后转后台」模型。
 
@@ -54,7 +54,7 @@ type Tool interface {
   * 非 Windows 主机**没有** `use_utf8` 参数（也没有可回退的 ANSI 代码页）：始终 UTF-8，
     仅额外注入 `PYTHONIOENCODING=utf-8`。
 * 同步等待最多 `wait_timeout` 秒（默认取 `exec.wait_seconds`，10s）：等的是**进程退出**，窗口内写出的
-  内容不会提前结束等待。**`exec_command` 就是「启动 + 一次 `poll`」**：窗口结束后的输出处理与
+  内容不会提前结束等待。**`run_script` 就是「启动 + 一次 `poll`」**：窗口结束后的输出处理与
   `manage_session` 的 `poll` 完全一致——把缓冲区当前内容整份交给模型并清空，所以窗口内完成就直接
   返回 `exit_code` 与输出，未完成就转后台返回 `session_id` 并附上当时缓冲区的内容。`max_lines`/
   `max_chars` 只约束**本次调用**返回的量（不跨调用、不按进程生命周期累计）。`max_lines` 的默认值是
@@ -73,12 +73,12 @@ type Tool interface {
   字节交给模型。`\n`（含 CRLF）结束一行，交付的行里不含 `\r`。
 * **被就地改写过的行不会逐次刷新地进入上下文**：缓冲区是两次交接之间的窗口，同一窗口内对同一行的
   重画只是在反复覆盖缓冲区里的这一行，因此**只有交接那一刻该行的状态**（连同窗口内写完的每一行）会
-  进入上下文。交接 = `exec_command` 的返回与 `manage_session` 的 `poll`：**不论进程是否结束**都把
+  进入上下文。交接 = `run_script` 的返回与 `manage_session` 的 `poll`：**不论进程是否结束**都把
   缓冲区当前内容整份交出并清空，所以每次调用都能看到进度条当时的状态，下一次调用只看到之后写出的
   内容（同一状态出现在两次调用里是允许的——那是下一次调用自己的事）。从未被就地改写的未完成行
   （如不带换行的提示符）照常立即可见。交出的内容随后按 `max_lines`/`max_chars` 做头尾折叠，上限
   只约束**本次调用**（不跨调用、不按进程生命周期累计）。
-* **被用户中断**（回合的中断 / Stop）：`exec_command` 是唯一**不允许继续跑**的调用——整棵进程
+* **被用户中断**（回合的中断 / Stop）：`run_script` 是唯一**不允许继续跑**的调用——整棵进程
   树被强制结束，返回同一份 JSON 契约、`status=interrupted`，`output` 就是进程被终止前已经打印的
   内容（没有输出则为空），`session_id` 为 `null`（没有任何东西留在后台）。恰好在中断时退出的
   进程仍按 `completed` 报告。
@@ -132,7 +132,7 @@ type Tool interface {
 
 ## `manage_session`
 
-管理 `exec_command` 产生的后台会话（共享同一个会话池）。`exec_command` 可理解为**「启动 + 一次
+管理 `run_script` 产生的后台会话（共享同一个会话池）。`run_script` 可理解为**「启动 + 一次
 `poll`」**：窗口结束后的那一步与这里的 `poll` 是同一个操作。
 
 | 参数 | 类型 | 默认 | 说明 |
@@ -141,18 +141,18 @@ type Tool interface {
 | `session_id` | string | — | 目标会话（`list` 不需要） |
 | `data` | string | — | `input` 时写入 stdin 的内容 |
 | `wait_timeout` | int | `10` | `poll` 最长等待**进程退出**的秒数（中间有输出也不提前返回） |
-| `max_lines` | int | `exec.max_lines` | **本次调用**返回的行数上限（头尾折叠；不跨调用累计）。参数范围**与 `exec_command` 相同**（默认值与最大值都由那里配置，见 [`exec_command` 参数](#exec_command)） |
+| `max_lines` | int | `exec.max_lines` | **本次调用**返回的行数上限（头尾折叠；不跨调用累计）。参数范围**与 `run_script` 相同**（默认值与最大值都由那里配置，见 [`run_script` 参数](#run_script)） |
 | `max_chars` | int | `30000` | **本次调用**返回的字符上限（不跨调用累计） |
 
 行为：
 
-* `poll`：等待**进程退出**，最多 `wait_timeout` 秒（与 `exec_command` 的同步等待同一语义：
+* `poll`：等待**进程退出**，最多 `wait_timeout` 秒（与 `run_script` 的同步等待同一语义：
   窗口内写出的内容不会提前结束等待）。**不论进程是否结束**，都把缓冲区当前内容**整份交出并清空**
   （含被就地重画、尚未定稿的那一行）：仍在运行 → `status=running`（附 `session_id`），已退出 →
   `status=completed` 且带 `exit_code`。因此进度条按每次 poll 当时的状态进入上下文，而两次 poll
   之间被覆盖掉的中间刷新不会出现。`max_lines`/`max_chars` 只约束**本次 poll** 返回的量（不跨
   poll、不按进程生命周期累计）：上限是「这一次交给模型多少」，而不是「这个进程一共交给模型多少」。
-  `max_lines` 的**参数范围与 `exec_command` 相同**（默认值与最大值同一处配置，超出自动截断）。
+  `max_lines` 的**参数范围与 `run_script` 相同**（默认值与最大值同一处配置，超出自动截断）。
   等待可被**回合中断**取消：中断像 `wait_timeout` 到期一样结束等待，`warning` 说明 poll 被中断
   而进程仍在运行——poll 只是观察者，绝不去动它监视的进程；下一次 poll 继续接着读。
   **把进程的退出状态（退出前写出的输出 + `exit_code`）交出来的那一次 poll 就是该会话的终点**：
@@ -160,7 +160,7 @@ type Tool interface {
   用来取走最后的输出与退出码的（见下面的僵尸说明）。
 * `input`：写入 stdin。纯控制键会被翻译：`ctrl-c`、`ctrl-d`、`ctrl-z`、`enter`/`return`、
   `tab`、`esc`、`up`/`down`/`left`/`right`、`backspace`；其余文本原样写入（如需换行请写 `"\n"`）。
-  stdio 编码在 `exec_command` 启动该会话时已确定（Windows 上的 `use_utf8`），`manage_session` 不再另行选择。
+  stdio 编码在 `run_script` 启动该会话时已确定（Windows 上的 `use_utf8`），`manage_session` 不再另行选择。
   进程已经退出时无法写入：回答 `failed`，并提示 poll 该会话取走它的输出。
 * `kill`：结束**整棵进程树**（宿主 shell 及其派生的所有子进程；Windows 经 Job Object，Unix 经进程组，见 [architecture.md](architecture.md#进程树与退出)）并**释放会话**，同时把该进程树到此刻为止写出的输出交出来（与 poll 同一套折叠）。两种情形：
   * 进程**仍在运行** → 终止成功（`completed`），`exit_code = -1`（不是自己退出的，没有真实退出码），`output` = 终止说明 + 最后输出的内容；
@@ -172,14 +172,14 @@ type Tool interface {
 > **僵尸与清理**：会话的进程退出时**不立即清理**——退出前写出的输出与 `exit_code` 还留在池里等着
 > 被取走，这正是 `list` 里的 `zombie`（只有「输出 + 退出码等」这些状态，没有进程）。取走（poll 或
 > kill）即释放。**24 小时内始终没人 poll 的僵尸自动清理**（`zombieTTL`，见 `internal/tools/session.go`），
-> 之后该 `session_id` 报 not found。`exec_command` 在窗口内就等到退出时，退出状态已经写在回答里，
+> 之后该 `session_id` 报 not found。`run_script` 在窗口内就等到退出时，退出状态已经写在回答里，
 > 会话当场释放、不会留下僵尸；转后台的会话则在 poll 取走退出状态时释放。
 
 > 进程树归属：会话的根进程是它自己进程树的根，因此
 > * 会话根进程自行退出时，它留下的后台子进程会被一并清理（会话池不会积累孤儿进程）；
 >   若该子进程还占着 stdout/stderr，会话最多再等 2s（`WaitDelay`）收敛输出，然后置为 completed 并把它清掉
 >   ——被清掉的是那个留下的**程序**，**会话本身**（输出 + `exit_code`）仍按上面「僵尸与清理」保留到被取走；
-> * lightagent 退出（正常退出、Ctrl+C、SIGTERM、终端挂断）时会结束所有仍在运行的会话——`exec_command` 启动的进程不会比 lightagent 活得更久；
+> * lightagent 退出（正常退出、Ctrl+C、SIGTERM、终端挂断）时会结束所有仍在运行的会话——`run_script` 启动的进程不会比 lightagent 活得更久；
 > * 仅 Windows 上「本进程被强杀」也能保证清理：kill-on-close 的 Job 句柄随 lightagent 进程关闭，OS 带走整棵树。
 
 ---
@@ -307,7 +307,7 @@ type Tool interface {
   再看文件头**，任一候选被接受即通过。
 * **不是可接收类型时报错**（不上传任何内容）：返回形如
   `"x.zip" looks like application/zip, which this model does not accept; upload one of: image/png, application/pdf`，
-  模型可据此改走 `exec_command` 转换，或对纯文本改用 `read_file`。
+  模型可据此改走 `run_script` 转换，或对纯文本改用 `read_file`。
 * 其余拒绝情况：路径缺失/空、文件不存在、路径是目录、空文件、超过 `tools.upload_media.max_bytes`
   （默认 20 MiB）——全部只返回错误，**错误结果不带任何附件**。
 * 成功时的工具结果分两部分：
@@ -337,7 +337,7 @@ type Tool interface {
 ## `webfetch`
 
 抓取网页并把它简化成 Markdown 交给模型。**只吃网页与文本**：地址返回二进制内容（PDF、图片、
-压缩包等）时直接返回**错误结果**（说明是什么类型、并提示用 `exec_command` 下载或转换），
+压缩包等）时直接返回**错误结果**（说明是什么类型、并提示用 `run_script` 下载或转换），
 HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在拿到渲染结果后同样检查。
 
 | 参数 | 类型 | 默认 | 说明 |
@@ -485,7 +485,7 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
   <其余原始返回内容>
   ```
 
-  * 值原样回填：**字符串**就是脚本写的那串字符（Cookie 头可以直接给 `exec_command` 用），
+  * 值原样回填：**字符串**就是脚本写的那串字符（Cookie 头可以直接给 `run_script` 用），
     其他值（对象/数组/数字）是它的 JSON。
   * `undefined`、`null` 或空串**什么都不反馈**：连 `invokejs return info:` 这行都不出现 —— 适合"脚本只做注册/预热"
     的用法。
@@ -608,7 +608,7 @@ tool: <真实执行结果>
 每个 server 工具被包装为 `tools.Tool`，命名为 `mcp_<server>_<tool>`（小写、非法字符归一为 `_`）；描述与参数 schema 直接取自 server。
 
 * MCP 工具**始终**以 `RegisterDeferred` 作为**锁定函数**注册，进入搜索/解锁体系；**永不出现在模型的 `tools` 声明里**。
-* 内置工具（`exec_command` / `manage_session` / `read_file` / `write_file` / `edit_file` / `webfetch`）不受此机制影响，始终作为核心工具暴露。
+* 内置工具（`run_script` / `manage_session` / `read_file` / `write_file` / `edit_file` / `webfetch`）不受此机制影响，始终作为核心工具暴露。
 
 ### 系统提示词注入
 

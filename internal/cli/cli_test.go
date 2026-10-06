@@ -231,8 +231,8 @@ func TestShowHistoryPrintsTheSummaryFirst(t *testing.T) {
 	}
 }
 
-// historyToolResult is a persisted exec_command answer (the commandResult JSON
-// contract exec_command and manage_session store), used to check that a resumed
+// historyToolResult is a persisted run_script answer (the commandResult JSON
+// contract run_script and manage_session store), used to check that a resumed
 // transcript recovers the tool's user-facing rendering.
 const historyToolResult = `{"status":"completed","exit_code":0,"session_id":null,"output":"file1\nfile2","truncated":false,"total_lines":2,"total_bytes":11,"elapsed_seconds":0.1,"warning":null}`
 
@@ -246,10 +246,10 @@ func historyTail() []llm.Message {
 			ReasoningContent: "think about it",
 			ToolCalls: []llm.ToolCall{{
 				ID:       "1",
-				Function: llm.ToolCallFunction{Name: "exec_command", Arguments: `{"script":"ls"}`},
+				Function: llm.ToolCallFunction{Name: "run_script", Arguments: `{"script":"ls"}`},
 			}},
 		},
-		{Role: "tool", ToolCallID: "1", Name: "exec_command", Content: historyToolResult},
+		{Role: "tool", ToolCallID: "1", Name: "run_script", Content: historyToolResult},
 		{Role: "assistant", Content: "done"},
 	}
 }
@@ -269,7 +269,7 @@ func TestShowHistoryRendersTheWholeTranscript(t *testing.T) {
 	for _, want := range []string{
 		"--- history: 4 messages ---",
 		"[thinking]", "think about it",
-		"[tool]", "exec_command", "script - ls",
+		"[tool]", "run_script", "script - ls",
 		"[result]", "Command completed.", "file1",
 		"done",
 		"--- end of history ---",
@@ -1599,8 +1599,8 @@ func TestToolRowKeepsNameAndArgs(t *testing.T) {
 	}
 
 	buf.Reset()
-	c.render(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"script":"ls","timeout_seconds":30,"flag":true}`})
-	if want := "[tool] exec_command\nscript - ls\ntimeout_seconds - 30\nflag - true\n"; buf.String() != want {
+	c.render(agent.Event{Type: agent.EventToolCall, Name: "run_script", Args: `{"script":"ls","timeout_seconds":30,"flag":true}`})
+	if want := "[tool] run_script\nscript - ls\ntimeout_seconds - 30\nflag - true\n"; buf.String() != want {
 		t.Fatalf("multi-argument tool row = %q, want %q", buf.String(), want)
 	}
 
@@ -1631,8 +1631,8 @@ func TestToolRowShowsFullValues(t *testing.T) {
 	}
 
 	buf.Reset()
-	c.render(agent.Event{Type: agent.EventToolCall, Name: "exec_command", Args: `{"script":"line1\nline2"}`})
-	if got, want := buf.String(), "[tool] exec_command\nscript\nline1\nline2\n"; got != want {
+	c.render(agent.Event{Type: agent.EventToolCall, Name: "run_script", Args: `{"script":"line1\nline2"}`})
+	if got, want := buf.String(), "[tool] run_script\nscript\nline1\nline2\n"; got != want {
 		t.Fatalf("multi-line value = %q, want %q", got, want)
 	}
 

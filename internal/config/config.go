@@ -330,7 +330,7 @@ func (c *Config) ensureMCPServer() {
 // Built-in exec output limits: the default of the shells' max_lines parameter
 // and the most one call may ask for (tools.exec.max_lines / max_lines_max).
 const (
-	// ExecMaxLinesDefault is the default line budget of one exec_command or
+	// ExecMaxLinesDefault is the default line budget of one run_script or
 	// manage_session answer.
 	ExecMaxLinesDefault = 50
 	// ExecMaxLinesMaxDefault is the upper bound of that budget: a call that
@@ -338,7 +338,7 @@ const (
 	ExecMaxLinesMaxDefault = 100
 )
 
-// ExecToolConfig configures exec_command / manage_session.
+// ExecToolConfig configures run_script / manage_session.
 type ExecToolConfig struct {
 	Enabled        bool `json:"enabled"`
 	TimeoutSeconds int  `json:"timeout_seconds"`

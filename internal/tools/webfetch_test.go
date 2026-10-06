@@ -424,7 +424,7 @@ func TestWebFetchToolRefusesContentThatIsNotAPage(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("Execute = %+v, want a refusal", res)
 	}
-	for _, want := range []string{"not a web page", "application/zip", "exec_command"} {
+	for _, want := range []string{"not a web page", "application/zip", "run_script"} {
 		if !strings.Contains(res.ForLLM, want) {
 			t.Errorf("the refusal is missing %q:\n%s", want, res.ForLLM)
 		}

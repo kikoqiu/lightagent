@@ -61,7 +61,7 @@ const (
 	// nonPageHint tells the model what to do instead of fetching again when the
 	// address does not serve a page.
 	nonPageHint = "webfetch reads pages and text documents only; download or convert binary content " +
-		"(PDF, images, archives, ...) with exec_command instead."
+		"(PDF, images, archives, ...) with run_script instead."
 	// webFetchInvokeHeader opens the block a script's value is reported under,
 	// at the very top of the answer: the caller asked for that value, and it
 	// belongs before the page it was read from.

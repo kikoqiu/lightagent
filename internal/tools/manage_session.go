@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// ManageSessionTool manages background processes created by exec_command.
+// ManageSessionTool manages background processes created by run_script.
 type ManageSessionTool struct {
 	engine *ExecEngine
 }
@@ -22,7 +22,7 @@ func (t *ManageSessionTool) Name() string { return "manage_session" }
 
 // Description implements Tool.
 func (t *ManageSessionTool) Description() string {
-	return "Manage background processes created by exec_command. Supports non-blocking " +
+	return "Manage background processes created by run_script. Supports non-blocking " +
 		"and long-polling output retrieval (each call returns the whole output buffered " +
 		"so far and clears it), input sending, listing and termination. A session whose " +
 		"process exited is kept as a zombie until a poll takes its last output and exit " +
@@ -58,7 +58,7 @@ func (t *ManageSessionTool) Parameters() map[string]any {
 				"default": t.engine.maxLinesDefault,
 				"description": "Maximum lines this call returns (head/tail folded). The limit is per call, " +
 					"not over the process lifetime. The parameter range (default and maximum) is the same as " +
-					"exec_command's `max_lines`. The range applies to action='poll'.",
+					"run_script's `max_lines`. The range applies to action='poll'.",
 			},
 			"max_chars": map[string]any{
 				"type":        "integer",

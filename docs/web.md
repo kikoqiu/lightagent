@@ -272,8 +272,8 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "reasoning_delta", "text": "模型思考增量" }
 { "type": "assistant_delta", "text": "部分文本" }
 { "type": "assistant", "text": "完整回复" }
-{ "type": "tool_call", "name": "exec_command", "args": "{\"command\":\"ls\"}" }
-{ "type": "tool_result", "name": "exec_command", "text": "展示文本", "is_error": false }
+{ "type": "tool_call", "name": "run_script", "args": "{\"command\":\"ls\"}" }
+{ "type": "tool_result", "name": "run_script", "text": "展示文本", "is_error": false }
 { "type": "info", "text": "..." }
 { "type": "compacted", "text": "context compressed: 20 -> 1 messages", "summary": "被压缩消息的累积摘要" }
 { "type": "interrupted", "text": "interrupted; the turn was stopped" }

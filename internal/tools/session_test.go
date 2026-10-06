@@ -49,7 +49,7 @@ func backgroundCommand(t *testing.T, engine *ExecEngine) string {
 // the background, and returns its session id.
 func startBackground(t *testing.T, engine *ExecEngine, command string) string {
 	t.Helper()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 	res := tool.Execute(context.Background(), map[string]any{
 		"script": command, "wait_timeout": 1,
 	})
@@ -214,7 +214,7 @@ func TestExecCommandCompletionLeavesNoSession(t *testing.T) {
 
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {

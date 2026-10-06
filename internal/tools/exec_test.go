@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// TestExecCommandCompletes verifies the synchronous fast path of exec_command.
+// TestExecCommandCompletes verifies the synchronous fast path of run_script.
 func TestExecCommandCompletes(t *testing.T) {
 	command := "echo hello"
 	if runtime.GOOS == "windows" {
@@ -23,7 +23,7 @@ func TestExecCommandCompletes(t *testing.T) {
 
 	engine := NewExecEngine(60, 5, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
@@ -57,7 +57,7 @@ func TestExecCommandCollapsesCRProgress(t *testing.T) {
 
 	engine := NewExecEngine(60, 20, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
@@ -130,7 +130,7 @@ func TestExecCommandKeepsOverwrittenTail(t *testing.T) {
 
 	engine := NewExecEngine(60, 20, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
@@ -151,7 +151,7 @@ func TestExecCommandBackgroundThenManageSession(t *testing.T) {
 
 	engine := NewExecEngine(60, 1, true)
 	defer engine.Close()
-	execTool := NewExecCommandTool(engine)
+	execTool := NewRunScriptTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
 	res := execTool.Execute(context.Background(), map[string]any{
@@ -220,7 +220,7 @@ func TestManageSessionPollReportsTheRepaintState(t *testing.T) {
 
 	engine := NewExecEngine(60, 1, true)
 	defer engine.Close()
-	execTool := NewExecCommandTool(engine)
+	execTool := NewRunScriptTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
 	res := execTool.Execute(context.Background(), map[string]any{"script": command})
@@ -289,7 +289,7 @@ func TestManageSessionPollWaitsForExit(t *testing.T) {
 
 	engine := NewExecEngine(60, 1, true)
 	defer engine.Close()
-	execTool := NewExecCommandTool(engine)
+	execTool := NewRunScriptTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
 	res := execTool.Execute(context.Background(), map[string]any{"script": command, "wait_timeout": 1})
@@ -326,7 +326,7 @@ func TestManageSessionPollInterruptLeavesTheProcessRunning(t *testing.T) {
 
 	engine := NewExecEngine(60, 1, true)
 	defer engine.Close()
-	execTool := NewExecCommandTool(engine)
+	execTool := NewRunScriptTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
 	// wait_timeout 1 backgrounds the command, which keeps printing for ~3s.
@@ -394,7 +394,7 @@ func TestManageSessionPollInterruptLeavesTheProcessRunning(t *testing.T) {
 func TestExecCommandInterruptKillsProcess(t *testing.T) {
 	engine := NewExecEngine(60, 30, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	command := "echo working; sleep 5; echo done"
 	if runtime.GOOS == "windows" {
@@ -472,7 +472,7 @@ func TestEngineCloseKillsRunningSessions(t *testing.T) {
 	}
 
 	engine := NewExecEngine(300, 1, true)
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 	res := tool.Execute(context.Background(), map[string]any{"script": command, "wait_timeout": 1})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
@@ -507,7 +507,7 @@ func TestExecCommandCompletesWhenALeftoverHoldsThePipes(t *testing.T) {
 
 	engine := NewExecEngine(300, 10, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
@@ -585,7 +585,7 @@ func TestPollFlushesPerCallAndLimitsApplyPerCall(t *testing.T) {
 
 	engine := NewExecEngine(60, 1, true)
 	defer engine.Close()
-	execTool := NewExecCommandTool(engine)
+	execTool := NewRunScriptTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
 	// The child only waits for input, so its start hands over no output.
@@ -626,7 +626,7 @@ func TestPollFlushesPerCallAndLimitsApplyPerCall(t *testing.T) {
 	}
 }
 
-// TestExecMaxLinesBudget pins the max_lines budget shared by exec_command and
+// TestExecMaxLinesBudget pins the max_lines budget shared by run_script and
 // manage_session: the built-in pair is 50/100, both schemas advertise the
 // configured default, a request above the configured maximum is truncated to it
 // (which folds the output), and the description states the default, the maximum
@@ -643,11 +643,11 @@ func TestExecMaxLinesBudget(t *testing.T) {
 		t.Fatalf("configured max_lines budget = %d/%d, want 10/20", engine.maxLinesDefault, engine.maxLinesMax)
 	}
 
-	execTool := NewExecCommandTool(engine)
+	execTool := NewRunScriptTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
 	// Both schemas carry the configured default.
-	for name, tool := range map[string]Tool{"exec_command": execTool, "manage_session": manageTool} {
+	for name, tool := range map[string]Tool{"run_script": execTool, "manage_session": manageTool} {
 		props, _ := tool.Parameters()["properties"].(map[string]any)
 		param, ok := props["max_lines"].(map[string]any)
 		if !ok {
@@ -657,11 +657,11 @@ func TestExecMaxLinesBudget(t *testing.T) {
 			t.Fatalf("%s: max_lines default = %v, want the configured 10", name, param["default"])
 		}
 	}
-	// manage_session says its range equals exec_command's.
+	// manage_session says its range equals run_script's.
 	props, _ := manageTool.Parameters()["properties"].(map[string]any)
 	param, _ := props["max_lines"].(map[string]any)
-	if desc, _ := param["description"].(string); !strings.Contains(desc, "exec_command") {
-		t.Fatalf("manage_session max_lines does not point at exec_command's range: %s", desc)
+	if desc, _ := param["description"].(string); !strings.Contains(desc, "run_script") {
+		t.Fatalf("manage_session max_lines does not point at run_script's range: %s", desc)
 	}
 
 	// A request above the maximum is truncated to it, which folds the output.
@@ -682,8 +682,33 @@ func TestExecMaxLinesBudget(t *testing.T) {
 	description := execTool.Description()
 	for _, want := range []string{"default: 10", "maximum: 20", "Redirect important output"} {
 		if !strings.Contains(description, want) {
-			t.Fatalf("the exec_command description is missing %q: %s", want, description)
+			t.Fatalf("the run_script description is missing %q: %s", want, description)
 		}
+	}
+}
+
+// TestRunScriptDescriptionGuidance pins the advisory wording that keeps the model
+// from writing a shell command line (a `cd` prefix or an inline `-c` one-liner)
+// into this tool: the base description states that the tool runs source text,
+// not a shell command line, and the concrete Python example appears only when an
+// interpreter was detected.
+func TestRunScriptDescriptionGuidance(t *testing.T) {
+	engine := NewExecEngine(60, 10, true)
+	defer engine.Close()
+	desc := NewRunScriptTool(engine).Description()
+
+	if !strings.Contains(desc, "not a shell command line") {
+		t.Fatalf("the description no longer states that the tool runs source text, not a shell command line: %s", desc)
+	}
+	if !strings.Contains(desc, "cwd") {
+		t.Fatalf("the description does not steer the model to `cwd` instead of a `cd`: %s", desc)
+	}
+	if systemPython().Found {
+		if !strings.Contains(desc, `"language":"python"`) {
+			t.Fatalf("the recommended Python example is missing although python is installed: %s", desc)
+		}
+	} else if strings.Contains(desc, `"language":"python"`) {
+		t.Fatalf("the Python example is advertised without an interpreter: %s", desc)
 	}
 }
 
@@ -723,7 +748,7 @@ func TestExecCommandDecodesLocalizedOutput(t *testing.T) {
 
 	engine := NewExecEngine(60, 10, false)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
@@ -783,7 +808,7 @@ func TestExecCommandDecodesPythonOutput(t *testing.T) {
 
 	engine := NewExecEngine(60, 20, false)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	// PowerShell needs the call operator to run a quoted path; sh takes the
 	// quoted words directly.
@@ -815,7 +840,7 @@ func TestManageSessionInputRoundTrip(t *testing.T) {
 
 	engine := NewExecEngine(60, 1, true)
 	defer engine.Close()
-	execTool := NewExecCommandTool(engine)
+	execTool := NewRunScriptTool(engine)
 	manageTool := NewManageSessionTool(engine)
 
 	res := execTool.Execute(context.Background(), map[string]any{"script": command, "wait_timeout": 1})
@@ -861,10 +886,10 @@ func TestExecCommandUseUTF8Param(t *testing.T) {
 	if !useUTF8ParamAvailable() {
 		engine := NewExecEngine(60, 10, true)
 		defer engine.Close()
-		if desc := NewExecCommandTool(engine).Description(); strings.Contains(desc, "use_utf8") {
+		if desc := NewRunScriptTool(engine).Description(); strings.Contains(desc, "use_utf8") {
 			t.Fatalf("the description mentions use_utf8 on a host without the parameter: %s", desc)
 		}
-		props, _ := NewExecCommandTool(engine).Parameters()["properties"].(map[string]any)
+		props, _ := NewRunScriptTool(engine).Parameters()["properties"].(map[string]any)
 		if _, ok := props["use_utf8"]; ok {
 			t.Fatal("use_utf8 is advertised on a host without the parameter")
 		}
@@ -872,17 +897,17 @@ func TestExecCommandUseUTF8Param(t *testing.T) {
 	}
 
 	// The model must be able to discover the parameter from the description.
-	if desc := NewExecCommandTool(NewExecEngine(60, 10, true)).Description(); !strings.Contains(desc, "use_utf8") {
+	if desc := NewRunScriptTool(NewExecEngine(60, 10, true)).Description(); !strings.Contains(desc, "use_utf8") {
 		t.Fatalf("the tool description does not mention use_utf8: %s", desc)
 	}
 
 	// The schema must carry the configured default.
 	for _, def := range []bool{true, false} {
 		engine := NewExecEngine(60, 10, def)
-		props, _ := NewExecCommandTool(engine).Parameters()["properties"].(map[string]any)
+		props, _ := NewRunScriptTool(engine).Parameters()["properties"].(map[string]any)
 		param, ok := props["use_utf8"].(map[string]any)
 		if !ok {
-			t.Fatal("use_utf8 is missing from the exec_command parameters")
+			t.Fatal("use_utf8 is missing from the run_script parameters")
 		}
 		if param["type"] != "boolean" || param["default"] != def {
 			t.Fatalf("use_utf8 schema = %+v, want type boolean and default %v", param, def)
@@ -896,7 +921,7 @@ func TestExecCommandUseUTF8Param(t *testing.T) {
 	// emits UTF-8 and Go forwards it unchanged.
 	utf8Engine := NewExecEngine(60, 10, false)
 	defer utf8Engine.Close()
-	utf8Tool := NewExecCommandTool(utf8Engine)
+	utf8Tool := NewRunScriptTool(utf8Engine)
 	utf8Command := "echo " + sample
 	if runtime.GOOS == "windows" {
 		utf8Command = "Write-Output '" + sample + "'"
@@ -915,7 +940,7 @@ func TestExecCommandUseUTF8Param(t *testing.T) {
 	}
 	legacyEngine := NewExecEngine(60, 10, true)
 	defer legacyEngine.Close()
-	legacyTool := NewExecCommandTool(legacyEngine)
+	legacyTool := NewRunScriptTool(legacyEngine)
 	res = legacyTool.Execute(context.Background(), map[string]any{
 		"script": rawCommand, "use_utf8": false,
 	})
@@ -959,7 +984,7 @@ func TestExecCommandUTF8ModeLocalizedOutput(t *testing.T) {
 
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": command})
 	if res.IsError {
@@ -991,7 +1016,7 @@ func TestExecCommandUTF8ModeForcesPythonUTF8(t *testing.T) {
 
 	engine := NewExecEngine(60, 20, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	// PowerShell needs the call operator to run a quoted path; sh takes the
 	// quoted words directly.
@@ -1155,13 +1180,13 @@ func TestScriptLanguageSelection(t *testing.T) {
 func TestExecCommandLanguageParameter(t *testing.T) {
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	host := hostScriptLanguageID()
 	props, _ := tool.Parameters()["properties"].(map[string]any)
 	param, ok := props["language"].(map[string]any)
 	if !ok {
-		t.Fatal("language is missing from the exec_command parameters")
+		t.Fatal("language is missing from the run_script parameters")
 	}
 	if param["type"] != "string" || param["default"] != host {
 		t.Fatalf("language schema = %+v, want type string and default %q", param, host)
@@ -1193,14 +1218,14 @@ func TestExecCommandLanguageParameter(t *testing.T) {
 	}
 }
 
-// TestPowerShellFlagsHint checks that the exec_command description advertises
+// TestPowerShellFlagsHint checks that the run_script description advertises
 // the PowerShell invocation flags exactly when PowerShell is a selectable
 // language (the host shell on Windows), and never on a host that offers only
 // another engine.
 func TestPowerShellFlagsHint(t *testing.T) {
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 	description := tool.Description()
 
 	selectable := false
@@ -1305,7 +1330,7 @@ func TestPythonVersionPattern(t *testing.T) {
 func TestExecCommandRejectsUnsupportedLanguage(t *testing.T) {
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	res := tool.Execute(context.Background(), map[string]any{"script": "echo hi", "language": "ruby"})
 	if !res.IsError || !strings.Contains(res.ForLLM, "unsupported language") {
@@ -1327,7 +1352,7 @@ func TestExecCommandPythonLanguage(t *testing.T) {
 	}
 	engine := NewExecEngine(60, 20, true)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	// The source stays ASCII and spans several lines: Python decodes the \u
 	// escapes into Chinese, and the whole text travels through `-c`.
@@ -1364,7 +1389,7 @@ func TestExecCommandPythonLanguageANSIMode(t *testing.T) {
 
 	engine := NewExecEngine(60, 20, false)
 	defer engine.Close()
-	tool := NewExecCommandTool(engine)
+	tool := NewRunScriptTool(engine)
 
 	script := `print("\u4e2d\u6587\u8f93\u51fa")`
 	res := tool.Execute(context.Background(), map[string]any{

@@ -13,18 +13,18 @@ import (
 	"lightagent/internal/proc"
 )
 
-// execCommandDefaultWaitSeconds is the default synchronous wait window.
-const execCommandDefaultWaitSeconds = 10
+// runScriptDefaultWaitSeconds is the default synchronous wait window.
+const runScriptDefaultWaitSeconds = 10
 
 // Built-in max_lines budget of the exec tools: the default of one call and the
 // most a call may ask for (tools.exec.max_lines / tools.exec.max_lines_max).
 const (
-	execCommandDefaultMaxLines = 50
-	execCommandMaxLinesCap     = 100
+	runScriptDefaultMaxLines = 50
+	runScriptMaxLinesCap     = 100
 )
 
 // ExecEngine spawns shell commands and tracks their sessions. It is shared by
-// exec_command and manage_session so both operate on one session pool.
+// run_script and manage_session so both operate on one session pool.
 type ExecEngine struct {
 	sessions        *SessionManager
 	runTimeout      time.Duration
@@ -36,7 +36,7 @@ type ExecEngine struct {
 
 // NewExecEngine builds an engine. timeoutSeconds drives the default run_timeout
 // and waitSeconds the default synchronous wait window. useUTF8 is the default
-// child stdio mode on Windows (exec_command's `use_utf8` parameter overrides it
+// child stdio mode on Windows (run_script's `use_utf8` parameter overrides it
 // per call): child processes read and write UTF-8 (shell preamble plus
 // PYTHONIOENCODING) instead of the host ANSI code page; see childCodec. Hosts
 // without an ANSI code page ignore it and always speak UTF-8, see execUseUTF8.
@@ -45,14 +45,14 @@ func NewExecEngine(timeoutSeconds, waitSeconds int, useUTF8 bool) *ExecEngine {
 		timeoutSeconds = 3600
 	}
 	if waitSeconds <= 0 {
-		waitSeconds = execCommandDefaultWaitSeconds
+		waitSeconds = runScriptDefaultWaitSeconds
 	}
 	return &ExecEngine{
 		sessions:        NewSessionManager(),
 		runTimeout:      time.Duration(timeoutSeconds) * time.Second,
 		waitSeconds:     waitSeconds,
-		maxLinesDefault: execCommandDefaultMaxLines,
-		maxLinesMax:     execCommandMaxLinesCap,
+		maxLinesDefault: runScriptDefaultMaxLines,
+		maxLinesMax:     runScriptMaxLinesCap,
 		useUTF8:         useUTF8,
 	}
 }
@@ -64,10 +64,10 @@ func NewExecEngine(timeoutSeconds, waitSeconds int, useUTF8 bool) *ExecEngine {
 // below the default lowers the default to it.
 func (e *ExecEngine) SetMaxLines(defaultLines, maxLines int) {
 	if maxLines <= 0 {
-		maxLines = execCommandMaxLinesCap
+		maxLines = runScriptMaxLinesCap
 	}
 	if defaultLines <= 0 {
-		defaultLines = execCommandDefaultMaxLines
+		defaultLines = runScriptDefaultMaxLines
 	}
 	if defaultLines > maxLines {
 		defaultLines = maxLines
@@ -112,6 +112,21 @@ func (e *ExecEngine) maxLinesRule() string {
 	return fmt.Sprintf(" `max_lines` caps the lines one call returns (default: %d, maximum: %d, a "+
 		"larger value is truncated). Redirect important output to a file and read it back.",
 		e.maxLinesDefault, e.maxLinesMax)
+}
+
+// runScriptExamplesHint returns a short example pair for the run_script
+// description. It always shows the default (shell) engine and, only when a
+// Python interpreter was found, the recommended way to run Python source
+// directly instead of a shell wrapper with a `cd` and an inline one-liner. The
+// wording is advisory: the tool still runs whatever source the model sends.
+func runScriptExamplesHint() string {
+	hint := " Example (default shell engine): {\"script\":\"ls -la\"}."
+	if !systemPython().Found {
+		return hint
+	}
+	return hint + " For Python prefer {\"language\":\"python\",\"script\":\"print(1)\"}," +
+		" or {\"language\":\"python\",\"cwd\":\"src\",\"script\":\"...\"} for another directory," +
+		" over a shell wrapper such as {\"script\":\"cd src; python -c 'print(1)'\"}."
 }
 
 // childCodec returns the stdio conversion used for child processes in the given
@@ -226,7 +241,7 @@ func hostShellEnvironment() string {
 // windowsShellFlags are the options lightagent passes to PowerShell (pwsh or
 // powershell) before `-Command`: -NoProfile loads no profile script,
 // -NonInteractive never waits for input, and -ExecutionPolicy Bypass keeps the
-// execution policy from blocking the script. The exec_command description
+// execution policy from blocking the script. The run_script description
 // advertises them verbatim when PowerShell is a selectable language (see
 // powerShellFlagsHint).
 var windowsShellFlags = []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"}
@@ -316,24 +331,30 @@ func resolveWindowsShell() string {
 	return windowsShellExe
 }
 
-// ExecCommandTool runs shell commands with the wait-then-background model.
-type ExecCommandTool struct {
+// RunScriptTool runs scripts with the wait-then-background model: the source is
+// handed to the engine chosen by the `language` parameter (the host shell by
+// default).
+type RunScriptTool struct {
 	engine *ExecEngine
 }
 
-// NewExecCommandTool wraps a shared engine with the exec_command surface.
-func NewExecCommandTool(engine *ExecEngine) *ExecCommandTool {
-	return &ExecCommandTool{engine: engine}
+// NewRunScriptTool wraps a shared engine with the run_script surface.
+func NewRunScriptTool(engine *ExecEngine) *RunScriptTool {
+	return &RunScriptTool{engine: engine}
 }
 
 // Name implements Tool.
-func (t *ExecCommandTool) Name() string { return "exec_command" }
+func (t *RunScriptTool) Name() string { return "run_script" }
 
 // Description implements Tool.
-func (t *ExecCommandTool) Description() string {
-	description := fmt.Sprintf("Execute a script with state-aware execution. `script` holds the script "+
-		"source and `language` selects the engine that runs it (available: %s; default: %s, the host "+
-		"shell). "+
+func (t *RunScriptTool) Description() string {
+	description := fmt.Sprintf("Run a script with state-aware execution. This tool runs source text, "+
+		"not a shell command line: `script` holds the source and `language` selects the engine that "+
+		"interprets it (available: %s; default: %s, the host shell), and the text is handed to that "+
+		"engine as-is. It is recommended to put the program's own source directly in `script` and pick "+
+		"the `language` that matches it, rather than shelling out to another interpreter's inline "+
+		"(`-c`) one-liner, and to set `cwd` for the working directory instead of starting the script "+
+		"with a `cd`. "+
 		"Synchronously waits up to `wait_timeout` seconds (default: %d). If it finishes within "+
 		"that window, returns exit_code and output directly. If it exceeds `wait_timeout` it "+
 		"detaches to the background and returns a `session_id`: the call is a start followed by "+
@@ -342,6 +363,7 @@ func (t *ExecCommandTool) Description() string {
 		"%d seconds). Output is cleaned and truncated by `max_lines`/`max_chars`, which bound what "+
 		"a call returns rather than the process lifetime.",
 		scriptLanguageSummary(), hostScriptLanguageID(), t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
+	description += runScriptExamplesHint()
 	description += t.engine.maxLinesRule()
 	description += powerShellFlagsHint()
 	if !useUTF8ParamAvailable() {
@@ -356,21 +378,26 @@ func (t *ExecCommandTool) Description() string {
 }
 
 // Parameters implements Tool.
-func (t *ExecCommandTool) Parameters() map[string]any {
+func (t *RunScriptTool) Parameters() map[string]any {
 	runDefault := int(t.engine.runTimeoutDefault() / time.Second)
 	hostLanguage := hostScriptLanguageID()
 	properties := map[string]any{
 		"script": map[string]any{
-			"type":        "string",
-			"description": "The script source text to run with the engine chosen by `language`.",
+			"type": "string",
+			"description": "The script source text, run as-is by the engine chosen by `language`. It is " +
+				"recommended to put the program's own source here and select the matching `language`, " +
+				"rather than shelling out to another interpreter's inline (`-c`) one-liner; use `cwd` " +
+				"for the working directory.",
 		},
 		"language": map[string]any{
 			"type":    "string",
 			"enum":    scriptLanguageIDs(),
 			"default": hostLanguage,
 			"description": "Script language that interprets `script`: it selects the engine that runs the " +
-				"text, not a label for the call. Omit to use the host shell. The schema enum lists the " +
-				"available engines and the tool description explains each one.",
+				"text, not a label for the call. Omit to use the host shell (the source is then a shell " +
+				"script). When a non-shell engine is selected, `script` is that language's source run " +
+				"directly, so no inline (`-c`) wrapper is needed. The schema enum lists the available " +
+				"engines and the tool description explains each one.",
 		},
 		"wait_timeout": map[string]any{
 			"type":        "integer",
@@ -384,7 +411,7 @@ func (t *ExecCommandTool) Parameters() map[string]any {
 		},
 		"cwd": map[string]any{
 			"type":        "string",
-			"description": "Working directory. ",
+			"description": "Working directory for the script. Recommended over a `cd` at the start of the script.",
 		},
 	}
 	// use_utf8 exists only where the host has an ANSI code page to fall back to.
@@ -416,14 +443,14 @@ func (t *ExecCommandTool) Parameters() map[string]any {
 }
 
 // Execute implements Tool.
-func (t *ExecCommandTool) Execute(ctx context.Context, args map[string]any) *Result {
+func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Result {
 	start := time.Now()
 	fail := func(message string) *Result {
 		return commandResult{Status: statusFailed, Output: message, ElapsedSeconds: elapsedSeconds(start)}.toResult()
 	}
 
 	if t.engine == nil {
-		return fail("exec_command is not configured")
+		return fail("run_script is not configured")
 	}
 	script, _ := stringArg(args, "script")
 	if trimSpace(script) == "" {

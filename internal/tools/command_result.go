@@ -11,13 +11,13 @@ const (
 	statusCompleted = "completed"
 	statusRunning   = "running"
 	statusFailed    = "failed"
-	// statusInterrupted marks a call the user cut short: exec_command's process
+	// statusInterrupted marks a call the user cut short: run_script's process
 	// tree is terminated and the output it had produced until then is reported
 	// with this status.
 	statusInterrupted = "interrupted"
 )
 
-// commandResult is the unified JSON contract returned by exec_command and
+// commandResult is the unified JSON contract returned by run_script and
 // manage_session.
 type commandResult struct {
 	Status         string  `json:"status"`
