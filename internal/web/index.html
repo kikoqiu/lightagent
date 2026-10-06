@@ -95,6 +95,14 @@
       </label>
       <div class="meter" role="progressbar" aria-label="context usage"><span id="meterFill"></span></div>
       <div class="card-note meter-note"><span id="meterNote">waiting for usage…</span><span class="card-pct" id="meterPct">—</span></div>
+      <!-- The session line under the context meter: which file the conversation
+           belongs to and when it was last saved (setSessionInfo fills both). A
+           fresh /new has no file of its own yet, so it reads as "(unsaved)"
+           until the first /save. -->
+      <div class="session-line">
+        <span class="session-name" id="sessionName" title="">session: —</span>
+        <span class="session-saved" id="sessionSaved"></span>
+      </div>
     </section>
     <section class="card">
       <!-- The rail lists the commands this page can run, built from

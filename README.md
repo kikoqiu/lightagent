@@ -378,9 +378,12 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
   折叠组以 `/compact` 开头、以 `/help` / `/stop` 收尾；**点击即执行**，`/result` 与 `/markdown`
   显示 on / off 状态，点击切换另一状态。
 * 左侧栏的 **模型卡片**（在上方）：一个接口下拉（**只显示接口名**，**忙时不可改**，样式像
-  label 而非输入框）+ 上下文进度条；下拉即 `/switchapi`，进度条说明行显示 `tokens / window` 与
-  右侧百分比。标题栏 logo 下的小字显示**当前接口名**（连接状态由右侧绿点表示，不再显示
-  `online` / `offline`）。
+  label 而非输入框）+ 上下文进度条；下拉即 `/switchapi`，
+  进度条说明行显示 `tokens / window` 与右侧百分比。进度条下方是**会话行**：`session: <文件名>` 与
+  `saved: <相对时间>`（`just now` / `N minutes ago` / `N hours ago` / `N days ago`，超过一个月
+  显示日期；未保存的 `/new` 显示 `(unsaved)` 与 `saved: never`），`/save`、`/saveas`、`/load`、`/new`
+  之后随之刷新。切换会话、切换接口（模型）与上下文压缩后，上下文用量都会立即刷新。
+  标题栏 logo 下的小字显示**当前接口名**（连接状态由右侧绿点表示，不再显示 `online` / `offline`）。
 * 右上角 **⚙** 打开配置编辑器（左侧栏不再有 Configuration 卡片），右上角可在 **Form / JSON** 两种模式间切换：
   Form 是分段控件表单（文本框 / 开关 / 滑杆 / 下拉 / 多行文本，按 `config.json` 的键逐项列出，留空即用内置默认），
   JSON 是整份文档原文；两者同步，改动实时写入将提交的文档。保存前两端都会校验（控件行内报错 + 服务端规则），

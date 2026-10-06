@@ -309,6 +309,9 @@ func runSession(o *options, stdout io.Writer) error {
 		// through the CLI, so the page's next /save writes the same default
 		// file a terminal /new + /save would.
 		srv.SetSessionNewer(c.NewSession)
+		// The rail's session line reads the current file and its last-saved time
+		// through the CLI, the same source /save and /load move.
+		srv.SetSessionInfo(c.CurrentSession)
 		// The page's Restart button saves the session (the endpoint does that,
 		// so the conversation is on disk before anything is given up) and then
 		// hands the run over to a fresh process, which resumes it: the same

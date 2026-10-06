@@ -155,6 +155,10 @@ CLI 与 web 都用它画出消息旁的灰色时间戳（`compacted` 的摘要�
 `usage` 事件带 `tokens` / `context_window`，用于上下文用量显示。它在上下文增长的每个时点
 （回合开始、每次模型回复、每轮工具执行后）广播，因此 tool 循环进行中前端也能实时刷新；
 `tokens` 以接口返回的 `usage.prompt_tokens` 为基准，再加上此后追加消息的估算。
+它还在**上下文被替换或窗口变化**的非回合时点广播，让用量显示立即跟上而不必等下一次模型回复：
+`Agent.Load`（`/load`、启动恢复）、`Agent.Reset`（`/clear`、`/new`）、`Agent.SwitchLLM`
+（`/switchapi` 或 Web 模型下拉，窗口属于接口）以及 `doCompact`（`/compact` 或自动压缩，
+压缩后以摘要重算）。
 `reasoning_delta` 携带模型「思考」增量文本，CLI 与
 web 各自流式渲染（CLI 为 `[thinking]` 块，web 为 thinking 行），并和可见回答一样按
 `ui.markdown` 设置渲染 Markdown；定稿后的思考写入 assistant 消息（`reasoning_content`）并随后续请求回传，供 preserve thinking 模板使用。

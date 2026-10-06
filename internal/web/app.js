@@ -663,6 +663,64 @@
     if (noteEl) { noteEl.textContent = tokens + ' / ' + win + ' tokens'; }
   }
 
+  // sessionSavedISO is the last-saved moment the server reported for the current
+  // session (RFC 3339), or "" when the conversation has never been saved. The
+  // label is rendered from it every tick, so "just now" keeps counting up.
+  var sessionSavedISO = '';
+
+  // countLabel renders "1 minute" / "5 minutes": the unit is pluralized only when
+  // there really is more than one.
+  function countLabel(n, unit) { return n + ' ' + unit + (n === 1 ? '' : 's'); }
+
+  // relativeTime turns a timestamp into the readable form a reader wants at a
+  // glance — "just now", "5 minutes ago", "3 hours ago", "2 days ago" — and falls
+  // back to the calendar date once it is older than a month, where a day count
+  // stops meaning much. A future timestamp (clock skew) reads as "just now"
+  // rather than "in 3 minutes". It returns "" for an unparseable value.
+  function relativeTime(iso) {
+    var t = Date.parse(iso);
+    if (isNaN(t)) { return ''; }
+    var secs = Math.floor((Date.now() - t) / 1000);
+    if (secs < 45) { return 'just now'; }
+    var mins = Math.round(secs / 60);
+    if (mins < 60) { return countLabel(Math.max(1, mins), 'minute') + ' ago'; }
+    var hours = Math.floor(mins / 60);
+    if (mins < 24 * 60) { return countLabel(hours, 'hour') + ' ago'; }
+    var days = Math.floor(hours / 24);
+    if (days < 30) { return countLabel(days, 'day') + ' ago'; }
+    var d = new Date(t);
+    return 'on ' + d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+  }
+
+  // pad2 zero-pads a number to two digits (the absolute fallback date).
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  // renderSessionSaved paints the "saved: …" half of the rail's session line from
+  // sessionSavedISO. It is called whenever the value changes and on a slow timer,
+  // so the relative label stays current.
+  function renderSessionSaved() {
+    var savedEl = document.getElementById('sessionSaved');
+    if (!savedEl) { return; }
+    savedEl.textContent = 'saved: ' + (sessionSavedISO ? relativeTime(sessionSavedISO) : 'never');
+    savedEl.title = sessionSavedISO ? new Date(Date.parse(sessionSavedISO)).toLocaleString() : 'not saved yet';
+  }
+
+  // setSessionInfo fills the rail's session line under the context meter: the file
+  // the conversation belongs to and when it was last saved. The server sends it in
+  // the history header and again whenever a session command changes it (see the
+  // session frame). A nameless conversation (a fresh /new) reads as "(unsaved)" and
+  // "saved: never"; the title carries the full name and the exact save time for
+  // when the relative label is not enough.
+  function setSessionInfo(name, saved) {
+    var nameEl = document.getElementById('sessionName');
+    if (nameEl) {
+      nameEl.textContent = 'session: ' + (name || '(unsaved)');
+      nameEl.title = name || 'not saved yet';
+    }
+    sessionSavedISO = saved || '';
+    renderSessionSaved();
+  }
+
   // apiName is the active provider's name, shown under the logo. The green dot
   // already tells connection state apart, so that line is never
   // "online"/"offline": it holds the last known name (and "connecting…" only
@@ -2444,6 +2502,7 @@
     replayBatch = document.createDocumentFragment();
     historyBusy = !!ev.busy;
     setUsage(ev.tokens || 0, ev.window || 0);
+    setSessionInfo(ev.session || '', ev.saved || '');
     applySettings(ev);
   }
 
@@ -2464,6 +2523,7 @@
   function sameHistory(ev) {
     recordHistoryVersion(ev);
     setUsage(ev.tokens || 0, ev.window || 0);
+    setSessionInfo(ev.session || '', ev.saved || '');
     applySettings(ev);
     setRunning(!!ev.busy);
   }
@@ -2656,6 +2716,10 @@
       if (ev.type === 'history_end') { endHistory(); return; }
       // The switches the rail mirrors: no row, just state.
       if (ev.type === 'settings') { applySettings(ev); return; }
+      // The rail's session line is transient state too (it changes on /save,
+      // /saveas, /load and /new): no row, just state, and it must not disturb
+      // read-aloud's thinking buffer the way a content event would.
+      if (ev.type === 'session') { setSessionInfo(ev.name || '', ev.saved || ''); return; }
       render(ev.type, ev);
     };
   }
@@ -3056,6 +3120,12 @@
   // frame.
   buildModelSelect(CFG.apis || []);
   if (CFG.name) { setAPIName(CFG.name); }
+  // The rail's "saved: 5 minutes ago" keeps counting up: one slow tick re-renders
+  // it. A hidden, stopped page is skipped (coming back redraws from a fresh
+  // snapshot anyway), so a backgrounded tab does not wake for the label.
+  setInterval(function () {
+    if (!stopped) { renderSessionSaved(); }
+  }, 30000);
   sendEl.disabled = true;
   // Wait for the session state before dialing: the handshake fails without a
   // session, and the dialog may sign this browser in on its own with a stored

@@ -189,6 +189,35 @@ func TestMobileChrome(t *testing.T) {
 	}
 }
 
+// TestSessionLine pins the rail's session line under the context meter: the
+// markup, the stylesheet and the app.js wiring that fills it from the history
+// header and the live session frame, so the page shows which file the
+// conversation belongs to and when it was last saved.
+func TestSessionLine(t *testing.T) {
+	src := pageSource()
+	// The markup ids and the stylesheet class, the app.js function that fills
+	// them, and the relative-time rendering that keeps "saved: …" readable and
+	// counting up (a slow tick, which a hidden page skips).
+	for _, want := range []string{
+		`id="sessionName"`,
+		`id="sessionSaved"`,
+		".session-line",
+		"function setSessionInfo",
+		"'session: ' +",
+		"'saved: ' +",
+		"ev.session",
+		"ev.type === 'session'",
+		"function relativeTime",
+		"' ago'",
+		"sessionSavedISO",
+		"if (!stopped) { renderSessionSaved(); }",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the session line is missing %q", want)
+		}
+	}
+}
+
 // TestPhoneRailDrawer pins the rail under the banner: the app is a two-row grid
 // (the banner across the whole width, the rail and the content sharing the row
 // under it), so the rail — the desktop's first column and a phone's drawer — never

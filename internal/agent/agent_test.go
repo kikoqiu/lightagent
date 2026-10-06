@@ -1540,7 +1540,10 @@ func TestCompactionPublishesProgressAndSummary(t *testing.T) {
 	var kinds []EventType
 	var texts []string
 	deadline := time.After(2 * time.Second)
-	for len(kinds) < 3 {
+	// Four events: the compacting info, the error from the failed summarize, the
+	// compacted one and the usage refresh that follows it (the pass shrank the
+	// context, so the front-ends have to see the new size).
+	for len(kinds) < 4 {
 		select {
 		case ev := <-events:
 			kinds = append(kinds, ev.Type)
@@ -1549,7 +1552,7 @@ func TestCompactionPublishesProgressAndSummary(t *testing.T) {
 				t.Fatalf("compacted event summary = %q, want the carried-over one", ev.Summary)
 			}
 		case <-deadline:
-			t.Fatalf("events = %v %v, want the info, the error and the compacted one", kinds, texts)
+			t.Fatalf("events = %v %v, want the info, the error, the compacted one and the usage refresh", kinds, texts)
 		}
 	}
 	if kinds[0] != EventInfo || texts[0] != "compacting context: summarizing 5 of 5 messages" {
@@ -1557,6 +1560,9 @@ func TestCompactionPublishesProgressAndSummary(t *testing.T) {
 	}
 	if kinds[1] != EventError || kinds[2] != EventCompacted {
 		t.Fatalf("event kinds = %v, want info, error, compacted", kinds)
+	}
+	if kinds[3] != EventUsage {
+		t.Fatalf("event kinds = %v, want the usage refresh after the compacted one", kinds)
 	}
 	// Nothing was kept raw, so the pass leaves the engine's continue marker: a
 	// request without a user message is what chat templates reject.
@@ -2206,6 +2212,38 @@ drain:
 	if usageCount < 3 {
 		t.Fatalf("usage events = %d, want one per context growth (turn start, model reply, tool round)", usageCount)
 	}
+}
+
+// TestContextSwitchesRefreshUsage pins that the operations replacing the context
+// or changing its window — /load, /clear // /new and /switchapi — report the
+// usage again. Without it the front-ends keep the previous conversation's meter
+// (or the previous interface's window) until the next model reply.
+func TestContextSwitchesRefreshUsage(t *testing.T) {
+	cfg := config.Default()
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), NewBus())
+	events, cancel := a.Bus().Subscribe()
+	defer cancel()
+
+	wantUsage := func(stage string) {
+		t.Helper()
+		select {
+		case ev := <-events:
+			if ev.Type != EventUsage {
+				t.Fatalf("%s: event = %v, want a usage refresh", stage, ev.Type)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: no usage event was published", stage)
+		}
+	}
+
+	a.Load([]llm.Message{{Role: "user", Content: "hello"}}, "")
+	wantUsage("Load")
+	a.Reset()
+	wantUsage("Reset")
+	if err := a.SwitchLLM(llm.NewClient(cfg.LLMs[0].OpenAIConfig), 4096, 0); err != nil {
+		t.Fatalf("SwitchLLM: %v", err)
+	}
+	wantUsage("SwitchLLM")
 }
 
 // TestSystemPromptUnlockRule verifies the global unlock rule is injected

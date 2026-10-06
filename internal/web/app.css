@@ -138,6 +138,19 @@
   /* The context card's note: the token ratio on the left and the percentage on
      the right of the same line (the card has no "Context window" title). */
   .card-note.meter-note { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
+  /* The session line under the context meter: the file the conversation belongs
+     to and when it was last saved (see setSessionInfo). The two stack, because a
+     full timestamp beside a file name does not fit the rail's width; each half
+     ellipsizes instead of wrapping, so a long name cannot push the card taller. */
+  .session-line {
+    display:flex; flex-direction:column; gap:2px; min-width:0;
+    margin-top:6px; color:var(--fg-dim); font-size:11px;
+  }
+  .session-line .session-name,
+  .session-line .session-saved {
+    min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .session-line .session-name { color:var(--fg-muted); }
   /* The model picker at the top of the context card, disabled while a turn runs
      (a switch is refused then anyway). It reads as a label, not an input: no
      box and muted text, with the native arrow signalling it is a dropdown; hover

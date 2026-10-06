@@ -177,8 +177,8 @@ func (a *Agent) SwitchLLM(client *llm.Client, contextWindow, maxTokens int) erro
 		return errors.New("switch llm: no client")
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.busy {
+		a.mu.Unlock()
 		return errors.New("a turn is running; try again when idle")
 	}
 	a.client = client
@@ -194,6 +194,11 @@ func (a *Agent) SwitchLLM(client *llm.Client, contextWindow, maxTokens int) erro
 			a.compactor.maxTokens = maxTokens
 		}
 	}
+	a.mu.Unlock()
+	// The context window belongs to the interface: report the usage again so the
+	// meter follows the window that is now active instead of keeping the old one
+	// until the next model reply.
+	a.bus.Publish(a.usageEvent())
 	return nil
 }
 
@@ -291,6 +296,10 @@ func (a *Agent) Load(history []llm.Message, summary string) {
 	a.usage = 0
 	a.usageAt = 0
 	a.mu.Unlock()
+	// The context was replaced: report its new size so both front-ends drop the
+	// previous conversation's usage right away (a loaded session can be far
+	// larger or smaller than what was on screen).
+	a.bus.Publish(a.usageEvent())
 }
 
 // Reset clears the conversation.
@@ -301,6 +310,9 @@ func (a *Agent) Reset() {
 	a.usage = 0
 	a.usageAt = 0
 	a.mu.Unlock()
+	// The context is empty now: refresh the usage so the front-ends stop showing
+	// the size of the conversation that was just cleared.
+	a.bus.Publish(a.usageEvent())
 }
 
 // Busy reports whether a turn is currently running.
@@ -1173,6 +1185,10 @@ func (a *Agent) doCompact(ctx context.Context, mode summarizeMode) bool {
 		Text:    fmt.Sprintf("context compressed: %d -> %d messages", len(hist), len(newHist)),
 		Summary: newSum,
 	})
+	// The context shrank with the pass: report the new size so the meter drops to
+	// the compacted estimate instead of keeping the pre-pass number (the pass
+	// runs outside a turn too, from /compact, so nothing else would refresh it).
+	a.bus.Publish(a.usageEvent())
 	a.save()
 	return true
 }

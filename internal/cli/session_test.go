@@ -341,3 +341,34 @@ func TestSaveSessionKeepsTheLoadedDefault(t *testing.T) {
 	}
 }
 
+// TestCurrentSession pins the rail's session description: it reports the file the
+// conversation belongs to (its base name) and when it was last written, and an
+// empty name plus a zero time before anything has been saved (a fresh /new).
+func TestCurrentSession(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+
+	if name, saved := c.CurrentSession(); name != "" || !saved.IsZero() {
+		t.Fatalf("fresh conversation reports (%q, %v), want an empty name and a zero time", name, saved)
+	}
+
+	c.agent.Load([]llm.Message{{Role: "user", Content: "hi"}}, "")
+	path, err := c.SaveSession()
+	if err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	name, saved := c.CurrentSession()
+	if name != filepath.Base(path) {
+		t.Fatalf("name = %q, want %q", name, filepath.Base(path))
+	}
+	if saved.IsZero() {
+		t.Fatal("the last-saved time is zero after a save")
+	}
+
+	// /new forgets the file again: the rail goes back to its unsaved state.
+	c.NewSession()
+	if name, saved := c.CurrentSession(); name != "" || !saved.IsZero() {
+		t.Fatalf("after /new reports (%q, %v), want an empty name and a zero time", name, saved)
+	}
+}
+

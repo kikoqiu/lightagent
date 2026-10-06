@@ -306,3 +306,73 @@ func TestPageCarriesSessionPanels(t *testing.T) {
 	}
 }
 
+// TestHistoryFrameCarriesSessionLine pins that the snapshot header tells the page
+// which session the conversation belongs to and when it was last saved, so the
+// rail's session line is right as soon as the socket opens.
+func TestHistoryFrameCarriesSessionLine(t *testing.T) {
+	srv := newTestServer(t, "")
+	saved := time.Date(2026, 10, 6, 15, 4, 5, 0, time.UTC)
+	srv.SetSessionInfo(func() (string, time.Time) { return "notes.json", saved })
+	_, reader := dialWS(t, srv)
+
+	for {
+		_, payload, err := readServerFrame(reader)
+		if err != nil {
+			t.Fatalf("read header: %v", err)
+		}
+		s := string(payload)
+		if strings.Contains(s, `"type":"history_end"`) {
+			t.Fatal("no history_start frame arrived")
+		}
+		if !strings.Contains(s, `"type":"history_start"`) {
+			continue
+		}
+		if !strings.Contains(s, `"session":"notes.json"`) {
+			t.Fatalf("header = %s, want the session name", payload)
+		}
+		// The moment travels as RFC 3339: the page turns it into a relative label.
+		if !strings.Contains(s, `"saved":"2026-10-06T15:04:05Z"`) {
+			t.Fatalf("header = %s, want the last-saved time", payload)
+		}
+		return
+	}
+}
+
+// TestSessionFrameFollowsSessionChanges pins the live path: a broadcast sends a
+// session frame carrying the current file and its last-saved time, which is what
+// the rail's session line follows after /save, /saveas and /load. A never-saved
+// conversation reports both fields empty, so the rail shows its unsaved state.
+func TestSessionFrameFollowsSessionChanges(t *testing.T) {
+	srv := newTestServer(t, "")
+	saved := time.Date(2026, 10, 6, 9, 30, 0, 0, time.UTC)
+	srv.SetSessionInfo(func() (string, time.Time) { return "notes.json", saved })
+	_, reader := dialWS(t, srv)
+	drainHistory(t, reader)
+
+	readSessionFrame := func() string {
+		t.Helper()
+		for {
+			_, payload, err := readServerFrame(reader)
+			if err != nil {
+				t.Fatalf("read session frame: %v", err)
+			}
+			if strings.Contains(string(payload), `"type":"session"`) {
+				return string(payload)
+			}
+		}
+	}
+
+	srv.broadcastSession()
+	if frame := readSessionFrame(); !strings.Contains(frame, `"name":"notes.json"`) ||
+		!strings.Contains(frame, `"saved":"2026-10-06T09:30:00Z"`) {
+		t.Fatalf("session frame = %s, want the name and the last-saved time", frame)
+	}
+
+	srv.SetSessionInfo(func() (string, time.Time) { return "", time.Time{} })
+	srv.broadcastSession()
+	if frame := readSessionFrame(); !strings.Contains(frame, `"name":""`) ||
+		!strings.Contains(frame, `"saved":""`) {
+		t.Fatalf("session frame = %s, want the unsaved state", frame)
+	}
+}
+

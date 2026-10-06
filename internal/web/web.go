@@ -111,6 +111,10 @@ type Server struct {
 	// registered by the program (SetSessionNewer); a nil one leaves /new
 	// resetting only the conversation, which is what /clear does.
 	newSession func()
+	// sessionInfo describes the current session for the rail's session line: its
+	// file name and when it was last written. It is registered by the program
+	// (SetSessionInfo); a nil one leaves the line empty.
+	sessionInfo func() (string, time.Time)
 	// apiSwitch switches the active LLM interface (the page's model dropdown and
 	// /switchapi); apiList describes the interfaces. Both are registered by the
 	// program (SetAPISwitcher / SetAPIList); a nil one means the picker is
@@ -242,6 +246,12 @@ func (s *Server) SetSessionRemover(fn func(name string) (string, error)) { s.rem
 // the current file, exactly like /clear.
 func (s *Server) SetSessionNewer(fn func()) { s.newSession = fn }
 
+// SetSessionInfo registers the callback behind the rail's session line: it
+// returns the file the current conversation belongs to (its base name) and when
+// it was last written. The program wires it to the CLI, and a nameless
+// conversation that has never been saved reports an empty name and a zero time.
+func (s *Server) SetSessionInfo(fn func() (string, time.Time)) { s.sessionInfo = fn }
+
 // SetAPISwitcher registers the callback behind the browser's /switchapi and its
 // model dropdown: it makes the named or numbered interface active and returns a
 // confirmation message. The program wires it to the runtime interface selection
@@ -278,6 +288,39 @@ func (s *Server) activeAPIName() string {
 // the settings frame the mirror already uses for its switches, which now also
 // carries the active model and the interface list.
 func (s *Server) BroadcastAPI() { s.broadcastSettings() }
+
+// sessionState returns the rail's session line: the current session file's base
+// name and when it was last saved. The moment travels as an RFC 3339 timestamp
+// because the page renders it as a readable relative label ("just now", "5
+// minutes ago") that keeps counting up; both are empty when the conversation has
+// never been saved (a fresh /new).
+func (s *Server) sessionState() (name, saved string) {
+	if s.sessionInfo == nil {
+		return "", ""
+	}
+	n, t := s.sessionInfo()
+	if t.IsZero() {
+		return n, ""
+	}
+	return n, t.Format(time.RFC3339)
+}
+
+// broadcastSession pushes the current session's name and last-saved time to the
+// connected pages, so the rail's session line follows /save, /saveas and /load.
+func (s *Server) broadcastSession() {
+	name, saved := s.sessionState()
+	data, err := json.Marshal(map[string]any{
+		"type":  "session",
+		"name":  name,
+		"saved": saved,
+	})
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.broadcastLocked(data)
+}
 
 // Start seeds the in-memory scrollback, serves in the background and subscribes
 // to the agent event bus.
@@ -868,6 +911,11 @@ type historyHeader struct {
 	// connects.
 	Name string           `json:"name"`
 	APIs []config.APIInfo `json:"apis,omitempty"`
+	// Session and Saved are the rail's session line: the current session file and
+	// when it was last written (empty for a conversation that has never been
+	// saved), so a reconnecting page shows the right one right away.
+	Session string `json:"session,omitempty"`
+	Saved   string `json:"saved,omitempty"`
 }
 
 // historyRowsFrame is one batch of replayed rows.
@@ -890,9 +938,13 @@ type historySameFrame struct {
 	Markdown bool   `json:"markdown"`
 	Result   bool   `json:"result"`
 	// Name and APIs ride here too: the interface can change without the rows
-	// changing, and a reconnecting page must not keep a stale name.
-	Name string           `json:"name"`
-	APIs []config.APIInfo `json:"apis,omitempty"`
+	// changing, and a reconnecting page must not keep a stale name. The session
+	// line travels the same way (a /save renames the conversation without the
+	// rows changing).
+	Name    string           `json:"name"`
+	APIs    []config.APIInfo `json:"apis,omitempty"`
+	Session string           `json:"session,omitempty"`
+	Saved   string           `json:"saved,omitempty"`
 }
 
 // sameHistoryFrame renders the "nothing new" reply from the same header the
@@ -909,6 +961,8 @@ func sameHistoryFrame(header historyHeader) []byte {
 		Result:   header.Result,
 		Name:     header.Name,
 		APIs:     header.APIs,
+		Session:  header.Session,
+		Saved:    header.Saved,
 	})
 	if err != nil {
 		return nil
@@ -920,6 +974,7 @@ func sameHistoryFrame(header historyHeader) []byte {
 // caller must hold s.mu.
 func (s *Server) historyHeaderLocked(rows int) historyHeader {
 	stats := s.agent.Stats()
+	session, saved := s.sessionState()
 	return historyHeader{
 		Type:     "history_start",
 		Version:  s.version,
@@ -931,6 +986,8 @@ func (s *Server) historyHeaderLocked(rows int) historyHeader {
 		Count:    rows,
 		Name:     s.activeAPIName(),
 		APIs:     s.apiInfos(),
+		Session:  session,
+		Saved:    saved,
 	}
 }
 
@@ -1103,6 +1160,9 @@ func (s *Server) handleCommand(text string) {
 		}
 		// The page has to forget the rows of the conversation /new dropped.
 		s.clearScrollback()
+		// The conversation no longer belongs to a file: the rail's session line
+		// goes back to its unsaved state.
+		s.broadcastSession()
 		s.info("started a new conversation (in memory; /save to persist)")
 	case "/clear":
 		if s.agent.Busy() {
@@ -1124,6 +1184,7 @@ func (s *Server) handleCommand(text string) {
 			s.fail("failed to save session: " + err.Error())
 			return
 		}
+		s.broadcastSession()
 		s.info("session saved to " + path)
 	case "/saveas":
 		if s.saveAs == nil {
@@ -1140,6 +1201,7 @@ func (s *Server) handleCommand(text string) {
 			s.fail(err.Error())
 			return
 		}
+		s.broadcastSession()
 		s.info("session saved to " + path)
 	case "/load":
 		if s.load == nil {
@@ -1162,6 +1224,9 @@ func (s *Server) handleCommand(text string) {
 		}
 		// The page has to redraw the whole transcript the load replaced.
 		s.rebuildScrollback()
+		// The conversation belongs to the loaded file now: refresh the rail's
+		// session line along with the transcript.
+		s.broadcastSession()
 		s.info("loaded session " + path)
 	case "/list":
 		if s.list == nil {

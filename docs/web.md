@@ -204,7 +204,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 在解析+重建期间整段卡住（这正是超长会话停在 `Waiting for messages…` 的原因）：
 
 ```json
-{ "type": "history_start", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "count": 812, "model": "gpt-4o-mini", "apis": [ { "index": 1, "name": "default", "type": "openai", "model": "gpt-4o-mini", "enabled": true, "active": true } ] }
+{ "type": "history_start", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "count": 812, "model": "gpt-4o-mini", "apis": [ { "index": 1, "name": "default", "type": "openai", "model": "gpt-4o-mini", "enabled": true, "active": true } ], "session": "session.json", "saved": "2026-10-06 15:04:05" }
 { "type": "history_rows", "messages": [ { "role": "user", "content": "..." } ] }
 { "type": "history_rows", "messages": [ ... ] }
 { "type": "history_end" }
@@ -213,7 +213,9 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 * `history_start` 是表头：`tokens`/`window` 用于顶部上下文用量徽标，`busy` 让运行中连上的页面也
   显示转圈指示，`markdown` / `result` 是当前的渲染开关与工具结果开关（重连的标签页据此与其它
   标签页或 CLI 的改动保持一致），`name` 是**当前接口名**（画在 logo 下）、`apis` 是接口列表
-  （页面用它填侧栏的模型下拉），`count` 是本次快照的行数，`version` 是这批行对应的**回滚版本**
+  （页面用它填侧栏的模型下拉），`session` / `saved` 是**侧栏的会话行**（当前会话文件名，以及最近保存时刻的
+  RFC 3339 时间戳——页面把它渲染成「刚刚 / N 分钟前」这类可读相对时间；未保存的新会话两者为空），
+  `count` 是本次快照的行数，`version` 是这批行对应的**回滚版本**
   （页面先记下、等快照**收齐**才提交为「自己这份日志的版本」，中途断线时下一次连接仍按手上那份日志的
   版本发 `?since=`，不会把没收到的快照当成自己的）。
 * `history_rows` 每帧一个**批次**：至多 200 行，或累计文本达到 256 KB 就提前切批（单行过大时自己
@@ -233,7 +235,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 服务端只回：
 
 ```json
-{ "type": "history_same", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ] }
+{ "type": "history_same", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ], "session": "session.json", "saved": "2026-10-06 15:04:05" }
 ```
 
 * 页面收到它**不动日志区**，只把表头里的状态（用量、`busy`、开关、当前模型与接口列表）应用上去——这正是手机停工后
@@ -280,6 +282,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "user", "text": "某客户端发送的消息", "source": "web" }
 { "type": "turn_done" }
 { "type": "settings", "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ] }
+{ "type": "session", "name": "session.json", "saved": "2026-10-06 15:04:05" }
 ```
 
 * `compacted` 携带 `summary`：累计摘要（总结失败时退化为丢弃消息，此时它可能为空/未变）。
@@ -300,8 +303,16 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 * `settings` 是**瞬时帧**（不进日志区）：服务端在网页侧开关（`/result`、`/markdown`）变化时广播，
   页面的命令栏据此刷新 on / off 状态；新页面从注入的配置、重连页面从 `history_start` 表头拿到同样的值。
 
+* `session` 也是**瞬时帧**（不进日志区）：`/save`、`/saveas`、`/load`、`/new` 这类改变当前会话归属的
+  命令之后广播，页面据此刷新侧栏的会话行（`name` 为当前会话文件名、`saved` 为最近保存时刻的
+  RFC 3339 时间戳，页面渲染成「刚刚 / N 分钟前」并每 30 秒续算一次；未保存的新会话两者为空）。
+  新页面与重连页面从 `history_start` 表头拿到同样的值。
+
 * `usage` 在上下文增长的每个时点广播（回合开始、每次模型回复、每轮工具执行后），
   页面据此**实时**更新顶部上下文用量徽标（`tokens` 以接口返回的 `prompt_tokens` 为基准）。
+  它在**上下文被替换或窗口变化**时也会广播——`/load` 与启动恢复（`Load`）、`/clear` 与 `/new`（`Reset`）、
+  `/switchapi` 与侧栏模型下拉（`SwitchLLM`，窗口属于接口）以及 `/compact` 或自动压缩（`doCompact`，
+  压缩后以摘要重算）——因此切换会话或模型、以及压缩之后，用量立即刷新而不必等下一次模型回复。
 * `user` 事件带 `source` 字段（`cli` / `web`），终端据此区分本地输入与网页输入。
 * **`user` 事件在消息真正进入对话时才广播**（Agent 的 `drainSteering()` / `startSteeringTurn()`）：
   回合运行中提交的消息会先入队，等它所打断的那一轮结束后才进入上下文，事件也在**那一刻**才发出。
@@ -485,8 +496,12 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   系统开启「减弱动态效果」时不动）。抽屉宽 `min(292px, 86vw)`，遮罩只盖第二行（banner 保持可交互）；
   跨 1000px 断点（旋转、改窗口大小）自动回落为关闭；宽屏下 logo 只是装饰（不进 Tab 顺序、指针穿透）。
   桌面（宽屏 ≥1000px）在 banner 下方展开固定信息栏：**模型卡片**（顶部的模型/接口下拉 ——
-  下拉即 `/switchapi`，忙时禁用；下面是上下文进度条（随占用变黄/变红），说明行左侧 `tokens / window`、
-  右侧百分比，**不再有 “Context window” 标题**）、
+  下拉即 `/switchapi`，忙时禁用；下面是上下文进度条（随占用变黄/变红），
+  说明行左侧 `tokens / window`、右侧百分比，**不再有 “Context window” 标题**；进度条下是**会话行**，
+  两行显示当前会话文件名（`session: …`，未保存的 `/new` 显示 `(unsaved)`）与最近保存时刻
+  （`saved: …` 渲染成可读相对时间 `just now` / `N minutes ago` / `N hours ago` / `N days ago`，
+  超过一个月回落到日期，未保存时为 `saved: never`；每 30 秒续算一次，隐藏停工时不刷新），
+  由 `history_start` 表头与 `session` 帧填充，`/save`、`/saveas`、`/load`、`/new` 之后随之刷新）、
   **Commands 命令栏**（默认列 6 条 `primary` 命令 `/new`、`/clear`、`/save`、`/saveas`、`/load`、`/history`，其余折叠在标题后，点击标题展开/收起（`/switchapi` 标注 `Hidden`，不出现在命令栏里，但仍可在输入框里执行）；
   点击即执行；折叠组以 `/compact` 开头、以 `/help` / `/stop` 收尾；`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态）、
   **Read aloud** 朗读卡片（自带的启用开关 + **Voice settings** 面板入口；

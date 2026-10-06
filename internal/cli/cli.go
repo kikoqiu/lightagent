@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1905,6 +1906,22 @@ func (c *CLI) setHome(path string) {
 // or "" when nothing was resumed. The program calls it right after building the
 // CLI, because the resume happens before the CLI exists.
 func (c *CLI) SetHome(path string) { c.setHome(path) }
+
+// CurrentSession describes the session the current conversation belongs to, for
+// the web rail: the file's base name and when it was last written. A
+// conversation that has never been saved (a fresh /new) reports an empty name
+// and a zero time; the name is still reported when the file cannot be stat'd,
+// so the rail keeps showing which session the conversation would save to.
+func (c *CLI) CurrentSession() (string, time.Time) {
+	path := c.home()
+	if path == "" {
+		return "", time.Time{}
+	}
+	if info, err := os.Stat(path); err == nil {
+		return filepath.Base(path), info.ModTime()
+	}
+	return filepath.Base(path), time.Time{}
+}
 
 // NewSession starts a fresh conversation that no longer belongs to any session
 // file: the conversation is cleared and the current file is forgotten, so the
