@@ -289,9 +289,9 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   CLI 与网页都在**截断处**显示它——CLI 先打印 `[info] context compressed: …` 再打印一个
   `[summary]` 块，网页在信息行之后追加一条 `summary` 行；网页的这条行同时写进回放缓冲，
   所以刷新/重连后摘要仍出现在同一个位置。
-  箭头后的条数 = 摘要 + 保留策略留下的原始消息（`context.summarize_keep`，默认一条都不留，
-  因此是 `1` —— 整段历史都被压缩时，剩下的那条是引擎补的 `[engine] Context summarized,
-  continue.` 标记）。
+  箭头后的条数 = 摘要 + 保留策略留下的原始消息（`context.summarize_keep`，默认一条都不留）。
+  **自动**压缩（回合内）在整段历史都被压掉时会补一条 `[engine] Context summarized, continue.`
+  标记（请求不能没有 user 查询），因此是 `1`；手动 `/compact` 不补这条标记，因此是 `0`。
   总结要调用模型（可能较慢），因此压缩**开始前**会先广播一条 `info`：
   `compacting context: summarizing N of M messages`，两端立刻显示「正在压缩」；没有可压缩
   内容时不广播任何事件（`/compact` 由命令处理方回复 `nothing to compress yet`）。
@@ -511,14 +511,13 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   不使用 `position:fixed`，输入区始终可见；内容列居中且最宽 920px；点触目标不小于 44px。
 * 回合运行中顶部显示转圈指示，输入框右侧出现 **Stop** 按钮：点击等同于发送 `/stop`，
   中断当前模型调用或工具调用；中断事件（`interrupted`）与工具反馈 `interrupted by user`
-  会和其它事件一样广播给所有客户端。中断落在**任何工具调用开始之前**时：已经流出的**正文**保留
-  （流式的那条 `assistant` 行由 `assistant` 事件定稿，与 CLI 一致），其中携带的 tool 调用全部
-  丢弃；正文为空时看 `agent.include_only_think`：开启（默认）且已流出思考时，思考作为一条
-  `reasoning` 行保留进回放/镜像（消息正文仍为空、tool 调用丢弃），关闭或思考也为空时连这条消息
-  也不保留。中断落在**工具调用已经开始之后**
-  时：正在执行的那个调用照常返回真实结果，其后未开始的调用各记一条 `interrupted by user`
-  （见 [architecture.md](architecture.md#agent-回合循环)）。这些记录只进历史，随**下一条用户
-  消息**一起发出。
+  会和其它事件一样广播给所有客户端。中断落在**任何工具调用开始之前**时，这条**不完整回复**留不留由
+  `agent.include_interrupted` 决定：**开启**时已流出的正文/思考保留（流式的那条 `assistant` / `reasoning`
+  行由事件定稿，与 CLI 一致），其中携带的 tool 调用全部丢弃，并追加一条 `[engine]` 用户消息（画在 user
+  位置、标签显示为 **engine**）；**关闭（默认）**时整条不完整回复——正文、思考、tool 调用一起——完全丢弃。中断落在
+  **工具调用已经开始之后**时：正在执行的那个调用照常返回真实结果，其后未开始的调用各记一条
+  `interrupted by user`（见 [architecture.md](architecture.md#agent-回合循环)）。这些记录只进历史，
+  随**下一条用户消息**一起发出。
 * 转圈指示旁是**本回合用时**，格式与 CLI 提示符一致（`busyElapsedLocked`）：不足一分钟
   显示到 0.1 秒（`12.3s`），之后 `1m05s`、`1h02m`。计时随转圈一起开始、可见桌面每 100ms 刷新
   （与 CLI 的动画节奏相同；可见手机与后台页面 1 秒一跳，见[省电](#省电移动端与隐藏页面)），

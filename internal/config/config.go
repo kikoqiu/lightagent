@@ -490,19 +490,18 @@ type AgentConfig struct {
 	// section). The switch shapes the message list that is sent and nothing
 	// else.
 	SummaryInSystemPrompt bool `json:"summary_in_system_prompt"`
-	// IncludeOnlyThink keeps an assistant message that carries only the model's
-	// thinking — no visible text and no tool calls — in the history. It
-	// defaults to true; loading starts from the defaults, so an explicit false
-	// is required to turn it off. With it off such a reply is dropped, and
-	// ContinueOnlyThink below has no effect.
-	IncludeOnlyThink bool `json:"include_only_think"`
-	// ContinueOnlyThink asks the model again when its reply carried only
-	// thinking, instead of ending the turn, so a reply that carries nothing but
-	// thinking still gets an answer — whatever the provider's finish_reason
-	// (stop, a cut-off at max_tokens, or none). It defaults to true and only
-	// applies while IncludeOnlyThink is on: reasoning that was not recorded
-	// cannot be carried into a retry.
-	ContinueOnlyThink bool `json:"continue_only_think"`
+	// IncludeInterrupted keeps a reply the user interrupted — its partial
+	// thinking and/or partial text — in the history and leaves an engine note
+	// telling the model the attempt was cut short, so it follows the next
+	// prompt instead of mistaking the fragment for a finished answer. It also
+	// governs a reply that carries only thinking. It defaults to false:
+	// loading starts from the defaults, so an explicit true is required to turn
+	// it on. With it off an interrupted (incomplete) reply is dropped whole —
+	// text, thinking and tool calls together — and leaves no record.
+	//
+	// Enabling it can confuse some models, which may then imitate the
+	// interrupted fragment or misread the user's next prompt.
+	IncludeInterrupted bool `json:"include_interrupted"`
 }
 
 // Default returns the built-in configuration used when no file exists yet.
@@ -559,7 +558,7 @@ func Default() *Config {
 				UseBM25:          true,
 			},
 		},
-		Agent: AgentConfig{MaxToolIterations: 200, IncludeWorkingDir: true, SummaryInSystemPrompt: false, IncludeOnlyThink: true, ContinueOnlyThink: true},
+		Agent: AgentConfig{MaxToolIterations: 200, IncludeWorkingDir: true, SummaryInSystemPrompt: false, IncludeInterrupted: false},
 		UI:    UIConfig{Markdown: true},
 	}
 }
@@ -742,63 +741,6 @@ func decode(data []byte, strict bool) (*Config, bool, error) {
 	}
 	cfg.applyDefaults()
 	return cfg, migrated || changed, nil
-}
-
-// legacyLLMInput captures the pre-multi-interface layout of a document: whether
-// a "providers" array is present at all, the raw single "openai" block, and the
-// context window that used to live under "context".
-type legacyLLMInput struct {
-	hasLLMs       bool
-	openai        json.RawMessage
-	contextWindow int
-}
-
-// probeLegacyLLM reads the legacy shape out of a raw document without touching
-// the parsed config: the caller uses it to decide whether the seeded default
-// interface has to be replaced by a migrated one.
-func probeLegacyLLM(data []byte) legacyLLMInput {
-	var probe struct {
-		LLMs    json.RawMessage `json:"providers"`
-		OpenAI  json.RawMessage `json:"openai"`
-		Context struct {
-			ContextWindow int `json:"context_window"`
-		} `json:"context"`
-	}
-	_ = json.Unmarshal(data, &probe) // a malformed document is reported by the caller
-	return legacyLLMInput{
-		hasLLMs:       len(bytes.TrimSpace(probe.LLMs)) > 0,
-		openai:        probe.OpenAI,
-		contextWindow: probe.Context.ContextWindow,
-	}
-}
-
-// migrateLegacyLLM folds a legacy single-endpoint document into cfg.LLMs. It is
-// a no-op for a document that already carries a "providers" array; a document with
-// neither keeps the default interface. It reports whether cfg changed and must
-// be written back.
-//
-// The migrated interface starts from the built-in default entry (so an omitted
-// legacy field keeps its default — the temperature -1 sentinel included) and is
-// then overlaid with the legacy "openai" block and its context window.
-func (c *Config) migrateLegacyLLM(in legacyLLMInput) bool {
-	if in.hasLLMs {
-		// A new-format document: drop any legacy block the decoder picked up.
-		if c.LegacyOpenAI != nil {
-			c.LegacyOpenAI = nil
-			return true
-		}
-		return false
-	}
-	api := Default().LLMs[0]
-	if len(bytes.TrimSpace(in.openai)) > 0 {
-		_ = json.Unmarshal(in.openai, &api.OpenAIConfig)
-	}
-	if in.contextWindow > 0 {
-		api.ContextWindow = in.contextWindow
-	}
-	c.LLMs = []LLMConfig{api}
-	c.LegacyOpenAI = nil
-	return true
 }
 
 // ensureWebSalt makes sure a password is always paired with a salt and that an

@@ -94,8 +94,7 @@
     "system_prompt": "",
     "include_working_dir": true,
     "summary_in_system_prompt": false,    // 发送时摘要的位置：默认第一条用户消息；true 则写进系统提示词
-    "include_only_think": true,           // 保留「只有思考」的 assistant 消息（无正文、无工具调用）
-    "continue_only_think": true           // 只到思考就停时再问一次模型；仅 include_only_think 为 true 时生效
+    "include_interrupted": false          // 中断时不完整回复（思考/正文）是否保留；默认关闭，开启可能让部分模型异常
   },
   "ui": {
     "markdown": true
@@ -305,8 +304,7 @@ lightagent 内置一个**纯标准库**的 MCP 客户端。启动时按 `servers
 | `system_prompt` | string | 空 | 自定义系统提示词；空则用内置默认（`agent.md` 优先级更高）。运行时环境行由程序自动追加，不必写在这里 |
 | `include_working_dir` | bool | `true` | 启动时把**工作目录行**（仅进程所在目录的绝对路径，不列目录内容）追加到系统提示词末尾。省略即开启，显式 `false` 关闭 |
 | `summary_in_system_prompt` | bool | `false` | 发送时累积摘要的位置：`false` = 第一条用户消息（`[engine] CONVERSATION SUMMARY:` 开头）；`true` = 系统提示词末尾的 `# CONVERSATION SUMMARY` 段 |
-| `include_only_think` | bool | `true` | 一条**只有思考**（可见正文为空、无工具调用）的 assistant 回复是否记入历史。省略即开启，显式 `false` 关闭；关闭时这条消息被丢弃 |
-| `continue_only_think` | bool | `true` | 模型「只到思考就停」时（`finish_reason=stop`），是否记一条 `info` 并**带着这段思考**再问一次模型，而不是结束回合。默认开启，且**仅在 `include_only_think=true` 时生效**（没记下的思考无法带入重试） |
+| `include_interrupted` | bool | `false` | 被中断的**不完整回复**（已流出的思考/正文）是否记入历史。默认 `false`（显式写 `true` 才开启）；关闭时中断导致的不完整回复——正文、思考、tool 调用一起——**完全丢弃**，也不追加 `[engine]` 消息。开启时保留已流出的思考/正文（其中携带的 tool 调用照旧全部丢弃），并在其后追加一条 `[engine]` 用户消息告知模型「上次被打断、尚未完成」。该开关也决定「只有思考就自然结束」的回复是否记入历史。**开启可能让部分模型异常**（模仿半截片段、或误读下一条提示），故默认关闭 |
 
 `include_working_dir` 插入的段落只有一行，即进程的工作目录：
 
@@ -332,24 +330,24 @@ user:   <历史里的第一条 user>
 组装的消息列表（`history`、会话文件与 CLI/web 显示不变）。细节见
 [architecture.md](architecture.md#摘要的放置agentsummary_in_system_prompt)。
 
-### 「只有思考」的回复（`include_only_think` / `continue_only_think`）
+### 「只有思考」的回复与中断（`include_interrupted`）
 
 有的服务商会让模型**先吐思考、随后直接结束**（可见正文为空、没有工具调用）。这类回复**无论
 `finish_reason` 是什么**都走同一通路 —— 正常结束、`max_tokens` 截断（`length`）、或没有给出，处理
-完全一致。两个开关决定怎么处理，默认都开启：
+完全一致：`agent.include_interrupted` 决定这条消息记不记入历史，回合就此结束（不再多问一次模型）。
 
-* 默认：这条回复作为 assistant 消息（`reasoning_content`，无正文）**记入历史**，发布一条 `info`
-  （`the reply carried only thinking; asking the model again`），然后**带着这段思考再问一次模型** ——
-  若模型只是提前停住，这次通常就能给出正文。思考因此会随后续请求一起回传（配合 preserve thinking 模板）。
-* `include_only_think=false`：这条消息**不记**入历史，回合就此结束；`continue_only_think` 此时不生效。
-* `include_only_think=true`、`continue_only_think=false`：消息**记入**历史，但不再多问一次。
+* `include_interrupted=false`（默认）：这条消息**不记**入历史，回合就此结束。
+* `include_interrupted=true`：消息**记入**历史（`reasoning_content`，无正文）；后续请求会把它回传
+  （配合 preserve thinking 模板）。
 * 只有**带了正文**的 `finish_reason=length` 截断才走「截断续跑」（`response truncated at max_tokens;
-  continuing (n/3)`）。
-* 上述两种自动续跑（**只有思考**、**`length` 截断**）**共用同一个连续计数**：连续 **3** 次即报
-  `error`（`stopped after 3 consecutive continuations ...`）并结束回合；中途出现工具轮次会把计数清零。
-* **中断**（用户 / stop）时同样受 `include_only_think` 影响：开启且已流出思考时，思考被保留为一条
-  assistant 消息（其中携带的 tool 调用照旧全部丢弃）；关闭、或思考也为空时整条消息不保留。细节见
-  [architecture.md](architecture.md#agent-回合循环)。
+  continuing (n/3)`），最多连续 **3** 次，超过即报 `error` 并结束回合；中途出现工具轮次会把计数清零。
+* **中断**（用户 / stop）同样受 `include_interrupted` 影响：
+  * **开启**：中断时已流出的思考/正文保留为一条 assistant 消息（其中携带的 tool 调用照旧全部丢弃），
+    并追加一条 `[engine]` 用户消息告知模型「上次的思考/输出被用户打断、尚未完成，请按后续提示继续」。
+  * **关闭（默认）**：中断导致的不完整回复——正文、思考、tool 调用一起——**完全丢弃**，也不追加
+    `[engine]` 消息。
+  * 中断落在**工具调用已经开始之后**时按工具轮逻辑处理（正在执行的调用跑完，其余记为 interrupted），
+    与 `include_interrupted` 无关。细节见 [architecture.md](architecture.md#agent-回合循环)。
 
 ### `ui`
 
@@ -429,6 +427,6 @@ lightagent gen-agent-prompt -f     # 强制覆盖
    `(0,100]` 时回退；`summarize_keep` 的 `budget_percent` 不在 `[0,100]`、`turns` 为负时回退
    （默认两者都是 0，即不保留原始消息）。
 4. 若存在 `agent.md`，覆盖 `agent.system_prompt`（文件中的 `@include` 会先展开）。
-5. `ui.markdown`、`agent.include_working_dir`、`agent.include_only_think`、`agent.continue_only_think`
-   默认 `true`，仅在文件中显式写 `false` 才会关闭；
-   `agent.summary_in_system_prompt` 反之默认 `false`（摘要作为独立的 `[engine]` 消息紧跟系统提示词），显式写 `true` 才放进系统提示词。
+5. `ui.markdown`、`agent.include_working_dir` 默认 `true`，仅在文件中显式写 `false` 才会关闭；
+   `agent.summary_in_system_prompt`、`agent.include_interrupted` 反之默认 `false`，
+   显式写 `true` 才开启（后者：中断时保留不完整回复）。

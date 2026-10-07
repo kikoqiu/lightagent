@@ -810,7 +810,7 @@ func TestPageStampsMessageTimes(t *testing.T) {
 		"if (label && stamp && !user) { label.appendChild(timeSpan(stamp)); }",
 		"if (label && stamp && user) { label.appendChild(timeSpan(stamp)); }",
 		// The live and replayed paths both carry it.
-		"addRow('user', 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
+		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
 		"addRow('assistant', 'agent', text, true, null, false, stampOf(ev.time))",
 		"addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, false, stampOf(ev.time))",
 		"render('assistant', { text: m.content, time: m.time })",
@@ -825,6 +825,23 @@ func TestPageStampsMessageTimes(t *testing.T) {
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("the page is missing %q", want)
+		}
+	}
+}
+
+// TestPageLabelsEngineNotes pins the page's side of the engine label: a
+// user-position message the engine inserted (the interrupt notes, the
+// context-continue marker) is drawn under "engine" rather than the ordinary
+// user label, and it does not light the running indicator.
+func TestPageLabelsEngineNotes(t *testing.T) {
+	src := pageSource()
+	for _, want := range []string{
+		"function isEngine(text) { return (/^\\[engine\\] /).test(text || ''); }",
+		"if (kind === 'user' && !isEngine(ev.text)) {",
+		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the page is missing the engine label wiring %q", want)
 		}
 	}
 }

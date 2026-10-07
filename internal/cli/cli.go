@@ -336,7 +336,13 @@ var inputIndent = strings.Repeat(" ", displayColumns(promptLabel))
 // visual block.
 func messageLine(source, text string) string {
 	label := promptLabel
-	if source != "" && source != "cli" {
+	switch {
+	case agent.IsEngineNote(text):
+		// The engine's own words (the interrupt notes, the context-continue
+		// marker): drawn at the user position but attributed to "engine"
+		// rather than the user.
+		label = "engine> "
+	case source != "" && source != "cli":
 		label = "you(" + source + ")> "
 	}
 	return termcolor.Color(label, termcolor.BoldCode, termcolor.GreenCode) +
@@ -1402,6 +1408,14 @@ func (c *CLI) render(ev agent.Event) {
 	case agent.EventReasoningDelta:
 		c.appendReasoningLocked(ev.Text, ev.Time)
 	case agent.EventUser:
+		// An engine-inserted note (an interrupt note) sits at the user
+		// position but is not a user turn: it neither marks the prompt busy
+		// nor settles a pending line. messageLine labels it "engine".
+		if agent.IsEngineNote(ev.Text) {
+			c.flushMarkdownLocked()
+			c.writeStampedLocked(messageLine(ev.Source, ev.Text)+"\n", ev.Time)
+			return
+		}
 		// A user message starts a turn (or steers a running one), so mark the
 		// prompt busy: it then shows a spinner and the elapsed time until
 		// turn_done. A steering message joins the running turn, so it must not
@@ -1788,7 +1802,8 @@ func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
 		case "user":
 			// A resumed message has no source (the front-end that typed it is
 			// not recorded) and no start time, so it carries the plain prompt
-			// label, exactly like a line typed in this terminal.
+			// label, exactly like a line typed in this terminal — except an
+			// engine-inserted note, which userLine labels "engine".
 			c.write(userLine(m.Content) + "\n")
 		case "assistant":
 			// Same order as the live transcript: the thinking block opens the

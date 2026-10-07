@@ -164,8 +164,7 @@
         { path: 'agent.system_prompt', type: 'textarea', rows: 5, help: 'custom prompt; an agent.md next to config.json overrides it, and the runtime line is appended automatically' },
         { path: 'agent.include_working_dir', type: 'bool', help: 'inject the working directory path into the system prompt' },
         { path: 'agent.summary_in_system_prompt', type: 'bool', help: 'where a request carries the compressed context summary: off (default) = as the first user message, on = in the system prompt' },
-        { path: 'agent.include_only_think', type: 'bool', help: 'keep an assistant reply that carries only thinking (no visible text, no tool calls) in the history; off drops it' },
-        { path: 'agent.continue_only_think', type: 'bool', help: 'when a reply carried only thinking, ask the model again instead of ending the turn (only applies while include_only_think is on)' }
+        { path: 'agent.include_interrupted', type: 'bool', help: 'keep a reply the user interrupted (partial thinking or text) in the history and tell the model its last thinking/output was interrupted. Off (default) drops the incomplete reply whole. Warning: enabling this can make some models misbehave' }
       ]
     },
     {

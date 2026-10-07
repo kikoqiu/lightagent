@@ -60,7 +60,7 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
       以上「不完整答复」统一返回 `llm.IncompleteResponseError`（可用 `llm.IsIncompleteResponse`
       判定），目前一律以 `error` 结束回合；`runTurn` 的错误分支处已标注**预留的恢复挂载点**
       ——将来若要「把解析错误回喂模型、让它重发调用」，就在该处按这个判定分支（策略未定，暂不启用）。
-   6. 无 `tool_calls` 时：**回复只有思考**（可见正文 trim 后为空、无工具调用，**无论 `finish_reason` 是正常结束、`length` 截断、还是没有给出**）走「只有思考」通路——`agent.include_only_think` 决定是否记入历史，`agent.continue_only_think`（仅前者为真时生效）决定是否记一条 `info`（`the reply carried only thinking; asking the model again`）后带着这段思考再问一次模型，默认都开。其余 `finish_reason=length`（被 `max_tokens` 截断但**带了正文**）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮。**这两种自动续跑（只有思考 / `length` 截断）共用同一个连续计数**（`maxConsecutiveAutoContinues`=3）：连续 3 次即报 `error` 并结束回合，中途出现工具轮次会把计数清零。若此刻 `steerCh` 里还有消息（流式过程中刚插入的），本回合继续下一轮把它并入上下文。
+   6. 无 `tool_calls` 时：**回复只有思考**（可见正文 trim 后为空、无工具调用，**无论 `finish_reason` 是正常结束、`length` 截断、还是没有给出**）走「只有思考」通路——`agent.include_interrupted` 决定是否记入历史，回合就此结束（不再多问一次模型）。其余 `finish_reason=length`（被 `max_tokens` 截断但**带了正文**）→ 自动续跑：不追加用户消息，直接保留该 assistant 消息进入下一轮，最多连续 `maxConsecutiveAutoContinues`=3 次，超过即报 `error` 并结束回合；中途出现工具轮次会把计数清零。若此刻 `steerCh` 里还有消息（流式过程中刚插入的），本回合继续下一轮把它并入上下文。
    7. 逐个执行工具，发布 `tool_call` / `tool_result`，把结果作为 `tool` 消息追加；本轮结束后
       广播 `usage`（工具结果同样占用上下文），回到 2。tool 消息的正文就是工具函数的返回值
       （`res.ForLLM`），不加任何包装/信封；被中断的调用也在这条通路上记一条
@@ -89,17 +89,19 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 > `/stop`、网页的 Stop 按钮 / `/stop`）。中断取消正在进行的模型调用或工具调用，语义按
 > **有没有工具调用已经开始**分两类：
 >
-> * **没有任何工具调用开始**（正在等模型；或回复已到达/仍在流式，但第一个调用尚未开始）：
->   * 服务商已经流出的**正文**保留为一条 assistant 消息（连同一起流出的思考）：流式过程中它由
->     `assistant` 事件定稿（前端把正在绘制的行收尾，回放缓冲记录这一行），完整到达的回复则本来
->     就已入历史。消息里携带的 tool 调用**全部丢弃**——它们一个都没开始执行，而被截断的回复本身
->     可能只含半条调用——丢弃数量以 `info`（消息已落库时写在 `interrupted` 文案里）说明；这种
->     情况下调用是**从已记录的消息上摘掉**的，因此不会为任何调用记 tool 回答。随后发布
->     `interrupted` 并结束回合。
->   * **正文 trim 后为空**时看 `agent.include_only_think`：开启（默认）且回复**流出了思考**时，思考作
->     为一条 assistant 消息（`reasoning_content`，无正文）**保留**下来，其中携带的 tool 调用照旧全部
->     丢弃；关闭、或思考也为空时整条 assistant 消息**不保留**——空 content 的消息对下一次请求毫无
->     意义。用户消息仍留在历史里。
+> * **没有任何工具调用开始**（正在等模型；或回复已到达/仍在流式，但第一个调用尚未开始）：这条
+>   **不完整回复**留不留由 `agent.include_interrupted` 决定。
+>   * **开启**：服务商已经流出的**思考/正文**保留为一条 assistant 消息（流式过程中它由 `assistant` /
+>     `reasoning` 事件定稿），其中携带的 tool 调用**全部丢弃**——它们一个都没开始执行，而被截断的回复
+>     本身可能只含半条调用——丢弃数量以 `info` 说明（这种调用是**从已记录的消息上摘掉**的，因此不会
+>     为任何调用记 tool 回答）。随后追加一条 `[engine]` 用户消息告知模型「上次的思考/输出被用户打断、
+>     尚未完成，请按后续提示继续」：仍在 thinking（正文 trim 后为空）记 `Your last thinking was
+>     interrupted ...`，已流出正文则记 `Your last output was interrupted ...`。这条 engine 消息随下一次
+>     请求带回；两端把它画在 user 消息的位置，但角色标签显示为 **engine** 而不是用户（`enginePrefix` /
+>     `IsEngineNote`，见[事件总线](#事件总线)）。若正文与思考 trim 后都为空，整条 assistant
+>     消息同样不留。
+>   * **关闭（默认）**：整条不完整回复——正文、思考、tool 调用一起——**完全丢弃**，也不追加 `[engine]`
+>     消息；半截的中断片段因此绝不进入下一次请求。随后发布 `interrupted` 并结束回合。
 >   * 连一个字符都没流出（严格处于「等模型」）：assistant 侧同样什么都不记，只发布
 >     `interrupted while waiting for the model; nothing had been produced`。
 >   * **用户消息在任何中断下都保留**：中断不会改写用户发过的东西，历史里始终留着那条 user 消息，
@@ -146,6 +148,9 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 `user` 事件带 `source` 字段（`cli` / `web` 等），前端据此决定标签与是否回显自己的输入；它由
 `drainSteering()` / `startSteeringTurn()` 在消息进入对话时广播（见上），因此各端的行顺序与
 上下文里的消息顺序一致。
+`[engine]` 开头（`enginePrefix`）的 user 消息是引擎自己插入的（中断注记、`contextContinueMessage`、
+独立摘要等），其 `user` 事件带 `source: "engine"`。两端照常把它画在 user 消息的位置，但把角色标签
+显示为 **engine** 而不是用户（CLI 为 `engine> `，网页为 `engine`），且不点亮运行指示、不结算 pending 行。
 每条事件都带 `time`（RFC 3339，总线在发布时补上当前时刻）：`user` 事件是消息提交的时刻，
 一条回复的 `reasoning_delta` / `assistant_delta` / 最终 `assistant` 则共用同一个**回复开始时刻**
 （`callLLM()` 在**第一个流式块到达**时记下，思考块也算；没有块的非流式回复留零值，总线在最终
@@ -305,9 +310,10 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
    消息，整个尾部都进入摘要（`safeCut == len(history)`）—— 这正是默认配置下的常态。
 6. 当整个尾部本就落在预算内时返回「无事可做」，不触发压缩（默认预算为 0，因此只可能出现在
    低于两行的历史上，被调用方按「无需压缩」跳过）。
-7. **user 消息保底**：若压缩后一条消息都不剩（连触发本轮的那个 user 消息也被压掉，见第 5
+7. **user 消息保底**：若**自动**压缩后一条消息都不剩（连触发本轮的那个 user 消息也被压掉，见第 5
    点），引擎会先补一条 `[engine] Context summarized, continue.` 的 user 消息再发请求 ——
-   聊天模板要求请求里至少有一条 user 查询，否则接口直接返回 400。
+   聊天模板要求请求里至少有一条 user 查询，否则接口直接返回 400。手动 `/compact` **不补**这条标记：
+   它不在回合里跑，压缩后要等到用户下一条消息才发请求，而那条消息本身就是 user 查询。
 
 **为什么默认一条都不留**：有些推理引擎在**回退**下不保存 prompt 缓存 —— 一旦保留最新几轮原始消息，
 压缩后的实时请求前缀就回到更早的位置（比上一次请求更短），缓存随即失效；一条都不保留时，压缩后的请求

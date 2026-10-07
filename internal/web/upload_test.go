@@ -481,7 +481,7 @@ func TestPageDrawsTheFilesOfAMessage(t *testing.T) {
 		"img.onerror = function ()",
 		// Both row paths carry the files: the replayed row and the live event.
 		"render('user', { text: m.content, attachments: m.attachments, time: m.time })",
-		"addRow('user', 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
+		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
 		".row .attachments .media-image img",
 	} {
 		if !strings.Contains(page, want) {

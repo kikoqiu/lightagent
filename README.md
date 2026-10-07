@@ -33,7 +33,7 @@
 | 11 | Markdown 渲染 | 助手回答与模型思考均渲染为 Markdown：CLI 转 ANSI，Web 用浏览器端 marked（GFM，含表格）+ DOMPurify，公式（`$…$` / `$$…$$`）由内嵌的 **math.js** 渲染为 MathML（浏览器原生排版，无字体文件、无第三方公式库）；`ui.markdown` 默认开启 |
 | 12 | 多行输入 | CLI 与 Web 均为 **Enter 换行**；CLI 发送用 **Ctrl+J**（Windows 本地也可 Ctrl+Enter；Linux/SSH 下终端支持 kitty 键盘协议时也可 Ctrl+Enter，另有 Alt+Enter），Web 用 **Ctrl+Enter** |
 | 13 | MCP 客户端 + 工具发现 / unlock | 纯标准库 MCP 客户端（stdio / Streamable HTTP / HTTP+SSE），server 在 `tools.mcp` 中配置；MCP 工具**恒为锁定函数**（永不进 `tools` 声明）：`tool_search_tool_bm25` 发现 → `unlock_tool` 下发 schema 并授权（TTL）→ `dynamic_call` 间接调用；系统提示词只注入 1 条全局 unlock 规则 + 每 server 1 条 MCP 全局信息（含 server 返回的 `serverInfo`/`instructions`） |
-| 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板）；模型只产出思考（可见正文为空、无工具调用，**无论 `finish_reason`**）时默认记一条 `info` 并带着这段思考再问一次模型（`agent.include_only_think` / `agent.continue_only_think`，默认都开；后者仅前者为真时生效；只有思考与 `length` 截断共用连续 3 次的续跑上限） |
+| 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板）；模型只产出思考（可见正文为空、无工具调用，**无论 `finish_reason`**）时不再多问模型，是否记入历史由 `agent.include_interrupted` 决定（默认关闭）；被中断的不完整回复同理——开启时保留并追加一条 `[engine]` 提示、关闭时整体丢弃；带正文的 `length` 截断自动续跑上限连续 3 次 |
 | 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
 | 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；`method` 决定反馈放什么（`fetch_as_md` 默认 / `save_as_md` / `save_as_html` / `ignore`），正文里的站内链接写成根相对路径（`/docs/other`，状态行给出抓取的地址），反馈默认**最多 100 行**（`max_lines`，可关）且**优先只回填正文**（`<article>`/`<main>`/`class=main` 之类的容器，导航/侧栏/页脚用 `...(omitted)` 标记代替），定位不到正文时回填中间的 100 行；`invokejs` 可在**页面加载后、抓取前**在页面里跑一段脚本（浏览器取法限定），用注入的 `_invokejs_done(value)` 结束并把值放在反馈最前面（拿 Cookie/token，供后续命令用同一身份）；整页存到工作目录 `.lightagent/webfetch/<时间>.md`（Markdown 正文）并在反馈里给出路径 |
@@ -183,8 +183,7 @@ source <(lightagent completion bash)       # bash 补全
     "max_tool_iterations": 200,
     "system_prompt": "",                // 留空使用内置默认系统提示词
     "summary_in_system_prompt": false,  // 发送时摘要的位置：默认第一条用户消息；true 则写进系统提示词
-    "include_only_think": true,         // 保留「只有思考」的回复（无正文、无工具调用）并带着它再问一次模型
-    "continue_only_think": true         // 只到思考就停时再问一次；仅 include_only_think 为 true 时生效
+    "include_interrupted": false        // 中断时不完整回复（思考/正文）是否保留；默认关闭，开启可能让部分模型异常
   },
   "ui": {
     "markdown": true                    // 助手输出按 Markdown 渲染（false 则原样输出）
@@ -332,8 +331,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 
 **中断（interrupt）**：按 **Ctrl+C**（或输入 `/stop`）可停止当前这一回合：
 
-* 正在等模型（思考/流式）时中断 → **丢弃这条记录**：刚提交的用户消息不进入历史，
-  下一条消息重新开始；控制台/网页显示 `[interrupted]`。
+* 正在等模型（思考/流式）时中断 → 这条**不完整回复**留不留看 `agent.include_interrupted`：开启时已
+  流出的思考/正文保留、并追加一条 `[engine]` 提示让模型知道上次被打断，关闭（默认）时整条（含 tool
+  调用）整体丢弃；**用户消息在任何中断下都保留**。控制台/网页显示 `[interrupted]`。
 * 正在执行工具时中断 → 该工具调用反馈 **`interrupted by user`**，已产生的记录保留
   （`run_script` 的进程会被直接结束）；模型下一回合能看到这次中断。
 * 中断后 Agent 回到空闲，**等下一条用户消息再继续**。
@@ -578,9 +578,10 @@ token 预算 + 回合数上限：
 * 摘要的位置由 `agent.summary_in_system_prompt` 决定（默认 `false`）：发送时把累积摘要作为
   **第一条用户消息**（`[engine] CONVERSATION SUMMARY:` 开头）放进消息列表；设为 `true` 则追加到
   系统提示词的 `# CONVERSATION SUMMARY` 段。
-* 若压缩后一条消息都不剩（连触发本轮的 user 消息也被压掉），请求前会补一条
+* 若**自动**压缩后一条消息都不剩（连触发本轮的 user 消息也被压掉），请求前会补一条
   `[engine] Context summarized, continue.` 的 user 消息：聊天模板要求请求里至少有一条
-  user 查询，否则接口直接返回 400。
+  user 查询，否则接口直接返回 400。手动 `/compact` 不补这条标记（它不在回合里跑，下一条用户
+  消息本身就是 user 查询）。
 * 压缩后发布带 `summary` 的 `compacted` 事件：CLI 与网页都在**截断处**显示这份摘要
   （CLI 为一个 `[summary]` 块，网页为一条带边框的摘要行），一眼可见详细消息到此为止。
   恢复会话时摘要出现在历史消息之前（网页日志区的第一行），因为切点之前的内容本就只以

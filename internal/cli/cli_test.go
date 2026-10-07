@@ -1365,6 +1365,29 @@ func TestMultiLineInputIsIndented(t *testing.T) {
 	}
 }
 
+// TestEngineNoteIsLabelledEngine pins the engine label: a user-position message
+// the engine inserted (the interrupt notes, the context-continue marker) is
+// drawn under "engine" rather than the user, both live and when a stored
+// conversation is redrawn, and it neither marks the prompt busy nor starts the
+// turn clock.
+func TestEngineNoteIsLabelledEngine(t *testing.T) {
+	const note = "[engine] Your last output was interrupted by user. It's not completed. Follow user's next prompt."
+	if got := userLine(note); !strings.Contains(got, "engine> "+note) {
+		t.Fatalf("userLine(%q) = %q, want the engine label", note, got)
+	}
+
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.render(agent.Event{Type: agent.EventUser, Text: note, Source: "engine"})
+	if out := buf.String(); !strings.Contains(out, "engine> "+note) {
+		t.Fatalf("the engine note was not drawn under the engine label: %q", out)
+	}
+	if c.busy {
+		t.Fatal("an engine note must not mark the CLI busy")
+	}
+}
+
 // narrowTerminal lays the prompt region out for a fixed terminal width, so the
 // wrapping can be pinned without a real console.
 func narrowTerminal(c *CLI, width int) {

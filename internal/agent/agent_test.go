@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -328,6 +327,7 @@ func TestInterruptKeepsTheStreamedPartialReply(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	cfg := config.Default()
+	cfg.Agent.IncludeInterrupted = true
 	cfg.LLMs[0].APIBase = srv.URL
 	cfg.LLMs[0].Stream = true
 	bus := NewBus()
@@ -354,7 +354,7 @@ interrupt:
 		t.Fatal("Interrupt reported no running turn")
 	}
 
-	var sawPartial, sawDropped, sawToolCall, sawMarker bool
+	var sawPartial, sawDropped, sawToolCall, sawMarker, sawEngineNote bool
 	deadline := time.After(10 * time.Second)
 drain:
 	for {
@@ -367,6 +367,8 @@ drain:
 				sawDropped = true
 			case ev.Type == EventToolCall:
 				sawToolCall = true
+			case ev.Type == EventUser && ev.Source == "engine" && ev.Text == interruptNoteOutput:
+				sawEngineNote = true
 			case ev.Type == EventInterrupted:
 				sawMarker = true
 			case ev.Type == EventTurnDone:
@@ -388,10 +390,13 @@ drain:
 	if !sawMarker {
 		t.Fatal("no interrupted event was published")
 	}
+	if !sawEngineNote {
+		t.Fatal("the engine note was not announced as an engine user message")
+	}
 
 	msgs := a.History()
-	if len(msgs) != 2 {
-		t.Fatalf("history = %d messages, want user + the partial reply", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("history = %d messages, want user + the partial reply + the engine note", len(msgs))
 	}
 	if msgs[1].Role != "assistant" || msgs[1].Content != "Hello" {
 		t.Fatalf("partial reply = %+v, want the streamed text kept", msgs[1])
@@ -399,11 +404,14 @@ drain:
 	if len(msgs[1].ToolCalls) != 0 {
 		t.Fatalf("the partial reply kept %d tool call(s), want none", len(msgs[1].ToolCalls))
 	}
+	if msgs[2].Role != "user" || msgs[2].Content != interruptNoteOutput {
+		t.Fatalf("history[2] = %+v, want the output interrupt note", msgs[2])
+	}
 }
 
 // TestInterruptDropsATextlessReply covers a reply that was cut short before it
 // produced any text: only thinking and a tool call had arrived, and
-// agent.include_only_think is off. Nothing of it enters the history — an
+// agent.include_interrupted is off. Nothing of it enters the history — an
 // assistant message without content has nothing to tell the next request — while
 // the user message stays, and the turn ends there.
 func TestInterruptDropsATextlessReply(t *testing.T) {
@@ -428,7 +436,7 @@ func TestInterruptDropsATextlessReply(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	cfg := config.Default()
-	cfg.Agent.IncludeOnlyThink = false
+	cfg.Agent.IncludeInterrupted = false
 	cfg.LLMs[0].APIBase = srv.URL
 	cfg.LLMs[0].Stream = true
 	bus := NewBus()
@@ -494,10 +502,11 @@ drain:
 	}
 }
 
-// TestInterruptKeepsAnOnlyThinkReply covers the same cut-short reply with the
-// default agent.include_only_think on: the thinking the provider had streamed is
-// kept as an assistant message of its own — the tool call it carried is still
-// dropped — so the next request can carry the model's own reasoning.
+// TestInterruptKeepsAnOnlyThinkReply covers the same cut-short reply with
+// agent.include_interrupted on: the thinking the provider had streamed is kept
+// as an assistant message of its own — the tool call it carried is still
+// dropped, and an engine note follows — so the next request can carry the
+// model's own reasoning.
 func TestInterruptKeepsAnOnlyThinkReply(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -517,6 +526,7 @@ func TestInterruptKeepsAnOnlyThinkReply(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	cfg := config.Default()
+	cfg.Agent.IncludeInterrupted = true
 	cfg.LLMs[0].APIBase = srv.URL
 	cfg.LLMs[0].Stream = true
 	bus := NewBus()
@@ -573,8 +583,8 @@ drain:
 	}
 
 	msgs := a.History()
-	if len(msgs) != 2 {
-		t.Fatalf("history = %d messages, want the user message and the kept thinking", len(msgs))
+	if len(msgs) != 3 {
+		t.Fatalf("history = %d messages, want the user message, the kept thinking and the engine note", len(msgs))
 	}
 	if msgs[0].Role != "user" || msgs[0].Content != "think about it" {
 		t.Fatalf("history[0] = %+v, want the user message kept", msgs[0])
@@ -583,31 +593,29 @@ drain:
 		len(msgs[1].ToolCalls) != 0 {
 		t.Fatalf("history[1] = %+v, want the thinking kept without the tool call", msgs[1])
 	}
+	if msgs[2].Role != "user" || msgs[2].Content != interruptNoteThinking {
+		t.Fatalf("history[2] = %+v, want the thinking interrupt note", msgs[2])
+	}
 }
 
-// TestOnlyThinkReplyPolicy pins the two switches that govern a reply carrying
-// only thinking (no visible text, no tool calls): agent.include_only_think
-// decides whether the message is recorded at all, and agent.continue_only_think
-// — only effective while the first is on — decides whether the model is asked
-// again instead of the turn ending. The policy is the same whatever the
-// provider's finish_reason says, so the cases cover stop, a max_tokens cut-off
-// and no reason at all.
+// TestOnlyThinkReplyPolicy pins agent.include_interrupted for a reply that
+// carries only thinking (no visible text, no tool calls): it decides whether the
+// message is recorded at all, and the turn ends either way — the model is never
+// asked again (agent.continue_only_think is gone). The policy is the same
+// whatever the provider's finish_reason says, so the cases cover stop, a
+// max_tokens cut-off and no reason at all.
 func TestOnlyThinkReplyPolicy(t *testing.T) {
 	cases := []struct {
-		name         string
-		include      bool
-		cont         bool
-		finish       string
-		wantRequests int
-		wantMsgs     int
-		wantInfo     bool
+		name     string
+		include  bool
+		finish   string
+		wantMsgs int
 	}{
-		{name: "recorded and continued", include: true, cont: true, finish: "stop", wantRequests: 2, wantMsgs: 3, wantInfo: true},
-		{name: "recorded but the turn ends", include: true, cont: false, finish: "stop", wantRequests: 1, wantMsgs: 2},
-		{name: "dropped and continue is ignored", include: false, cont: true, finish: "stop", wantRequests: 1, wantMsgs: 1},
-		{name: "no finish_reason given", include: true, cont: true, finish: "", wantRequests: 2, wantMsgs: 3, wantInfo: true},
-		{name: "truncated at max_tokens while thinking", include: true, cont: true, finish: "length", wantRequests: 2, wantMsgs: 3, wantInfo: true},
-		{name: "truncated and continue is off", include: true, cont: false, finish: "length", wantRequests: 1, wantMsgs: 2},
+		{name: "recorded", include: true, finish: "stop", wantMsgs: 2},
+		{name: "dropped", include: false, finish: "stop", wantMsgs: 1},
+		{name: "recorded with no finish_reason", include: true, finish: "", wantMsgs: 2},
+		{name: "recorded and truncated at max_tokens", include: true, finish: "length", wantMsgs: 2},
+		{name: "dropped and truncated at max_tokens", include: false, finish: "length", wantMsgs: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -632,8 +640,7 @@ func TestOnlyThinkReplyPolicy(t *testing.T) {
 			cfg := config.Default()
 			cfg.LLMs[0].APIBase = srv.URL
 			cfg.LLMs[0].Stream = false
-			cfg.Agent.IncludeOnlyThink = tc.include
-			cfg.Agent.ContinueOnlyThink = tc.cont
+			cfg.Agent.IncludeInterrupted = tc.include
 			bus := NewBus()
 			events, cancel := bus.Subscribe()
 			defer cancel()
@@ -641,15 +648,11 @@ func TestOnlyThinkReplyPolicy(t *testing.T) {
 
 			a.Submit("hi")
 
-			var sawInfo bool
 			deadline := time.After(10 * time.Second)
 		drain:
 			for {
 				select {
 				case ev := <-events:
-					if ev.Type == EventInfo && strings.Contains(ev.Text, "only thinking") {
-						sawInfo = true
-					}
 					if ev.Type == EventTurnDone {
 						break drain
 					}
@@ -661,11 +664,10 @@ func TestOnlyThinkReplyPolicy(t *testing.T) {
 			mu.Lock()
 			asked := requests
 			mu.Unlock()
-			if asked != tc.wantRequests {
-				t.Fatalf("the model was asked %d time(s), want %d", asked, tc.wantRequests)
-			}
-			if sawInfo != tc.wantInfo {
-				t.Fatalf("saw the only-thinking info = %v, want %v", sawInfo, tc.wantInfo)
+			// The turn always ends after the only-thinking reply: the model is
+			// asked exactly once, whether the message was recorded or not.
+			if asked != 1 {
+				t.Fatalf("the model was asked %d time(s), want 1", asked)
 			}
 			msgs := a.History()
 			if len(msgs) != tc.wantMsgs {
@@ -675,81 +677,19 @@ func TestOnlyThinkReplyPolicy(t *testing.T) {
 				t.Fatalf("history[0] = %+v, want the user message", msgs[0])
 			}
 			// When the only-thinking reply is recorded it sits right after the
-			// user message, and the continued model call answers after it.
+			// user message.
 			if tc.include && (msgs[1].Role != "assistant" || msgs[1].Content != "" || msgs[1].ReasoningContent != "let me think") {
 				t.Fatalf("history[1] = %+v, want the only-thinking reply kept", msgs[1])
-			}
-			if tc.wantMsgs == 3 && (msgs[2].Role != "assistant" || msgs[2].Content != "the answer") {
-				t.Fatalf("history[2] = %+v, want the answer from the retry", msgs[2])
 			}
 		})
 	}
 }
 
-// TestOnlyThinkReplyRetryCarriesThinking verifies the retry carries the kept
-// thinking back to the provider: the point of recording an only-thinking reply is
-// that the model sees its own reasoning when it is asked again.
-func TestOnlyThinkReplyRetryCarriesThinking(t *testing.T) {
-	var (
-		mu       sync.Mutex
-		requests int
-		second   string
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		mu.Lock()
-		requests++
-		n := requests
-		if n == 2 {
-			second = string(body)
-		}
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		if n == 1 {
-			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","reasoning_content":"let me think"},"finish_reason":"stop"}]}`)
-			return
-		}
-		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"the answer"},"finish_reason":"stop"}]}`)
-	}))
-	defer srv.Close()
-
-	cfg := config.Default()
-	cfg.LLMs[0].APIBase = srv.URL
-	cfg.LLMs[0].Stream = false
-	bus := NewBus()
-	events, cancel := bus.Subscribe()
-	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
-
-	a.Submit("hi")
-	deadline := time.After(10 * time.Second)
-	for done := false; !done; {
-		select {
-		case ev := <-events:
-			if ev.Type == EventTurnDone {
-				done = true
-			}
-		case <-deadline:
-			t.Fatal("no turn_done")
-		}
-	}
-
-	mu.Lock()
-	asked := requests
-	gotSecond := second
-	mu.Unlock()
-	if asked != 2 {
-		t.Fatalf("the model was asked %d time(s), want 2", asked)
-	}
-	if !strings.Contains(gotSecond, "let me think") {
-		t.Fatalf("the retry did not carry the kept thinking: %s", gotSecond)
-	}
-}
-
 // TestInterruptBeforeTheFirstCallDropsTheRound covers the rule in the real tool
-// loop: the reply is recorded and the turn is cancelled before its first call
-// starts. The round is dropped whole — the text stays, the calls do not, and no
-// tool answer is recorded, because the message no longer asks for anything.
+// loop with agent.include_interrupted off (the default): the reply is recorded
+// and the turn is cancelled before its first call starts, so the whole
+// incomplete reply — text, thinking and tool calls together — is dropped and no
+// tool answer is recorded.
 func TestInterruptBeforeTheFirstCallDropsTheRound(t *testing.T) {
 	var (
 		mu       sync.Mutex
@@ -789,11 +729,11 @@ func TestInterruptBeforeTheFirstCallDropsTheRound(t *testing.T) {
 	}
 
 	msgs := a.History()
-	if len(msgs) != 2 {
-		t.Fatalf("history = %d messages, want the user message and the reply", len(msgs))
+	if len(msgs) != 1 {
+		t.Fatalf("history = %d messages, want only the user message: with agent.include_interrupted off the incomplete reply is dropped whole", len(msgs))
 	}
-	if msgs[1].Role != "assistant" || msgs[1].Content != "writing" || len(msgs[1].ToolCalls) != 0 {
-		t.Fatalf("reply = %+v, want the text kept without its tool call", msgs[1])
+	if msgs[0].Role != "user" {
+		t.Fatalf("history[0] = %+v, want the user message kept", msgs[0])
 	}
 	mu.Lock()
 	asked := requests
@@ -826,9 +766,10 @@ func (w *interruptingWriter) Execute(context.Context, map[string]any) *tools.Res
 }
 
 // TestDropUnstartedToolCalls pins what a round interrupted before its first call
-// records: the reply keeps its text and loses every tool call, a reply left
-// without text goes away entirely, and no tool answer is written for either —
-// nothing ran, and no call is left to answer.
+// records with agent.include_interrupted on: the reply keeps its text and loses
+// every tool call, an engine note tells the model the attempt was cut short, and
+// a reply left without text goes away entirely. No tool answer is written for
+// either — nothing ran, and no call is left to answer.
 func TestDropUnstartedToolCalls(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -836,12 +777,13 @@ func TestDropUnstartedToolCalls(t *testing.T) {
 		wantMsgs int
 		wantText string
 	}{
-		{name: "the text is kept", content: "Here is what I found", wantMsgs: 2, wantText: "kept without its 2 tool call(s)"},
-		{name: "a reply without text is dropped", content: "  \n", wantMsgs: 1, wantText: "it and its 2 tool call(s) were dropped"},
+		{name: "the text is kept", content: "Here is what I found", wantMsgs: 3, wantText: "kept without its 2 tool call(s)"},
+		{name: "a reply without text is dropped", content: "  \n", wantMsgs: 1, wantText: "and its 2 tool call(s) were dropped"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newTestAgent(t)
+			a.includeInterrupted = true
 			events, cancel := a.Bus().Subscribe()
 			defer cancel()
 
@@ -867,19 +809,37 @@ func TestDropUnstartedToolCalls(t *testing.T) {
 			if tc.wantMsgs > 1 && (msgs[1].Role != "assistant" || msgs[1].Content != tc.content || len(msgs[1].ToolCalls) != 0) {
 				t.Fatalf("history[1] = %+v, want the text kept without tool calls", msgs[1])
 			}
+			if tc.wantMsgs == 3 && (msgs[2].Role != "user" || msgs[2].Content != interruptNoteOutput) {
+				t.Fatalf("history[2] = %+v, want the output interrupt note", msgs[2])
+			}
 			for _, m := range msgs {
 				if m.Role == "tool" {
 					t.Fatalf("history = %+v, want no tool answer for a round that never started", msgs)
 				}
 			}
 
-			select {
-			case ev := <-events:
-				if ev.Type != EventInterrupted || !strings.Contains(ev.Text, tc.wantText) {
-					t.Fatalf("event = %+v, want a marker mentioning %q", ev, tc.wantText)
+			// The kept reply's engine note is published before the marker:
+			// drain until the interrupted marker, remembering the engine event.
+			sawEngine := false
+			deadline := time.After(2 * time.Second)
+		drain:
+			for {
+				select {
+				case ev := <-events:
+					if ev.Type == EventUser && ev.Source == "engine" {
+						sawEngine = true
+						continue
+					}
+					if ev.Type != EventInterrupted || !strings.Contains(ev.Text, tc.wantText) {
+						t.Fatalf("event = %+v, want a marker mentioning %q", ev, tc.wantText)
+					}
+					if tc.wantMsgs == 3 && !sawEngine {
+						t.Fatal("the kept reply's engine note was not announced")
+					}
+					break drain
+				case <-deadline:
+					t.Fatal("no interrupted marker was published")
 				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("no interrupted marker was published")
 			}
 		})
 	}
@@ -1564,14 +1524,18 @@ func TestCompactionPublishesProgressAndSummary(t *testing.T) {
 	if kinds[3] != EventUsage {
 		t.Fatalf("event kinds = %v, want the usage refresh after the compacted one", kinds)
 	}
-	// Nothing was kept raw, so the pass leaves the engine's continue marker: a
-	// request without a user message is what chat templates reject.
-	if texts[2] != "context compressed: 5 -> 1 messages" {
+	// Nothing was kept raw, and the pass is manual (/compact): the engine's
+	// continue marker is only added by the automatic pass, which continues a
+	// running turn, so the history comes out empty here.
+	if texts[2] != "context compressed: 5 -> 0 messages" {
 		t.Fatalf("compacted event text = %q", texts[2])
 	}
+	if h := a.History(); len(h) != 0 {
+		t.Fatalf("history after a manual pass = %+v, want it empty (no engine continue marker)", h)
+	}
 
-	// The history is down to that marker, which is not enough to condense: a
-	// further pass publishes nothing and says so to its caller.
+	// The history is now empty, which is not enough to condense: a further pass
+	// publishes nothing and says so to its caller.
 	if msg := a.CompactNow(context.Background()); msg != "nothing to compress yet" {
 		t.Fatalf("CompactNow on a compacted history = %q", msg)
 	}
@@ -2582,47 +2546,6 @@ func TestTurnStopsAfterConsecutiveTruncations(t *testing.T) {
 		calls++
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"part\"},\"finish_reason\":\"length\"}]}\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	cfg := config.Default()
-	cfg.LLMs[0].APIBase = srv.URL
-	bus := NewBus()
-	events, cancel := bus.Subscribe()
-	defer cancel()
-	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
-
-	a.Submit("hi")
-	got := drainEvents(t, events)
-
-	if calls != maxConsecutiveAutoContinues {
-		t.Fatalf("model calls = %d, want %d", calls, maxConsecutiveAutoContinues)
-	}
-	if !hasEvent(got, EventError, "consecutive continuations") {
-		t.Fatal("no stop error was published")
-	}
-	if hist := a.History(); len(hist) != maxConsecutiveAutoContinues+1 {
-		t.Fatalf("history = %d messages, want user + %d assistant", len(hist), maxConsecutiveAutoContinues)
-	}
-}
-
-// TestOnlyThinkAndTruncationShareTheContinueBudget pins the shared budget: an
-// only-thinking reply and a max_tokens truncation are the same kind of
-// auto-continuation, so alternating them still stops the turn once
-// maxConsecutiveAutoContinues is reached.
-func TestOnlyThinkAndTruncationShareTheContinueBudget(t *testing.T) {
-	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		w.Header().Set("Content-Type", "text/event-stream")
-		if calls%2 == 1 {
-			// An only-thinking reply that stops normally.
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":\"stop\"}]}\n\n")
-		} else {
-			// Some text, cut off at max_tokens.
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"part\"},\"finish_reason\":\"length\"}]}\n\n")
-		}
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer srv.Close()

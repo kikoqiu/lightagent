@@ -452,10 +452,17 @@ func (c *compactor) compact(ctx context.Context, history []llm.Message, prefix l
 	batch := history[:cut]
 	// Cutting everything — including the user turn that started the running
 	// loop — would leave the next request without a user message, which chat
-	// templates reject, so ensureUserMessage adds the engine marker. The
-	// retention policy keeps no raw message by default (see retention), so a
-	// pass normally leaves that marker and nothing else.
-	tail := ensureUserMessage(history[cut:])
+	// templates reject, so ensureUserMessage adds the engine marker. A manual
+	// pass (/compact) runs outside a turn, so the marker is not added there:
+	// the next request only goes out when the user sends a new message, which
+	// is the user query itself, and a marker left behind would only linger as a
+	// stray engine note. The retention policy keeps no raw message by default
+	// (see retention), so an automatic pass normally leaves that marker and
+	// nothing else, and a manual one leaves nothing.
+	tail := history[cut:]
+	if mode != summarizeModeManual {
+		tail = ensureUserMessage(tail)
+	}
 
 	digest, err := c.digest(ctx, batch, prefix)
 	if err != nil || digest == "" {

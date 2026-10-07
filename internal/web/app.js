@@ -2346,6 +2346,12 @@
   // must stand out from the ordinary info rows. The CLI prints the same wording.
   var SUMMARY_ROLE = 'summary (older messages condensed)';
 
+  // isEngine reports whether a user-position message was inserted by the engine
+  // (the interrupt notes, the context-continue marker, the standalone summary)
+  // rather than typed by a person. Such a row keeps the user position but is
+  // labelled "engine".
+  function isEngine(text) { return (/^\[engine\] /).test(text || ''); }
+
   function render(kind, ev) {
     // Read-aloud follows the same event stream as the rows below (a replayed
     // history frame is skipped: reloading the page must not read the whole
@@ -2359,7 +2365,7 @@
     // event or replayed from the history frame. It carries the moment of the
     // compaction like any other message.
     if (kind === 'summary') { addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, false, stampOf(ev.time)); return; }
-    if (kind === 'user') {
+    if (kind === 'user' && !isEngine(ev.text)) {
       setRunning(true);
       // A message this page sent while the turn was running is being sent now:
       // Its pending row becomes an ordinary one, in place (it already sits after
@@ -2410,7 +2416,7 @@
     // it with the text the branches below render in full.
     if (pendingRender) { clearTimeout(pendingRender); pendingRender = null; }
     if (kind === 'turn_done') { return; }
-    if (kind === 'user') { addRow('user', 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time)); }
+    if (kind === 'user') { addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time)); }
     else if (kind === 'assistant') {
       var text = ev.text || streamedText;
       if (streamed) { setRow(streamed, text, true); }

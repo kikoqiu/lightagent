@@ -67,13 +67,12 @@ type Agent struct {
 	// toolResultsVisible controls whether tool_result events are broadcast.
 	toolResultsVisible bool
 
-	// onlyThink handling: a reply that carried only the model's thinking (no
-	// visible text, no tool calls). includeOnlyThink keeps such a message in
-	// the history (agent.include_only_think); continueOnlyThink asks the model
-	// again instead of ending the turn (agent.continue_only_think) and only
-	// applies while includeOnlyThink is on.
-	includeOnlyThink  bool
-	continueOnlyThink bool
+	// includeInterrupted keeps an interrupted, incomplete reply — its partial
+	// thinking and/or partial text — in the history and leaves an engine note
+	// telling the model the attempt was cut short (agent.include_interrupted).
+	// It also governs a reply that carries only thinking. When it is off (the
+	// default) an incomplete reply is dropped whole, leaving no record.
+	includeInterrupted bool
 
 	// cancelTurn cancels the turn in flight (nil while idle). Interrupt uses it
 	// to stop the current operation.
@@ -138,8 +137,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		autoSplitWrites:    cfg.Tools.WriteFile.AutoSplit,
 		contextWindow:      contextWindow,
 		toolResultsVisible: true,
-		includeOnlyThink:   cfg.Agent.IncludeOnlyThink,
-		continueOnlyThink:  cfg.Agent.ContinueOnlyThink,
+		includeInterrupted: cfg.Agent.IncludeInterrupted,
 		steerCh:            make(chan steerMessage, 64),
 	}
 	a.compactor = &compactor{
@@ -466,11 +464,10 @@ func (a *Agent) ToolResultsVisible() bool {
 }
 
 // maxConsecutiveAutoContinues bounds how many times one turn auto-continues
-// without a new user message: an only-thinking reply (while
-// agent.continue_only_think is on) and a reply the provider cut off at
-// max_tokens (finish_reason "length") share this one budget, so a model stuck
-// producing thinking alone — or never finishing inside max_tokens — cannot spin
-// the loop. A round that runs tools resets it.
+// without a new user message: a reply the provider cut off at max_tokens
+// (finish_reason "length") is continued this many times at most, so a model
+// that never finishes inside max_tokens cannot spin the loop. A round that runs
+// tools resets the count.
 const maxConsecutiveAutoContinues = 3
 
 // userInput is one user message of a turn: its text plus the media parts it
@@ -599,9 +596,8 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		// A reply that carries only the model's thinking — no visible text and
 		// no tool calls — is not an answer, whatever the provider's
 		// finish_reason says (a normal stop, a cut-off at max_tokens, or no
-		// reason at all). agent.include_only_think decides whether it is
-		// recorded at all; agent.continue_only_think then decides whether the
-		// loop asks the model again, with the recorded thinking in front of it.
+		// reason at all). agent.include_interrupted decides whether it is
+		// recorded at all; the turn ends either way.
 		onlyThink := len(resp.ToolCalls) == 0 &&
 			strings.TrimSpace(resp.Content) == "" && strings.TrimSpace(resp.Reasoning) != ""
 
@@ -610,7 +606,7 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 		// one assistant message carrying several tool calls (see
 		// runWriteSplits).
 		assistantIdx := -1
-		if !onlyThink || a.includeOnlyThink {
+		if !onlyThink || a.includeInterrupted {
 			assistant := llm.Message{
 				Role:      "assistant",
 				Content:   resp.Content,
@@ -638,37 +634,27 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 				// calls the model again.
 				continue
 			}
-			// Ask the model again without a new user message when the reply
-			// carried only thinking (and agent.continue_only_think is on) or
-			// the provider cut it off at max_tokens after some text. Both draw
-			// on the same budget: a run of such continuations stops the turn
-			// (see maxConsecutiveAutoContinues), so a model stuck producing
-			// nothing but thinking cannot spin the loop.
-			var retry string
-			switch {
-			case onlyThink && a.includeOnlyThink && a.continueOnlyThink:
-				retry = "the reply carried only thinking; asking the model again"
-			case onlyThink:
-				// Kept or dropped, the turn ends here: the configuration does
-				// not ask the model again.
-				return
-			case resp.Finish == "length":
-				retry = "response truncated at max_tokens; continuing"
-			default:
+			// Kept or dropped, a reply that carried only thinking ends the
+			// turn: the model is not asked again (agent.continue_only_think is
+			// gone). A reply the provider cut off at max_tokens after some
+			// text is continued instead, without a new user message, up to
+			// maxConsecutiveAutoContinues times so a model that never finishes
+			// inside max_tokens cannot spin the loop.
+			if onlyThink || resp.Finish != "length" {
 				return
 			}
 			autoContinues++
 			if autoContinues >= maxConsecutiveAutoContinues {
 				a.bus.Publish(Event{
 					Type: EventError,
-					Text: fmt.Sprintf("stopped after %d consecutive continuations (only thinking or cut off at max_tokens); raise openai.max_tokens or turn off agent.continue_only_think",
+					Text: fmt.Sprintf("stopped after %d consecutive continuations (cut off at max_tokens); raise openai.max_tokens",
 						autoContinues),
 				})
 				return
 			}
 			a.bus.Publish(Event{
 				Type: EventInfo,
-				Text: fmt.Sprintf("%s (%d/%d)", retry, autoContinues, maxConsecutiveAutoContinues),
+				Text: fmt.Sprintf("response truncated at max_tokens; continuing (%d/%d)", autoContinues, maxConsecutiveAutoContinues),
 			})
 			continue
 		}
@@ -829,75 +815,125 @@ func (a *Agent) reportInterruptedTools(calls []llm.ToolCall, from int) {
 	}
 }
 
-// finishUnstartedToolRound ends a tool round the user interrupted before its
-// first call could start. The reply keeps its text but loses every tool call it
-// carried, and the message goes too when that leaves it without text and without
-// thinking — an assistant message with nothing in it has nothing to tell the next
-// request. No tool answer is recorded: the message no longer asks for anything,
-// and the turn ends here, so the model is never asked with these results.
-func (a *Agent) finishUnstartedToolRound() {
-	dropped, messageGone := a.dropUnstartedToolCalls()
-	text := fmt.Sprintf("interrupted before any tool call started; the reply was kept without its %d tool call(s)", dropped)
-	if messageGone {
-		text = fmt.Sprintf("interrupted before any tool call started; the reply had no text, so it and its %d tool call(s) were dropped", dropped)
+// The engine notes an interrupted turn leaves behind: they tell the model that
+// its last thinking or its last output was cut short, so it does not take the
+// fragment for a finished answer and instead follows the next prompt. They are
+// recorded only while agent.include_interrupted is on and are never drawn as a
+// row (see IsEngineNote).
+const (
+	interruptNoteThinking = "[engine] Your last thinking was interrupted by user. It's not completed. Follow user's next prompt."
+	interruptNoteOutput   = "[engine] Your last output was interrupted by user. It's not completed. Follow user's next prompt."
+)
+
+// interruptNote picks the engine note for an interrupted reply: the output note
+// once any visible text had streamed, the thinking note while the reply was
+// still in its thinking.
+func interruptNote(content string) string {
+	if strings.TrimSpace(content) == "" {
+		return interruptNoteThinking
 	}
-	a.bus.Publish(Event{Type: EventInterrupted, Text: text})
+	return interruptNoteOutput
 }
 
-// dropUnstartedToolCalls takes the tool calls off the reply the user interrupted
-// before any of them could start, and drops the message itself when that leaves
-// it with nothing to say: no text, and — unless agent.include_only_think keeps
-// the thinking — no reasoning either. It reports how many calls were dropped and
-// whether the message went with them.
-func (a *Agent) dropUnstartedToolCalls() (int, bool) {
+// enginePrefix tags the user messages the engine inserts on its own behalf: the
+// interrupt notes below, the context-continue marker (contextContinueMessage)
+// and the standalone summary (summaryUserPrefix). The front-ends draw such a
+// message at the user position but label it "engine" rather than the user, so a
+// reader can tell the engine's own words from what someone typed.
+const enginePrefix = "[engine] "
+
+// IsEngineNote reports whether a user message is engine-inserted text rather
+// than something the user typed (see enginePrefix).
+func IsEngineNote(content string) bool {
+	return strings.HasPrefix(content, enginePrefix)
+}
+
+// appendEngineNote records an engine-inserted user message and announces it, so
+// the front-ends draw it at the user position under the "engine" label. The
+// event carries source "engine": the note is not a user turn, so it neither
+// starts the turn clock nor settles a pending line.
+func (a *Agent) appendEngineNote(note string) {
+	a.appendMessage(llm.Message{Role: "user", Content: note})
+	a.bus.Publish(Event{Type: EventUser, Text: note, Source: "engine"})
+}
+
+// finishUnstartedToolRound ends a tool round the user interrupted before its
+// first call could start. agent.include_interrupted decides what the reply
+// leaves behind:
+//
+//   - when it is on, the reply keeps its text and thinking but loses every tool
+//     call it carried (none of them ran) and an engine note tells the model
+//     the attempt was cut short;
+//   - when it is off (the default), the incomplete reply is dropped whole —
+//     text, thinking and tool calls together;
+//   - a reply with neither text nor thinking is dropped even when the option is
+//     on: a message with nothing in it has nothing to tell the next request.
+//
+// No tool answer is recorded either way: the message no longer asks for
+// anything, and the turn ends here, so the model is never asked with these
+// results.
+func (a *Agent) finishUnstartedToolRound() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	n := len(a.history)
 	if n == 0 || a.history[n-1].Role != "assistant" {
-		return 0, false
+		a.mu.Unlock()
+		a.bus.Publish(Event{Type: EventInterrupted, Text: "interrupted before any tool call started"})
+		return
 	}
-	dropped := len(a.history[n-1].ToolCalls)
-	a.history[n-1].ToolCalls = nil
-	if strings.TrimSpace(a.history[n-1].Content) == "" &&
-		!(a.includeOnlyThink && strings.TrimSpace(a.history[n-1].ReasoningContent) != "") {
+	msg := a.history[n-1]
+	dropped := len(msg.ToolCalls)
+	if !a.includeInterrupted || (strings.TrimSpace(msg.Content) == "" && strings.TrimSpace(msg.ReasoningContent) == "") {
 		a.history = a.history[:n-1]
-		return dropped, true
+		a.mu.Unlock()
+		a.bus.Publish(Event{
+			Type: EventInterrupted,
+			Text: fmt.Sprintf("interrupted before any tool call started; the incomplete reply and its %d tool call(s) were dropped", dropped),
+		})
+		return
 	}
-	return dropped, false
+	a.history[n-1].ToolCalls = nil
+	a.history = append(a.history, llm.Message{Role: "user", Content: interruptNote(msg.Content)})
+	a.mu.Unlock()
+	a.bus.Publish(Event{Type: EventUser, Text: interruptNote(msg.Content), Source: "engine"})
+	a.bus.Publish(Event{
+		Type: EventInterrupted,
+		Text: fmt.Sprintf("interrupted before any tool call started; the reply was kept without its %d tool call(s)", dropped),
+	})
 }
 
 // finishInterruptedModelCall ends a turn the user interrupted while the model was
 // answering. The user message always stays: an interrupt never rewrites what the
-// user sent. What is dropped is the assistant side of the turn —
+// user sent. What happens to the assistant side is agent.include_interrupted:
 //
-//   - text the provider had already delivered is kept as one assistant message
-//     (see keepPartialReply);
-//   - a reply whose text is empty after trimming is dropped entirely — an
-//     assistant message without content has nothing to tell the next request —
-//     unless it carried thinking and agent.include_only_think is on, in which
-//     case the thinking is kept on its own;
-//   - a reply that never arrived leaves no record at all.
+//   - when it is on, the partial reply the provider had streamed is kept (its
+//     text and thinking; the tool calls it carried never ran and are dropped)
+//     and an engine note tells the model the attempt was cut short;
+//   - when it is off (the default), the incomplete reply leaves no record at
+//     all — a half-finished fragment never reaches the next request;
+//   - a reply that never arrived leaves no record either way.
 //
 // Whatever is kept travels with the next user message, never as a call of its own.
 func (a *Agent) finishInterruptedModelCall(resp *llm.Response, started time.Time) {
-	switch {
-	case a.keepPartialReply(resp, started):
-		a.bus.Publish(Event{
-			Type: EventInterrupted,
-			Text: "interrupted while the reply was streaming; the partial reply was kept",
-		})
-	case resp == nil || (resp.Content == "" && resp.Reasoning == "" && len(resp.ToolCalls) == 0):
+	if resp == nil || (strings.TrimSpace(resp.Content) == "" && strings.TrimSpace(resp.Reasoning) == "" && len(resp.ToolCalls) == 0) {
 		a.bus.Publish(Event{
 			Type: EventInterrupted,
 			Text: "interrupted while waiting for the model; nothing had been produced",
 		})
-	default:
-		text := "interrupted; the reply had no text, so its message was dropped"
-		if n := len(resp.ToolCalls); n > 0 {
-			text = fmt.Sprintf("interrupted; the reply had no text, so its message and its %d tool call(s) were dropped", n)
-		}
-		a.bus.Publish(Event{Type: EventInterrupted, Text: text})
+		return
 	}
+	if a.includeInterrupted && a.keepPartialReply(resp, started) {
+		a.appendEngineNote(interruptNote(resp.Content))
+		a.bus.Publish(Event{
+			Type: EventInterrupted,
+			Text: "interrupted; the partial reply was kept and the model was told it was cut short",
+		})
+		return
+	}
+	text := "interrupted; the incomplete reply was dropped"
+	if n := len(resp.ToolCalls); n > 0 {
+		text = fmt.Sprintf("interrupted; the incomplete reply and its %d tool call(s) were dropped", n)
+	}
+	a.bus.Publish(Event{Type: EventInterrupted, Text: text})
 }
 
 // keepPartialReply records the reply a cancelled model call had streamed so far
@@ -905,17 +941,15 @@ func (a *Agent) finishInterruptedModelCall(resp *llm.Response, started time.Time
 // kept, the tool calls it carried are not. None of those calls started, and the
 // reply never finished, so even a call that looks complete can be a fragment; the
 // turn ends here, which means nothing would ever run them. It reports whether a
-// message was kept — a reply whose text is empty after trimming is only kept
-// while it carried thinking and agent.include_only_think is on, because an empty
-// message otherwise has nothing to contribute — and the kept text is published
-// as the assistant row the front-ends had been streaming, so the row is
-// finalized live and replayed from the mirror.
+// message was kept — a reply with neither text nor thinking has nothing to
+// contribute — and the kept text is published as the assistant row the
+// front-ends had been streaming, so the row is finalized live and replayed from
+// the mirror.
 func (a *Agent) keepPartialReply(resp *llm.Response, started time.Time) bool {
 	if resp == nil {
 		return false
 	}
-	if strings.TrimSpace(resp.Content) == "" &&
-		!(a.includeOnlyThink && strings.TrimSpace(resp.Reasoning) != "") {
+	if strings.TrimSpace(resp.Content) == "" && strings.TrimSpace(resp.Reasoning) == "" {
 		return false
 	}
 	a.appendMessage(llm.Message{
