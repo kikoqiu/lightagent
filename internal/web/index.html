@@ -103,6 +103,16 @@
         <span class="session-name" id="sessionName" title="">session: —</span>
         <span class="session-saved" id="sessionSaved"></span>
       </div>
+      <!-- The directory line under the session line: the working directory the
+           process runs in (the one /cd moves and /pwd prints). A long path keeps
+           its tail — the leaf names say more than the root — so the front is
+           clipped with a leading ellipsis (see .dir-line in app.css, which also
+           keeps the path itself laid out left to right). setDir fills it and
+           hides it when the directory could not be resolved. -->
+      <div class="dir-line" id="dirLine" hidden>
+        <span class="dir-label">dir:</span>
+        <span class="dir-path" id="dirPath" title=""><bdi id="dirText"></bdi></span>
+      </div>
     </section>
     <section class="card">
       <!-- The rail lists the commands this page can run, built from

@@ -24,6 +24,7 @@ import (
 	"lightagent/internal/termcolor"
 	"lightagent/internal/textwidth"
 	"lightagent/internal/tools"
+	"lightagent/internal/workdir"
 )
 
 // SaveMode controls what happens to the session when the CLI exits.
@@ -1658,6 +1659,35 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 			break
 		}
 		c.write(termcolor.Cyan("[info] ") + "removed session " + path + "\n")
+	case "/pwd":
+		dir, err := workdir.Get()
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + err.Error() + "\n")
+			break
+		}
+		c.write(dir + "\n")
+	case "/cd":
+		target := strings.Join(args, " ")
+		if strings.TrimSpace(target) == "" {
+			c.write(termcolor.Red("[error] ") + "usage: /cd <dir>\n")
+			break
+		}
+		dir, err := workdir.Set(target)
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + "cannot change directory: " + err.Error() + "\n")
+			break
+		}
+		// The directory is process state: the next request's system prompt has
+		// to state the new one too.
+		c.agent.SetWorkingDir(dir)
+		c.write(termcolor.Cyan("[info] ") + "working directory: " + dir + "\n")
+	case "/ls":
+		text, err := workdir.Listing(strings.Join(args, " "))
+		if err != nil {
+			c.write(termcolor.Red("[error] ") + err.Error() + "\n")
+			break
+		}
+		c.write(text + "\n")
 	case "/compact":
 		if c.agent.Busy() {
 			c.write(termcolor.Red("[error] ") + "a turn is running; try again when idle\n")

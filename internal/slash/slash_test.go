@@ -244,6 +244,24 @@ func TestWebCommandsOffersEveryRunnableCommand(t *testing.T) {
 	}
 }
 
+// TestWorkingDirectoryCommandsAreWebCommands pins that both front-ends offer
+// /pwd, /cd and /ls: they read and move the process working directory the two
+// share, so the page must be able to run them and the rail must describe them.
+func TestWorkingDirectoryCommandsAreWebCommands(t *testing.T) {
+	offered := make(map[string]bool)
+	for _, c := range WebCommands() {
+		offered[c.Name] = c.Web
+	}
+	for _, name := range []string{"/pwd", "/cd", "/ls"} {
+		if canonical, ok := Canonical(name); !ok || canonical != name {
+			t.Fatalf("%s is not in the catalogue", name)
+		}
+		if !offered[name] {
+			t.Fatalf("%s is not offered as a web command", name)
+		}
+	}
+}
+
 // TestUsageText renders messages, tokens and the context-window percentage.
 func TestUsageText(t *testing.T) {
 	got := UsageText(agent.Stats{

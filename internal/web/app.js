@@ -721,6 +721,29 @@
     renderSessionSaved();
   }
 
+  // setDir fills the rail's directory line: the working directory the process
+  // runs in, which /cd moves and /pwd prints. It arrives in the history header
+  // and, live, in a dir frame after a /cd (see broadcastDir); nothing else
+  // changes it. An empty path (the directory could not be resolved) hides the
+  // line. A very long path keeps its tail — the stylesheet clips the front and
+  // marks it with a leading ellipsis (see .dir-line) — and the full path stays
+  // readable in the title.
+  function setDir(dir) {
+    var line = document.getElementById('dirLine');
+    var pathEl = document.getElementById('dirPath');
+    var text = document.getElementById('dirText');
+    if (!line || !pathEl || !text) { return; }
+    if (!dir) {
+      line.hidden = true;
+      text.textContent = '';
+      pathEl.title = '';
+      return;
+    }
+    text.textContent = dir;
+    pathEl.title = dir;
+    line.hidden = false;
+  }
+
   // apiName is the active provider's name, shown under the logo. The green dot
   // already tells connection state apart, so that line is never
   // "online"/"offline": it holds the last known name (and "connecting…" only
@@ -2509,6 +2532,7 @@
     historyBusy = !!ev.busy;
     setUsage(ev.tokens || 0, ev.window || 0);
     setSessionInfo(ev.session || '', ev.saved || '');
+    setDir(ev.dir || '');
     applySettings(ev);
   }
 
@@ -2530,6 +2554,7 @@
     recordHistoryVersion(ev);
     setUsage(ev.tokens || 0, ev.window || 0);
     setSessionInfo(ev.session || '', ev.saved || '');
+    setDir(ev.dir || '');
     applySettings(ev);
     setRunning(!!ev.busy);
   }
@@ -2726,6 +2751,9 @@
       // /saveas, /load and /new): no row, just state, and it must not disturb
       // read-aloud's thinking buffer the way a content event would.
       if (ev.type === 'session') { setSessionInfo(ev.name || '', ev.saved || ''); return; }
+      // The working directory is transient state too (a /cd moved it): no row,
+      // just the rail's directory line.
+      if (ev.type === 'dir') { setDir(ev.path || ''); return; }
       render(ev.type, ev);
     };
   }

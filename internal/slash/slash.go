@@ -74,6 +74,11 @@ var Commands = []Command{
 	{Name: "/markdown", Args: "[on|off]", Summary: "toggle markdown rendering", Web: true},
 	{Name: "/list", Args: "[n]", Summary: "list the last n saved sessions (default 10)", Web: true},
 	{Name: "/rm", Args: "<name>", Summary: "delete a saved session by file name", Web: true},
+	// The working-directory commands move the process the front-ends share, so
+	// both can run them and both see the same directory.
+	{Name: "/pwd", Summary: "print the current working directory", Web: true},
+	{Name: "/cd", Args: "<dir>", Summary: "change the current working directory", Web: true},
+	{Name: "/ls", Args: "[dir]", Summary: "list a directory's contents (default: the current one)", Web: true},
 	{Name: "/help", Aliases: []string{"/?"}, Summary: "show the command list", Web: true},
 	{Name: "/stop", Aliases: []string{"/interrupt"}, Summary: "interrupt the turn that is running", Web: true},
 	{Name: "/exit", Aliases: []string{"/quit", "/q"}, Summary: "quit (you are asked whether to save)"},

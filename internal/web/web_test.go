@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -214,6 +216,33 @@ func TestSessionLine(t *testing.T) {
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("the session line is missing %q", want)
+		}
+	}
+}
+
+// TestWorkingDirLine pins the rail's directory line under the session line: the
+// markup, the stylesheet and the app.js wiring that fills it from the history
+// header and the live dir frame, so the page shows which directory the process
+// runs in — and, because the front of a long path is clipped, which leaf it is.
+func TestWorkingDirLine(t *testing.T) {
+	src := pageSource()
+	for _, want := range []string{
+		`id="dirLine"`,
+		`id="dirPath"`,
+		`id="dirText"`,
+		".dir-line",
+		// The overflow is clipped at the front with a leading ellipsis...
+		"direction:rtl",
+		"text-overflow:ellipsis",
+		// ...while the path itself stays left to right.
+		"<bdi id=\"dirText\">",
+		"function setDir",
+		"ev.type === 'dir'",
+		"setDir(ev.dir || '')",
+		"setDir(ev.path || '')",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the directory line is missing %q", want)
 		}
 	}
 }
@@ -624,6 +653,7 @@ type historyFrame struct {
 	Markdown bool         `json:"markdown"`
 	Result   bool         `json:"result"`
 	Count    int          `json:"count"`
+	Dir      string       `json:"dir"`
 }
 
 // decodeHistoryFrames decodes the frames of the current snapshot, in order.
@@ -1272,6 +1302,13 @@ func TestIndexAndAssets(t *testing.T) {
 		`id="cmdToggle"`,
 		`"primary":true`,
 		`"name":"/compact"`,
+		// The rail is fed by the shared catalogue, so the working-directory
+		// commands reach the page (and its directory line markup ships with
+		// the shell).
+		`"name":"/pwd"`,
+		`"name":"/cd"`,
+		`"name":"/ls"`,
+		`id="dirLine"`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("page does not carry %q: %s", want, page)
@@ -1681,6 +1718,92 @@ func TestExitCommandStaysPageLocal(t *testing.T) {
 	case ev := <-events:
 		t.Fatalf("/exit leaked onto the agent bus: %+v", ev)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestWorkingDirectoryCommands drives /pwd, /cd and /ls through the mirror. The
+// working directory is process state both front-ends share, so /cd moves it for
+// the terminal too, reports on the bus and pushes the rail's directory line to
+// every page as a dir frame.
+func TestWorkingDirectoryCommands(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	srv := newTestServer(t, "")
+	conn, reader := dialWS(t, srv)
+	// The handshake is followed by the history snapshot; the dir frame asserted
+	// below comes after it, so read the snapshot to its terminator first.
+	drainHistory(t, reader)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "marker.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := json.Marshal(map[string]string{"text": "/cd " + dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMaskedFrame(conn, opText, msg); err != nil {
+		t.Fatal(err)
+	}
+	waitForServerFrame(t, reader, `"type":"dir"`)
+	if got, err := os.Getwd(); err != nil || got != dir {
+		t.Fatalf("working directory = %q (err %v), want %q", got, err, dir)
+	}
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) > 0 })
+	if last := rows[len(rows)-1]; last.Role != "info" || !strings.Contains(last.Content, "working directory:") {
+		t.Fatalf("row = %+v, want the /cd confirmation", last)
+	}
+	// A reconnecting page reads the same directory from its snapshot header.
+	if header := decodeHistoryFrames(t, srv)[0]; header.Dir != dir {
+		t.Fatalf("history header dir = %q, want %q", header.Dir, dir)
+	}
+
+	// /pwd and /ls answer on the bus, like the other shared-state commands.
+	nextRow := func(text string) historyRow {
+		t.Helper()
+		before := len(decodeHistory(t, srv))
+		srv.handleCommand(text)
+		rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) > before })
+		return rows[len(rows)-1]
+	}
+	if row := nextRow("/pwd"); row.Role != "info" || !strings.Contains(row.Content, dir) {
+		t.Fatalf("/pwd row = %+v, want the working directory", row)
+	}
+	if row := nextRow("/ls"); row.Role != "info" || !strings.Contains(row.Content, "marker.txt") {
+		t.Fatalf("/ls row = %+v, want the listing", row)
+	}
+	// A missing argument and a missing directory are refused without moving
+	// anything.
+	if row := nextRow("/cd"); row.Role != "error" || !strings.Contains(row.Content, "usage: /cd") {
+		t.Fatalf("/cd without an argument = %+v, want the usage note", row)
+	}
+	if row := nextRow("/cd " + filepath.Join(dir, "nope")); row.Role != "error" || !strings.Contains(row.Content, "cannot change directory") {
+		t.Fatalf("/cd to a missing directory = %+v, want the failure", row)
+	}
+	if got, _ := os.Getwd(); got != dir {
+		t.Fatalf("a refused /cd moved the directory to %q, want %q", got, dir)
+	}
+	if srv.agent.Busy() {
+		t.Fatal("a directory command must not start a turn")
+	}
+}
+
+// waitForServerFrame reads frames until one carries want (a substring of its
+// payload), which is how a transient state frame reaches a test client.
+func waitForServerFrame(t *testing.T, r *bufio.Reader, want string) []byte {
+	t.Helper()
+	for {
+		_, payload, err := readServerFrame(r)
+		if err != nil {
+			t.Fatalf("read a frame, waiting for %s: %v", want, err)
+		}
+		if strings.Contains(string(payload), want) {
+			return payload
+		}
 	}
 }
 

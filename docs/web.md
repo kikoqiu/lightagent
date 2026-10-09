@@ -204,7 +204,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 在解析+重建期间整段卡住（这正是超长会话停在 `Waiting for messages…` 的原因）：
 
 ```json
-{ "type": "history_start", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "count": 812, "model": "gpt-4o-mini", "apis": [ { "index": 1, "name": "default", "type": "openai", "model": "gpt-4o-mini", "enabled": true, "active": true } ], "session": "session.json", "saved": "2026-10-06 15:04:05" }
+{ "type": "history_start", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "count": 812, "model": "gpt-4o-mini", "apis": [ { "index": 1, "name": "default", "type": "openai", "model": "gpt-4o-mini", "enabled": true, "active": true } ], "session": "session.json", "saved": "2026-10-06 15:04:05", "dir": "D:\\build\\go\\lightagent" }
 { "type": "history_rows", "messages": [ { "role": "user", "content": "..." } ] }
 { "type": "history_rows", "messages": [ ... ] }
 { "type": "history_end" }
@@ -217,7 +217,8 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   RFC 3339 时间戳——页面把它渲染成「刚刚 / N 分钟前」这类可读相对时间；未保存的新会话两者为空），
   `count` 是本次快照的行数，`version` 是这批行对应的**回滚版本**
   （页面先记下、等快照**收齐**才提交为「自己这份日志的版本」，中途断线时下一次连接仍按手上那份日志的
-  版本发 `?since=`，不会把没收到的快照当成自己的）。
+  版本发 `?since=`，不会把没收到的快照当成自己的）。`dir` 是**侧栏的目录行**：进程当前工作目录
+  （`/cd` 移动、`/pwd` 打印的那一个；页面超长时隐藏前部、只留尾部，因为叶子名比根更说明问题）。
 * `history_rows` 每帧一个**批次**：至多 200 行，或累计文本达到 256 KB 就提前切批（单行过大时自己
   成一批），因此单帧大小有上界（`internal/web/web.go` 的 `historyBatchRows` / `historyBatchBytes`）。
 * `history_end` 收尾；之后的帧都是实时事件。收到 `history_start` 时页面**重建**日志区（历史始终是
@@ -235,7 +236,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 服务端只回：
 
 ```json
-{ "type": "history_same", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ], "session": "session.json", "saved": "2026-10-06 15:04:05" }
+{ "type": "history_same", "version": 812, "tokens": 1234, "window": 131072, "busy": false, "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ], "session": "session.json", "saved": "2026-10-06 15:04:05", "dir": "D:\\build\\go\\lightagent" }
 ```
 
 * 页面收到它**不动日志区**，只把表头里的状态（用量、`busy`、开关、当前模型与接口列表）应用上去——这正是手机停工后
@@ -283,6 +284,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 { "type": "turn_done" }
 { "type": "settings", "markdown": true, "result": true, "model": "gpt-4o-mini", "apis": [ ... ] }
 { "type": "session", "name": "session.json", "saved": "2026-10-06 15:04:05" }
+{ "type": "dir", "path": "D:\\build\\go\\lightagent" }
 ```
 
 * `compacted` 携带 `summary`：累计摘要（总结失败时退化为丢弃消息，此时它可能为空/未变）。
@@ -307,6 +309,9 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   命令之后广播，页面据此刷新侧栏的会话行（`name` 为当前会话文件名、`saved` 为最近保存时刻的
   RFC 3339 时间戳，页面渲染成「刚刚 / N 分钟前」并每 30 秒续算一次；未保存的新会话两者为空）。
   新页面与重连页面从 `history_start` 表头拿到同样的值。
+
+* `dir` 也是**瞬时帧**（不进日志区）：`/cd` 之后广播（`{"type":"dir","path":"…"}`），
+  页面据此刷新侧栏的目录行；新页面与重连页面从 `history_start` 表头拿到同样的值。
 
 * `usage` 在上下文增长的每个时点广播（回合开始、每次模型回复、每轮工具执行后），
   页面据此**实时**更新顶部上下文用量徽标（`tokens` 以接口返回的 `prompt_tokens` 为基准）。
@@ -406,6 +411,9 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 | `/load` `[-f] <name\|n>` | 通过 `SetSessionLoader` 回调载入（文件名或 `/list` 序号），并**重建网页日志区**；当前会话有未保存改动时未加 `-f` 会被拒绝 |
 | `/list` `[n]` | 通过 `SetSessionLister` 取最近 n 条（默认 10），**只写进网页日志区**（终端有自己的 `/list`）；网页把它画成**网格表格**（序号 / 文件名 / 时间三列），因此文件名含中文时列也能对齐（纯文本靠空格补位做不到——浏览器里 CJK 回退字体的宽度未必正好等于两个等宽字符） |
 | `/rm` `<name>` | 通过 `SetSessionRemover` 回调按文件名删除（不接受序号、不删当前会话） |
+| `/pwd` | 打印进程当前工作目录（共享：终端与所有网页同屏） |
+| `/cd` `<dir>` | 切换进程当前工作目录（`~` 展开为主目录）；改的是两端共享的进程状态，因此也更新系统提示词里的工作目录行并广播 `dir` 帧刷新侧栏目录行；缺参数或目录不存在会拒绝且不改动 |
+| `/ls` `[dir]` | 列出目录内容（默认当前目录；隐藏项不列；目录带 `/` 后缀），结果走事件总线（终端与所有网页同屏） |
 | `/switchapi` `<name\|序号>` | 通过 `SetAPISwitcher` 回调切换当前 LLM 接口（无参列出接口）；只改内存，切换成功后广播 `settings` 帧（侧栏模型下拉也走同一条）。**命令表里标了 `Hidden`**：不出现在命令栏，但在输入框里可用 |
 | `/stop` `/interrupt` | 中断当前回合（与 CLI 共享） |
 | `/compact` | 手动压缩上下文；回合运行中会拒绝 |
@@ -415,7 +423,7 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
 | `/exit` `/quit` `/q` | 只提示「请在终端退出」：它会结束整个会话（含终端） |
 | 其它 `/xxx` | 与 CLI 一致地报 `unknown command`，**不发给模型** |
 
-共享状态的命令（`/new`、`/clear`、`/save`、`/saveas`、`/load`、`/rm`、`/stop`、`/compact`、`/history`、`/result`）的结果通过**事件总线**
+共享状态的命令（`/new`、`/clear`、`/save`、`/saveas`、`/load`、`/rm`、`/stop`、`/compact`、`/history`、`/result`、`/pwd`、`/cd`、`/ls`）的结果通过**事件总线**
 广播，因此终端与所有网页看到同一条反馈；只属于当前页面的命令（上面的 `/help`、`/list`、`/markdown`、
 未知命令）只写进网页日志区，不会污染终端回滚。
 
@@ -502,8 +510,11 @@ UI 随二进制内嵌，重建后浏览器会重新校验，不会继续使用�
   （`saved: …` 渲染成可读相对时间 `just now` / `N minutes ago` / `N hours ago` / `N days ago`，
   超过一个月回落到日期，未保存时为 `saved: never`；每 30 秒续算一次，隐藏停工时不刷新），
   由 `history_start` 表头与 `session` 帧填充，`/save`、`/saveas`、`/load`、`/new` 之后随之刷新）、
+  会话行下是**目录行**（`dir: …` 显示进程当前工作目录，由 `history_start` 表头与 `dir` 帧填充，
+  `/cd` 之后随之刷新；**路径过长时隐藏前部**、只留尾部——叶子名比根更能说明这是哪个项目，
+  完整路径保留在 `title` 里）、
   **Commands 命令栏**（默认列 6 条 `primary` 命令 `/new`、`/clear`、`/save`、`/saveas`、`/load`、`/history`，其余折叠在标题后，点击标题展开/收起（`/switchapi` 标注 `Hidden`，不出现在命令栏里，但仍可在输入框里执行）；
-  点击即执行；折叠组以 `/compact` 开头、以 `/help` / `/stop` 收尾；`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态）、
+  点击即执行；折叠组以 `/compact` 开头、以 `/help` / `/stop` 收尾，`/rm`、`/pwd`、`/cd`、`/ls` 等折叠其中；`/result` 与 `/markdown` 显示 on / off 状态，点击切换另一状态）、
   **Read aloud** 朗读卡片（自带的启用开关 + **Voice settings** 面板入口；
   页头 **🔊** 打开同一个面板，手机端也能用），
   右侧为聊天主区（日志区右下角悬浮**上一条用户消息**与**最新消息**两个按钮，见下文）。

@@ -151,6 +151,25 @@
     min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
   .session-line .session-name { color:var(--fg-muted); }
+  /* The directory line under the session line: the working directory the process
+     runs in (see setDir). The label is fixed and the path takes the rest, so the
+     path can be clipped rather than wrap. direction:rtl moves the line's end edge
+     — where an overflowing box is clipped and its ellipsis drawn — to the left,
+     which keeps the tail of a long path (the leaf names) visible; the <bdi>
+     keeps the path itself laid out left to right, so no character of it is
+     reordered. The line is hidden until a directory is known. */
+  .dir-line {
+    display:flex; align-items:baseline; gap:4px; min-width:0;
+    margin-top:2px; color:var(--fg-dim); font-size:11px;
+  }
+  .dir-line[hidden] { display:none; }
+  .dir-line .dir-label { flex:none; }
+  .dir-line .dir-path {
+    min-width:0; flex:1;
+    direction:rtl; text-align:left;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    color:var(--fg-muted);
+  }
   /* The model picker at the top of the context card, disabled while a turn runs
      (a switch is refused then anyway). It reads as a label, not an input: no
      box and muted text, with the native arrow signalling it is a dropdown; hover

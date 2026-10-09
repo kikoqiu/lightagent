@@ -23,6 +23,7 @@ import (
 	"lightagent/internal/slash"
 	"lightagent/internal/store"
 	"lightagent/internal/tools"
+	"lightagent/internal/workdir"
 )
 
 // assetsFS holds the vendored browser libraries (marked for markdown, DOMPurify
@@ -303,6 +304,31 @@ func (s *Server) sessionState() (name, saved string) {
 		return n, ""
 	}
 	return n, t.Format(time.RFC3339)
+}
+
+// currentDir is the rail's directory line: the working directory the process
+// runs in, or "" when it cannot be resolved.
+func (s *Server) currentDir() string {
+	dir, err := workdir.Get()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// broadcastDir pushes the current working directory to the connected pages, so
+// the rail's directory line follows a /cd made here or in another tab.
+func (s *Server) broadcastDir() {
+	data, err := json.Marshal(map[string]any{
+		"type": "dir",
+		"path": s.currentDir(),
+	})
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.broadcastLocked(data)
 }
 
 // broadcastSession pushes the current session's name and last-saved time to the
@@ -916,6 +942,10 @@ type historyHeader struct {
 	// saved), so a reconnecting page shows the right one right away.
 	Session string `json:"session,omitempty"`
 	Saved   string `json:"saved,omitempty"`
+	// Dir is the rail's directory line: the working directory the process runs
+	// in, moved by /cd, so a reconnecting page shows where a relative path
+	// resolves before it runs one.
+	Dir string `json:"dir,omitempty"`
 }
 
 // historyRowsFrame is one batch of replayed rows.
@@ -945,6 +975,9 @@ type historySameFrame struct {
 	APIs    []config.APIInfo `json:"apis,omitempty"`
 	Session string           `json:"session,omitempty"`
 	Saved   string           `json:"saved,omitempty"`
+	// Dir rides here like the session line: a /cd moves the working directory
+	// without the rows changing.
+	Dir string `json:"dir,omitempty"`
 }
 
 // sameHistoryFrame renders the "nothing new" reply from the same header the
@@ -963,6 +996,7 @@ func sameHistoryFrame(header historyHeader) []byte {
 		APIs:     header.APIs,
 		Session:  header.Session,
 		Saved:    header.Saved,
+		Dir:      header.Dir,
 	})
 	if err != nil {
 		return nil
@@ -988,6 +1022,7 @@ func (s *Server) historyHeaderLocked(rows int) historyHeader {
 		APIs:     s.apiInfos(),
 		Session:  session,
 		Saved:    saved,
+		Dir:      s.currentDir(),
 	}
 }
 
@@ -1261,6 +1296,37 @@ func (s *Server) handleCommand(text string) {
 			return
 		}
 		s.info("removed session " + path)
+	case "/pwd":
+		dir, err := workdir.Get()
+		if err != nil {
+			s.fail(err.Error())
+			return
+		}
+		s.info(dir)
+	case "/cd":
+		target := strings.Join(args, " ")
+		if strings.TrimSpace(target) == "" {
+			s.fail("usage: /cd <dir>")
+			return
+		}
+		dir, err := workdir.Set(target)
+		if err != nil {
+			s.fail("cannot change directory: " + err.Error())
+			return
+		}
+		// The directory is process state both front-ends share: tell the agent
+		// so the next request's system prompt states the new one, and push the
+		// rail's directory line to every open page.
+		s.agent.SetWorkingDir(dir)
+		s.broadcastDir()
+		s.info("working directory: " + dir)
+	case "/ls":
+		text, err := workdir.Listing(strings.Join(args, " "))
+		if err != nil {
+			s.fail(err.Error())
+			return
+		}
+		s.info(text)
 	case "/compact":
 		if s.agent.Busy() {
 			s.fail("a turn is running; try again when idle")

@@ -54,6 +54,7 @@ internal/textwidth/         终端列宽测量（东亚宽字符算 2 列；CLI 
 internal/markdown/          Markdown → ANSI 渲染（CLI）
 internal/passwd/            加盐摘要：sha256(盐+密码)，Go 与页面共用同一字节约定
 internal/slash/             斜杠命令表：CLI 的 /help、网页的 /help 与左侧命令栏共用（含命令解析、引号参数、/list 文案）
+internal/workdir/           当前工作目录服务（/pwd、/cd、/ls 共用：读取/切换 + ~ 展开 + 目录列表文案）
 internal/cli/               彩色 REPL + 多行编辑（Enter 换行、Ctrl+J 发送）
   escape.go                 转义序列解码（CSI/SS3、kitty CSI-u、modifyOtherKeys）
   term_windows.go           Windows 控制台 raw 输入（ReadConsoleInputW + Win32 input mode）

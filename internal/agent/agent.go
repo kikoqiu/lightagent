@@ -31,8 +31,12 @@ type Agent struct {
 	// workingDirInfo is the optional working-directory line (the absolute
 	// directory the process runs in, nothing more). It is empty when
 	// agent.include_working_dir is off or the directory cannot be resolved. It
-	// is set once in New.
+	// is set in New and then follows a /cd through SetWorkingDir.
 	workingDirInfo string
+	// includeWorkingDir records agent.include_working_dir: whether the prompt
+	// carries the working-directory line at all. SetWorkingDir keeps a prompt
+	// without it without one.
+	includeWorkingDir bool
 	// unlockRule is the single global "Tool Discovery & Unlock" mechanism
 	// section. It is non-empty only while locked (deferred) functions exist,
 	// so it is injected exactly once and only when it is meaningful.
@@ -131,6 +135,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		base:               base,
 		runtimeInfo:        RuntimeInfo(),
 		workingDirInfo:     workingDirInfo,
+		includeWorkingDir:  cfg.Agent.IncludeWorkingDir,
 		unlockRule:         unlockRule,
 		summaryInSystem:    cfg.Agent.SummaryInSystemPrompt,
 		maxIter:            maxIter,
@@ -207,6 +212,18 @@ func (a *Agent) SwitchLLM(client *llm.Client, contextWindow, maxTokens int) erro
 func (a *Agent) SetMCPServers(servers []MCPServerInfo) {
 	a.mu.Lock()
 	a.mcpInfo = append([]MCPServerInfo(nil), servers...)
+	a.mu.Unlock()
+}
+
+// SetWorkingDir records a new working directory for the system prompt, so the
+// /cd either front-end runs is told to the model on the next request. dir is the
+// absolute path the process now runs in. It is a no-op while
+// agent.include_working_dir is off: the prompt carries no such line then.
+func (a *Agent) SetWorkingDir(dir string) {
+	a.mu.Lock()
+	if a.includeWorkingDir {
+		a.workingDirInfo = WorkingDirectoryInfo(dir)
+	}
 	a.mu.Unlock()
 }
 

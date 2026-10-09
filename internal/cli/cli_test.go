@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -762,6 +763,62 @@ func TestEveryCataloguedCommandIsHandled(t *testing.T) {
 		if wantExit := cmd.Name == "/exit"; exit != wantExit {
 			t.Errorf("%s exit = %v, want %v", cmd.Name, exit, wantExit)
 		}
+	}
+}
+
+// TestWorkingDirectoryCommandsMoveTheProcess pins the terminal side of /pwd,
+// /cd and /ls: they read and move the process working directory (so a relative
+// path means the same thing to the terminal and to the tools), report it and
+// refuse a missing directory or a missing argument without moving anything.
+func TestWorkingDirectoryCommandsMoveTheProcess(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	if exit := c.handleCommand(context.Background(), "/pwd"); exit {
+		t.Fatal("/pwd must not exit")
+	}
+	if !strings.Contains(buf.String(), old) {
+		t.Fatalf("/pwd = %q, want the working directory %q", buf.String(), old)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "marker.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	c.handleCommand(context.Background(), "/cd "+dir)
+	if got, _ := os.Getwd(); got != dir {
+		t.Fatalf("working directory = %q, want %q", got, dir)
+	}
+	if !strings.Contains(buf.String(), "working directory:") {
+		t.Fatalf("/cd = %q, want the confirmation", buf.String())
+	}
+
+	buf.Reset()
+	c.handleCommand(context.Background(), "/ls")
+	if !strings.Contains(buf.String(), "marker.txt") {
+		t.Fatalf("/ls = %q, want the listing", buf.String())
+	}
+
+	buf.Reset()
+	c.handleCommand(context.Background(), "/cd")
+	if !strings.Contains(buf.String(), "usage: /cd") {
+		t.Fatalf("/cd without an argument = %q, want the usage note", buf.String())
+	}
+	buf.Reset()
+	c.handleCommand(context.Background(), "/cd "+filepath.Join(dir, "nope"))
+	if !strings.Contains(buf.String(), "cannot change directory") {
+		t.Fatalf("/cd to a missing directory = %q, want the failure", buf.String())
+	}
+	if got, _ := os.Getwd(); got != dir {
+		t.Fatalf("a refused /cd moved the directory to %q, want %q", got, dir)
 	}
 }
 
