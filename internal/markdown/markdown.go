@@ -24,7 +24,9 @@ func ANSI(doc string) string {
 
 // Stream renders markdown incrementally. Callers feed chunks with Write and
 // drain the tail with Flush; incomplete lines stay buffered, so a half-arrived
-// marker is never interpreted.
+// marker is never interpreted. A row ends on LF, CRLF or a lone CR (a classic-Mac
+// file read verbatim): all three are drawn as the one break the terminal has, so
+// no CR ever reaches the screen and moves the cursor back over the row it ended.
 type Stream struct {
 	buf     string
 	inFence bool
@@ -35,17 +37,18 @@ type Stream struct {
 func NewStream() *Stream { return &Stream{} }
 
 // Write consumes a chunk and returns the rendered text of every line the chunk
-// completed. A trailing partial line stays buffered.
+// completed. A trailing partial line stays buffered, and so does a trailing CR:
+// the LF that would make it a CRLF may still be on its way in the next chunk.
 func (s *Stream) Write(chunk string) string {
 	if chunk == "" {
 		return ""
 	}
 	s.buf += chunk
-	idx := strings.LastIndexByte(s.buf, '\n')
-	if idx < 0 {
+	cut := lineBreakCut(s.buf)
+	if cut <= 0 {
 		return ""
 	}
-	complete, rest := s.buf[:idx+1], s.buf[idx+1:]
+	complete, rest := s.buf[:cut], s.buf[cut:]
 	s.buf = rest
 	return s.render(complete)
 }
@@ -53,9 +56,10 @@ func (s *Stream) Write(chunk string) string {
 // Pending returns the partial line received so far, without rendering it. It
 // never contains a newline (complete lines travel through Write), so a caller
 // can show it as a streaming preview while the rest of the line is still
-// arriving.
+// arriving; a CR that ends the buffer is held back with it — it may still turn
+// out to be half of a CRLF, and a bare CR would move the cursor back.
 func (s *Stream) Pending() string {
-	return s.buf
+	return strings.TrimSuffix(s.buf, "\r")
 }
 
 // Flush renders whatever is still buffered, without adding a line break.
@@ -75,25 +79,61 @@ func (s *Stream) Reset() {
 	s.fence = ""
 }
 
+// lineBreakCut returns the length of the longest prefix of text that ends on a
+// row break the terminal may draw: LF, CRLF or a lone CR. A CR at the very end
+// of text does not count yet — an LF may still follow it in the next chunk, and
+// the two together are a single break.
+func lineBreakCut(text string) int {
+	cut := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '\n':
+			cut = i + 1
+		case '\r':
+			if i+1 < len(text) {
+				if text[i+1] == '\n' {
+					cut = i + 2
+					i++
+				} else {
+					cut = i + 1
+				}
+			}
+		}
+	}
+	return cut
+}
+
 // render converts text whose lines are known to be complete.
 func (s *Stream) render(text string) string {
 	var out strings.Builder
 	for len(text) > 0 {
-		line := text
-		hasNewline := false
-		if idx := strings.IndexByte(text, '\n'); idx >= 0 {
-			line, text = text[:idx], text[idx+1:]
-			hasNewline = true
-		} else {
-			text = ""
-		}
-		rendered, keepBreak := s.line(strings.TrimSuffix(line, "\r"))
+		line, rest, hasBreak := cutRow(text)
+		text = rest
+		rendered, keepBreak := s.line(line)
 		out.WriteString(rendered)
-		if hasNewline && keepBreak {
+		if hasBreak && keepBreak {
 			out.WriteByte('\n')
 		}
 	}
 	return out.String()
+}
+
+// cutRow splits the first row off text: the row without its terminator, the rest
+// of the text, and whether a terminator was there at all. A CRLF is one break, so
+// the row never carries a trailing CR.
+func cutRow(text string) (row, rest string, hasBreak bool) {
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '\n':
+			return text[:i], text[i+1:], true
+		case '\r':
+			if i+1 < len(text) && text[i+1] == '\n' {
+				return text[:i], text[i+2:], true
+			}
+			return text[:i], text[i+1:], true
+		}
+	}
+	return text, "", false
 }
 
 // line renders one complete markdown line, tracking fenced code state. The

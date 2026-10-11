@@ -446,7 +446,14 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 ### `read_file`
 按行读取文本文件，1 起算的 `start_line` + `max_lines` 分页，输出带行号范围表头与
 `[PARTIAL]` / `[TRUNCATED]` / `[END OF FILE]` 标记；表头还给出识别到的编码、文件是否带 BOM 与窗口内的
-行尾类型（`LF`/`CRLF`/`CR`/`mixed`/`none`）。CRLF/CR 归一化为 LF。
+行尾类型（`LF`/`CRLF`/`CR`/`mixed`/`none`）。
+**行区间按原样返回**：每行带着**完整的行尾**（LF、CRLF 或 CR，逐字节照抄；只有文件最后一行本来就没有行尾时
+才没有），文件末尾有没有换行照实反映，不把 CRLF/CR 归一化成 LF——所以
+「读到的就是文件里的」，从 read 复制出来的 `find` 可以直接拿去 `edit_file` 匹配（`find` **先逐字节**匹配：
+行尾写法不同时工具不改写 `find`，而是按**文件自己的行尾**放宽匹配一次，成功反馈里附一条 `warning:` 说明）。
+行尾在屏幕上不可见，
+因此表头在不是纯 LF 时**把行尾字节写出来**：`eol: CRLF (rows end with \r\n)`、`eol: CR (rows end with a
+single \r)`、`eol: mixed (rows mix \n, \r\n and \r)`；纯 LF 与整窗无换行不加注。行尾计入字节预算。
 读取顺序是**先解码、再切行**：字节先按编码解码成文本，再在解码后的文本上切行、按 `rune` 边界截断
 （UTF-16 的换行是 `0A 00`/`00 0A`，按原始字节切行会把编码单元切断，第 2 行起全乱码）。
 `encoding` 默认 `auto`：先看字节序 BOM（`FF FE`→utf-16le、`FE FF`→utf-16be、`FF FE 00 00`→utf-32le、
@@ -473,7 +480,10 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 `encoding`：`utf8`（默认，无 BOM）写文本、`utf-8-sig` 写 UTF-8 + BOM；泛化 `utf-16`/`utf-32` 写 BOM、
 显式 `utf-16le`/`utf-16be`/`utf-32le`/`utf-32be` 不写；`mode='a'` **一律不写 BOM**（不改变已有文件的 BOM）；
 `hex`/`base64` 解码二进制载荷；其它标签按字符集编码。
-行尾按原样写入，系统不会自动补换行；因此写入的文本不以换行结尾时，成功反馈后面会追加一条
+行尾默认**按文件第一个换行符的类型写入**（`eol='auto'`，见下），系统不会自动补换行；`eol` 参数可以改它：
+`auto`（默认，按文件第一个换行符的类型写入，新建/为空/整篇没有换行时无参照、原样写入）、`keep`（原样写入）、
+`lf`/`crlf`/`cr`（改成指定行尾）。不含换行的载荷不受影响，也不会凭空补换行；**只有真的改写过时**反馈首行才
+带 ` | eol: content written with \r\n (CRLF), following the file`。因此写入的文本不以换行结尾时，成功反馈后面会追加一条
 `[no trailing newline: the system never adds one. If the next call appends (mode='a'), start its content
 with one newline: \n, or \r\n for a CRLF file.]`（下一步要 `mode='a'` 续写就得在内容最前面自己加一个换行）。
 
@@ -482,13 +492,31 @@ with one newline: \n, or \r\n for a CRLF file.]`（下一步要 `mode='a'` 续�
 `mode='insert'` 把 `content` 插到唯一字面量 `find` 之前（匹配内容原样保留）；
 `mode='regex'` 把 `find` 当 RE2 正则，**允许不唯一**，所有匹配都被 `content` 替换（可用 `$1`、`$2` 引用捕获组），
 成功反馈给出匹配次数。
-`encoding` 支持字符集标签（解码匹配、写回再编码）与 `hex`/`base64` 字节级编辑（`regex` 不可用）；
-CRLF 文件按 LF 匹配、写回时恢复 CRLF。
+`encoding` 支持字符集标签（解码匹配、写回再编码）与 `hex`/`base64` 字节级编辑（`regex` 不可用）。
+**逐字节匹配、逐字节写回**：行尾也是内容的一部分，匹配处之外的字节一个都不动——工具不会把整个文件的行尾
+改成"统一"的某种风格，也不会把 `content` 里的 CRLF 再套一层（旧实现会在 CRLF 文件里把 `x\r\ny` 写成
+`x\r\r\ny`）。
+字面量（`replace`/`insert`）的 `find` **先逐字节匹配**：工具不会替你改写 `find` 的行尾去凑匹配，而是
+**按文件自己的行尾放宽匹配一次**——命中就照常编辑（改的是文件里真实存在的那段字节，匹配之外一个字节都不动），
+并在成功反馈后附一条警告，点名两侧的行尾写法：`` `find` spells row endings the file does not hold (\n (LF)
+vs \r\n (CRLF)); the match was made with the file's own endings, and only the matched range was touched``。
+放宽后若同一段文字在文件里**出现多次**（忽略行尾有多种落点），这次调用仍然拒绝执行：报错说明
+`the file holds that text N times with its own row endings … so nothing was written`，**不落盘一个字节**，
+加更多上下文或把行尾写对再调一次。想**没有警告**就按 `read_file` 返回的行照抄行尾（逐字节命中时一个字都不多写）。
+`regex` 与 `hex`/`base64` 不做任何行尾换算（严格匹配）。
+`content` 的行尾默认**跟随文件的第一个换行符**（`eol='auto'`）：CRLF 文件里只写 `\n` 的 `content` 也会被写成
+CRLF，文件保持统一，不再出现 mixed 提示；`eol='keep'` 则原样写入（不一致时文件会变成 mixed，反馈里照实说明
+`note: the file's rows now mix endings …`），`eol='lf'`/`'crlf'`/`'cr'` 直接改成指定行尾。它**只作用于
+`content`**：`find` 的匹配方式不受它影响（工具不会为它改写行尾），匹配之外的字节一个都不动；只有真的改写过时反馈首行才带
+` | eol: content written with \r\n (CRLF), following the file`。想整体转换行尾仍然走 `mode='regex'`（见下）。
+想整体转换行尾就是显式的一步：`mode='regex'`、`find="\r\n"`、`content="\n"`（反向同理），反馈里会说明
+行尾从 CRLF 变成了 LF。
 `replace`/`insert` 未找到 `find` 时，错误反馈会带上**不匹配诊断**：把 `find` 按行前缀从长到短尝试，找到
 第一个在全文中唯一出现的行前缀，再从最后匹配行起列出文件原文（最多 `f-m+3` 行，`f` 为 `find` 行数、
 `m` 为匹配到的行数；正文上限 2KB，截断处补 `... (rest of the excerpt omitted)`），模型因此能直接
-看到文件实际长什么样；`find` 为单行、没有唯一行前缀或候选前缀为空时只返回通用错误
-（`` `find` not found in file. Make sure it matches exactly ``），二进制编码与 `regex` 没有此诊断。
+看到文件实际长什么样（诊断按 LF 平面视图渲染，行号与 `find` 的行数对齐）；`find` 为单行、没有唯一行前缀或
+候选前缀为空时只返回通用错误（`` `find` not found in file. Make sure it matches exactly ``），二进制编码与
+`regex` 没有此诊断。文件行尾不是纯 LF 时，这条错误还会先点名文件的行尾（`\r\n` / 单个 `\r` / mixed）。
 两个字面模式的**未找到**与**不唯一**错误各共用一条消息（`insert` 的措辞与 `replace` 完全一致）。
 
 ### `webfetch`

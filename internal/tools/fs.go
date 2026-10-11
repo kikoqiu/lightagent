@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -49,8 +50,10 @@ func (t *ReadFileLinesTool) Name() string { return "read_file" }
 // Description implements Tool.
 func (t *ReadFileLinesTool) Description() string {
 	return fmt.Sprintf("Read a text file line by line (source, markdown, logs, configs). "+
-		"Rows are returned without line numbers; the header states the file line of the first "+
-		"row. CRLF is normalized to LF. start_line is 1-indexed and inclusive, max_lines is a row "+
+		"Rows come back exactly as the file holds them, each with its complete line ending (LF, CRLF "+
+		"or CR) — only a final row the file leaves unterminated comes back without one — and without "+
+		"line numbers; the header states the file line of the first row and spells the ending bytes "+
+		"out when they are not plain LF. start_line is 1-indexed and inclusive, max_lines is a row "+
 		"count, so one call returns [start_line, start_line + rows - 1]; continue with "+
 		"start_line = last returned file line + 1. With the default 'auto' encoding the header "+
 		"also names the charset that was detected (UTF-8, UTF-16/UTF-32, or a legacy code page). "+
@@ -246,7 +249,10 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 		return "", "", nil
 	}
 
-	var lines []string
+	// Rows come back verbatim, each with its own terminator: what the model reads
+	// is what the file holds, so a find copied from here matches byte for byte.
+	// The terminator counts against the byte budget with its row.
+	var content strings.Builder
 	var outputBytes, linesRead int64
 	var byteTruncated, lineTruncated bool
 	var lf, crlf, cr int
@@ -273,37 +279,60 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 		case termCR:
 			cr++
 		}
-		// The line reader already capped the line at sizeBudget on a rune
-		// boundary; a shorter cut happens when the budget has shrunk after
-		// earlier lines, and is kept rune-safe too.
-		if int64(len(line)) > remaining {
-			line = cutToRuneBoundary(line[:remaining])
-			truncated = true
-		}
-		lines = append(lines, line)
-		outputBytes += int64(len(line))
-		linesRead++
-		lineIndex++
+		sep := term.seq()
 		if truncated {
+			// The reader cut this row mid-way (its own maxBytes cap): the file
+			// has no break at the cut, so none is returned and the rest of the
+			// row was dropped with it.
+			content.WriteString(line)
+			outputBytes += int64(len(line))
+			linesRead++
 			byteTruncated = true
 			lineTruncated = true
 			break
 		}
+		if int64(len(line)+len(sep)) > remaining {
+			// The row no longer fits together with its terminator. The line is
+			// cut at the budget on a rune boundary, and the terminator is
+			// dropped either way: the window ends where the budget ended, not
+			// at a file break.
+			if int64(len(line)) > remaining {
+				line = cutToRuneBoundary(line[:remaining])
+				lineTruncated = true
+			}
+			content.WriteString(line)
+			outputBytes += int64(len(line))
+			linesRead++
+			byteTruncated = true
+			break
+		}
+		content.WriteString(line)
+		content.WriteString(sep)
+		outputBytes += int64(len(line) + len(sep))
+		linesRead++
+		lineIndex++
 	}
 
-	if len(lines) == 0 {
+	if linesRead == 0 {
 		return "", "", nil
 	}
 
-	content := strings.Join(lines, "\n")
 	endLine := startLine + linesRead - 1
+	eolLabel := lineEndingLabel(lf, crlf, cr)
 	header := fmt.Sprintf("[file: %s | lines %d-%d | first row below = file line %d",
 		displayName, startLine, endLine, startLine)
 	if encodingName != "" {
 		header += fmt.Sprintf(" | encoding: %s", encodingName)
 	}
 	header += fmt.Sprintf(" | bom: %s", yesNo(hasBOM))
-	header += fmt.Sprintf(" | eol: %s]", lineEndingLabel(lf, crlf, cr))
+	header += fmt.Sprintf(" | eol: %s", eolLabel)
+	// The rows carry their endings (often invisible on screen), so the header
+	// spells them out whenever they are not plain LF: what a multi-line find or
+	// content has to reproduce.
+	if hint := eolHeaderHint(eolLabel); hint != "" {
+		header += " (" + hint + ")"
+	}
+	header += "]"
 
 	var footer string
 	switch {
@@ -319,7 +348,7 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	default:
 		footer = header + "\n[END OF FILE - no further content.]"
 	}
-	return content, footer, nil
+	return content.String(), footer, nil
 }
 
 // lineTerm is how a decoded line ended.
@@ -331,6 +360,21 @@ const (
 	termCRLF
 	termCR
 )
+
+// seq is the terminator's own text: what read_file puts back after a row so the
+// returned rows are the file's bytes. termNone is the end of a file that does
+// not end with a break, so it adds nothing.
+func (t lineTerm) seq() string {
+	switch t {
+	case termLF:
+		return "\n"
+	case termCRLF:
+		return "\r\n"
+	case termCR:
+		return "\r"
+	}
+	return ""
+}
 
 // lineReader splits a decoded UTF-8 stream into lines. Terminators are LF, CRLF
 // and lone CR; the terminator is not part of the returned line. Because the
@@ -469,6 +513,30 @@ func lineEndingLabel(lf, crlf, cr int) string {
 	}
 }
 
+// lineEndingLabelOf names the row endings of a whole decoded text (the reader's
+// own label is per window).
+func lineEndingLabelOf(text string) string {
+	lf, crlf, cr := lineEndingCounts(text)
+	return lineEndingLabel(lf, crlf, cr)
+}
+
+// eolHeaderHint spells out the bytes that end a row when the window's endings
+// are worth naming: read_file returns rows verbatim, and a CR or CRLF is
+// invisible once the text is drawn, so only the header can tell the model what a
+// multi-line find or content has to reproduce. Plain LF (the default) says
+// nothing, and neither does a window without any break.
+func eolHeaderHint(label string) string {
+	switch label {
+	case "CRLF":
+		return "rows end with \\r\\n"
+	case "CR":
+		return "rows end with a single \\r"
+	case "mixed":
+		return "rows mix \\n, \\r\\n and \\r"
+	}
+	return ""
+}
+
 // AutoSplitWriteTool is implemented by a write tool that can spread a payload
 // larger than its own per-call limit over several consecutive calls. The agent
 // loop consults it for every write_file call: instead of letting the call be cut
@@ -505,7 +573,7 @@ func (t *WriteFileTool) Description() string {
 		"lines beyond the limit are TRUNCATED and DISCARDED. For long files, write one part at a "+
 		"time and continue with mode='a'; the newline that ended the last written line is kept, so "+
 		"the next call starts with the next line's text directly. You're suggested to write one function(or several small functions) at a time for writing code. "+
-		"Mode: 'o' overwrite (default), 'a' append, 'c' create  only if the file does not exist. Line endings (LF and CRLF) are preserved exactly as provided; the system never "+
+		"Mode: 'o' overwrite (default), 'a' append, 'c' create  only if the file does not exist. Line endings are written with the ending the file's own first row break uses by default (eol='auto'); eol='keep' writes them exactly as given and eol='lf'/'crlf'/'cr' picks one. The system never "+
 		"adds a trailing newline automatically.", t.fs.MaxWriteLines)
 }
 
@@ -531,6 +599,11 @@ func (t *WriteFileTool) Parameters() map[string]any {
 				"type":        "string",
 				"default":     "utf8",
 				"description": "'utf8' (default) writes text without a byte order mark; 'utf-8-sig' writes UTF-8 with one; 'hex'/'base64' decode an encoded binary payload; a Unicode form (utf-16, utf-16le, utf-16be, utf-32, utf-32le, utf-32be) or a legacy label (gbk, big5, shift_jis, euc-jp, euc-kr, windows-1252) encodes the text into that charset. A generic utf-16/utf-32 writes a byte order mark, the explicit little-/big-endian forms do not. mode='a' never writes a byte order mark, so an existing file's mark is left untouched.",
+			},
+			"eol": map[string]any{
+				"type":        "string",
+				"default":     eolAuto,
+				"description": "'auto' (default) writes content's line endings as the ending the file's own first row break uses (LF, CRLF or CR), so a file stays in the one convention it had; 'keep' writes them exactly as given; 'lf', 'crlf' or 'cr' rewrite them as that ending. A file that does not exist yet, is empty or holds no row break at all leaves nothing to follow, and content is written as given. A payload without a line break is written as given, and no trailing newline is ever added. The result names the ending on its first line whenever content's endings were really rewritten. Text content only: not available with encoding='hex'/'base64'.",
 			},
 		},
 		"required": []string{"path", "content"},
@@ -589,6 +662,14 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	if err != nil {
 		return Fail(err.Error())
 	}
+	eolRaw, _ := stringArg(args, "eol")
+	eolReq, eolErr := parseEOLArg(eolRaw)
+	if eolErr != nil {
+		return Fail(eolErr.Error())
+	}
+	if contentEncodingIsBinary(encoding) && eolReq != eolKeep && eolReq != eolAuto {
+		return Fail(fmt.Sprintf("eol is only available for text content; with encoding=%s the payload is written as the bytes it decodes to", encoding))
+	}
 	// A byte order mark belongs at the very start of a file: append writes the
 	// same codec without one, so the mark the create/overwrite call laid down is
 	// left untouched.
@@ -597,7 +678,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		writeEnc = appendEncodingNoBOM(encoding)
 	}
 
-	var note string
+	var note, eolField string
 	var data []byte
 	if contentEncodingIsBinary(encoding) {
 		data, err = decodeContentPayload(content, writeEnc)
@@ -606,12 +687,15 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		}
 	} else {
 		kept, dropped, total, truncated := enforceWriteLineLimit(content, t.fs.MaxWriteLines)
+		// The eol request is answered for the payload that is really written;
+		// the line accounting above stays on the text as it was given.
+		kept, eolField = respellPayload(kept, eolTarget(eolReq, detectFileEOL(path, encoding)), eolReq)
 		switch {
 		case truncated:
 			// The cut restores the separator of the last kept line, so the tail
 			// that resumes the write is the only concern left to report.
 			note = truncationNote(dropped, t.fs.MaxWriteLines, total)
-		case kept != "" && !strings.HasSuffix(kept, "\n"):
+		case kept != "" && !hasRowEndingSuffix(kept):
 			note = noFinalNewlineNote()
 		}
 		data, err = decodeContentPayload(kept, writeEnc)
@@ -630,7 +714,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		if _, err := f.Write(data); err != nil {
 			return Fail(err.Error())
 		}
-		return OK(fmt.Sprintf("Appended to %s%s", path, note))
+		return OK(fmt.Sprintf("Appended to %s%s%s", path, eolField, note))
 
 	case createMode:
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -644,7 +728,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		if _, err := f.Write(data); err != nil {
 			return Fail(err.Error())
 		}
-		return OK(fmt.Sprintf("File created: %s%s", path, note))
+		return OK(fmt.Sprintf("File created: %s%s%s", path, eolField, note))
 
 	default: // overwrite
 		existed := true
@@ -655,9 +739,9 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 			return Fail(err.Error())
 		}
 		if existed {
-			return OK(fmt.Sprintf("File overwritten: %s%s", path, note))
+			return OK(fmt.Sprintf("File overwritten: %s%s%s", path, eolField, note))
 		}
-		return OK(fmt.Sprintf("File created: %s (did not previously exist)%s", path, note))
+		return OK(fmt.Sprintf("File created: %s (did not previously exist)%s%s", path, eolField, note))
 	}
 }
 
@@ -817,9 +901,18 @@ func (t *EditFileTool) Name() string { return "edit_file" }
 // Description implements Tool.
 func (t *EditFileTool) Description() string {
 	return "Edit a file by locating find and writing content at that spot; the `mode` parameter says " +
-		"how find is matched and where content lands. A find that is not unique, or that matches " +
-		"nothing, is reported as an error so the call can be retried with more context. JSON escaping " +
-		"applies to the arguments: \\n is a newline and \\\\n is a literal backslash-n."
+		"how find is matched and where content lands. find and content are matched and written byte for " +
+		"byte, line endings included: read_file returns rows verbatim, so a multi-line find has to spell " +
+		"out the endings the header reports (\\r\\n for a CRLF file). content's line endings follow the file's own first row break by default " +
+		"(eol='auto'); eol='keep' writes them exactly as given and eol='lf'/'crlf'/'cr' picks one. find " +
+		"is matched byte for byte first and is never rewritten: a find the file only holds with other " +
+		"row endings is matched anyway, with the file's own endings, and the result says so in a " +
+		"warning — send the endings the file has (copy the rows read_file returned) to edit without " +
+		"one. Every edit reports what it " +
+		"did — the file is never rewritten " +
+		"outside the match. A find that is not unique, or that matches nothing, is reported as an error " +
+		"so the call can be retried with more context. JSON escaping applies to the arguments: \\n is a " +
+		"newline and \\\\n is a literal backslash-n."
 }
 
 // Parameters implements Tool.
@@ -833,7 +926,7 @@ func (t *EditFileTool) Parameters() map[string]any {
 			},
 			"find": map[string]any{
 				"type":        "string",
-				"description": "Text to locate: an exact literal for mode='replace'/'insert' (must occur exactly once), an RE2 pattern for mode='regex', or the hex/base64 byte sequence when encoding is a binary representation.",
+				"description": "Text to locate: an exact literal for mode='replace'/'insert' (must occur exactly once; a multi-line literal should carry the file's own line endings, as the read_file header reports them — copy the rows read_file returned. A literal the file only holds with other row endings is still matched, with the file's own endings, and the result carries a warning), an RE2 pattern for mode='regex', or the hex/base64 byte sequence when encoding is a binary representation.",
 			},
 			"content": map[string]any{
 				"type":        "string",
@@ -848,6 +941,11 @@ func (t *EditFileTool) Parameters() map[string]any {
 				"type":        "string",
 				"default":     "utf8",
 				"description": "'utf8' (default) text; 'hex'/'base64' treat find/content as literal byte sequences (mode='regex' is rejected); other values are charset labels (gbk, big5, shift_jis, windows-1252) for non-UTF-8 files.",
+			},
+			"eol": map[string]any{
+				"type":        "string",
+				"default":     eolAuto,
+				"description": "'auto' (default) writes content's line endings as the ending the file's own first row break uses (LF, CRLF or CR), so a file stays in the one convention it had; 'keep' writes them exactly as given; 'lf', 'crlf' or 'cr' rewrite them as that ending. Only content is rewritten: find is matched byte for byte and is never rewritten by this — a find the file only holds with other row endings is matched with the file's own ones and reported as a warning — a payload without a line break is written as given, and the file is never rewritten outside the match (convert a file's endings on purpose with mode='regex'). The result names the ending on its first line whenever content's endings were really rewritten. Text edits only: not available with encoding='hex'/'base64'.",
 			},
 		},
 		"required": []string{"path", "find", "content"},
@@ -893,6 +991,14 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	if err != nil {
 		return Fail(err.Error())
 	}
+	eolRaw, _ := stringArg(args, "eol")
+	eolReq, eolErr := parseEOLArg(eolRaw)
+	if eolErr != nil {
+		return Fail(eolErr.Error())
+	}
+	if contentEncodingIsBinary(encoding) && eolReq != eolKeep && eolReq != eolAuto {
+		return Fail(fmt.Sprintf("eol is only available for text edits; with encoding=%s find and content are written as the bytes they decode to", encoding))
+	}
 	if mode == editModeRegex && contentEncodingIsBinary(encoding) {
 		return Fail(fmt.Sprintf("mode='regex' is only supported with text encodings; binary edits with encoding=%s are literal byte-sequence edits", encoding))
 	}
@@ -909,6 +1015,7 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 
 	var matches int
 	var newBytes []byte
+	note, warning, eolField := "", "", ""
 
 	if contentEncodingIsBinary(encoding) {
 		newBytes, matches, err = payloadEditContent(raw, encoding, find, content, mode == editModeInsert)
@@ -920,26 +1027,27 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 		if derr != nil {
 			return Fail(derr.Error())
 		}
-		// CRLF files are matched with LF patterns and restored on write.
-		crlf := hasCRLFLineEndings(text)
-		if crlf {
-			text = normalizeTextToLF(text)
+		// The file is matched as it stands — read_file hands rows over verbatim,
+		// so a find copied from it matches byte for byte — and written back
+		// unchanged outside the match: the file's own endings are never
+		// rewritten behind the model's back (the eol argument below rewrites the
+		// payload it is given instead, and only when it is asked to). A find
+		// spelled with other row endings is matched once more with the file's
+		// own ones and the result says so (see applyTextEdit).
+		before := lineEndingLabelOf(text)
+		// The eol request is answered on the payload alone; find is matched as it
+		// stands and is never rewritten by it (a find the file only holds with
+		// other row endings is a relaxed match that reports itself — see
+		// applyTextEdit and findEndingsWarning).
+		content, eolField = respellPayload(content, eolTarget(eolReq, firstRowEnding(text)), eolReq)
+		after, m, relaxed, eerr := applyTextEdit(text, find, content, mode)
+		if eerr != nil {
+			// Nothing was written, so the eol request has nothing to report.
+			return Fail(eerr.Error())
 		}
-		var after string
-		switch mode {
-		case editModeRegex:
-			after, matches, err = regexReplaceText(text, find, content)
-		case editModeInsert:
-			after, matches, err = insertBeforeText(text, find, content)
-		default:
-			after, matches, err = literalReplaceText(text, find, content)
-		}
-		if err != nil {
-			return Fail(err.Error())
-		}
-		if crlf {
-			after = restoreTextToCRLF(after)
-		}
+		matches = m
+		warning = relaxed
+		note = editLineEndingNote(after, before)
 		newBytes, err = encodeTextToFileBytes(after, encoding)
 		if err != nil {
 			return Fail(err.Error())
@@ -950,22 +1058,251 @@ func (t *EditFileTool) Execute(ctx context.Context, args map[string]any) *Result
 		return Fail(err.Error())
 	}
 
-	return OK(editResultMessage(path, encoding, mode, find, matches))
+	return OK(editResultMessage(path, encoding, mode, find, matches, eolField) + warning + note)
+}
+
+// applyTextEdit runs the edit against the decoded file text. A literal find is
+// matched byte for byte first — read_file hands rows over verbatim, so a find
+// copied from it lands as written. A find the file only holds with other row
+// endings is matched a second time with the file's own ones (see
+// relaxedLiteralEdit): the edit still happens, and the result carries a warning
+// naming the difference, because the bytes that were matched are not spelled the
+// way find spelled them. regex and the byte-level encodings are matched strictly
+// literally and are never relaxed.
+func applyTextEdit(text, find, content, mode string) (result string, matches int, warning string, err error) {
+	if mode == editModeRegex {
+		out, n, rerr := regexReplaceText(text, find, content)
+		return out, n, "", rerr
+	}
+
+	insert := mode == editModeInsert
+	var out string
+	var n int
+	if insert {
+		out, n, err = insertBeforeText(text, find, content)
+	} else {
+		out, n, err = literalReplaceText(text, find, content)
+	}
+	if err == nil {
+		return out, n, "", nil
+	}
+	if !errors.Is(err, errFindNotFound) {
+		// Not a miss (an ambiguous find, say): report it as it is.
+		return "", 0, "", err
+	}
+	miss := err
+
+	relaxed, count, rerr := relaxedLiteralEdit(text, find, content, insert)
+	switch {
+	case rerr != nil || count == 0:
+		// The endings are not the whole difference either (or the find is not
+		// there at all): the miss explains it better than a relaxed count.
+		return "", 0, "", miss
+	case count > 1:
+		return "", 0, "", findEndingsAmbiguousError(count)
+	}
+	return relaxed, 1, findEndingsWarning(text, find), nil
+}
+
+// rowEndingTolerantEnding is what every row ending a literal find carries
+// matches in the relaxed pattern: any of the endings a file may hold, so a find
+// written in one convention can land on a file written in another.
+const rowEndingTolerantEnding = `(?:\r\n|\r|\n)`
+
+// rowEndingTolerantPattern turns a literal find into the pattern the relaxed
+// match runs: every byte find spells is quoted, and each row ending it carries
+// matches any row ending. A find without an ending is its own quoted literal.
+func rowEndingTolerantPattern(find string) string {
+	var b strings.Builder
+	start := 0
+	for i := 0; i < len(find); i++ {
+		if find[i] != '\r' && find[i] != '\n' {
+			continue
+		}
+		b.WriteString(regexp.QuoteMeta(find[start:i]))
+		b.WriteString(rowEndingTolerantEnding)
+		if find[i] == '\r' && i+1 < len(find) && find[i+1] == '\n' {
+			i++
+		}
+		start = i + 1
+	}
+	b.WriteString(regexp.QuoteMeta(find[start:]))
+	return b.String()
+}
+
+// relaxedLiteralEdit applies a literal replace or insert across the row endings:
+// the find is matched on a pattern in which each ending it spells matches any
+// ending, so it lands on the bytes the file really holds — those bytes are what
+// gets edited, and every other row keeps its own ending. insert keeps the match
+// and writes content in front of it. count is how many places the find matches
+// that way (the caller requires exactly one); it is 0 when the find is not there
+// at all, and more than one when ignoring the endings made it ambiguous. content
+// is written verbatim: nothing in it is expanded, unlike mode='regex'.
+func relaxedLiteralEdit(text, find, content string, insert bool) (string, int, error) {
+	re, err := regexp.Compile(rowEndingTolerantPattern(find))
+	if err != nil {
+		return "", 0, err
+	}
+	locs := re.FindAllStringIndex(text, -1)
+	switch {
+	case len(locs) == 0:
+		return "", 0, nil
+	case len(locs) > 1:
+		return "", len(locs), nil
+	}
+	start, end := locs[0][0], locs[0][1]
+	if insert {
+		return text[:start] + content + text[start:], 1, nil
+	}
+	return text[:start] + content + text[end:], 1, nil
+}
+
+// findEndingsAmbiguousError is the relaxed match's not-unique error: the find is
+// not in the file byte for byte, and ignoring the row endings leaves more than
+// one place it could land on, so nothing was written.
+func findEndingsAmbiguousError(count int) error {
+	return fmt.Errorf("%w: the file holds that text %d times with its own row endings; matching it while "+
+		"ignoring the endings is ambiguous, so nothing was written. Add more context to make it unique, "+
+		"or send the endings the file has (copy the rows read_file returned)", errFindNotFound, count)
+}
+
+// findEndingsWarning is the note an edit carries when its literal find was not in
+// the file byte for byte and was matched with the file's own row endings instead.
+// The edit did happen — that is what the relaxed match is for — but it happened
+// on bytes spelled differently than find asked for, so the difference is named
+// rather than absorbed silently, and the note says the edit stayed inside the
+// matched range.
+func findEndingsWarning(text, find string) string {
+	return fmt.Sprintf(" | warning: `find` spells row endings the file does not hold (%s vs %s); "+
+		"the match was made with the file's own endings, and only the matched range was touched",
+		rowEndingPhrase(lineEndingLabelOf(find)), rowEndingPhrase(lineEndingLabelOf(text)))
+}
+
+// rowEndingPhrase spells a row-ending label out for a sentence: the escape the
+// text carries together with the label's name ("\\r\\n (CRLF)"), and a plain
+// phrase for a text that mixes endings or has none.
+func rowEndingPhrase(label string) string {
+	if esc := eolBytes(label); esc != "" {
+		return fmt.Sprintf("%s (%s)", esc, label)
+	}
+	if label == "mixed" {
+		return "mixed endings"
+	}
+	return "no row ending at all"
+}
+
+// eolSpelling renders a row ending the way a result talks about it: the escape
+// text a payload carries together with the ending's name ("\r\n (CRLF)").
+func eolSpelling(sep string) string {
+	label := lineEndingLabelOf(sep)
+	return fmt.Sprintf("%s (%s)", eolBytes(label), label)
+}
+
+// eolTarget resolves an eol request into the ending the payload has to be written
+// with: "" means it is written exactly as given. fileEnding is the ending the
+// target file's first row break uses (what 'auto' follows); it is "" when the
+// file does not exist yet, is empty, or holds no row break at all.
+func eolTarget(requested, fileEnding string) string {
+	switch requested {
+	case eolKeep:
+		return ""
+	case eolAuto:
+		return fileEnding
+	}
+	return requested
+}
+
+// respellPayload answers an eol request on a payload that is about to be written:
+// the payload written with sep, plus the field the result's first line carries
+// about it. The field is empty — nothing is said — unless the payload's own
+// endings are really rewritten: a payload already written with that ending, or
+// one without a row break at all, is left exactly as it came in.
+func respellPayload(payload, sep, requested string) (string, string) {
+	if sep == "" {
+		return payload, ""
+	}
+	rewritten := writeLineEndingsAs(payload, sep)
+	if rewritten == payload {
+		return payload, ""
+	}
+	source := "as asked"
+	if requested == eolAuto {
+		source = "following the file"
+	}
+	return rewritten, fmt.Sprintf(" | eol: content written with %s, %s", eolSpelling(sep), source)
+}
+
+// detectFileEOL reports the row ending the file at path opens with: the ending of
+// its first row break, which is what an 'auto' request follows even when the rest
+// of the file mixes endings. It is "" when the file does not exist, cannot be
+// read or decoded, or holds no row break at all — there is then nothing to
+// follow, and the payload is written as it was given.
+func detectFileEOL(path, encoding string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	text, err := decodeFileBytesToText(raw, encoding)
+	if err != nil {
+		return ""
+	}
+	return firstRowEnding(text)
+}
+
+// editLineEndingNote explains a result whose row endings are worth a word: an
+// edit whose content mixed the file's endings, or one that changed the file's
+// convention. It reports — it never rewrites. beforeLabel is the label of the
+// file as it was found.
+func editLineEndingNote(after, beforeLabel string) string {
+	var b strings.Builder
+	afterLabel := lineEndingLabelOf(after)
+	switch {
+	case beforeLabel != afterLabel && afterLabel == "mixed":
+		b.WriteString(" | note: the file's rows now mix endings — the content's row endings differ from the file's")
+		if seq := eolBytes(beforeLabel); seq != "" {
+			fmt.Fprintf(&b, " (write them as %s to match)", seq)
+		}
+		b.WriteString("; use mode='regex' to change a file's endings on purpose")
+	case isUniformEOL(beforeLabel) && isUniformEOL(afterLabel) && beforeLabel != afterLabel:
+		fmt.Fprintf(&b, " | note: the file's row endings changed from %s to %s", beforeLabel, afterLabel)
+	}
+	return b.String()
+}
+
+// isUniformEOL reports whether a label names one row ending a payload can be
+// written with ("LF", "CRLF" or "CR"); "mixed" and "none" name no convention.
+func isUniformEOL(label string) bool { return eolBytes(label) != "" }
+
+// eolBytes is the escape a payload has to carry for a uniform row-ending label
+// ("\n" for an LF file, and so on); an empty string when the label names no
+// single convention.
+func eolBytes(label string) string {
+	switch label {
+	case "LF":
+		return "\\n"
+	case "CRLF":
+		return "\\r\\n"
+	case "CR":
+		return "\\r"
+	}
+	return ""
 }
 
 // editResultMessage reports what the edit did, including how many occurrences
-// were matched: regex mode may legitimately hit more than one.
-func editResultMessage(path, encoding, mode, find string, matches int) string {
+// were matched: regex mode may legitimately hit more than one. eolField is the
+// clause an eol request added to the first line ("" when no ending was rewritten,
+// so a default edit's line reads exactly as it always did).
+func editResultMessage(path, encoding, mode, find string, matches int, eolField string) string {
 	switch mode {
 	case editModeInsert:
-		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s | content inserted before the match (1 occurrence)",
-			path, mode, encoding)
+		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s%s | content inserted before the match (1 occurrence)",
+			path, mode, encoding, eolField)
 	case editModeRegex:
-		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s | regex %q matched %d occurrence(s), all replaced",
-			path, mode, encoding, find, matches)
+		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s%s | regex %q matched %d occurrence(s), all replaced",
+			path, mode, encoding, eolField, find, matches)
 	default:
-		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s | replaced %d occurrence(s)",
-			path, mode, encoding, matches)
+		return fmt.Sprintf("File edited: %s | mode=%s | encoding=%s%s | replaced %d occurrence(s)",
+			path, mode, encoding, eolField, matches)
 	}
 }
 
@@ -1020,15 +1357,57 @@ func literalReplaceText(text, find, content string) (string, int, error) {
 // bound at all.
 const mismatchDiagnosticMaxBytes = 2 << 10
 
+// errFindNotFound is the miss a literal find reports. The caller tells it apart
+// from an ambiguous hit to decide whether matching the find across the row
+// endings is worth a try.
+var errFindNotFound = errors.New("`find` not found in file")
+
 // findNotFoundError is the error of a find that matched nothing in text: the
-// plain message, or one carrying the mismatch diagnostic when there is one to
-// give. Both literal modes share it, so an insert that misses its anchor is
-// explained the same way a replace is.
+// plain message, one that calls out a find the file holds with other row endings
+// (the fallback for a relaxed match that could not settle the spot — nothing is
+// written for it, so the find has to be sent the way the file spells it), or one
+// carrying the mismatch diagnostic when there is one to give. Both literal modes
+// share it, so an insert that misses its anchor is explained the same way a
+// replace is. The file's own row endings are named when they are not plain LF,
+// and the diagnostic runs over a flat LF view, so its line numbers and excerpt
+// read the same whatever the endings are.
 func findNotFoundError(text, find string) error {
-	if diag := findMismatchDiagnostic(text, find); diag != "" {
-		return fmt.Errorf("`find` not found in file. %s", diag)
+	hint := eolFindHint(text)
+	if findDiffersOnlyByEndings(text, find) {
+		return fmt.Errorf("%w: the file holds that text, but with different row endings. "+
+			"%s`find` is matched byte for byte and is never rewritten, so nothing was written: "+
+			"send the endings the file has (copy the rows read_file returned) and call again.",
+			errFindNotFound, hint)
 	}
-	return fmt.Errorf("`find` not found in file. Make sure it matches exactly")
+	if diag := findMismatchDiagnostic(normalizeTextLinesToLF(text), normalizeTextLinesToLF(find)); diag != "" {
+		return fmt.Errorf("%w. %s%s", errFindNotFound, hint, diag)
+	}
+	return fmt.Errorf("%w. %sMake sure it matches exactly", errFindNotFound, hint)
+}
+
+// findDiffersOnlyByEndings reports whether a find the file does not hold verbatim
+// is in it once both sides are read with plain LF row endings — i.e. row endings
+// are the whole difference. A find without a row ending of its own cannot differ
+// that way: it would be in the file verbatim.
+func findDiffersOnlyByEndings(text, find string) bool {
+	if !strings.ContainsAny(find, "\r\n") {
+		return false
+	}
+	return strings.Contains(normalizeTextLinesToLF(text), normalizeTextLinesToLF(find))
+}
+
+// eolFindHint names the row endings a multi-line find has to reproduce, for a
+// file whose rows do not end with plain LF (the default says nothing).
+func eolFindHint(text string) string {
+	switch lineEndingLabelOf(text) {
+	case "CRLF":
+		return "The file's rows end with \\r\\n; a multi-line find has to spell that out. "
+	case "CR":
+		return "The file's rows end with a single \\r; a multi-line find has to spell that out. "
+	case "mixed":
+		return "The file's rows mix endings; a multi-line find has to match them as they are. "
+	}
+	return ""
 }
 
 // findNotUniqueError is the error of a find that matched more than once. Both

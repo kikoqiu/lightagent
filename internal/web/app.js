@@ -1105,10 +1105,22 @@
     return Date.now() - started >= MD_SLICE_MS;
   }
 
+  // displayText rewrites a row's row endings for the screen: a file read verbatim
+  // may carry CRLF or a lone CR (a classic-Mac file), and a browser draws both
+  // inside exactly one long row. Every renderer in the page looks for \n (the
+  // stream split, marked's breaks option, the pre-wrap text), so the drawn copy
+  // gets LF endings. Only the drawn copy changes: setSpan keeps the row's exact
+  // source aside for the copy control first.
+  function displayText(text) {
+    return text.indexOf('\r') < 0 ? text : text.replace(/\r\n?/g, '\n');
+  }
+
   function setSpan(span, text, renderMD) {
     // The source text is kept aside before anything is drawn: the copy control
     // needs it in every branch below.
     if (span) { rowSource.set(span, text); }
+    // Drawn with LF endings, whatever the source used (see displayText).
+    text = displayText(text);
     // While a snapshot is being replayed the markdown pass is deferred: the row is
     // drawn as plain text now and upgraded in an idle slice (see queueMarkdown).
     // Parsing thousands of rows as one long task is what froze the tab (and hid the

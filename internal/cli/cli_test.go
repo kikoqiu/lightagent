@@ -301,6 +301,27 @@ func TestShowHistoryHonorsTheResultSwitch(t *testing.T) {
 	}
 }
 
+// TestToolResultDrawsCREndingsAsBreaks pins the display path of a result the file
+// tools now hand over verbatim: CRLF and lone-CR rows reach the terminal as plain
+// breaks, never as a bare CR (which would move the cursor back over its row).
+func TestToolResultDrawsCREndingsAsBreaks(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.render(agent.Event{Type: agent.EventToolResult, Name: "read_file", Text: "one\r\ntwo\rthree\r"})
+	got := buf.String()
+	if strings.Contains(got, "\r") {
+		t.Fatalf("a bare CR reached the terminal: %q", got)
+	}
+	for _, want := range []string{"[result]", "one", "two", "three"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the result is missing %q:\n%s", want, got)
+		}
+	}
+}
+
 // TestInterruptAffordances covers the console interrupt markers: the interrupted
 // event renders a marker and /stop reports when there is nothing to stop.
 func TestInterruptAffordances(t *testing.T) {

@@ -88,8 +88,10 @@ func TestReadFileAutoDetectsUTF16(t *testing.T) {
 					if !strings.Contains(res.ForLLM, "eol: "+wantEOL) {
 						t.Errorf("header does not report %s endings: %s", wantEOL, res.ForLLM)
 					}
-					if got := readFileBody(t, res.ForLLM); got != strings.Join(lines, "\n") {
-						t.Errorf("content = %q, want %q", got, strings.Join(lines, "\n"))
+					// Rows come back verbatim, so the CRLF file's rows keep
+					// their own endings.
+					if got := readFileBody(t, res.ForLLM); got != text {
+						t.Errorf("content = %q, want %q", got, text)
 					}
 				})
 			}
@@ -103,9 +105,11 @@ func TestReadFileUTF16SingleLine(t *testing.T) {
 	cases := []struct {
 		name string
 		text string
+		want string
 	}{
-		{"no-terminator", "the only line"},
-		{"crlf", "the only line\r\n"},
+		{"no-terminator", "the only line", "the only line"},
+		// A single CRLF row is returned with its break.
+		{"crlf", "the only line\r\n", "the only line\r\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,8 +118,8 @@ func TestReadFileUTF16SingleLine(t *testing.T) {
 			if res.IsError {
 				t.Fatalf("read failed: %s", res.ForLLM)
 			}
-			if got := readFileBody(t, res.ForLLM); got != "the only line" {
-				t.Errorf("content = %q, want %q", got, "the only line")
+			if got := readFileBody(t, res.ForLLM); got != tc.want {
+				t.Errorf("content = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -135,7 +139,7 @@ func TestReadFileBOMStrippedEverywhere(t *testing.T) {
 	labels := map[string]string{"utf16le": "utf-16le", "utf16be": "utf-16be", "utf32le": "utf-32le", "utf32be": "utf-32be"}
 	for name, data := range fixtures {
 		p := writeRawFile(t, t.TempDir(), name+".txt", data)
-		want := "first\nsecond"
+		want := "first\nsecond\n"
 		t.Run(name+"/auto", func(t *testing.T) {
 			res := NewReadFileLinesTool(FsConfig{}).Execute(context.Background(), map[string]any{"path": p})
 			if res.IsError {
@@ -164,7 +168,8 @@ func TestReadFileBOMStrippedEverywhere(t *testing.T) {
 }
 
 // TestReadFilePaginationUTF16 jets to line 100 of a UTF-16 file and checks that
-// the reported line numbers and the rows line up with the original text.
+// the reported line numbers and the rows line up with the original text. The
+// rows keep their own CRLF endings.
 func TestReadFilePaginationUTF16(t *testing.T) {
 	var lines []string
 	for i := 1; i <= 200; i++ {
@@ -182,7 +187,7 @@ func TestReadFilePaginationUTF16(t *testing.T) {
 	if !strings.Contains(res.ForLLM, "lines 100-102") {
 		t.Errorf("header range wrong: %s", res.ForLLM)
 	}
-	want := strings.Join(lines[99:102], "\n")
+	want := strings.Join(lines[99:102], "\r\n") + "\r\n"
 	if got := readFileBody(t, res.ForLLM); got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
@@ -433,8 +438,8 @@ func TestReadFileUserReportedUTF16Cases(t *testing.T) {
 		{"B-utf16le-nobom-multiline", utf16Bytes(t, src, unicode.LittleEndian, false), src},
 		{"C-utf16be-bom-multiline", utf16Bytes(t, src, unicode.BigEndian, true), src},
 		{"D-utf16le-single-nonl", utf16Bytes(t, "第一行 first", unicode.LittleEndian, true), "第一行 first"},
-		{"E-utf16le-single-crlf", utf16Bytes(t, "第一行 first\r\n", unicode.LittleEndian, true), "第一行 first"},
-		{"F-powershell-redirect-le-bom", utf16Bytes(t, src+"\r\n", unicode.LittleEndian, true), src},
+		{"E-utf16le-single-crlf", utf16Bytes(t, "第一行 first\r\n", unicode.LittleEndian, true), "第一行 first\r\n"},
+		{"F-powershell-redirect-le-bom", utf16Bytes(t, src+"\r\n", unicode.LittleEndian, true), src + "\r\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -472,8 +477,8 @@ func TestReadFileKeepBOM(t *testing.T) {
 	if !strings.HasPrefix(body, "\uFEFF") {
 		t.Errorf("keep_bom=true should retain the mark, got %q", body)
 	}
-	if !strings.HasSuffix(body, "first\nsecond") {
-		t.Errorf("content = %q, want it to end with %q", body, "first\nsecond")
+	if !strings.HasSuffix(body, "first\nsecond\n") {
+		t.Errorf("content = %q, want it to end with %q", body, "first\nsecond\n")
 	}
 }
 
@@ -575,8 +580,8 @@ func TestReadFileUTF8SigLabel(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("read failed: %s", res.ForLLM)
 	}
-	if got := readFileBody(t, res.ForLLM); got != "first\nsecond" {
-		t.Errorf("content = %q, want %q", got, "first\nsecond")
+	if got := readFileBody(t, res.ForLLM); got != "first\nsecond\n" {
+		t.Errorf("content = %q, want %q", got, "first\nsecond\n")
 	}
 }
 
@@ -644,7 +649,7 @@ func TestWriteFileBOMBehavior(t *testing.T) {
 	if read.IsError {
 		t.Fatalf("read back: %s", read.ForLLM)
 	}
-	if got := readFileBody(t, read.ForLLM); got != "one\ntwo" {
-		t.Errorf("content = %q, want %q", got, "one\ntwo")
+	if got := readFileBody(t, read.ForLLM); got != "one\ntwo\n" {
+		t.Errorf("content = %q, want %q", got, "one\ntwo\n")
 	}
 }

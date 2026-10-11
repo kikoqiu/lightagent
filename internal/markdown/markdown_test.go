@@ -111,6 +111,56 @@ func TestStreamPending(t *testing.T) {
 	}
 }
 
+// TestStreamDrawsCREndingsAsBreaks pins the CR handling: a file read verbatim can
+// carry CRLF or a lone CR (a classic-Mac file), and neither may reach the screen
+// as a bare CR — the terminal would move its cursor back over the row.
+func TestStreamDrawsCREndingsAsBreaks(t *testing.T) {
+	original := termcolor.Enabled()
+	termcolor.SetEnabled(false)
+	t.Cleanup(func() { termcolor.SetEnabled(original) })
+
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"crlf", "one\r\ntwo\r\n", "one\ntwo\n"},
+		{"lone cr", "one\rtwo\r", "one\ntwo\n"},
+		{"mixed", "one\ntwo\r\nthree\r", "one\ntwo\nthree\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ANSI(tc.input)
+			if got != tc.want {
+				t.Fatalf("ANSI(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStreamHoldsATrailingCR pins the chunk boundary: a CR that ends a chunk may
+// still turn out to be the first half of a CRLF, so it is held back instead of
+// being drawn as a break of its own.
+func TestStreamHoldsATrailingCR(t *testing.T) {
+	original := termcolor.Enabled()
+	termcolor.SetEnabled(false)
+	t.Cleanup(func() { termcolor.SetEnabled(original) })
+
+	s := NewStream()
+	if got := s.Write("one\r"); got != "" {
+		t.Fatalf("Write returned %q, want nothing while the CR may still be a CRLF", got)
+	}
+	if got := s.Pending(); got != "one" {
+		t.Fatalf("Pending() = %q, want the row without its CR", got)
+	}
+	if got := s.Write("\ntwo\r\n"); got != "one\ntwo\n" {
+		t.Fatalf("Write = %q, want both rows", got)
+	}
+	if got := s.Flush(); got != "" {
+		t.Fatalf("Flush() = %q, want empty", got)
+	}
+}
+
 func TestANSIDegradesToPlainText(t *testing.T) {
 	original := termcolor.Enabled()
 	termcolor.SetEnabled(false)

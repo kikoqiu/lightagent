@@ -316,6 +316,21 @@ func (c *CLI) rawLocked(s string) {
 	c.lineStart = strings.HasSuffix(s, "\n")
 }
 
+// displayText rewrites the row endings of text that is printed as it stands (a
+// tool result, an info line, a message restored from a session): the file tools
+// hand rows over verbatim now, and a lone CR would move the terminal's cursor
+// back over the row it ends. CRLF and CR both become the one break a terminal
+// has, so a CRLF file reads exactly as before and a classic-Mac file stops
+// overwriting itself. This is a display rewrite only — what is stored in the
+// session keeps its bytes. Streamed replies never come through here: the markdown
+// stream draws their rows itself (with markdown off they are printed raw).
+func displayText(s string) string {
+	if !strings.ContainsRune(s, '\r') {
+		return s
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
 // promptLabel is the input prompt text.
 const promptLabel = "> "
 
@@ -1414,7 +1429,7 @@ func (c *CLI) render(ev agent.Event) {
 		// nor settles a pending line. messageLine labels it "engine".
 		if agent.IsEngineNote(ev.Text) {
 			c.flushMarkdownLocked()
-			c.writeStampedLocked(messageLine(ev.Source, ev.Text)+"\n", ev.Time)
+			c.writeStampedLocked(messageLine(ev.Source, displayText(ev.Text))+"\n", ev.Time)
 			return
 		}
 		// A user message starts a turn (or steers a running one), so mark the
@@ -1440,7 +1455,7 @@ func (c *CLI) render(ev agent.Event) {
 			c.settlePendingSendLocked(ev.Text)
 		}
 		c.flushMarkdownLocked()
-		c.writeStampedLocked(messageLine(ev.Source, ev.Text)+"\n", ev.Time)
+		c.writeStampedLocked(messageLine(ev.Source, displayText(ev.Text))+"\n", ev.Time)
 	case agent.EventAssistantDelta:
 		if !c.streaming {
 			// The reply's first chunk: remember when it began, so a flush that
@@ -1467,7 +1482,7 @@ func (c *CLI) render(ev agent.Event) {
 			}
 			c.md.Reset()
 		} else if !c.streaming {
-			c.writeStampedLocked(ev.Text, ev.Time)
+			c.writeStampedLocked(displayText(ev.Text), ev.Time)
 		}
 		c.outLocked("\n\n")
 		c.streaming = false
@@ -1498,27 +1513,27 @@ func (c *CLI) render(ev agent.Event) {
 		if ev.IsError {
 			color = termcolor.Red
 		}
-		body := indentAfterFirst(clipForDisplay(ev.Text, resultDisplayLines, resultDisplayChars), "  ")
+		body := indentAfterFirst(clipForDisplay(displayText(ev.Text), resultDisplayLines, resultDisplayChars), "  ")
 		c.outLocked(color("[result] "+body) + "\n")
 	case agent.EventCompacted:
 		c.flushMarkdownLocked()
 		c.endLineLocked()
-		c.outLocked(termcolor.Cyan("[info] ") + ev.Text + "\n")
+		c.outLocked(termcolor.Cyan("[info] ") + displayText(ev.Text) + "\n")
 		// The summary replaced the messages that were just cut out of the
 		// context, so it is printed right at the truncation point.
 		c.writeSummaryLocked(ev.Summary, ev.Time)
 	case agent.EventInfo:
 		c.flushMarkdownLocked()
 		c.endLineLocked()
-		c.outLocked(termcolor.Cyan("[info] ") + ev.Text + "\n")
+		c.outLocked(termcolor.Cyan("[info] ") + displayText(ev.Text) + "\n")
 	case agent.EventInterrupted:
 		c.flushMarkdownLocked()
 		c.endLineLocked()
-		c.outLocked(termcolor.Yellow("[interrupted] ") + ev.Text + "\n")
+		c.outLocked(termcolor.Yellow("[interrupted] ") + displayText(ev.Text) + "\n")
 	case agent.EventError:
 		c.flushMarkdownLocked()
 		c.endLineLocked()
-		c.outLocked(termcolor.Red("[error] ") + ev.Text + "\n")
+		c.outLocked(termcolor.Red("[error] ") + displayText(ev.Text) + "\n")
 	case agent.EventUsage:
 		// Keep the latest numbers; the prompt repaint below (editing mode) draws
 		// them, so the usage updates live while the tool loop is still running.
@@ -1795,7 +1810,7 @@ const summaryMarker = "older messages are condensed into the summary below"
 // which carries no moment of its own) simply draws none. The caller must hold
 // c.mu.
 func (c *CLI) writeSummaryLocked(summary string, stamp time.Time) {
-	summary = strings.TrimSpace(summary)
+	summary = displayText(strings.TrimSpace(summary))
 	if summary == "" {
 		return
 	}
@@ -1834,7 +1849,7 @@ func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
 			// not recorded) and no start time, so it carries the plain prompt
 			// label, exactly like a line typed in this terminal — except an
 			// engine-inserted note, which userLine labels "engine".
-			c.write(userLine(m.Content) + "\n")
+			c.write(userLine(displayText(m.Content)) + "\n")
 		case "assistant":
 			// Same order as the live transcript: the thinking block opens the
 			// reply, then its visible answer, then one [tool] row per call.

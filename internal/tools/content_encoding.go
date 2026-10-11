@@ -564,19 +564,101 @@ func decodeBase64Data(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(cleaned)
 }
 
-// CRLF helpers shared by the text-oriented file tools.
+// Row-ending helpers shared by the text-oriented file tools. read_file returns
+// rows verbatim, so these describe a text's endings (what the header and a
+// failed find report) or rewrite a *payload* to a known convention — never a
+// file behind the model's back.
 
-// hasCRLFLineEndings reports whether text contains CRLF line endings.
-func hasCRLFLineEndings(text string) bool {
-	return strings.Contains(text, "\r\n")
+// lineEndingCounts counts a text's row terminators: CRLF pairs first, then the
+// lone LFs and lone CRs left over.
+func lineEndingCounts(text string) (lf, crlf, cr int) {
+	crlf = strings.Count(text, "\r\n")
+	rest := strings.ReplaceAll(text, "\r\n", "")
+	return strings.Count(rest, "\n"), crlf, strings.Count(rest, "\r")
 }
 
-// normalizeTextToLF converts every CRLF line ending to LF.
+// normalizeTextToLF converts CRLF row endings to LF. A lone CR is left alone:
+// only a convention that names CR as the row ending may read it that way.
 func normalizeTextToLF(text string) string {
 	return strings.ReplaceAll(text, "\r\n", "\n")
 }
 
-// restoreTextToCRLF converts every LF line ending back to CRLF.
-func restoreTextToCRLF(text string) string {
-	return strings.ReplaceAll(text, "\n", "\r\n")
+// normalizeTextLinesToLF makes every row ending plain LF, CRLF pairs and lone
+// CRs alike: the flat view a mismatch diagnostic is rendered in, so its line
+// numbers and excerpt read the same whatever the file's endings are.
+func normalizeTextLinesToLF(text string) string {
+	return strings.ReplaceAll(normalizeTextToLF(text), "\r", "\n")
+}
+
+// writeLineEndingsAs rewrites a payload's own row endings as sep ("\n", "\r\n"
+// or "\r"). It is how a find or content written in one convention is spelled in
+// another, so the payload matches the bytes a file really holds.
+func writeLineEndingsAs(text, sep string) string {
+	if !strings.ContainsAny(text, "\r\n") {
+		return text
+	}
+	return strings.ReplaceAll(normalizeTextLinesToLF(text), "\n", sep)
+}
+
+// hasRowEndingSuffix reports whether a payload ends with a row ending at all: LF,
+// CRLF or a lone CR, the three endings a text payload may be written with.
+func hasRowEndingSuffix(text string) bool {
+	return strings.HasSuffix(text, "\n") || strings.HasSuffix(text, "\r")
+}
+
+// firstRowEnding reports the row ending a text opens with: the ending of its very
+// first break, whatever the rest of the text uses. An 'auto' request follows it,
+// so even a file with mixed endings names one convention instead of leaving the
+// payload as given. It is "" when the text has no break at all.
+func firstRowEnding(text string) string {
+	i := strings.IndexAny(text, "\r\n")
+	switch {
+	case i < 0:
+		return ""
+	case text[i] == '\n':
+		return "\n"
+	case i+1 < len(text) && text[i+1] == '\n':
+		return "\r\n"
+	}
+	return "\r"
+}
+
+// Row-ending requests accepted by the "eol" argument of the writing tools.
+const (
+	// eolAuto writes a payload's row endings the way the target file's own first
+	// row break spells them, so a file stays in the one convention it had. It is
+	// the default.
+	eolAuto = "auto"
+	// eolKeep writes them exactly as given (the writing tools then never rewrite
+	// an ending at all).
+	eolKeep = "keep"
+)
+
+// parseEOLArg validates the "eol" argument shared by write_file and edit_file. An
+// omitted value and "auto" write a payload's row endings the way the target
+// file's own first row break spells them; "keep" leaves them exactly as given;
+// "lf", "crlf" and "cr" name the ending to write them with, and so does the
+// ending's own bytes (a caller that sends a literal "\n" means the same as "lf").
+// The result is eolAuto, eolKeep, or the ending sequence to write the payload
+// with.
+func parseEOLArg(raw string) (string, error) {
+	// The ending's own bytes are accepted as they are: trimming would eat them.
+	switch raw {
+	case "\n", "\r\n", "\r":
+		return raw, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", eolAuto:
+		return eolAuto, nil
+	case eolKeep:
+		return eolKeep, nil
+	case "lf":
+		return "\n", nil
+	case "crlf":
+		return "\r\n", nil
+	case "cr":
+		return "\r", nil
+	}
+	return "", fmt.Errorf("invalid eol %q: use 'auto' (default; write the endings the file's first row break uses), "+
+		"'keep' (write them as given), 'lf', 'crlf' or 'cr'", raw)
 }

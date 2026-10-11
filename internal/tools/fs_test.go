@@ -62,6 +62,45 @@ func TestReadFileLinesEOF(t *testing.T) {
 	}
 }
 
+// TestReadFileRowsAreVerbatim pins the read contract the file tools share: rows
+// come back exactly as the file holds them, each with its own ending, so a find
+// copied from a read matches byte for byte and a file that ends without a break
+// says so. The header spells the endings out (they are invisible once drawn),
+// and it adds no note for the plain LF default.
+func TestReadFileRowsAreVerbatim(t *testing.T) {
+	cases := []struct {
+		name     string
+		content  string
+		wantEOL  string
+		wantHint bool
+	}{
+		{"lf", "one\ntwo\n", "LF", false},
+		{"crlf", "one\r\ntwo\r\n", "CRLF", true},
+		{"cr", "one\rtwo\r", "CR", true},
+		{"mixed", "one\ntwo\r\nthree\r", "mixed", true},
+		{"no-final-newline", "one\ntwo", "LF", false},
+		{"single-row", "only", "none", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := writeFile(t, t.TempDir(), "rows.txt", tc.content)
+			res := NewReadFileLinesTool(FsConfig{}).Execute(context.Background(), map[string]any{"path": p})
+			if res.IsError {
+				t.Fatalf("read failed: %s", res.ForLLM)
+			}
+			if got := readFileBody(t, res.ForLLM); got != tc.content {
+				t.Errorf("content = %q, want %q", got, tc.content)
+			}
+			if !strings.Contains(res.ForLLM, "eol: "+tc.wantEOL) {
+				t.Errorf("header does not report %s: %s", tc.wantEOL, res.ForLLM)
+			}
+			if got := strings.Contains(res.ForLLM, "eol: "+tc.wantEOL+" ("); got != tc.wantHint {
+				t.Errorf("ending hint present = %v, want %v: %s", got, tc.wantHint, res.ForLLM)
+			}
+		})
+	}
+}
+
 // TestReadFileToolName pins the advertised tool name.
 func TestReadFileToolName(t *testing.T) {
 	if got := NewReadFileLinesTool(FsConfig{}).Name(); got != "read_file" {
@@ -105,7 +144,7 @@ func TestReadFileAutoStripsBOM(t *testing.T) {
 	if !strings.Contains(res.ForLLM, "encoding: utf-8") {
 		t.Fatalf("header missing the detected encoding: %s", res.ForLLM)
 	}
-	if !strings.HasSuffix(res.ForLLM, "\nfirst\nsecond") {
+	if !strings.HasSuffix(res.ForLLM, "\nfirst\nsecond\n") {
 		t.Fatalf("BOM not stripped or content wrong: %q", res.ForLLM)
 	}
 }
@@ -880,20 +919,193 @@ func TestEditFileCRLFPreserved(t *testing.T) {
 	}
 }
 
-// TestEditFileInsertCRLFPreserved keeps the line-ending contract in insert
-// mode too: the restored CRLF file gets CRLF line endings inside the inserted
-// text as well.
-func TestEditFileInsertCRLFPreserved(t *testing.T) {
+// TestEditFileInsertContentWrittenVerbatim pins the eol=keep contract: content is
+// written exactly as it was given, so LF content inserted into a CRLF file mixes
+// the file's endings — the edit reports that instead of rewriting anything. (The
+// default, eol='auto', would write the content with the file's own ending.)
+func TestEditFileInsertContentWrittenVerbatim(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "crlf_ins.txt", "one\r\ntwo\r\n")
 	tool := NewEditFileTool()
 	res := tool.Execute(context.Background(), map[string]any{
-		"path": p, "find": "two", "content": "mid\n", "mode": "insert",
+		"path": p, "find": "two", "content": "mid\n", "mode": "insert", "eol": "keep",
 	})
 	if res.IsError {
 		t.Fatalf("unexpected error: %s", res.ForLLM)
 	}
+	if got := readFile(t, p); got != "one\r\nmid\ntwo\r\n" {
+		t.Fatalf("content = %q, want the content written verbatim", got)
+	}
+	if !strings.Contains(res.ForLLM, "mix endings") {
+		t.Fatalf("the mixed result was not reported: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileContentKeepsItsOwnCRLF is the other half of that contract: content
+// that carries the file's own CRLF is written as it is. The old whole-file
+// "restore CRLF" pass rewrote it a second time, producing \r\r\n.
+func TestEditFileContentKeepsItsOwnCRLF(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "crlf_content.txt", "one\r\ntwo\r\n")
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "two", "content": "x\r\ny",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "one\r\nx\r\ny\r\n" {
+		t.Fatalf("content = %q, want %q", got, "one\r\nx\r\ny\r\n")
+	}
+}
+
+// TestEditFileFindEndingsRelaxedMatch pins the relaxed literal contract: find is
+// matched byte for byte first, and a find the file only holds with other row
+// endings is matched anyway — with the file's own endings, inside the file's own
+// bytes — and the result says so in a warning that names both spellings. A find
+// written the file's way stays silent.
+func TestEditFileFindEndingsRelaxedMatch(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "relaxed.txt", "hello\r\nworld\r\nfoo\r\n")
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "world\nfoo", "content": "X\nY",
+	})
+	if res.IsError {
+		t.Fatalf("a find with other row endings was not matched: %s", res.ForLLM)
+	}
+	for _, want := range []string{"warning:", "\\n (LF)", "\\r\\n (CRLF)", "only the matched range"} {
+		if !strings.Contains(res.ForLLM, want) {
+			t.Errorf("the relaxed match does not report %q: %s", want, res.ForLLM)
+		}
+	}
+	if got := readFile(t, p); got != "hello\r\nX\r\nY\r\n" {
+		t.Fatalf("file = %q, want the match replaced with the file's own endings", got)
+	}
+
+	// The same find written the file's way matches byte for byte: no warning.
+	p = writeFile(t, t.TempDir(), "verbatim.txt", "hello\r\nworld\r\nfoo\r\n")
+	res = tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "world\r\nfoo", "content": "X\nY",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "hello\r\nX\r\nY\r\n" {
+		t.Fatalf("content = %q", got)
+	}
+	if strings.Contains(res.ForLLM, "warning:") {
+		t.Errorf("a byte-for-byte match was reported as relaxed: %s", res.ForLLM)
+	}
+
+	// insert is relaxed the same way and keeps the anchor: only the anchor's
+	// endings are taken from the file.
+	p = writeFile(t, t.TempDir(), "relaxed_insert.txt", "one\r\ntwo\r\n")
+	res = tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "two\n", "content": "mid\r\n", "mode": "insert",
+	})
+	if res.IsError {
+		t.Fatalf("a relaxed insert failed: %s", res.ForLLM)
+	}
 	if got := readFile(t, p); got != "one\r\nmid\r\ntwo\r\n" {
-		t.Fatalf("CRLF not preserved: %q", got)
+		t.Fatalf("content = %q, want the anchor kept", got)
+	}
+	if !strings.Contains(res.ForLLM, "warning:") {
+		t.Errorf("a relaxed insert was not reported: %s", res.ForLLM)
+	}
+
+	// The other direction counts too: a find written with CRLF lands on an LF
+	// file, and the file's own endings are what stays written.
+	p = writeFile(t, t.TempDir(), "lf.txt", "one\ntwo\n")
+	res = tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "one\r\ntwo", "content": "X",
+	})
+	if res.IsError {
+		t.Fatalf("a CRLF find did not land on an LF file: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "X\n" {
+		t.Fatalf("file = %q, want the match replaced", got)
+	}
+	if !strings.Contains(res.ForLLM, "\\r\\n (CRLF)") || !strings.Contains(res.ForLLM, "\\n (LF)") {
+		t.Errorf("the warning does not name both spellings: %s", res.ForLLM)
+	}
+}
+
+// TestEditFileRegexEndingsAreNotRelaxed pins that the relaxed match belongs to
+// the literal modes alone: mode='regex' runs the pattern against the text as it
+// stands, so a pattern whose \n cannot reach a CRLF file's rows matches nothing
+// (and is refused) instead of being widened into a match.
+func TestEditFileRegexEndingsAreNotRelaxed(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "regex_crlf.txt", "one\r\ntwo\r\n")
+	res := NewEditFileTool().Execute(context.Background(), map[string]any{
+		"path": p, "find": "one\ntwo", "content": "X", "mode": "regex",
+	})
+	if !res.IsError {
+		t.Fatalf("regex mode matched across the row endings: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "warning:") {
+		t.Errorf("regex mode reported a relaxed match: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "one\r\ntwo\r\n" {
+		t.Fatalf("file = %q, want the CRLF rows untouched", got)
+	}
+}
+
+// TestEditFileFindEndingsRelaxedMatchAmbiguous pins what the relaxed match does
+// when ignoring the endings leaves the find in more than one place: the call is
+// refused instead of guessing a spot, and nothing is written.
+func TestEditFileFindEndingsRelaxedMatchAmbiguous(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "ambiguous.txt", "dup\r\nnext\r\nother\r\ndup\r\nnext\r\nother\r\n")
+	res := NewEditFileTool().Execute(context.Background(), map[string]any{
+		"path": p, "find": "dup\nnext\n", "content": "X",
+	})
+	if !res.IsError {
+		t.Fatalf("an ambiguous relaxed find was matched: %s", res.ForLLM)
+	}
+	for _, want := range []string{"holds that text 2 times", "row endings", "ambiguous", "nothing was written"} {
+		if !strings.Contains(res.ForLLM, want) {
+			t.Errorf("the error does not explain %q: %s", want, res.ForLLM)
+		}
+	}
+	if got := readFile(t, p); got != "dup\r\nnext\r\nother\r\ndup\r\nnext\r\nother\r\n" {
+		t.Fatalf("a refused edit touched the file: %q", got)
+	}
+}
+
+// TestEditFileLoneCREndingIsMatched pins the lone-CR rung: a file whose rows end
+// with a lone CR is matched as it stands, and a find written with LF is matched
+// across the endings with a warning that names the ending the file really uses.
+func TestEditFileLoneCREndingIsMatched(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "cr.txt", "one\rtwo\r")
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "one\ntwo", "content": "X",
+	})
+	if res.IsError {
+		t.Fatalf("a find with other row endings was not matched: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "\\r (CR)") {
+		t.Fatalf("the warning does not name the CR ending: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "X\r" {
+		t.Fatalf("file = %q, want the match replaced", got)
+	}
+}
+
+// TestEditFileMixedFileIsNotRewritten pins the case that motivated dropping the
+// whole-file normalization: editing one row of a file with mixed endings leaves
+// every other row's ending alone.
+func TestEditFileMixedFileIsNotRewritten(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "mixed.txt", "a\nb\r\nc\n")
+	tool := NewEditFileTool()
+	res := tool.Execute(context.Background(), map[string]any{
+		"path": p, "find": "b", "content": "B",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if got := readFile(t, p); got != "a\nB\r\nc\n" {
+		t.Fatalf("content = %q, want the other rows' endings untouched", got)
+	}
+	if strings.Contains(res.ForLLM, "note:") {
+		t.Fatalf("no ending change happened, but one was reported: %s", res.ForLLM)
 	}
 }
 
