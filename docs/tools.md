@@ -345,7 +345,7 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
 | `url` | string | 必填 | 页面地址（`http`/`https`；缺 scheme 时按 `https` 处理） |
 | `timeout` | int | `webfetch.timeout_seconds` | 整次抓取的秒数上限（渲染、加载与转换都算在内）。实际取值不会小于 30 秒，详情见下 |
 | `method` | string | `fetch_as_md` | 反馈里放什么：`fetch_as_md`（默认，正文 Markdown）/ `save_as_html` / `save_as_md` / `ignore`，见[四种反馈方式](#四种反馈方式method) |
-| `invokejs` | string | 空 | 页面加载完、抓取内容**之前**在页面里执行的 JavaScript（**只有浏览器取法支持**，见 [invokejs：在页面里跑脚本](#invokejs在页面里跑脚本)）。给 `http` 模式的工具时直接报参数错误，schema 里也不会出现这个参数 |
+| `invokejs` | string | 空 | 页面加载完、抓取内容**之前**在页面里执行的 JavaScript：可以直接写脚本，也可以给一个 **`file://` 文件 URL**（以 `file://` 开头的值按文件处理，`file://` 之后就是路径 —— 绝对路径如 `file:///home/me/token.js`，或相对当前工作目录如 `file://scripts/token.js`，内容被读出来注入执行；**只有浏览器取法支持**，见 [invokejs：在页面里跑脚本](#invokejs在页面里跑脚本)）。给 `http` 模式的工具时直接报参数错误，schema 里也不会出现这个参数 |
 
 * `method` 与 `invokejs` 都不会改变取页面的方式（`mode` 仍然是唯一的取法来源），它们只决定**抓到之后做什么**。
 * `invokejs` 是空字符串或省略时等于没给；给了就要求这次抓取真的渲染（`auto` 回退到源码时**不算成功**，见下）。
@@ -466,6 +466,14 @@ HTTP 路径在读到正文前就按 `Content-Type` 拒绝，浏览器路径在�
 的东西（`document.cookie`、`localStorage` 里的 token、框架内部状态），好让后续命令用**和浏览器一样的身份**去
 下载文件、调接口。**只有浏览器取法支持**：`tools.webfetch.mode` 为 `http` 时参数直接报错（schema 里也不会列出
 这个参数），`auto` 模式在没有可用浏览器时**不退回源码**，而是把"需要浏览器来跑脚本"作为抓取失败报出来。
+
+它有两种写法：**直接写脚本**，或**用一个 `file://` 文件 URL 指名文件**。判据是前缀：以 `file://` 开头（大小写不敏感）
+的值按文件处理 —— `file://` 之后的部分就是路径，**绝对路径**直接用（`file:///home/me/token.js`，Windows 上
+`file:///C:/x/token.js` 里盘符前的那条斜杠属于 URL、不属于路径），**相对路径**相对**当前工作目录**解析
+（`file://scripts/token.js`、`file://./a.js`），路径按 URL 的规则做百分号解码（`file://my%20token.js`）；其余的值
+（包括不带 scheme 的普通路径字符串、多行脚本）都按脚本本身处理。指名的文件读不到（不存在 / 是目录 / 为空 / 超过
+1 MiB）或 URL 里没有路径（光一个 `file://`）时直接报参数错误，并写明是哪个文件、为什么；从文件读入时展示行会附一句
+`invokejs: the script was read from <路径>`。
 
 执行约定：
 

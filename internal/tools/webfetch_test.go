@@ -274,6 +274,9 @@ func TestWebFetchToolRejectsInvalidArguments(t *testing.T) {
 		// The tool reads the source only: a script needs a browser to run in.
 		{"invokejs without a browser", map[string]any{
 			"url": "https://example.com", "invokejs": "_invokejs_done(1)"}},
+		// A script file needs a browser just as an inline script does.
+		{"invokejs file without a browser", map[string]any{
+			"url": "https://example.com", "invokejs": "file://script.js"}},
 	}
 	for _, testCase := range cases {
 		res := tool.Execute(context.Background(), testCase.args)
@@ -1021,6 +1024,143 @@ func TestWebFetchToolPassesTheScriptToTheFetcher(t *testing.T) {
 	}
 }
 
+// webfetchFileURL renders a path as a file URL the way the invokejs argument
+// takes it: an absolute path, with the separators of a URL.
+func webfetchFileURL(path string) string {
+	return "file:///" + strings.TrimPrefix(filepath.ToSlash(path), "/")
+}
+
+// TestWebFetchToolReadsTheScriptFromAFile pins the file form of invokejs: a value
+// that names a file with a file URL (file://…) is read and its content is what
+// runs — an absolute URL as it is, and a relative one below the working
+// directory — while any other value is the script itself, however it reads.
+func TestWebFetchToolReadsTheScriptFromAFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	tool := NewWebFetchTool(WebFetchConfig{Mode: utils.FetchModeChromeHeadless})
+
+	relative := filepath.Join("scripts", "token.js")
+	if err := os.MkdirAll(filepath.Join(dir, "scripts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := "_invokejs_done(document.cookie)"
+	if err := os.WriteFile(filepath.Join(dir, relative), []byte(source+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A URL that carries a relative path is resolved below the working directory.
+	script, from, errText := tool.invokeJSArg(map[string]any{"invokejs": "file://scripts/token.js"})
+	if errText != "" {
+		t.Fatalf("a relative file URL must be accepted: %s", errText)
+	}
+	if script != source {
+		t.Errorf("script = %q, want the content of the file %q", script, source)
+	}
+	if want := filepath.Join(dir, relative); from != want {
+		t.Errorf("from = %q, want %q", from, want)
+	}
+
+	// The scheme is what marks a file, not the name: any file the URL points at
+	// is read, and a space in its name arrives percent-encoded.
+	spaced := filepath.Join(dir, "my token")
+	if err := os.WriteFile(spaced, []byte("_invokejs_done(1)"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script, from, errText = tool.invokeJSArg(map[string]any{"invokejs": "file://my%20token"})
+	if errText != "" || script != "_invokejs_done(1)" || from != spaced {
+		t.Errorf("percent-encoded name: script = %q, from = %q, error = %q", script, from, errText)
+	}
+
+	// An absolute URL is taken as it is.
+	absolute := filepath.Join(dir, "absolute.JS")
+	if err := os.WriteFile(absolute, []byte("_invokejs_done(2)"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script, from, errText = tool.invokeJSArg(map[string]any{"invokejs": webfetchFileURL(absolute)})
+	if errText != "" || script != "_invokejs_done(2)" || from != absolute {
+		t.Errorf("absolute file: script = %q, from = %q, error = %q", script, from, errText)
+	}
+
+	// Anything else is the script itself — inline code of one line or several,
+	// and a bare path without the scheme is not read.
+	for _, value := range []string{
+		"_invokejs_done(document.cookie)",
+		"scripts/token.js",
+		"const r = await fetch('/token');\n_invokejs_done(await r.text());",
+	} {
+		script, from, errText = tool.invokeJSArg(map[string]any{"invokejs": value})
+		if errText != "" || script != value || from != "" {
+			t.Errorf("inline %q: script = %q, from = %q, error = %q", value, script, from, errText)
+		}
+	}
+}
+
+// TestWebFetchToolRefusesABrokenScriptFile pins what a call that names a script
+// file which cannot be run gets: an error naming the file and the reason, so the
+// value is not quietly run as a script of its own.
+func TestWebFetchToolRefusesABrokenScriptFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	tool := NewWebFetchTool(WebFetchConfig{Mode: utils.FetchModeChromeHeadless})
+
+	if err := os.WriteFile("empty.js", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir("directory.js", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("huge.js", []byte(strings.Repeat("a", webFetchInvokeJSFileMaxBytes+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		value string
+		wants []string
+	}{
+		{"missing", "file://missing.js", []string{"cannot be read", "missing.js"}},
+		{"directory", "file://directory.js", []string{"is a directory", "directory.js"}},
+		{"empty", "file://empty.js", []string{"is empty", "empty.js"}},
+		{"over the limit", "file://huge.js", []string{"over the", "huge.js"}},
+		{"no path", "file://", []string{"names no file"}},
+	}
+	for _, tc := range cases {
+		script, from, errText := tool.invokeJSArg(map[string]any{"invokejs": tc.value})
+		if errText == "" {
+			t.Errorf("%s: accepted %q (script %q, from %q), want an error",
+				tc.name, tc.value, script, from)
+			continue
+		}
+		for _, want := range tc.wants {
+			if !strings.Contains(errText, want) {
+				t.Errorf("%s: error = %q, want it to mention %q", tc.name, errText, want)
+			}
+		}
+	}
+}
+
+// TestInvokeDisplayNamesTheScriptFile pins the display line a call with a script
+// adds: the file the script was read from when it was not written inline, the
+// length of what it reported, or why nothing came back — and nothing at all for
+// a call that asked for no script.
+func TestInvokeDisplayNamesTheScriptFile(t *testing.T) {
+	if got := invokeDisplay("", utils.WebFetchResult{}); got != "" {
+		t.Errorf("a call without a script must add nothing: %q", got)
+	}
+	inline := invokeDisplay("", utils.WebFetchResult{InvokeInfo: "session=abc123"})
+	if strings.Contains(inline, "read from") || !strings.Contains(inline, "reported 14 chars") {
+		t.Errorf("an inline script must not be named as a file: %q", inline)
+	}
+	fromFile := invokeDisplay(filepath.Join("work", "token.js"), utils.WebFetchResult{InvokeInfo: "session=abc123"})
+	for _, want := range []string{"read from", filepath.Join("work", "token.js"), "reported 14 chars"} {
+		if !strings.Contains(fromFile, want) {
+			t.Errorf("the display line is missing %q: %q", want, fromFile)
+		}
+	}
+	if got := invokeDisplay("token.js", utils.WebFetchResult{InvokeNote: "boom"}); !strings.Contains(got, "invokejs: boom") {
+		t.Errorf("a failed script must say so: %q", got)
+	}
+}
+
 // TestWebFetchToolAdvertisesTheMethodAndTheScript pins what the model reads about
 // the two arguments: a rendering tool offers both, and a tool that reads the
 // source only offers the methods but no script, which it could never run.
@@ -1059,7 +1199,7 @@ func TestWebFetchToolAdvertisesTheMethodAndTheScript(t *testing.T) {
 		t.Fatal("a tool that renders must offer the invokejs argument")
 	}
 	scriptDescription, _ := script["description"].(string)
-	for _, want := range []string{"_invokejs_done", webFetchInvokeHeader, "undefined"} {
+	for _, want := range []string{"_invokejs_done", webFetchInvokeHeader, "undefined", "file://"} {
 		if !strings.Contains(scriptDescription, want) {
 			t.Errorf("the invokejs description is missing %q: %s", want, scriptDescription)
 		}

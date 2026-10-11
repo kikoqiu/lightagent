@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,11 @@ const (
 	// at the very top of the answer: the caller asked for that value, and it
 	// belongs before the page it was read from.
 	webFetchInvokeHeader = "invokejs return info:"
+	// webFetchInvokeJSFileMaxBytes caps the size of a JavaScript file the
+	// invokejs argument may name. A script meant to run in a page is small, and
+	// a fetch that points at a bundled library (or the wrong file) is a mistake
+	// worth reporting rather than injecting into a browser.
+	webFetchInvokeJSFileMaxBytes = 1 << 20
 )
 
 // webFetchMethod is what a call asks the answer to carry: the markdown itself
@@ -240,8 +246,8 @@ func (t *WebFetchTool) sideEffectRule() string {
 		"line. "
 	if t.rendersPages() {
 		rule += "The invokejs argument runs a script of yours in the loaded page before its content is read, " +
-			"which is how values only the page's JavaScript can reach — cookies, tokens — are handed back " +
-			"for later commands. "
+			"written inline or read from a file:// URL, which is how values only the page's JavaScript " +
+			"can reach — cookies, tokens — are handed back for later commands. "
 	}
 	return rule
 }
@@ -284,7 +290,10 @@ func (t *WebFetchTool) Parameters() map[string]any {
 		"invokejs": map[string]any{
 			"type": "string",
 			"description": "JavaScript to run in the page once it has loaded and before its content is " +
-				"read. The script must call the global function _invokejs_done(value) to end the call: " +
+				"read, either written here or named by a file URL: a value beginning with file:// is a " +
+				"file whose content is read and run instead — file:///home/me/token.js (an absolute " +
+				"path), or file://token.js (below the working directory). The script must call the " +
+				"global function _invokejs_done(value) to end the call: " +
 				"the value is reported at the top of the answer as \"" + webFetchInvokeHeader + "\", a " +
 				"value of undefined reports nothing, and the wait for it replaces the usual wait for the " +
 				"page to stop loading in the background — so fetch what you need inside the script " +
@@ -326,7 +335,7 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) *Result
 	if errText != "" {
 		return Fail(errText)
 	}
-	script, errText := t.invokeJSArg(args)
+	script, scriptFrom, errText := t.invokeJSArg(args)
 	if errText != "" {
 		return Fail(errText)
 	}
@@ -402,12 +411,7 @@ func (t *WebFetchTool) Execute(ctx context.Context, args map[string]any) *Result
 	if savedTo != "" {
 		res.ForUser += "; saved to " + savedTo
 	}
-	if page.InvokeNote != "" {
-		res.ForUser += "\ninvokejs: " + page.InvokeNote
-	} else if page.InvokeInfo != "" {
-		res.ForUser += fmt.Sprintf("\ninvokejs: the script reported %d chars, carried at the top of the result",
-			len(page.InvokeInfo))
-	}
+	res.ForUser += invokeDisplay(scriptFrom, page)
 	if len(page.Notes) > 0 {
 		res.ForUser += "\n" + strings.Join(page.Notes, "; ")
 	}
@@ -513,6 +517,25 @@ func invokeBlock(page utils.WebFetchResult) string {
 	return ""
 }
 
+// invokeDisplay is what the display line of a call says about its script: the
+// file it was read from (when it was not written inline) and what it reported —
+// or why it reported nothing. A call without a script, or with one that reported
+// nothing, adds nothing; every line it does add starts with a newline, so the
+// caller can append the result to the rest of the display line as it is.
+func invokeDisplay(scriptFrom string, page utils.WebFetchResult) string {
+	var b strings.Builder
+	if scriptFrom != "" {
+		b.WriteString("\ninvokejs: the script was read from " + scriptFrom)
+	}
+	if page.InvokeNote != "" {
+		b.WriteString("\ninvokejs: " + page.InvokeNote)
+	} else if page.InvokeInfo != "" {
+		fmt.Fprintf(&b, "\ninvokejs: the script reported %d chars, carried at the top of the result",
+			len(page.InvokeInfo))
+	}
+	return b.String()
+}
+
 // webFetchMethodArg reads the method argument of a call.
 func webFetchMethodArg(args map[string]any) (webFetchMethod, string) {
 	raw, present := args["method"]
@@ -538,26 +561,87 @@ func webFetchMethodArg(args map[string]any) (webFetchMethod, string) {
 }
 
 // invokeJSArg reads the invokejs argument of a call: the script to run in the
-// loaded page. Only a browser can run it, so a tool that never renders refuses
-// it here, where the message can say why, instead of fetching and failing.
-func (t *WebFetchTool) invokeJSArg(args map[string]any) (string, string) {
+// loaded page. The value either carries the source itself or names a file with a
+// file URL (file://…), whose content is read and run instead; from is the path a
+// script was read from, empty for a value that carried the source. Only a browser
+// can run a script, so a tool that never renders refuses it here, where the
+// message can say why, instead of fetching and failing.
+func (t *WebFetchTool) invokeJSArg(args map[string]any) (script, from, errText string) {
 	raw, present := args["invokejs"]
 	if !present || raw == nil {
-		return "", ""
+		return "", "", ""
 	}
 	text, ok := raw.(string)
 	if !ok {
-		return "", "Invalid 'invokejs' argument. Must be a string of JavaScript."
+		return "", "", "Invalid 'invokejs' argument. Must be a string of JavaScript."
 	}
-	script := strings.TrimSpace(text)
-	if script == "" {
-		return "", ""
+	value := strings.TrimSpace(text)
+	if value == "" {
+		return "", "", ""
 	}
 	if !t.rendersPages() {
-		return "", fmt.Sprintf("Invalid 'invokejs' argument: a script needs a browser to run in, and this "+
+		return "", "", fmt.Sprintf("Invalid 'invokejs' argument: a script needs a browser to run in, and this "+
 			"tool reads pages over HTTP only (tools.webfetch.mode is %q).", t.cfg.Mode)
 	}
-	return script, ""
+	path, isFile := invokeJSFileURL(value)
+	if !isFile {
+		return value, "", ""
+	}
+	if path == "" {
+		return "", "", fmt.Sprintf("Invalid 'invokejs' argument: %q names no file.", value)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", "", fmt.Sprintf("Invalid 'invokejs' argument: the script file %s cannot be read: %v.", path, err)
+	}
+	if info.IsDir() {
+		return "", "", fmt.Sprintf("Invalid 'invokejs' argument: %s is a directory, not a JavaScript file.", path)
+	}
+	if info.Size() > webFetchInvokeJSFileMaxBytes {
+		return "", "", fmt.Sprintf("Invalid 'invokejs' argument: the script file %s holds %s, over the %s limit.",
+			path, humanBytes(info.Size()), humanBytes(webFetchInvokeJSFileMaxBytes))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Sprintf("Invalid 'invokejs' argument: the script file %s cannot be read: %v.", path, err)
+	}
+	source := strings.TrimSpace(string(data))
+	if source == "" {
+		return "", "", fmt.Sprintf("Invalid 'invokejs' argument: the script file %s is empty.", path)
+	}
+	return source, path, ""
+}
+
+// invokeJSFileURL reports whether the invokejs argument names a file with a file
+// URL (file://…) and the path it points at: an absolute path
+// (file:///home/me/token.js, or file:///C:/x/token.js on Windows — the slash in
+// front of the drive letter belongs to the URL, not to the path), or one below
+// the working directory (file://scripts/token.js, file://./a.js). The path is
+// percent-decoded the way a URL is, its separators are taken as the host spells
+// them, and a relative one is resolved here, so the caller gets an openable path.
+// An empty path (a bare file://) comes back as one, for the caller to refuse.
+func invokeJSFileURL(value string) (string, bool) {
+	const scheme = "file://"
+	if len(value) < len(scheme) || !strings.EqualFold(value[:len(scheme)], scheme) {
+		return "", false
+	}
+	path := value[len(scheme):]
+	if unescaped, err := url.PathUnescape(path); err == nil {
+		path = unescaped
+	}
+	// A Windows file URL keeps the drive letter behind a slash
+	// (file:///C:/x/y.js); that slash is not part of the path.
+	if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
+	}
+	path = filepath.FromSlash(path)
+	if path == "" {
+		return "", true
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(workingDir(), path)
+	}
+	return path, true
 }
 
 // limitFeedback cuts the markdown to the configured number of lines. A page that
