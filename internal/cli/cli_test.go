@@ -36,6 +36,124 @@ func newTestCLI(t *testing.T) *CLI {
 	return New(ag, st, "test-model", true)
 }
 
+// TestCompleteAtExtendsTheNameAfterAt pins the raw editor's Tab: the unfinished
+// "@name" the input ends with is grown to the longest prefix its candidates
+// share, a lone match is spelled out in full, further Tabs walk the candidates in
+// turn (wrapping around), one level at a time and never with a trailing
+// separator — the user types that and presses Tab again — while an input without
+// such a token is left alone.
+func TestCompleteAtExtendsTheNameAfterAt(t *testing.T) {
+	dir := t.TempDir()
+	sep := string(os.PathSeparator)
+	for _, name := range []string{"alpha.txt", "alphabet.md", "az.md", "beta.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "inner.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each step is one Tab. An empty set drives the next Tab over the previous
+	// result, so a cycle reads as the sequence of values the key produces.
+	steps := []struct {
+		name string
+		set  string
+		want string
+	}{
+		{"grows to the shared prefix", "look at @" + dir + sep + "al", "look at @" + dir + sep + "alpha"},
+		{"then spells the first match", "", "look at @" + dir + sep + "alpha.txt"},
+		{"then walks to the second", "", "look at @" + dir + sep + "alphabet.md"},
+		{"and wraps around", "", "look at @" + dir + sep + "alpha.txt"},
+		{"a lone match is spelled out", "see @" + dir + sep + "be", "see @" + dir + sep + "beta.txt"},
+		{"a directory keeps its bare name", "see @" + dir + sep + "su", "see @" + dir + sep + "sub"},
+		{"the next level needs the separator", "see @" + dir + sep + "sub" + sep + "in", "see @" + dir + sep + "sub" + sep + "inner.txt"},
+		{"without a shared prefix the first owns the Tab", "@" + dir + sep + "a", "@" + dir + sep + "alpha.txt"},
+		{"then the second", "", "@" + dir + sep + "alphabet.md"},
+		{"then the third", "", "@" + dir + sep + "az.md"},
+		{"before wrapping", "", "@" + dir + sep + "alpha.txt"},
+		{"another base starts a new cycle", "@" + dir + sep + "be", "@" + dir + sep + "beta.txt"},
+		{"a name inside a word is no token", "mail me@host", "mail me@host"},
+		{"nothing matches", "see @" + dir + sep + "zzz", "see @" + dir + sep + "zzz"},
+		{"plain text", "hello", "hello"},
+	}
+	c := &CLI{}
+	in := ""
+	for _, tc := range steps {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set != "" {
+				in = tc.set
+			}
+			got := string(c.completeAt([]rune(in)))
+			if got != tc.want {
+				t.Fatalf("Tab on %q = %q, want %q", in, got, tc.want)
+			}
+			in = got
+		})
+	}
+}
+
+// TestCompleteAtForgetsAStaleCycle pins that a keystroke takes the input out of
+// the cycle: the names of the previous Tab must not be walked after the text has
+// changed, or a Tab would paste a name that no longer matches.
+func TestCompleteAtForgetsAStaleCycle(t *testing.T) {
+	dir := t.TempDir()
+	sep := string(os.PathSeparator)
+	for _, name := range []string{"alpha.txt", "alphabet.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &CLI{}
+	if got := string(c.completeAt([]rune("@" + dir + sep + "al"))); got != "@"+dir+sep+"alpha" {
+		t.Fatalf("first Tab = %q", got)
+	}
+	// The user narrows the name by hand ("alph" is neither the shared prefix nor
+	// a name): the next Tab reads the candidates afresh and, with several left,
+	// goes back to the shared prefix instead of walking the old list.
+	if got := string(c.completeAt([]rune("@" + dir + sep + "alph"))); got != "@"+dir+sep+"alpha" {
+		t.Fatalf("Tab after editing = %q, want a fresh cycle", got)
+	}
+	if got := string(c.completeAt([]rune("@" + dir + sep + "alphabet.m"))); got != "@"+dir+sep+"alphabet.md" {
+		t.Fatalf("Tab on a lone match = %q", got)
+	}
+}
+
+// TestRunRawTabCompletesTheAtToken drives the real key loop: Tabs typed after
+// "@a" walk the matching file names in the input the prompt would send.
+func TestRunRawTabCompletesTheAtToken(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	dir := t.TempDir()
+	for _, name := range []string{"alpha.txt", "alphabet.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCLI(t)
+	c.out = io.Discard
+	keys := []keyEvent{{kind: keyRune, r: '@'}, {kind: keyRune, r: 'a'},
+		{kind: keyTab}, {kind: keyTab}, {kind: keyTab}}
+	if err := c.runRaw(context.Background(), &fakeReader{keys: keys}); err != nil {
+		t.Fatalf("runRaw: %v", err)
+	}
+	// "@a" -> shared prefix "alpha" -> first name -> second name.
+	if got := string(c.input); got != "@alphabet.md" {
+		t.Fatalf("input = %q, want the second match of the cycle", got)
+	}
+}
+
 // TestClassifyRune pins the raw-editor key mapping: Enter is a newline and
 // Ctrl+Enter (LF) submits.
 func TestClassifyRune(t *testing.T) {
@@ -52,7 +170,7 @@ func TestClassifyRune(t *testing.T) {
 		{"ctrl+d is eof", 0x04, keyEOF},
 		{"ctrl+z is eof", 0x1a, keyEOF},
 		{"ctrl+u clears", 0x15, keyClearLine},
-		{"tab is ignored", '\t', keyIgnore},
+		{"tab completes", '\t', keyTab},
 		{"printable rune", 'a', keyRune},
 		{"non-ascii rune", '中', keyRune},
 	}

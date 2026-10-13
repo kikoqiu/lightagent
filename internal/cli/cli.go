@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"lightagent/internal/agent"
 	"lightagent/internal/config"
@@ -79,6 +81,14 @@ type CLI struct {
 	promptDrawn []promptRow
 	// input is the in-progress multi-line message (raw-mode editing only).
 	input []rune
+	// compNames, compStem and compIndex hold the raw editor's Tab completion
+	// cycle: the candidates the last Tab found, the text their names are
+	// appended to, and the one the input currently holds (-1 while it holds
+	// only their shared prefix). They make repeated Tabs walk the candidates
+	// instead of starting over, and are guarded by mu.
+	compNames []string
+	compStem  string
+	compIndex int
 	// editing is true while the raw-mode line editor owns the prompt.
 	editing bool
 	// reader is the active raw-mode reader (nil in line-scanner mode).
@@ -149,6 +159,8 @@ const (
 	keyBackspace
 	// keyClearLine discards the whole input (Ctrl+U).
 	keyClearLine
+	// keyTab completes the file name of an "@" token the input ends with.
+	keyTab
 	// keyInterrupt is Ctrl+C. It clears the input or exits when empty.
 	keyInterrupt
 	// keyEOF ends the session (Ctrl+D, Ctrl+Z, or a closed stdin).
@@ -188,7 +200,7 @@ func classifyRune(r rune) keyEvent {
 	case 0x15:
 		return keyEvent{kind: keyClearLine}
 	case '\t':
-		return keyEvent{kind: keyIgnore}
+		return keyEvent{kind: keyTab}
 	}
 	if r < 0x20 {
 		return keyEvent{kind: keyIgnore}
@@ -1071,6 +1083,15 @@ func (c *CLI) runRaw(ctx context.Context, reader termReader) error {
 		case keyClearLine:
 			c.mu.Lock()
 			c.input = nil
+			c.resetCompletion()
+			c.printPromptLocked()
+			c.mu.Unlock()
+		case keyTab:
+			// Tab extends the unfinished "@name" the input ends with; an
+			// input without one is left alone. Repeated Tabs walk the
+			// candidates when several match.
+			c.mu.Lock()
+			c.input = c.completeAt(c.input)
 			c.printPromptLocked()
 			c.mu.Unlock()
 		case keyInterrupt:
@@ -1094,6 +1115,7 @@ func (c *CLI) runRaw(ctx context.Context, reader termReader) error {
 			c.mu.Lock()
 			text := strings.TrimSpace(string(c.input))
 			c.input = nil
+			c.resetCompletion()
 			c.clearPromptLocked()
 			c.mu.Unlock()
 
@@ -1121,6 +1143,114 @@ func (c *CLI) redrawInput() {
 		c.printPromptLocked()
 	}
 	c.mu.Unlock()
+}
+
+// completeAt is the raw editor's Tab: it extends the unfinished "@name" the
+// input ends with one level deep. A lone candidate is spelled out in full;
+// several are first grown to their longest common prefix (the way a shell
+// narrows an ambiguous name), and every further Tab then walks the candidates in
+// turn, wrapping around at the end — so the same key picks through "alpha.txt",
+// "alphabet.md" and back without retyping anything. Only the name itself is ever
+// completed, never a trailing separator, which the user types before pressing
+// Tab again for the next level. An input that does not end in an "@" token, or
+// whose token matches nothing, comes back unchanged. The caller must hold c.mu.
+func (c *CLI) completeAt(input []rune) []rune {
+	text := string(input)
+	at := atTokenStart(text)
+	if at < 0 {
+		c.resetCompletion()
+		return input
+	}
+	head, candidates := workdir.Complete(text[at+1:])
+	if len(candidates) == 0 {
+		c.resetCompletion()
+		return input
+	}
+	names := make([]string, len(candidates))
+	for i, cand := range candidates {
+		names[i] = cand.Name
+	}
+	stem := text[:at+1] + head
+	base := text[len(stem):]
+
+	// The cycle continues while the same token is being completed and the input
+	// still holds either one of its names or their shared prefix; anything else
+	// (a keystroke, another token) means the list is stale and Tab starts over.
+	if c.compNames != nil && c.compStem == stem && c.compHolds(base) {
+		c.compIndex = (c.compIndex + 1) % len(c.compNames)
+		return []rune(stem + c.compNames[c.compIndex])
+	}
+
+	c.compNames, c.compStem = names, stem
+	if len(names) == 1 {
+		c.compIndex = -1
+		return []rune(stem + names[0])
+	}
+	// Prefer narrowing an ambiguous name to picking one outright, so a Tab is
+	// never a no-op on the first press.
+	if common := longestPrefix(names); len(common) > len(base) {
+		c.compIndex = -1
+		return []rune(stem + common)
+	}
+	c.compIndex = 0
+	return []rune(stem + names[0])
+}
+
+// compHolds reports whether base is part of the current cycle: it is one of the
+// candidates or their shared prefix.
+func (c *CLI) compHolds(base string) bool {
+	if base == longestPrefix(c.compNames) {
+		return true
+	}
+	for _, name := range c.compNames {
+		if base == name {
+			return true
+		}
+	}
+	return false
+}
+
+// resetCompletion forgets the Tab completion cycle, so the next Tab reads the
+// candidates afresh instead of stepping through a stale list. The caller must
+// hold c.mu.
+func (c *CLI) resetCompletion() {
+	c.compNames = nil
+	c.compStem = ""
+	c.compIndex = -1
+}
+
+// atTokenStart returns the index of the '@' that opens the token the input ends
+// with, or -1 when that token does not open with one. Requiring the '@' to start
+// the token keeps an address inside a word ("mail me@host") out of the file
+// completion.
+func atTokenStart(text string) int {
+	i := len(text)
+	for i > 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:i])
+		if unicode.IsSpace(r) {
+			break
+		}
+		i -= size
+	}
+	if i < len(text) && text[i] == '@' {
+		return i
+	}
+	return -1
+}
+
+// longestPrefix returns the longest common prefix of names, compared rune-wise
+// so a multi-byte character is never cut in half.
+func longestPrefix(names []string) string {
+	prefix := []rune(names[0])
+	for _, name := range names[1:] {
+		rs := []rune(name)
+		n := 0
+		for n < len(prefix) && n < len(rs) && prefix[n] == rs[n] {
+			n++
+		}
+		prefix = prefix[:n]
+	}
+	return string(prefix)
 }
 
 // dispatch routes one submitted line: slash commands are handled locally, every
@@ -2157,6 +2287,7 @@ func helpText() string {
 		"",
 		"the conversation lives in memory only; use /save to persist it now.",
 		"input: Enter inserts a newline; Ctrl+J sends (Ctrl+Enter and Alt+Enter where the terminal reports them).",
+		"Tab completes a file name after an @ (repeated Tabs walk the matches; type the next separator yourself).",
 		"while a turn runs, type a message to insert it into the loop (steering).",
 		"Ctrl+C interrupts a running turn; when idle it clears the input, then exits.",
 	}

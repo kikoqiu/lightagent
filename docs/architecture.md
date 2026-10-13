@@ -16,10 +16,10 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 | `internal/proc` | 子进程启动与停止：**树模式**（`Start`，Windows 用 Job Object「kill-on-close」、Unix 用独立进程组 `SIGTERM`→`SIGKILL`，exec 会话用）与**单进程模式**（`StartProcess`，只停止自己启动的那个进程，stdio MCP server 用）；`Shutdown` 在主进程退出或收到信号时按各自模式停止所有仍存活的进程 |
 | `internal/store` | 多会话持久化（会话文件在 `CWD/.lightagent/sessions/`，当前会话为 `session.json`） |
 | `internal/lock` | 目录锁（纯 `syscall`）：`<状态目录>/.lock` 上 `flock`（Unix）/ `LockFileEx`（Windows），使一个目录只运行一个实例；释放时删锁文件，目录里再没别的就删目录 |
-| `internal/cli` | 彩色 REPL、斜杠命令、Markdown 流式渲染（未完成行作为预览绘制在提示符上方，按终端宽度折行、最多 8 行，因此超出首行的文本也边收边显示）、提示区原地逐行重绘（不整块擦除，老式 Windows 控制台才不会闪屏）、`[thinking]` 思考流式块（同样应用 Markdown）、异步渲染事件 |
+| `internal/cli` | 彩色 REPL、斜杠命令、Markdown 流式渲染（未完成行作为预览绘制在提示符上方，按终端宽度折行、最多 8 行，因此超出首行的文本也边收边显示）、提示区原地逐行重绘（不整块擦除，老式 Windows 控制台才不会闪屏）、`[thinking]` 思考流式块（同样应用 Markdown）、异步渲染事件、Tab 对输入末尾 `@名字` 的补全（先补到候选的最长公共前缀，多个候选时重复 Tab 依次轮换并回卷；目录不带分隔符，分隔符用户自己打） |
 | `internal/slash` | 斜杠命令表（名称 / 别名 / 参数 / 说明 / 网页是否常显）：CLI 的 `/help`、网页的 `/help` 与左侧命令栏都由此生成；同时提供命令解析（全角斜杠、别名归一）、on/off 参数解析与 `/history` 用量文案 |
-| `internal/workdir` | 当前工作目录服务：`/pwd`、`/cd`、`/ls` 的共用实现（读取/切换进程工作目录、`~` 展开、目录列表文案），使终端与网页操作的是同一个目录 |
-| `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown；出站流式增量按 50ms 合帧（`web.go`），后台节流、手机隐藏超时后停表断连（`app.js`） |
+| `internal/workdir` | 当前工作目录服务：`/pwd`、`/cd`、`/ls` 的共用实现（读取/切换进程工作目录、`~` 展开、目录列表文案），以及 `@` 路径补全的一层候选（CLI 的 Tab 与网页浮层共用同一份实现），使终端与网页操作的是同一个目录 |
+| `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown；出站流式增量按 50ms 合帧（`web.go`），后台节流、手机隐藏超时后停表断连（`app.js`）；输入框 `@` 补全的一层候选经 `GET /api/complete` 取（`web/complete.go`），选中目录后顺手展开该目录的下一级 |
 | `internal/markdown` | 无依赖的 Markdown → ANSI 渲染（CLI 用），按行流式输出并暴露未完成行（`Pending`）供预览 |
 | `internal/termcolor` | ANSI 彩色封装（检测到终端支持才着色） |
 | `internal/textwidth` | 终端列宽测量：东亚宽字符算 2 列、制表符算最宽跳位、控制符算 0；CLI 的提示区折行与 `/list` 的列对齐共用它，含按列右补空格的 `PadRight` |

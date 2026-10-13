@@ -206,6 +206,11 @@
            nothing is attached. -->
       <ul class="attachments" id="attachments" hidden aria-label="attachments"></ul>
       <div class="composer">
+        <!-- The "@" picker: app.js fills it with the working directory's
+             entries while the caret sits in an "@name" token and hides it
+             otherwise. It floats above the input line, so a long listing never
+             moves the transcript. -->
+        <div class="complete" id="complete" hidden role="listbox" aria-label="file names"></div>
         <!-- The attach control only exists when the model declares the media
              types it accepts (openai.media_types); app.js unhides it and points
              the picker at those types. -->

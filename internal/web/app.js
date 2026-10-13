@@ -10,6 +10,7 @@
   var attachEl = document.getElementById('attach');
   var attachFileEl = document.getElementById('attachFile');
   var attachmentsEl = document.getElementById('attachments');
+  var completeEl = document.getElementById('complete');
   var copyPop = document.getElementById('copyPop');
   var copyNote = document.getElementById('copyNote');
   var current = null;
@@ -3092,6 +3093,170 @@
     });
   }
 
+  // ---- @file completion ----
+  // Typing '@' in front of a name opens the one-level listing of the directory
+  // the fragment points at (the working directory by default; an absolute head
+  // is used as spelled), the way an editor completes a path: the server lists it
+  // (see /api/complete) and picking a row replaces the fragment between the '@'
+  // and the caret). A directory is completed with the separator appended and its
+  // own listing opens right away, so one pick after another walks down the tree
+  // without a keystroke in between. Only that fragment is ever replaced, so the
+  // picker works mid-message.
+  var completeItems = [];
+  var completeHead = '';
+  var completeSep = '/';
+  // completeAt is the index of the '@' the caret currently sits after, -1 while
+  // the picker is closed; completeFragment is the text it was filled for, so a
+  // stale answer or a pick after further typing is refused rather than applied to
+  // the wrong text. completeDismissed remembers the fragment an Escape closed (and
+  // the one a pick left behind), so the caret events that follow cannot reopen the
+  // same listing; typing a character clears it.
+  var completeAt = -1;
+  var completeFragment = null;
+  var completeDismissed = null;
+  var completeSel = 0;
+  var completeSeq = 0;
+  var completeTimer = null;
+
+  function isBlanks(ch) { return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'; }
+
+  // atToken returns the index of the '@' that opens the fragment before caret, or
+  // -1 when that fragment does not start with one. Requiring the '@' to open the
+  // token keeps an address inside a word ("mail me@host") from opening the
+  // picker.
+  function atToken(value, caret) {
+    var start = caret;
+    while (start > 0 && !isBlanks(value.charAt(start - 1))) { start--; }
+    if (start < caret && value.charAt(start) === '@') { return start; }
+    return -1;
+  }
+
+  // currentFragment is the text between the '@' the picker opened on and the
+  // caret right now, or null when the caret left that fragment.
+  function currentFragment() {
+    if (completeAt < 0 || document.activeElement !== input) { return null; }
+    var caret = input.selectionStart;
+    if (caret !== input.selectionEnd || caret < completeAt) { return null; }
+    if (atToken(input.value, caret) !== completeAt) { return null; }
+    return input.value.slice(completeAt + 1, caret);
+  }
+
+  function closeComplete() {
+    if (completeTimer !== null) { window.clearTimeout(completeTimer); }
+    completeTimer = null;
+    completeAt = -1;
+    completeFragment = null;
+    completeItems = [];
+    completeEl.hidden = true;
+    completeEl.innerHTML = '';
+  }
+
+  // refreshComplete resolves the fragment the caret sits in and asks the server
+  // for its one-level listing. The request is debounced and stamped, so fast
+  // typing issues one lookup and a slow answer cannot replace a newer one.
+  function refreshComplete() {
+    if (document.activeElement !== input) { closeComplete(); return; }
+    var caret = input.selectionStart;
+    var at = atToken(input.value, caret);
+    if (at < 0) { closeComplete(); return; }
+    var fragment = input.value.slice(at + 1, caret);
+    if (fragment.indexOf('@') >= 0 || fragment === completeDismissed) { closeComplete(); return; }
+    if (at === completeAt && fragment === completeFragment) { return; }
+    completeAt = at;
+    if (completeTimer !== null) { window.clearTimeout(completeTimer); }
+    completeTimer = window.setTimeout(function () {
+      completeTimer = null;
+      if (currentFragment() !== fragment) { return; }
+      var seq = ++completeSeq;
+      fetch('/api/complete?path=' + encodeURIComponent(fragment), { credentials: 'same-origin' })
+        .then(function (res) { return res.json().catch(function () { return {}; }); })
+        .then(function (doc) {
+          if (seq !== completeSeq || currentFragment() !== fragment) { return; }
+          renderComplete(doc, fragment);
+        })
+        .catch(function () { closeComplete(); });
+    }, 120);
+  }
+
+  // renderComplete fills the popup. An empty listing closes it — there is nothing
+  // to pick, and a half-typed name is the normal case — and is remembered like a
+  // dismissal, so the keyup of the very keystroke that brought it stays put
+  // instead of asking again.
+  function renderComplete(doc, fragment) {
+    completeItems = (doc && doc.items) || [];
+    if (completeItems.length === 0) {
+      completeDismissed = fragment;
+      closeComplete();
+      return;
+    }
+    completeHead = (doc && doc.head) || '';
+    completeSep = (doc && doc.sep) || '/';
+    completeFragment = fragment;
+    completeSel = 0;
+    completeEl.innerHTML = '';
+    completeItems.forEach(function (item, i) {
+      var row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'complete-item';
+      row.setAttribute('role', 'option');
+      var name = document.createElement('span');
+      name.className = 'complete-name';
+      name.textContent = item.name + (item.dir ? completeSep : '');
+      var kind = document.createElement('span');
+      kind.className = 'complete-kind';
+      kind.textContent = item.dir ? 'dir' : 'file';
+      row.appendChild(name);
+      row.appendChild(kind);
+      // mousedown, not click: it fires while the textarea still holds the caret.
+      row.addEventListener('mousedown', function (e) { e.preventDefault(); acceptComplete(i); });
+      completeEl.appendChild(row);
+    });
+    highlightComplete();
+    completeEl.hidden = false;
+  }
+
+  function highlightComplete() {
+    var rows = completeEl.children;
+    for (var i = 0; i < rows.length; i++) { rows[i].classList.toggle('sel', i === completeSel); }
+    if (rows[completeSel] && rows[completeSel].scrollIntoView) {
+      rows[completeSel].scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  // acceptComplete writes one candidate in place of the fragment the picker was
+  // filled for, keeping the head (the directory part, as the user spelled it) in
+  // front of the name. A directory is only one step on the way: the separator it
+  // completes with leaves the caret in the next fragment, and that level is
+  // opened right away (an empty one just closes the picker). Picking a file ends
+  // the walk instead.
+  function acceptComplete(i) {
+    if (completeAt < 0 || completeFragment === null || currentFragment() !== completeFragment) {
+      closeComplete();
+      return;
+    }
+    var item = completeItems[i];
+    if (!item) { return; }
+    var caret = input.selectionStart;
+    var insert = completeHead + item.name + (item.dir ? completeSep : '');
+    input.value = input.value.slice(0, completeAt + 1) + insert + input.value.slice(caret);
+    var pos = completeAt + 1 + insert.length;
+    input.focus();
+    input.setSelectionRange(pos, pos);
+    autoGrow();
+    if (item.dir) {
+      // A deliberate pick voids any dismissal, so the next level can show.
+      completeDismissed = null;
+      closeComplete();
+      refreshComplete();
+      return;
+    }
+    // The fragment the pick left behind is marked as dismissed: the keyup of the
+    // Enter/Tab that accepted this row (or the mouse's own events) must not pop
+    // the picker straight back up. Typing anything re-arms it.
+    completeDismissed = insert;
+    closeComplete();
+  }
+
   // send submits the composer's content: its text plus the attachments still
   // pending (their ids — the server reads the stored files and hands them to the
   // model with this very message). A command line is a command, not a prompt, so
@@ -3106,6 +3271,7 @@
     if (!text && ids.length === 0) { return; }
     input.value = '';
     autoGrow();
+    closeComplete();
     // Sending is an explicit "show me what comes next" action: follow again and
     // re-pin the view (which also makes the pending user row count as
     // at-the-bottom) even when the reader had scrolled back through history.
@@ -3151,10 +3317,39 @@
   stopEl.onclick = function () {
     if (ws && ws.readyState === 1) { ws.send(JSON.stringify({ text: '/stop' })); }
   };
-  input.addEventListener('input', autoGrow);
+  input.addEventListener('input', function () {
+    // Typing invalidates the fragment an Escape dismissed: the same text typed
+    // again is a fresh request.
+    completeDismissed = null;
+    autoGrow();
+    refreshComplete();
+  });
+  // Moving the caret (arrows, a click, a selection) can enter or leave an "@"
+  // fragment, so the picker is re-resolved for those too.
+  input.addEventListener('keyup', refreshComplete);
+  input.addEventListener('click', refreshComplete);
+  input.addEventListener('blur', closeComplete);
   input.addEventListener('keydown', function (e) {
     // Enter inserts a newline (default textarea behavior); Ctrl+Enter sends.
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); return; }
+    // While the "@" picker is up it owns the arrows and the eol/accept keys:
+    // Enter or Tab completes the highlighted row, Escape leaves the text alone.
+    if (completeEl.hidden || completeItems.length === 0) { return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      completeSel = (completeSel + (e.key === 'ArrowDown' ? 1 : completeItems.length - 1)) % completeItems.length;
+      highlightComplete();
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      acceptComplete(completeSel);
+      return;
+    }
+    if (e.key === 'Escape') {
+      completeDismissed = completeFragment;
+      closeComplete();
+    }
   });
 
   // The rail only mirrors the shared catalogue, so it is built once, before the

@@ -621,7 +621,7 @@
     border-top:1px solid var(--border-soft);
     padding:10px max(14px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
   }
-  footer .composer { display:flex; align-items:flex-end; gap:8px; width:100%; max-width:920px; margin:0 auto; }
+  footer .composer { display:flex; align-items:flex-end; gap:8px; width:100%; max-width:920px; margin:0 auto; position:relative; }
   textarea {
     flex:1 1 auto; min-width:0; resize:none; height:44px; min-height:44px; max-height:40dvh;
     background:var(--bg-elev); color:var(--fg);
@@ -651,6 +651,27 @@
   button.stop { display:none; background:var(--bg-elev-2); color:var(--fg-muted); border-color:var(--border); box-shadow:none; }
   button.stop:hover { background:#22303f; color:var(--fg); }
   button.stop.on { display:inline-block; }
+  /* ---- @file picker ---- */
+  /* The one-level listing the composer opens on '@' (see app.js). It floats
+     above the input line so a directory with many children never squeezes the
+     transcript, and it scrolls on its own past the height cap. */
+  .complete {
+    position:absolute; left:0; right:0; bottom:calc(100% + 8px);
+    max-height:min(46dvh, 300px); overflow:auto; overscroll-behavior:contain;
+    background:var(--bg-elev); border:1px solid var(--border); border-radius:var(--radius);
+    box-shadow:var(--shadow); padding:4px; z-index:6;
+  }
+  .complete[hidden] { display:none; }
+  .complete-item {
+    display:flex; align-items:baseline; gap:8px; width:100%; min-height:34px; margin:0;
+    padding:7px 10px; background:transparent; border:1px solid transparent; border-radius:var(--radius-sm);
+    color:var(--fg); font-size:13px; font-weight:500; letter-spacing:0; text-align:left;
+    box-shadow:none; cursor:pointer;
+  }
+  .complete-item:hover { background:rgba(90,162,255,.10); color:var(--fg); }
+  .complete-item.sel { background:rgba(90,162,255,.16); border-color:rgba(90,162,255,.5); }
+  .complete-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .complete-kind { margin-left:auto; color:var(--fg-dim); font-size:11px; font-weight:600; }
   /* ---- attachments ---- */
   /* The composer's attach control is a glyph button on the composer's own row, so
      it lines up with the textarea's height; the chips of the files waiting to be

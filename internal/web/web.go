@@ -630,6 +630,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/ws", s.requireSession(http.HandlerFunc(s.handleWS)))
 	mux.Handle("/api/config", s.requireSession(http.HandlerFunc(s.handleConfig)))
 	mux.Handle("/api/sessions", s.requireSession(http.HandlerFunc(s.handleSessions)))
+	mux.Handle("/api/complete", s.requireSession(http.HandlerFunc(s.handleComplete)))
 	mux.Handle("/api/restart", s.requireSession(http.HandlerFunc(s.handleRestart)))
 	mux.Handle("/api/password", s.requireSession(http.HandlerFunc(s.handlePassword)))
 	// Attachments: the composer uploads a file here before sending, and drops
@@ -1457,6 +1458,7 @@ func (s *Server) helpNotes() string {
 	}
 	return strings.Join(append(lines,
 		"input: Enter inserts a newline, Ctrl+Enter sends.",
+		"typing @ offers the file/directory names you can reach from the working directory (one level at a time: ↑/↓ picks, Enter inserts, and a directory comes with its separator).",
 		"while a turn runs, type a message to insert it into the loop (steering).",
 	), "\n")
 }

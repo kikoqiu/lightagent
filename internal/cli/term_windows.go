@@ -288,7 +288,10 @@ func classifyKeyRecord(rec keyEventRecord) (keyEvent, bool) {
 		return keyEvent{kind: keyClearLine}, true
 	case ctrl && rec.VirtualKeyCode == 'H':
 		return keyEvent{kind: keyBackspace}, true
-	case rec.VirtualKeyCode == vkEscape, rec.VirtualKeyCode == vkTab,
+	case rec.VirtualKeyCode == vkTab:
+		// Tab completes the file name after an '@' in the input.
+		return keyEvent{kind: keyTab}, true
+	case rec.VirtualKeyCode == vkEscape,
 		rec.VirtualKeyCode == vkPrior, rec.VirtualKeyCode == vkNext,
 		rec.VirtualKeyCode == vkHome, rec.VirtualKeyCode == vkEnd,
 		rec.VirtualKeyCode == vkLeft, rec.VirtualKeyCode == vkUp,

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,6 +126,114 @@ func functionBody(t *testing.T, name string) string {
 // JS live in separate embedded files.
 func pageSource() string {
 	return indexHTML + "\n" + appCSS + "\n" + appJS + "\n" + configJS + "\n" + authJS + "\n" + ttsJS + "\n" + mathJS
+}
+
+// TestCompleteEndpointServesOneLevel pins the composer's "@" picker end to end:
+// the endpoint resolves the fragment one level deep under the head it was given
+// (directories marked, the separator reported) and the page carries the popup,
+// its stylesheet and the wiring that asks for it.
+func TestCompleteEndpointServesOneLevel(t *testing.T) {
+	dir := t.TempDir()
+	sep := string(os.PathSeparator)
+	if err := os.WriteFile(filepath.Join(dir, "alpha.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestServer(t, "")
+
+	resp, err := http.Get(baseURL(srv) + "/api/complete?path=" + url.QueryEscape(dir+sep))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var doc struct {
+		Head  string `json:"head"`
+		Sep   string `json:"sep"`
+		Items []struct {
+			Name string `json:"name"`
+			Dir  bool   `json:"dir"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Head != dir+sep || doc.Sep != sep {
+		t.Fatalf("head/sep = %q/%q, want %q/%q", doc.Head, doc.Sep, dir+sep, sep)
+	}
+	if len(doc.Items) != 2 {
+		t.Fatalf("items = %+v, want the directory and the file", doc.Items)
+	}
+	if doc.Items[0].Name != "sub" || !doc.Items[0].Dir {
+		t.Errorf("first item = %+v, want the directory first", doc.Items[0])
+	}
+	if doc.Items[1].Name != "alpha.txt" || doc.Items[1].Dir {
+		t.Errorf("second item = %+v, want the file", doc.Items[1])
+	}
+
+	// A fragment naming nothing that exists is an empty list, not an error: a
+	// half-typed name is the normal case.
+	missing, err := http.Get(baseURL(srv) + "/api/complete?path=" + url.QueryEscape(dir+sep+"zzz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer missing.Body.Close()
+	if body, _ := io.ReadAll(missing.Body); missing.StatusCode != http.StatusOK || !strings.Contains(string(body), `"items":[]`) {
+		t.Fatalf("empty listing = %d %s, want 200 with no items", missing.StatusCode, body)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL(srv)+"/api/complete", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Body.Close()
+	if bad.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /api/complete = %d, want 405", bad.StatusCode)
+	}
+
+	for _, want := range []string{
+		`id="complete" hidden`, // the popup starts out closed...
+		"function refreshComplete",
+		"function acceptComplete",
+		"'/api/complete?path='",
+		".complete-item.sel", // ...its stylesheet knows the highlighted row
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+
+	// Picking a directory is a step, not an end: the picker opens that
+	// directory's own level right away, so one pick after another walks down the
+	// tree.
+	accept := functionBody(t, "acceptComplete")
+	for _, want := range []string{"if (item.dir) {", "refreshComplete();"} {
+		if !strings.Contains(accept, want) {
+			t.Errorf("acceptComplete does not open the next level after a directory pick (%q missing):\n%s", want, accept)
+		}
+	}
+}
+
+// TestCompleteNeedsASession pins that the picker cannot be used to walk the
+// filesystem without signing in when a password is configured.
+func TestCompleteNeedsASession(t *testing.T) {
+	srv := newTestServer(t, "secret")
+	resp, err := http.Get(baseURL(srv) + "/api/complete?path=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
 }
 
 // TestPageIsPublic checks the shell is served without a session: the sign-in
@@ -1313,6 +1422,11 @@ func TestIndexAndAssets(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Fatalf("page does not carry %q: %s", want, page)
 		}
+	}
+	// /history is Hidden: it stays runnable from the composer (and described by
+	// /help) but the injected rail must not offer it.
+	if strings.Contains(page, `"name":"/history"`) {
+		t.Error("the page's command rail still offers /history")
 	}
 	// Every placeholder must be resolved before the page reaches the browser.
 	for _, ph := range []string{

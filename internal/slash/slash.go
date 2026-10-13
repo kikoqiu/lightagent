@@ -55,19 +55,22 @@ func (c Command) Usage() string {
 // front-end looks commands up by their canonical name, so the aliases never
 // need a case of their own. The order is the order of the mirror page's command
 // rail: the Primary entries show first, then the folded ones (Hidden entries
-// never appear there at all). /compact opens the folded group and /help and
+// never appear there at all). The folded group opens with /result and /help and
 // /stop sit at its very bottom.
 var Commands = []Command{
 	// The six primary commands show first in the mirror's rail; the rest start
-	// folded (with /compact opening the fold and /help and /stop closing it).
+	// folded (with /result opening the fold and /help and /stop closing it).
 	{Name: "/new", Summary: "start a new conversation and forget the current session file", Web: true, Primary: true},
 	{Name: "/clear", Summary: "clear the conversation but keep the current session file", Web: true, Primary: true},
 	{Name: "/save", Summary: "write the current conversation to its file now", Web: true, Primary: true},
 	{Name: "/saveas", Args: "[-f] <name>", Summary: "save the conversation under a new name", Web: true, Primary: true},
 	{Name: "/load", Args: "[-f] <name|n>", Summary: "load a saved session by name or /list number", Web: true, Primary: true},
-	{Name: "/history", Aliases: []string{"/context"}, Summary: "show message/token usage and context usage", Web: true, Primary: true},
+	{Name: "/compact", Summary: "compress the context now", Web: true, Primary: true},
 	// Folded commands start here.
-	{Name: "/compact", Summary: "compress the context now", Web: true},
+	// Hidden: the page's context badge shows the usage /history reports, so the
+	// command stays out of the rail while it remains runnable from the composer
+	// (and described by /help).
+	{Name: "/history", Aliases: []string{"/context"}, Summary: "show message/token usage and context usage", Web: true, Hidden: true},
 	// Hidden: the sidebar model picker already switches the interface.
 	{Name: "/switchapi", Args: "<name|n>", Summary: "switch the active LLM interface", Web: true, Hidden: true},
 	{Name: "/result", Aliases: []string{"/results"}, Args: "[on|off]", Summary: "show or hide tool/exec results (default on)", Web: true},

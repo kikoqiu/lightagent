@@ -278,9 +278,10 @@ func TestUsageText(t *testing.T) {
 }
 
 // TestRailOrderAndSwitchAPICatalogue pins the command order the mirror's rail
-// draws from: the primary commands first, then /compact opening the folded group
-// and /help and /stop at its very bottom. /switchapi stays out of the rail (the
-// model picker covers it) though it is still a web command.
+// draws from: the primary commands first (with /compact among them), then
+// /result opening the folded group and /help and /stop at its very bottom.
+// /history and /switchapi stay out of the rail — the model picker covers the
+// latter and the context badge the former — though both are still web commands.
 func TestRailOrderAndSwitchAPICatalogue(t *testing.T) {
 	web := WebCommands()
 	var names, primary []string
@@ -298,8 +299,8 @@ func TestRailOrderAndSwitchAPICatalogue(t *testing.T) {
 		t.Fatalf("primary = %v, want 6 commands shown before the fold", primary)
 	}
 	folded := names[len(primary):]
-	if folded[0] != "/compact" {
-		t.Fatalf("the folded group starts with %q, want /compact", folded[0])
+	if folded[0] != "/result" {
+		t.Fatalf("the folded group starts with %q, want /result", folded[0])
 	}
 	if last := names[len(names)-1]; last != "/stop" {
 		t.Fatalf("the last command is %q, want /stop", last)
@@ -307,15 +308,28 @@ func TestRailOrderAndSwitchAPICatalogue(t *testing.T) {
 	if prev := names[len(names)-2]; prev != "/help" {
 		t.Fatalf("the second to last command is %q, want /help", prev)
 	}
-	// /saveas is one of the primary entries.
-	hasSaveAs := false
+	// /saveas and /compact are primary entries; /history is not.
+	want := map[string]bool{"/saveas": true, "/compact": true}
 	for _, name := range primary {
-		if name == "/saveas" {
-			hasSaveAs = true
+		if want[name] {
+			delete(want, name)
+		}
+		if name == "/history" {
+			t.Fatalf("primary = %v, want /history out of the rail", primary)
 		}
 	}
-	if !hasSaveAs {
-		t.Fatalf("primary = %v, want /saveas among them", primary)
+	if len(want) != 0 {
+		t.Fatalf("primary = %v, want the entries of %v among them", primary, want)
+	}
+	// /history stays a web command so the composer (and /help) still run it.
+	var hist *Command
+	for i := range Commands {
+		if Commands[i].Name == "/history" {
+			hist = &Commands[i]
+		}
+	}
+	if hist == nil || !hist.Web || !hist.Hidden || len(hist.Aliases) == 0 {
+		t.Fatalf("/history = %+v, want a web command hidden from the rail with its alias", hist)
 	}
 	// /switchapi is not offered in the rail.
 	for _, name := range names {
