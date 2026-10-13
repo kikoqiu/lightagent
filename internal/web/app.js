@@ -455,11 +455,12 @@
   // firstLineHit reports whether a click landed on the line a row keeps when it is
   // folded: the label of a thinking row, the name line of a tool call, or the first
   // line of a result. A folded row is nothing but that line, so any click in it
-  // counts; on an unfolded one the click must be inside the first line's own band —
-  // measured from the text's top edge with its padding counted off, since a result's
-  // text sits in a padded block (see the folded rules in app.css). A click above the
-  // text (the label line) is inside the band too, which is what makes the label the
-  // handle of a thinking row.
+  // counts; on an unfolded one the click must be inside that line's own band. For a
+  // tool call or a result the line is the first line of the text, measured from the
+  // text's top edge with its padding counted off (a result's text sits in a padded
+  // block, see the folded rules in app.css). A thinking row is different: its line is
+  // the label, which sits above the text, so only the band above the text folds it —
+  // the first line of the thinking itself is body, not a handle.
   function firstLineHit(row, e) {
     if (row.classList.contains('folded')) { return true; }
     var span = rowText(row);
@@ -467,6 +468,9 @@
     var box = span.getBoundingClientRect();
     var pad = parseFloat(window.getComputedStyle(span).paddingTop) || 0;
     var line = parseFloat(window.getComputedStyle(row).lineHeight) || 20;
+    // The thinking label is the handle and it sits above the text: only a click
+    // above the text's top edge folds the row, never one on the thinking itself.
+    if (row.classList.contains('reasoning')) { return e.clientY < box.top; }
     return (e.clientY - box.top - pad) < line;
   }
 

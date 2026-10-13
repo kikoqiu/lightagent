@@ -618,9 +618,12 @@ func TestFoldSwitchFoldsTheLongRowParts(t *testing.T) {
 		"function toggleAllRows()",
 		"eachFoldableRow(function (row) { foldRow(row, foldAll); });",
 		// The first line of a row is its handle, and a click on it is the per-row
-		// switch — the whole-transcript one never locks a row.
+		// switch — the whole-transcript one never locks a row. A thinking row's first
+		// line is its label, which sits above the text: the first line of the thinking
+		// itself is body and must not fold the row.
 		"function firstLineHit(row, e)",
 		"if (row.classList.contains('folded')) { return true; }",
+		"if (row.classList.contains('reasoning')) { return e.clientY < box.top; }",
 		"log.addEventListener('click', function (e) {",
 		"foldRow(row, !row.classList.contains('folded'));",
 		// The folded look: the label alone, the tool's name line alone, and a result's
