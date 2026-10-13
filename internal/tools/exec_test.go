@@ -1172,11 +1172,10 @@ func TestScriptLanguageSelection(t *testing.T) {
 	}
 }
 
-// TestExecCommandLanguageParameter verifies the `language` parameter: the
-// selectable values are advertised by the enum (host engine first) and the host
-// engine is the default. The parameter description is a fixed wording, while the
-// host-dependent list (with the detected python version) is carried by the tool
-// description.
+// TestExecCommandLanguageParameter verifies the split between the tool
+// description and the `language` parameter: the description states the
+// mechanism, while the parameter itself carries the selectable values (enum,
+// default, per-engine wording with aliases, and the detected python version).
 func TestExecCommandLanguageParameter(t *testing.T) {
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
@@ -1196,25 +1195,79 @@ func TestExecCommandLanguageParameter(t *testing.T) {
 		t.Fatalf("language enum = %v, want %v", enum, scriptLanguageIDs())
 	}
 
-	// The parameter description is a plain statement: the model reads the
-	// selectable values from the enum checked above.
+	// The parameter explains the enum: every selectable engine with its
+	// aliases, and the host engine as the default.
 	description, _ := param["description"].(string)
-	if !strings.Contains(description, "Script language that interprets") {
+	if !strings.Contains(description, "The engine that interprets") {
 		t.Errorf("the language parameter has no usable description: %q", description)
 	}
-
-	// The host-dependent list and the python version belong to the tool
-	// description.
-	toolDescription := tool.Description()
-	if !strings.Contains(toolDescription, "language") || !strings.Contains(toolDescription, host) {
-		t.Fatalf("the tool description does not advertise the language parameter: %s", toolDescription)
+	summary := scriptLanguageSummary()
+	if !strings.Contains(description, summary) {
+		t.Errorf("the language parameter does not list the selectable engines:\n%s", description)
 	}
-	if python := systemPython(); python.Found {
-		if !strings.Contains(toolDescription, python.Version) {
-			t.Errorf("the tool description does not carry the python version %s: %s", python.Version, toolDescription)
+	if !strings.Contains(description, "(`"+host+"`)") {
+		t.Errorf("the language parameter does not name the default engine %q: %s", host, description)
+	}
+	python := systemPython()
+	if python.Found {
+		for _, want := range []string{python.Version, python.Path} {
+			if !strings.Contains(description, want) {
+				t.Errorf("the language parameter does not carry %q: %s", want, description)
+			}
 		}
-	} else if strings.Contains(toolDescription, ScriptLanguagePython) {
-		t.Errorf("the tool description advertises python without an interpreter: %s", toolDescription)
+	} else if strings.Contains(description, ScriptLanguagePython) {
+		t.Errorf("the language parameter advertises python without an interpreter: %s", description)
+	}
+
+	// The tool description states the mechanism only: the engine list and the
+	// python version belong to the parameter, and the inline (`-c`) advice is
+	// given once, by the tool description.
+	toolDescription := tool.Description()
+	if !strings.Contains(toolDescription, "`language`") {
+		t.Errorf("the tool description does not mention the language parameter: %s", toolDescription)
+	}
+	if strings.Contains(toolDescription, summary) {
+		t.Errorf("the tool description repeats the engine list instead of the mechanism: %s", toolDescription)
+	}
+	if python.Found && strings.Contains(toolDescription, python.Version) {
+		t.Errorf("the tool description carries the python version instead of the parameter: %s", toolDescription)
+	}
+	if strings.Contains(description, "wrapper") {
+		t.Errorf("the language parameter repeats the inline (`-c`) advice: %s", description)
+	}
+}
+
+// TestExecCommandScriptParameter pins the `script` wording: it holds the source
+// code of the language `language` names — the text, not a path — and it stays the
+// only required parameter. The wording is host-independent (no engine is named,
+// in particular no Python example on a host without an interpreter) and the
+// inline (`-c`) advice is left to the tool description, so it is not repeated.
+func TestExecCommandScriptParameter(t *testing.T) {
+	engine := NewExecEngine(60, 10, true)
+	defer engine.Close()
+	params := NewRunScriptTool(engine).Parameters()
+
+	required, _ := params["required"].([]string)
+	if len(required) != 1 || required[0] != "script" {
+		t.Fatalf("required = %v, want [script]", required)
+	}
+	props, _ := params["properties"].(map[string]any)
+	param, ok := props["script"].(map[string]any)
+	if !ok {
+		t.Fatal("script is missing from the run_script parameters")
+	}
+	description, _ := param["description"].(string)
+	if !strings.Contains(description, "source code of the language named by `language`") {
+		t.Errorf("the script parameter does not state that it holds the source of the language: %q", description)
+	}
+	if !strings.Contains(description, "not a path to a script file") {
+		t.Errorf("the script parameter does not state that it takes the text, not a path: %q", description)
+	}
+	if !systemPython().Found && strings.Contains(description, ScriptLanguagePython) {
+		t.Errorf("the script parameter names python although no interpreter was found: %q", description)
+	}
+	if strings.Contains(description, "-c") {
+		t.Errorf("the script parameter repeats the inline (`-c`) advice: %q", description)
 	}
 }
 
@@ -1262,8 +1315,9 @@ func TestPowerShellFlagsHint(t *testing.T) {
 }
 
 // TestResolveScriptLanguage covers language normalization: an omitted value keeps
-// the previous behaviour (the host engine) and an unknown value is rejected with
-// the selectable list.
+// the previous behaviour (the host engine), every canonical identifier and its
+// aliases reach the engine they name, and an unknown value is rejected with the
+// selectable list.
 func TestResolveScriptLanguage(t *testing.T) {
 	host := hostScriptLanguageID()
 	for _, raw := range []string{"", "   ", host, strings.ToUpper(host), " " + host + " "} {
@@ -1272,16 +1326,58 @@ func TestResolveScriptLanguage(t *testing.T) {
 			t.Errorf("resolveScriptLanguage(%q) = %q, %v; want %q", raw, got, err, host)
 		}
 	}
-	if systemPython().Found {
-		for _, raw := range []string{"python", "PYTHON", " python "} {
-			got, err := resolveScriptLanguage(raw)
-			if err != nil || got != ScriptLanguagePython {
-				t.Errorf("resolveScriptLanguage(%q) = %q, %v; want %q", raw, got, err, ScriptLanguagePython)
+	// Every advertised engine answers to its own spelling and to each alias, so
+	// a value written the way the engine is usually named still resolves.
+	for _, option := range scriptLanguageOptions() {
+		spellings := append([]string{option.ID}, option.Aliases...)
+		for _, raw := range spellings {
+			for _, spelling := range []string{raw, strings.ToUpper(raw), " " + raw + " "} {
+				got, err := resolveScriptLanguage(spelling)
+				if err != nil || got != option.ID {
+					t.Errorf("resolveScriptLanguage(%q) = %q, %v; want %q", spelling, got, err, option.ID)
+				}
 			}
 		}
 	}
+	if python := systemPython(); python.Found {
+		got, err := resolveScriptLanguage("python")
+		if err != nil || got != ScriptLanguagePython {
+			t.Errorf("resolveScriptLanguage(%q) = %q, %v; want %q", "python", got, err, ScriptLanguagePython)
+		}
+	}
+	// An alias only reaches an engine this host actually offers: the other
+	// host's shell alias is rejected like any other unavailable value.
+	if host == ScriptLanguageShell {
+		if got, err := resolveScriptLanguage("bash"); err != nil || got != ScriptLanguageShell {
+			t.Errorf("resolveScriptLanguage(%q) = %q, %v; want %q", "bash", got, err, ScriptLanguageShell)
+		}
+	} else if got, err := resolveScriptLanguage("bash"); err == nil {
+		t.Errorf("resolveScriptLanguage(%q) = %q, %v; want a rejection on a host without a POSIX shell", "bash", got, err)
+	}
 	if _, err := resolveScriptLanguage("ruby"); err == nil {
 		t.Error("resolveScriptLanguage accepted an unknown language")
+	}
+}
+
+// TestExecCommandRunsHostLanguageAliases runs one script through the host engine
+// and through every alias of it, so the accepted spellings are exercised against
+// a real process instead of the resolver alone.
+func TestExecCommandRunsHostLanguageAliases(t *testing.T) {
+	command := "echo alias-ok"
+	if runtime.GOOS == "windows" {
+		command = "Write-Output alias-ok"
+	}
+
+	engine := NewExecEngine(60, 10, true)
+	defer engine.Close()
+	tool := NewRunScriptTool(engine)
+
+	option := hostScriptLanguageOption()
+	for _, alias := range append([]string{option.ID}, option.Aliases...) {
+		res := tool.Execute(context.Background(), map[string]any{"script": command, "language": alias})
+		if res.IsError || !strings.Contains(res.ForLLM, `"status":"completed"`) || !strings.Contains(res.ForLLM, "alias-ok") {
+			t.Fatalf("language %q = %+v, want a completed run printing alias-ok", alias, res)
+		}
 	}
 }
 

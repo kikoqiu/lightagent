@@ -29,17 +29,21 @@ type Tool interface {
 执行脚本，采用「等待后转后台」模型。
 
 * 脚本语言由 `language` 选择，可选值**按当前主机动态生成**（探测不到的引擎不会出现在提示词里）；
-  **省略该参数时使用宿主 shell**（即下面的宿主脚本引擎，与旧版行为一致）：
-  * 宿主脚本引擎：Windows 为 `ps`（PowerShell 脚本，`pwsh` 优先、回退 `powershell`，
+  **省略该参数时使用宿主 shell**（即下面的宿主脚本引擎，与旧版行为一致）。取值是**规范全名**（schema 的
+  `enum` 列出的就是它们），同时接受常见别名——模型按引擎惯用写法给出的值照样命中；别名逐条列在
+  `language` 参数的 `description` 里（**工具描述只讲机制，不再列举取值**，可选值由 `enum` 与参数自己
+  的 `description` 表达）：
+  * 宿主脚本引擎：Windows 为 `powershell`（别名 `ps`/`pwsh`；`pwsh` 优先、回退 `powershell`，
     以 `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` 运行；该组参数会原样写进
     工具描述（提示已带该参数，**仅当 PowerShell 属于可选 `language` 时**才出现）。非 Windows 为
-    `sh`（`sh -c`）。
-  * `python`：**直接把 Python 解释器当作脚本引擎**（不经 shell，源码以 `-c` 传给解释器，
-    因此脚本必须是自包含的 Python 程序）。仅当 PATH 上存在可用的 Python 时才可选，并把探测到的
-    **版本**与解释器路径写进工具描述里的 `language` 可选值说明（参数本身的 `description` 是固定
-    文案，可选值列表由 schema 的 `enum` 表达）；未安装时该取值**完全不出现**——探测执行一次
-    `python -V`（5s 超时），Windows 的 Microsoft Store 占位程序会非零退出且不打印版本，故不会被误认。
-  * 其它取值：返回 `unsupported language ...; available: ...`，不执行任何命令。
+    `sh`（别名 `bash`/`shell`，`sh -c`）。
+  * `python`（别名 `python3`/`py`）：**直接把 Python 解释器当作脚本引擎**（不经 shell，源码以 `-c`
+    传给解释器，因此脚本必须是自包含的 Python 程序）。仅当 PATH 上存在可用的 Python 时才可选，并把
+    探测到的**版本**与解释器路径写进 **`language` 参数的 `description`**；未安装时该取值**完全不出现**
+    ——探测执行一次 `python -V`（5s 超时），Windows 的 Microsoft Store 占位程序会非零退出且不打印
+    版本，故不会被误认。
+  * 别名只在对应引擎可选时命中：Windows 上的 `bash`、非 Windows 上的 `ps`，与未知取值一样被拒。
+  * 其它取值：返回 `unsupported language ...; available: ...`（列出规范全名），不执行任何命令。
 * 子进程 stdio 编码：**参数 `use_utf8` 仅 Windows 存在**，默认取 `tools.exec.use_utf8`，可按次覆盖。
   * `true`：**强制脚本引擎使用 UTF-8**，Go **不做任何转码**。
     对 PowerShell：脚本前加一段 UTF-8 前置头——把 `[Console]::InputEncoding`、`[Console]::OutputEncoding`
@@ -87,8 +91,8 @@ type Tool interface {
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `script` | string | 必填 | 脚本内容，由 `language` 选择引擎解释 |
-| `language` | string | 宿主引擎（`ps` / `sh`，即宿主 shell） | **脚本语言**：选择用哪个引擎解释 `script` 文本（是引擎选择，不是调用标签）；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`ps`/`sh`、以及存在时的 `python`）；参数自带的 `description` 是固定文案，各取值含义与 Python 版本在工具描述里 |
+| `script` | string | 必填 | **脚本源码**：`language` 所选语言的源代码——**是文本本身，不是脚本文件路径**；原样交给该引擎当作一个程序执行（shell 引擎即 shell 脚本，`python` 即 Python 源码） |
+| `language` | string | 宿主引擎（`powershell` / `sh`，即宿主 shell） | **解释 `script` 的引擎**：决定源码是哪种语言、由什么执行（是引擎选择，不是调用标签）；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`powershell`/`sh`，以及存在时的 `python`——规范全名，另接受别名 `ps`/`pwsh`、`bash`/`shell`、`python3`/`py`）；参数自带的 `description` 逐条说明各取值含义、别名与 Python 版本，**工具描述只讲机制** |
 | `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
@@ -121,7 +125,7 @@ type Tool interface {
 示例（宿主引擎与 Python 直接引擎）：
 
 ```json
-{ "script": "Get-ChildItem -Name", "language": "ps" }
+{ "script": "Get-ChildItem -Name", "language": "powershell" }
 ```
 
 ```json

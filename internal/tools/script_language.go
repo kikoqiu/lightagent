@@ -12,10 +12,13 @@ import (
 )
 
 // Script language identifiers accepted by run_script's `language` parameter.
+// They are the canonical, fully spelled names the schema enum lists; the common
+// short spellings are accepted as aliases (see scriptLanguageOption.Aliases), so
+// a model that names an engine the way it is usually written still reaches it.
 const (
 	// ScriptLanguagePowerShell runs the script through the host shell on
 	// Windows: PowerShell, with the UTF-8 preamble when UTF-8 mode is on.
-	ScriptLanguagePowerShell = "ps"
+	ScriptLanguagePowerShell = "powershell"
 	// ScriptLanguageShell runs the script through "sh -c" on hosts whose script
 	// engine is the POSIX shell; it is the non-Windows counterpart of
 	// ScriptLanguagePowerShell.
@@ -31,8 +34,13 @@ const pythonProbeTimeout = 5 * time.Second
 
 // scriptLanguageOption is one selectable `language` value.
 type scriptLanguageOption struct {
-	// ID is the identifier the model passes in `language`.
+	// ID is the canonical identifier the model passes in `language` and the
+	// schema enum lists.
 	ID string
+	// Aliases are the alternative spellings accepted for ID: the short form or
+	// the name the engine is usually called by (ps, bash, python3, ...). They
+	// resolve to ID and are never advertised as separate selectable values.
+	Aliases []string
 	// Hint is the human-readable meaning advertised in the prompt.
 	Hint string
 }
@@ -115,11 +123,16 @@ func hostScriptLanguageID() string {
 func hostScriptLanguageOption() scriptLanguageOption {
 	if runtime.GOOS == "windows" {
 		return scriptLanguageOption{
-			ID:   ScriptLanguagePowerShell,
-			Hint: "PowerShell script, host shell pwsh or powershell",
+			ID:      ScriptLanguagePowerShell,
+			Aliases: []string{"ps", "pwsh"},
+			Hint:    "PowerShell script, host shell pwsh or powershell",
 		}
 	}
-	return scriptLanguageOption{ID: ScriptLanguageShell, Hint: "POSIX shell script, host shell sh -c"}
+	return scriptLanguageOption{
+		ID:      ScriptLanguageShell,
+		Aliases: []string{"bash", "shell"},
+		Hint:    "POSIX shell script, host shell sh -c",
+	}
 }
 
 // scriptLanguageOptions lists the selectable languages: the host script engine
@@ -130,8 +143,10 @@ func scriptLanguageOptions() []scriptLanguageOption {
 	options := []scriptLanguageOption{hostScriptLanguageOption()}
 	if python := systemPython(); python.Found {
 		options = append(options, scriptLanguageOption{
-			ID:   ScriptLanguagePython,
-			Hint: "Python " + python.Version + " script, interpreter " + python.Path,
+			ID:      ScriptLanguagePython,
+			Aliases: []string{"python3", "py"},
+			Hint: "Python " + python.Version + " script, interpreter " + python.Path +
+				" (started directly, no shell in between)",
 		})
 	}
 	return options
@@ -146,6 +161,26 @@ func scriptLanguageIDs() []string {
 		ids = append(ids, option.ID)
 	}
 	return ids
+}
+
+// scriptLanguageAliasTarget resolves one spelling of a `language` value to the
+// canonical identifier it names: the identifier itself or one of its aliases.
+// ok is false for a spelling no selectable engine answers to. Aliases belong to
+// the option, so this is also how an alias of an engine the host does not offer
+// is rejected: `bash` on Windows and `ps` on Unix are not in the advertised set
+// and fail here like any other unknown spelling.
+func scriptLanguageAliasTarget(name string) (string, bool) {
+	for _, option := range scriptLanguageOptions() {
+		if name == option.ID {
+			return option.ID, true
+		}
+		for _, alias := range option.Aliases {
+			if name == alias {
+				return option.ID, true
+			}
+		}
+	}
+	return "", false
 }
 
 // scriptLanguageAllowsPowerShell reports whether PowerShell is one of the
@@ -174,30 +209,39 @@ func powerShellFlagsHint() string {
 		"policy does not block the script."
 }
 
-// scriptLanguageSummary renders the selectable languages (identifier plus hint)
-// for the tool description and the `language` parameter.
+// scriptLanguageSummary renders the selectable languages for the `language`
+// parameter description: the canonical identifier, its accepted aliases and the
+// hint that says what it runs. The tool description states the mechanism only,
+// so the value list lives next to the enum in the parameter itself.
 func scriptLanguageSummary() string {
 	options := scriptLanguageOptions()
 	parts := make([]string, 0, len(options))
 	for _, option := range options {
-		parts = append(parts, option.ID+" = "+option.Hint)
+		label := option.ID
+		if len(option.Aliases) > 0 {
+			label += " (aliases: " + strings.Join(option.Aliases, ", ") + ")"
+		}
+		parts = append(parts, label+" = "+option.Hint)
 	}
 	return strings.Join(parts, "; ")
 }
 
 // resolveScriptLanguage normalizes a `language` argument and checks it against
-// the selectable set. An empty value (the parameter's default) selects the host
-// script engine, i.e. the shell - PowerShell on Windows, sh elsewhere - which
-// keeps calls that omit the parameter behaving as before.
+// the selectable set. The spelling is matched case-insensitively against the
+// canonical identifiers and their aliases (ps/pwsh for powershell, bash/shell
+// for sh, python3/py for python), so a model that spells an engine the way it is
+// usually written still reaches it; an alias of an engine this host does not
+// offer is rejected like any other unavailable value. An empty value (the
+// parameter's default) selects the host script engine, i.e. the shell -
+// PowerShell on Windows, sh elsewhere - which keeps calls that omit the
+// parameter behaving as before.
 func resolveScriptLanguage(raw string) (string, error) {
 	language := strings.ToLower(trimSpace(raw))
 	if language == "" {
 		return hostScriptLanguageID(), nil
 	}
-	for _, id := range scriptLanguageIDs() {
-		if language == id {
-			return language, nil
-		}
+	if id, ok := scriptLanguageAliasTarget(language); ok {
+		return id, nil
 	}
 	return "", fmt.Errorf("unsupported language %q; available: %s", raw, strings.Join(scriptLanguageIDs(), ", "))
 }

@@ -26,7 +26,7 @@
 | 4 | CLI 工具循环 | 彩色 REPL，循环期间可继续输入插入用户消息 |
 | 5 | Web 镜像 | 配置了 web 端口即启动（`web.host` 可选绑定 IP，默认 `127.0.0.1`）；端口被占用时自动递增；**WebSocket 实时双向镜像**；页面内置配置编辑器（控件表单 + JSON 双模式，`/api/config`，**重启生效**）与**一键重启**（`/api/restart`：先保存会话，新进程自动恢复）；**登录对话框**（密码明文保存在配置里、浏览器只发送加盐摘要，HttpOnly 会话 cookie + 记住我，**改密码立即生效**） |
 | 6 | 会话记录 | **一个目录一个会话**：启动询问是否恢复历史（默认是），退出询问是否保存（默认是），运行中只存内存，`/save` 手动落盘 |
-| 7 | 命令执行 | `run_script` / `manage_session`（脚本语言 `ps`/`sh`/`python`，后台会话、轮询、输入、终止；进程退出后保留为**僵尸**直到被 `poll` 取走最后的输出与退出码，没人取走则 24h 后清理）；`/result` 可开关结果输出 |
+| 7 | 命令执行 | `run_script` / `manage_session`（脚本语言 `powershell`/`sh`/`python`，另接受 `ps`/`pwsh`、`bash`/`shell`、`python3`/`py` 等别名；后台会话、轮询、输入、终止；进程退出后保留为**僵尸**直到被 `poll` 取走最后的输出与退出码，没人取走则 24h 后清理）；`/result` 可开关结果输出 |
 | 8 | 文件操作 | `read_file` / `write_file` / `edit_file`（`read_file` 默认 `auto` 自动侦测编码，含 UTF-16/UTF-32 与 GBK 等字符集转换，先解码再切行） |
 | 9 | 上下文压缩 | 全局唯一压缩模式：超阈值时把旧消息总结成一条摘要；**服务商报「上下文超限」时自动回退本轮消息、压缩后重发同一条消息**（最多 2 次）；`/history` 查看用量，CLI 提示行与网页徽标实时显示 |
 | 10 | 彩色 CLI | 角色区分颜色；仅在确认终端支持 ANSI 时才着色（非 TTY、`NO_COLOR`、`TERM=dumb`、旧版 Windows 控制台自动关闭） |
@@ -427,12 +427,13 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 都会结束整棵树，不留后台孤儿进程。详见
 [进程树与退出](docs/architecture.md#进程树与退出)。
 
-* `language` 选择脚本语言：Windows `ps`（PowerShell）、Unix `sh`（宿主 shell），
-  以及系统装了 Python 时的 `python`（**直接以解释器为引擎**，源码经 `-c` 传入）；
-  **省略该参数即用宿主 shell**。可选值按主机动态生成，Python 不存在时不出现；
-  存在时提示词里带上探测到的版本。Windows 宿主 shell 以 `-NoProfile -NonInteractive
-  -ExecutionPolicy Bypass` 运行，该组参数会原样写进工具描述（**仅当 PowerShell 属于可选
-  `language` 时**才出现）。
+* `language` 选择脚本语言：Windows `powershell`（别名 `ps`/`pwsh`）、Unix `sh`（别名
+  `bash`/`shell`，宿主 shell），以及系统装了 Python 时的 `python`（别名 `python3`/`py`；
+  **直接以解释器为引擎**，源码经 `-c` 传入）；**省略该参数即用宿主 shell**。规范全名由 schema 的
+  `enum` 按主机动态生成，Python 不存在时不出现；各取值的含义、别名与探测到的 Python 版本写在
+  **`language` 参数自己的描述里**（工具描述只讲机制）。Windows 宿主 shell 以 `-NoProfile
+  -NonInteractive -ExecutionPolicy Bypass` 运行，该组参数会原样写进工具描述（**仅当 PowerShell
+  属于可选 `language` 时**才出现）。
 * 子进程 stdio 编码（仅 Windows 有 `use_utf8` 参数，默认取配置 `tools.exec.use_utf8`）：
   `true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不做转码；
   `false` 由 Go 按主机 ANSI 代码页（如 GBK）转换：输出解码为 UTF-8，输入编码为该代码页字节。

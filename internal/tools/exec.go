@@ -349,12 +349,11 @@ func (t *RunScriptTool) Name() string { return "run_script" }
 // Description implements Tool.
 func (t *RunScriptTool) Description() string {
 	description := fmt.Sprintf("Run a script with state-aware execution. This tool runs source text, "+
-		"not a shell command line: `script` holds the source and `language` selects the engine that "+
-		"interprets it (available: %s; default: %s, the host shell), and the text is handed to that "+
-		"engine as-is. It is recommended to put the program's own source directly in `script` and pick "+
-		"the `language` that matches it, rather than shelling out to another interpreter's inline "+
-		"(`-c`) one-liner, and to set `cwd` for the working directory instead of starting the script "+
-		"with a `cd`. "+
+		"not a shell command line: `script` holds the source, `language` selects the engine that "+
+		"interprets it, and the text is handed to that engine as-is. It is recommended to put "+
+		"the program's own source directly in `script` and pick the `language` that matches it, rather "+
+		"than shelling out to another interpreter's inline (`-c`) one-liner, and to set `cwd` for the "+
+		"working directory instead of starting the script with a `cd`. "+
 		"Synchronously waits up to `wait_timeout` seconds (default: %d). If it finishes within "+
 		"that window, returns exit_code and output directly. If it exceeds `wait_timeout` it "+
 		"detaches to the background and returns a `session_id`: the call is a start followed by "+
@@ -362,7 +361,7 @@ func (t *RunScriptTool) Description() string {
 		"at that moment and clears it. The process lifetime is capped by `run_timeout` (default: "+
 		"%d seconds). Output is cleaned and truncated by `max_lines`/`max_chars`, which bound what "+
 		"a call returns rather than the process lifetime.",
-		scriptLanguageSummary(), hostScriptLanguageID(), t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
+		t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
 	description += runScriptExamplesHint()
 	description += t.engine.maxLinesRule()
 	description += powerShellFlagsHint()
@@ -384,20 +383,16 @@ func (t *RunScriptTool) Parameters() map[string]any {
 	properties := map[string]any{
 		"script": map[string]any{
 			"type": "string",
-			"description": "The script source text, run as-is by the engine chosen by `language`. It is " +
-				"recommended to put the program's own source here and select the matching `language`, " +
-				"rather than shelling out to another interpreter's inline (`-c`) one-liner; use `cwd` " +
-				"for the working directory.",
+			"description": "The script source: the source code of the language named by `language`, i.e. the " +
+				"text itself, not a path to a script file, handed to that engine as-is and run as one program.",
 		},
 		"language": map[string]any{
 			"type":    "string",
 			"enum":    scriptLanguageIDs(),
 			"default": hostLanguage,
-			"description": "Script language that interprets `script`: it selects the engine that runs the " +
-				"text, not a label for the call. Omit to use the host shell (the source is then a shell " +
-				"script). When a non-shell engine is selected, `script` is that language's source run " +
-				"directly, so no inline (`-c`) wrapper is needed. The schema enum lists the available " +
-				"engines and the tool description explains each one.",
+			"description": "The engine that interprets `script`, i.e. the language its source is written " +
+				"in: it selects what runs the text, not a label for the call. Available here: " +
+				scriptLanguageSummary() + ". Omit to use the host shell (`" + hostLanguage + "`).",
 		},
 		"wait_timeout": map[string]any{
 			"type":        "integer",

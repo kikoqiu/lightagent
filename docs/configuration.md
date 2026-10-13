@@ -206,7 +206,8 @@
   需要旧的 ANSI 代码页转换时显式写 `"use_utf8": false`。它只是默认值——`run_script` 的
   `use_utf8` 参数可由模型按次调用覆盖。该字段与参数**只在 Windows 生效**（非 Windows 无 ANSI
   代码页可回退，始终 UTF-8）。`run_script` 的脚本语言由 `language` 参数选择（宿主引擎
-  `ps`/`sh`，以及系统存在 Python 时的 `python`），细节见 [tools.md](tools.md#run_script)。
+  `powershell`/`sh`，以及系统存在 Python 时的 `python`；规范全名，另接受 `ps`/`pwsh`、
+  `bash`/`shell`、`python3`/`py` 等别名），细节见 [tools.md](tools.md#run_script)。
 
 * `exec.max_lines` / `exec.max_lines_max` 是同一对参数（默认值 / 最大值）。两者一起管
   `run_script` 与 `manage_session` 的 `max_lines`。省略参数时用 `max_lines`。要得比
