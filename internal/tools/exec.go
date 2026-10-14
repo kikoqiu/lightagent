@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -149,6 +150,26 @@ func childCodec(useUTF8 bool) consoleCodec {
 // finishes and the leftover program is terminated by the teardown (see
 // proc.Reap).
 const execWaitDelay = 2 * time.Second
+
+// resolveWorkingDir returns the absolute directory the child process runs in:
+// the call's `cwd` resolved against the agent's own directory, or that
+// directory when the call names none (the child inherits it, see launch). It
+// returns "" when the directory cannot be resolved, and the output cleanup then
+// leaves the program's output alone.
+func resolveWorkingDir(cwd string) string {
+	if strings.TrimSpace(cwd) == "" {
+		dir, err := os.Getwd()
+		if err != nil {
+			return ""
+		}
+		return dir
+	}
+	dir, err := filepath.Abs(cwd)
+	if err != nil {
+		return ""
+	}
+	return dir
+}
 
 // launch starts script and returns its session. language (see
 // resolveScriptLanguage) selects the script engine: the host shell or a Python
@@ -476,6 +497,10 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 	// per call (e.g. false for a program that writes the host code page). Hosts
 	// without the parameter (see useUTF8ParamAvailable) always speak UTF-8.
 	useUTF8 := execUseUTF8(boolArgOr(args, "use_utf8", t.engine.useUTF8))
+	// The directory the child runs in is what the output cleanup hides; it is
+	// resolved before the launch, so a call that cannot be resolved simply
+	// leaves the output alone.
+	workDir := resolveWorkingDir(cwd)
 
 	session, err := t.engine.launch(language, script, cwd, useUTF8)
 	if err != nil {
@@ -500,8 +525,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 		// The tree is gone and its output was just reported, so nothing is left
 		// to keep in the pool.
 		t.engine.sessions.Collect(session)
-		shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
-		totalLines, totalBytes := countLinesAndBytes(clean)
+		shown, truncated, totalLines, totalBytes := sanitizeScriptOutput(raw, maxLines, maxChars, workDir)
 		return commandResult{
 			Status:         statusInterrupted,
 			Output:         shown,
@@ -521,8 +545,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 	// left behind.
 	done := session.IsDone()
 	raw := session.TakeOutput()
-	shown, clean, truncated := sanitizeAndFold(raw, maxLines, maxChars)
-	totalLines, totalBytes := countLinesAndBytes(clean)
+	shown, truncated, totalLines, totalBytes := sanitizeScriptOutput(raw, maxLines, maxChars, workDir)
 
 	if done {
 		code := session.GetExitCode()

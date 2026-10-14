@@ -421,7 +421,9 @@ kitty 键盘协议时 Ctrl+Enter 同样发送，POSIX 终端上 Alt+Enter 也可
 `max_lines`/`max_chars` 只约束**本次调用**返回的量。`max_lines` 的默认值是 `tools.exec.max_lines`
 （默认 50），最大值是 `tools.exec.max_lines_max`（默认 100）。要得更多**自动截断到最大值**。
 重要输出建议重定向到文件再用文件工具读回。硬超时由 `run_timeout`（默认取配置）限制。
-输出经 ANSI 清理与头尾折叠。
+输出经 ANSI 清理与头尾折叠。输出还会**清理进程工作目录**：脚本打印出的工作目录绝对路径（`cwd` 参数，
+未给则是 agent 自己的目录）被替换为平台的相对标记（Windows `.\`、其它 `./`），**确实替换过**时输出以一行
+表头说明（`[output: cwd C:\work\ replaced by .\]`），没有替换则不出现。
 
 每次调用自成一个**进程树**：结束会话、硬超时、lightagent 退出（含 Ctrl+C / SIGTERM）
 都会结束整棵树，不留后台孤儿进程。详见
