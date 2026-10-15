@@ -1099,6 +1099,126 @@ func newTestAgent(t *testing.T) *Agent {
 	return New(cfg, nil, tools.NewRegistry(), NewBus())
 }
 
+// userMessageProbeTool stands in for run_script in the user-message-signal
+// tests: it waits for the signal the agent attached to its execution context
+// (see watchUserMessages) and answers with whether it fired, so a test can tell
+// whether a queued steering message reaches a tool call that is in flight.
+type userMessageProbeTool struct {
+	started chan struct{}
+	// wait bounds how long the probe watches for the signal; zero uses 5s.
+	wait time.Duration
+	once sync.Once
+}
+
+func (t *userMessageProbeTool) Name() string               { return "probe" }
+func (t *userMessageProbeTool) Description() string        { return "waits for the user-message signal" }
+func (t *userMessageProbeTool) Parameters() map[string]any { return map[string]any{"type": "object"} }
+
+func (t *userMessageProbeTool) Execute(ctx context.Context, _ map[string]any) *tools.Result {
+	t.once.Do(func() { close(t.started) })
+	signal := tools.UserMessageSignalFrom(ctx)
+	if signal == nil {
+		return &tools.Result{ForLLM: "no signal", ForUser: "no signal"}
+	}
+	wait := t.wait
+	if wait <= 0 {
+		wait = 5 * time.Second
+	}
+	select {
+	case <-signal:
+		return &tools.Result{ForLLM: "signaled", ForUser: "signaled"}
+	case <-time.After(wait):
+		return &tools.Result{ForLLM: "not signaled", ForUser: "not signaled"}
+	}
+}
+
+// probeCall builds the tool call the probe tool answers.
+func probeCall() llm.ToolCall {
+	return llm.ToolCall{
+		ID:       "c_probe",
+		Type:     "function",
+		Function: llm.ToolCallFunction{Name: "probe", Arguments: `{}`},
+	}
+}
+
+// TestToolCallIsSignaledByAQueuedUserMessage covers the signal a running tool
+// call watches: a message queued while the call is in flight fires it, so a
+// tool that would otherwise wait out a long window can stop waiting and let the
+// message through. The message itself still waits in the queue for the round
+// that folds it into the conversation.
+func TestToolCallIsSignaledByAQueuedUserMessage(t *testing.T) {
+	a := newTestAgent(t)
+	tool := &userMessageProbeTool{started: make(chan struct{})}
+	a.reg.Register(tool)
+
+	done := make(chan *tools.Result, 1)
+	go func() { done <- a.executeTool(context.Background(), probeCall()) }()
+	<-tool.started
+
+	a.pushSteer("cli", "hold on", nil)
+
+	select {
+	case res := <-done:
+		if res.ForLLM != "signaled" {
+			t.Fatalf("result = %q, want the call to have been signaled", res.ForLLM)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the tool call was not signaled by the queued message")
+	}
+
+	a.mu.Lock()
+	watch := a.steerNotify
+	a.mu.Unlock()
+	if watch != nil {
+		t.Fatal("the watch was not cleared when the call returned")
+	}
+	if len(a.steerCh) != 1 {
+		t.Fatalf("queued entries = %d, want the message still waiting", len(a.steerCh))
+	}
+}
+
+// TestToolCallSeesAPendingUserMessageRightAway covers a message that was queued
+// before the call started (it arrived while the model reply was streaming): the
+// signal is already fired when the call begins, so a long wait cannot settle in
+// behind a message the user is waiting with.
+func TestToolCallSeesAPendingUserMessageRightAway(t *testing.T) {
+	a := newTestAgent(t)
+	tool := &userMessageProbeTool{started: make(chan struct{})}
+	a.reg.Register(tool)
+
+	a.pushSteer("web", "look at this", nil)
+
+	res := a.executeTool(context.Background(), probeCall())
+	if res.ForLLM != "signaled" {
+		t.Fatalf("result = %q, want the pending message to have fired the signal", res.ForLLM)
+	}
+	if len(a.steerCh) != 1 {
+		t.Fatalf("queued entries = %d, want the message still waiting", len(a.steerCh))
+	}
+}
+
+// TestToolCallHasNoSignalWithoutOneQueued pins the default: a call that starts
+// with an empty queue watches a signal that is not fired, so tools that run to
+// the end keep doing so.
+func TestToolCallHasNoSignalWithoutOneQueued(t *testing.T) {
+	a := newTestAgent(t)
+	tool := &userMessageProbeTool{started: make(chan struct{}), wait: 200 * time.Millisecond}
+	a.reg.Register(tool)
+
+	done := make(chan *tools.Result, 1)
+	go func() { done <- a.executeTool(context.Background(), probeCall()) }()
+	<-tool.started
+
+	select {
+	case res := <-done:
+		if res.ForLLM != "not signaled" {
+			t.Fatalf("result = %q, want the signal to have stayed quiet", res.ForLLM)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe did not return")
+	}
+}
+
 // TestDrainSteering verifies that queued steering messages become user turns and
 // are announced (with the client they came from) at that very moment: the row is
 // published when the message enters the conversation, not when it was queued.

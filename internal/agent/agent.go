@@ -88,6 +88,11 @@ type Agent struct {
 	// one and the user event that folds it into the conversation can be paired
 	// by a front-end (see pushSteer).
 	steerSeq int64
+	// steerNotify is, while a tool call is running, the channel that call
+	// watches for a new user message (see watchUserMessages); nil between
+	// calls. The message itself still waits in steerCh — this only lets the
+	// call give up what it was waiting for, so the user is not held behind it.
+	steerNotify chan struct{}
 
 	persist func(history []llm.Message, summary string)
 }
@@ -547,6 +552,10 @@ func (a *Agent) pushSteer(source, text string, media []llm.ContentPart) {
 	m := steerMessage{id: a.nextSteerID(), source: source, text: text, media: media}
 	select {
 	case a.steerCh <- m:
+		// A tool call in flight — run_script waiting out a long wait_timeout,
+		// for instance — learns right here that the user sent something, so it
+		// can stop waiting instead of holding the message behind it.
+		a.signalUserMessage()
 		a.bus.Publish(Event{
 			Type:        EventPending,
 			ID:          m.id,
@@ -938,7 +947,55 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall) *tools.Result 
 	execCtx := tools.WithUnlockLookup(ctx, func(toolName string) bool {
 		return tools.MessagesContainUnlockRecord(a.History(), toolName)
 	})
+	// The call is watched for user messages: a tool that would otherwise hold
+	// the conversation for a long time — run_script waiting out a wait_timeout
+	// the model asked to be long — stops what it is waiting for instead of
+	// keeping the user behind it (see watchUserMessages).
+	execCtx, stopWatch := a.watchUserMessages(execCtx)
+	defer stopWatch()
 	return a.reg.Execute(execCtx, tc.Function.Name, tc.Function.Arguments)
+}
+
+// watchUserMessages attaches a user-message signal to the context of the tool
+// call that is about to run (see tools.WithUserMessageSignal) and returns the
+// function that clears the watch. The channel is closed by signalUserMessage
+// when a message is queued while the call runs, and right away when one is
+// already waiting in the queue: a call must not settle in for a long wait the
+// user is already waiting behind.
+func (a *Agent) watchUserMessages(ctx context.Context) (context.Context, func()) {
+	signal := make(chan struct{})
+	a.mu.Lock()
+	// A message that is already queued closes the signal right here instead:
+	// the call must not start a long wait the user is already waiting behind.
+	// The watching and the queued side agree under this lock on who closes the
+	// channel, so it is closed exactly once either way.
+	if len(a.steerCh) > 0 {
+		a.mu.Unlock()
+		close(signal)
+		return tools.WithUserMessageSignal(ctx, signal), func() {}
+	}
+	a.steerNotify = signal
+	a.mu.Unlock()
+	return tools.WithUserMessageSignal(ctx, signal), func() {
+		a.mu.Lock()
+		if a.steerNotify == signal {
+			a.steerNotify = nil
+		}
+		a.mu.Unlock()
+	}
+}
+
+// signalUserMessage fires the watch a running tool call installed (see
+// watchUserMessages). The watch is cleared while it fires, so a channel is
+// closed exactly once even when several messages arrive during one call.
+func (a *Agent) signalUserMessage() {
+	a.mu.Lock()
+	signal := a.steerNotify
+	a.steerNotify = nil
+	a.mu.Unlock()
+	if signal != nil {
+		close(signal)
+	}
 }
 
 // reportInterruptedTools publishes the interrupted feedback for every call from

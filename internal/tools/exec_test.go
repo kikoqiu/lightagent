@@ -435,6 +435,98 @@ func TestExecCommandInterruptKillsProcess(t *testing.T) {
 	}
 }
 
+// TestExecCommandYieldsToUserMessageOnLongWait covers the wait a call asked to be
+// longer than the default: a user message arriving while the program runs ends
+// the wait, the program is left running in the background (not killed), and the
+// answer carries what the console had printed until then plus the note telling
+// the model why the wait stopped.
+func TestExecCommandYieldsToUserMessageOnLongWait(t *testing.T) {
+	engine := NewExecEngine(60, 10, true)
+	defer engine.Close()
+	tool := NewRunScriptTool(engine)
+
+	command := "echo working; sleep 5; echo done"
+	if runtime.GOOS == "windows" {
+		command = "Write-Output working; Start-Sleep -Seconds 5; Write-Output done"
+	}
+
+	signal := make(chan struct{})
+	ctx := WithUserMessageSignal(context.Background(), signal)
+	done := make(chan *Result, 1)
+	go func() {
+		done <- tool.Execute(ctx, map[string]any{"script": command, "wait_timeout": 30})
+	}()
+
+	// Let the program print its first line, so the answer has output to report.
+	waitForBufferedOutput(t, engine, 5*time.Second)
+	close(signal)
+
+	select {
+	case res := <-done:
+		cr := commandResultFromResult(t, res.ForLLM)
+		if res.IsError || cr.Status != statusRunning {
+			t.Fatalf("result = %+v (%s), want the program left running", res, res.ForLLM)
+		}
+		if cr.SessionID == nil || *cr.SessionID == "" {
+			t.Fatal("session_id is missing: the backgrounded program must stay pollable")
+		}
+		if cr.Warning == nil || !strings.Contains(*cr.Warning, "new user message") {
+			t.Fatalf("warning = %v, want the note about the user message (%s)", cr.Warning, res.ForLLM)
+		}
+		if !strings.Contains(cr.Output, "working") {
+			t.Fatalf("output = %q, want what the console had printed until then", cr.Output)
+		}
+		if !strings.Contains(res.ForUser, "Command is running in session") {
+			t.Fatalf("ForUser = %q, want the running-session rendering", res.ForUser)
+		}
+		session, err := engine.sessions.Get(*cr.SessionID)
+		if err != nil {
+			t.Fatalf("the session is not in the pool: %v", err)
+		}
+		if session.IsDone() {
+			t.Fatal("the user message terminated the program instead of backgrounding it")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wait was not cut short by the user message")
+	}
+}
+
+// TestExecCommandKeepsTheDefaultWaitWhenUserMessageArrives pins the other half:
+// only a wait window the call asked to be longer than the default yields. A
+// window equal to the default runs its course, so the user message is folded in
+// by the round that follows instead of cutting the wait.
+func TestExecCommandKeepsTheDefaultWaitWhenUserMessageArrives(t *testing.T) {
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	tool := NewRunScriptTool(engine)
+
+	command := "echo working; sleep 5; echo done"
+	if runtime.GOOS == "windows" {
+		command = "Write-Output working; Start-Sleep -Seconds 5; Write-Output done"
+	}
+
+	// The signal is already fired: a wait that wrongly yielded would return
+	// immediately, with nothing for the answer to report.
+	signal := make(chan struct{})
+	close(signal)
+	ctx := WithUserMessageSignal(context.Background(), signal)
+
+	res := tool.Execute(ctx, map[string]any{"script": command, "wait_timeout": 1})
+	cr := commandResultFromResult(t, res.ForLLM)
+	if res.IsError || cr.Status != statusRunning {
+		t.Fatalf("result = %s, want the program left running after the window", res.ForLLM)
+	}
+	if cr.Warning != nil {
+		t.Fatalf("warning = %q, want none: the default window is not cut short", *cr.Warning)
+	}
+	if cr.ElapsedSeconds < 0.9 {
+		t.Fatalf("elapsed = %v, want the 1s window to have run its course", cr.ElapsedSeconds)
+	}
+	if !strings.Contains(cr.Output, "working") {
+		t.Fatalf("output = %q, want what the process printed inside the window", cr.Output)
+	}
+}
+
 // bufferedOutput reports how much output the session holds for the next
 // hand-over, which is how a test waits for a child's first line.
 func bufferedOutput(session *ProcessSession) int {

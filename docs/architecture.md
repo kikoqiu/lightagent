@@ -150,6 +150,15 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 > 则由 `startSteeringTurn()` **立即开一个新回合**处理它——**除非**这个回合是被暂停或被用户
 > 停止的（那时队列留给用户，见下面的「暂停」与上面的「中断」）。
 >
+> 入队即**打断一次长等待**：模型若把 `run_script` 的 `wait_timeout` 设得**比默认值更长**（自愿长等一个
+> 长时间运行的程序），这段等待会让位于新用户消息——消息入队时立即结束等待，进程**不被终止**而是留在
+> 后台（`status=running` + `session_id`，照常可 `poll`/`input`/`kill`），回答带 `warning`（说明收到新用户
+> 消息、程序已转入后台）与到那一刻为止的 console 输出，于是模型先处理这条消息，用户不会被长等挡在后面。
+> 信号随**执行工具调用的 context** 交给工具（`tools.WithUserMessageSignal` / `UserMessageSignalFrom`，
+> agent 侧 `watchUserMessages` / `signalUserMessage`），`pushSteer` 入队即触发；队列里**已有**消息时信号在
+> 调用开始时就已触发，因此长等不会在用户已经等待时才开始。等默认窗口的调用不受影响（窗口很短，消息由
+> 下一轮 `drainSteering()` 照常并入）。
+>
 > `user` 事件（也就是前端画的那条消息行）**不在入队时广播，而是在消息真正进入对话时**
 > （`drainSteering()` / `startSteeringTurn()`）才广播：这样消息行落在它进入对话的准确位置——
 > 它所打断的那条回复之后——前端无需任何"暂存/挪位"的猜测，刷新后的回放顺序也天然一致。

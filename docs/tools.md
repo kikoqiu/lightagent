@@ -64,6 +64,12 @@ type Tool interface {
   `max_chars` 只约束**本次调用**返回的量（不跨调用、不按进程生命周期累计）。`max_lines` 的默认值是
   `tools.exec.max_lines`（默认 50）。最大值是 `tools.exec.max_lines_max`（默认 100）。要得更多**自动
   截断到最大值**。重要输出建议重定向到文件再用文件工具读回。
+* `wait_timeout` **大于默认值**时（模型自愿长等一个长时间运行的程序），这段等待会让位于**新的用户消息**：
+  消息到达就结束等待，进程**不被终止**，原样留在后台（`status=running` + `session_id`，与非中断的转后台
+  完全一样，可继续 `poll`/`input`/`kill`），回答里 `warning` 说明收到新用户消息、程序已转入后台，`output`
+  是到那一刻为止的 console 输出——模型据此先回应这条消息，用户不会被长等挡在后面。等默认窗口（`wait_timeout`
+  未给、或不大于默认值）的调用不受影响：窗口很短，消息由下一轮 `drainSteering` 照常并入；若消息在调用开始
+  **之前**就已入队，长等也不会开始——信号在那时已经触发。
 * 硬超时 `run_timeout`（默认取 `exec.timeout_seconds`，3600s）到点强制结束进程；
   `run_timeout=0` 关闭硬超时。
 * 每次调用都是一个会话，会话的根进程（宿主 shell 或 Python 解释器）是它**自己进程树的根**：
@@ -105,7 +111,7 @@ type Tool interface {
 |------|------|------|------|
 | `script` | string | 必填 | **脚本源码**：`language` 所选语言的源代码——**是文本本身，不是脚本文件路径**；原样交给该引擎当作一个程序执行（shell 引擎即 shell 脚本，`python` 即 Python 源码） |
 | `language` | string | 宿主引擎（`powershell` / `sh`，即宿主 shell） | **解释 `script` 的引擎**：决定源码是哪种语言、由什么执行（是引擎选择，不是调用标签）；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`powershell`/`sh`，以及存在时的 `python`——规范全名，另接受别名 `ps`/`pwsh`、`bash`/`shell`、`python3`/`py`）；参数自带的 `description` 逐条说明各取值含义、别名与 Python 版本，**工具描述只讲机制** |
-| `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回） |
+| `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回）。**大于默认值**时这段等待还会让位于新的用户消息：消息到达即结束等待，进程留在后台（`status=running` + `session_id`），回答带 `warning` 与到那一刻的输出（见上） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
 | `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |

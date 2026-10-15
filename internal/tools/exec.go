@@ -389,6 +389,37 @@ func resolveWindowsShell() string {
 	return windowsShellExe
 }
 
+// waitForUserMessage returns a context that is cancelled when signal fires,
+// together with the function that releases the watch. A nil signal leaves ctx
+// as it is. The cancellation is what ends a wait early (see
+// ProcessSession.WaitForExitContext), and the caller tells the two
+// cancellations apart: a user interrupt is still visible on the original ctx
+// while a user message is not.
+func waitForUserMessage(ctx context.Context, signal UserMessageSignal) (context.Context, func()) {
+	if signal == nil {
+		return ctx, func() {}
+	}
+	waitCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-signal:
+			cancel()
+		case <-waitCtx.Done():
+		}
+	}()
+	return waitCtx, cancel
+}
+
+// userMessageWarning is the note run_script answers with when a new user message
+// ended its wait: it tells the model why the wait stopped short, where the
+// program went, and that the output below is what the console had printed at
+// that moment.
+func userMessageWarning(sessionID string) string {
+	return fmt.Sprintf("a new user message arrived while the program was still running, so the wait ended early: "+
+		"the program is now running in the background as session %s (poll it with manage_session). "+
+		"The console output so far is reported below.", sessionID)
+}
+
 // RunScriptTool runs scripts with the wait-then-background model: the source is
 // handed to the engine chosen by the `language` parameter (the host shell by
 // default).
@@ -416,9 +447,11 @@ func (t *RunScriptTool) Description() string {
 		"that window, returns exit_code and output directly. If it exceeds `wait_timeout` it "+
 		"detaches to the background and returns a `session_id`: the call is a start followed by "+
 		"the same step as `manage_session` poll, so either one reports the whole output buffered "+
-		"at that moment and clears it. The process lifetime is capped by `run_timeout` (default: "+
-		"%d seconds). Output is cleaned and truncated by `max_lines`/`max_chars`, which bound what "+
-		"a call returns rather than the process lifetime.",
+		"at that moment and clears it. A `wait_timeout` above the default also ends early when a "+
+		"new user message arrives: the program keeps running in the background (same `session_id` "+
+		"answer, plus a warning) and the message is handled first. The process lifetime is capped "+
+		"by `run_timeout` (default: %d seconds). Output is cleaned and truncated by "+
+		"`max_lines`/`max_chars`, which bound what a call returns rather than the process lifetime.",
 		t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
 	description += runScriptExamplesHint()
 	description += t.engine.maxLinesRule()
@@ -454,9 +487,11 @@ func (t *RunScriptTool) Parameters() map[string]any {
 				scriptLanguageSummary() + ". Omit to use the host shell (`" + hostLanguage + "`).",
 		},
 		"wait_timeout": map[string]any{
-			"type":        "integer",
-			"default":     t.engine.waitSeconds,
-			"description": "Max seconds to wait synchronously before auto-backgrounding. Default: " + fmt.Sprint(t.engine.waitSeconds) + ".",
+			"type":    "integer",
+			"default": t.engine.waitSeconds,
+			"description": "Max seconds to wait synchronously before auto-backgrounding. Default: " +
+				fmt.Sprint(t.engine.waitSeconds) + ". A value above the default yields to a new user message: " +
+				"the wait ends early, the program keeps running in the background, and the answer reports the output so far.",
 		},
 		"run_timeout": map[string]any{
 			"type":        "integer",
@@ -516,9 +551,14 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 		return fail(err.Error())
 	}
 
+	// The configured default is what a call that names no window gets; only a
+	// window the model asked to be longer than that is the model deciding to
+	// sit and watch a long-running program, and only that wait yields to a new
+	// user message (see the wait below).
+	defaultWait := time.Duration(t.engine.waitSeconds) * time.Second
 	waitTimeout := time.Duration(intArg(args, "wait_timeout", t.engine.waitSeconds)) * time.Second
 	if waitTimeout <= 0 {
-		waitTimeout = time.Duration(t.engine.waitSeconds) * time.Second
+		waitTimeout = defaultWait
 	}
 	runTimeout := t.engine.runTimeoutDefault()
 	if hasArg(args, "run_timeout") {
@@ -555,9 +595,43 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 	// running — and what the process had printed until then is reported with the
 	// interrupted status instead of being discarded. A process that exited at
 	// the very moment of the interrupt is still reported as completed.
+	//
+	// A new user message ends the wait too, but only a wait window the call
+	// asked to be longer than the default: the model chose to watch a
+	// long-running program and the user must not be held behind that choice.
+	// The program is left running in the background and the model is told so
+	// together with what the console printed until then, so it can answer the
+	// user while the program keeps going; the window that was asked to be short
+	// is not cut — it passes in a moment, and the steering message is folded
+	// into the conversation by the round that follows anyway.
+	var userMessage UserMessageSignal
+	if waitTimeout > defaultWait {
+		userMessage = UserMessageSignalFrom(ctx)
+	}
+	waitCtx, stopWaiting := waitForUserMessage(ctx, userMessage)
+	defer stopWaiting()
+
 	deadline := start.Add(waitTimeout)
-	_, _, canceled := session.WaitForExitContext(ctx, time.Until(deadline))
+	_, _, canceled := session.WaitForExitContext(waitCtx, time.Until(deadline))
 	if canceled && !session.IsDone() {
+		if ctx.Err() == nil {
+			// A new user message arrived: the program is not killed, it is
+			// left running in the background (it is polled like any other
+			// session), and the answer carries what the console printed so
+			// far so the model can act on the message right away.
+			raw := session.TakeOutput()
+			shown, truncated, totalLines, totalBytes := sanitizeScriptOutput(raw, maxLines, maxChars, workDir)
+			return commandResult{
+				Status:         statusRunning,
+				SessionID:      strPtr(session.ID),
+				Output:         shown,
+				Truncated:      truncated,
+				TotalLines:     totalLines,
+				TotalBytes:     totalBytes,
+				ElapsedSeconds: elapsedSeconds(start),
+				Warning:        strPtr(userMessageWarning(session.ID)),
+			}.toResult()
+		}
 		raw := session.TakeOutput()
 		_ = session.Kill()
 		// The tree is gone and its output was just reported, so nothing is left
