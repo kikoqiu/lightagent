@@ -488,6 +488,30 @@ func (f *fakeReader) ReadKey() (keyEvent, error) {
 
 func (f *fakeReader) Restore() { f.restored = true }
 
+// stepReader hands out keys like fakeReader, but holds the key at waitAt back
+// until the channel it was given is closed: a test uses it to let the turn reach a
+// known state (the model call started, say) before the next key press.
+type stepReader struct {
+	keys   []keyEvent
+	pos    int
+	waitAt int
+	wait   <-chan struct{}
+}
+
+func (r *stepReader) ReadKey() (keyEvent, error) {
+	if r.pos == r.waitAt && r.wait != nil {
+		<-r.wait
+	}
+	if r.pos >= len(r.keys) {
+		return keyEvent{}, io.EOF
+	}
+	k := r.keys[r.pos]
+	r.pos++
+	return k, nil
+}
+
+func (r *stepReader) Restore() {}
+
 // TestRestoreTerminalRestoresTheActiveReader pins the shutdown affordance: an
 // exit driven by a signal cannot run runRaw's deferred restore, so the CLI
 // offers one that works from the shutdown goroutine. Without an active raw
@@ -1012,9 +1036,38 @@ func TestPromptShowsSpinnerWhileBusy(t *testing.T) {
 	}
 }
 
+// TestEmptyPromptNamesTheContinue pins the third state of the prompt hint: with a
+// pause (or a round that ended on a tool answer) waiting to be answered, an empty
+// prompt names the continue the send key would take from there.
+func TestEmptyPromptNamesTheContinue(t *testing.T) {
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	c.editing = true
+	c.lastKind = agent.EventPaused
+
+	c.mu.Lock()
+	c.printPromptLocked()
+	c.mu.Unlock()
+
+	out := buf.String()
+	if !strings.Contains(out, continuePromptHint) {
+		t.Fatalf("an empty prompt with something to continue should name it: %q", out)
+	}
+	if !strings.HasSuffix(out, caretBackSeqFor(continuePromptHint)) {
+		t.Fatalf("the caret is not parked at the input start: %q", out)
+	}
+}
+
 // caretBackSeq is the escape sequence that parks the caret at the input start.
 func caretBackSeq() string {
-	return fmt.Sprintf("\x1b[%dD", displayColumns(emptyPromptHint))
+	return caretBackSeqFor(emptyPromptHint)
+}
+
+// caretBackSeqFor is caretBackSeq for a given hint: a busy prompt shows the pause
+// hint, and one with something to continue shows the continue hint.
+func caretBackSeqFor(hint string) string {
+	return fmt.Sprintf("\x1b[%dD", displayColumns(hint))
 }
 
 // TestPromptParksCaretAfterLabel pins the caret position of the empty prompt: the
@@ -1094,9 +1147,13 @@ func TestBusyIndicatorFollowsLabel(t *testing.T) {
 	if spin != label+len(promptLabel) {
 		t.Fatalf("the spinner must follow the label directly: %q", out)
 	}
-	// The caret points at the input start, i.e. after the busy glyph.
-	if !strings.HasSuffix(out, caretBackSeq()) {
+	// The caret points at the input start, i.e. after the busy glyph. The hint
+	// names the pause the send key would ask for next.
+	if !strings.HasSuffix(out, caretBackSeqFor(pausePromptHint)) {
 		t.Fatalf("caret not parked at the input start: %q", out)
+	}
+	if !strings.Contains(out, pausePromptHint) {
+		t.Fatalf("a busy prompt should name the pause the send key asks for: %q", out)
 	}
 }
 
@@ -1329,17 +1386,26 @@ func TestPendingSendIsShownAboveThePrompt(t *testing.T) {
 	c.out = &buf
 	c.editing = true
 
-	c.queuePendingSend("later")
+	// The agent announces the queued message (this terminal's own one included):
+	// the prompt region carries it as a dim "(pending)" line until the official
+	// row arrives.
+	c.render(agent.Event{Type: agent.EventPending, ID: "3", Text: "later", Source: "cli"})
 	if out := buf.String(); !strings.Contains(out, "> later"+pendingSuffix) {
 		t.Fatalf("the pending line is missing: %q", out)
 	}
 	if len(c.pendingSends) != 1 {
 		t.Fatalf("pending sends = %d, want 1", len(c.pendingSends))
 	}
+	// The same announcement redelivered draws no second line: the two events are
+	// paired by their id.
+	c.render(agent.Event{Type: agent.EventPending, ID: "3", Text: "later", Source: "cli"})
+	if len(c.pendingSends) != 1 {
+		t.Fatalf("pending sends = %d, want the redelivered event ignored", len(c.pendingSends))
+	}
 
 	// The agent sends it: the official row is written and the pending line goes.
 	buf.Reset()
-	c.render(agent.Event{Type: agent.EventUser, Text: "later", Source: "cli"})
+	c.render(agent.Event{Type: agent.EventUser, ID: "3", Text: "later", Source: "cli"})
 	out := buf.String()
 	if !strings.Contains(out, "> later\n") {
 		t.Fatalf("the official row is missing: %q", out)
@@ -1356,12 +1422,115 @@ func TestPendingSendIsShownAboveThePrompt(t *testing.T) {
 	scanner := newTestCLI(t)
 	var scannerBuf strings.Builder
 	scanner.out = &scannerBuf
-	scanner.queuePendingSend("later")
+	scanner.render(agent.Event{Type: agent.EventPending, ID: "4", Text: "later", Source: "cli"})
 	if out := scannerBuf.String(); !strings.Contains(out, "queued") {
 		t.Fatalf("the scanner mode printed no note: %q", out)
 	}
 	if len(scanner.pendingSends) != 0 {
 		t.Fatalf("the scanner mode queued a pending line: %d", len(scanner.pendingSends))
+	}
+}
+
+// TestEmptySendKeyPausesTheTurn pins the terminal's half of the composer's pause
+// mode: the send key on an empty prompt acts on the turn instead of sending — it
+// pauses a running one, exactly like the web page's Send button in that state —
+// and the round already in flight still finishes.
+func TestEmptySendKeyPausesTheTurn(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		calls    int
+		started  = make(chan struct{})
+		startOne sync.Once
+	)
+	releaseCh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		startOne.Do(func() { close(started) })
+		<-releaseCh
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(release)
+
+	cfg := config.Default()
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
+	ag := agent.New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), agent.NewBus())
+	events, cancel := ag.Bus().Subscribe()
+	defer cancel()
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	c := New(ag, st, "test-model", true)
+	c.out = io.Discard
+
+	// "hi" starts the turn; the empty submit waits until the model call is in
+	// flight — the state a reader pauses from — and then pauses it.
+	keys := []keyEvent{
+		{kind: keyRune, r: 'h'}, {kind: keyRune, r: 'i'}, {kind: keySubmit},
+		{kind: keySubmit},
+	}
+	reader := &stepReader{keys: keys, waitAt: 3, wait: started}
+	done := make(chan error, 1)
+	go func() { done <- c.runRaw(context.Background(), reader) }()
+
+	// The pause has to reach the agent before the round may finish: that is what
+	// makes it the turn-ending round.
+	deadline := time.After(5 * time.Second)
+paused:
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == agent.EventPending && ev.Pause {
+				break paused
+			}
+			if ev.Type == agent.EventTurnDone {
+				t.Fatal("the turn ended before the pause request landed")
+			}
+		case <-deadline:
+			t.Fatal("the pause request never reached the agent")
+		}
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("runRaw: %v", err)
+	}
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("model calls = %d, want the paused turn to stop after its round", n)
+	}
+	hist := ag.History()
+	if len(hist) != 2 || hist[0].Content != "hi" || hist[1].Content != "answer" {
+		t.Fatalf("history = %+v, want the message and the round's reply", hist)
+	}
+}
+
+// TestPauseAndContinueCommandsReportWhenIdle pins the terminal's two pause
+// commands: /pause and /continue say so when the turn has nothing to do instead of
+// staying silent.
+func TestPauseAndContinueCommandsReportWhenIdle(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.handleCommand(context.Background(), "/pause")
+	if !strings.Contains(buf.String(), "nothing to pause") {
+		t.Fatalf("/pause on an idle agent = %q", buf.String())
+	}
+	buf.Reset()
+	c.handleCommand(context.Background(), "/continue")
+	if !strings.Contains(buf.String(), "nothing to continue") {
+		t.Fatalf("/continue on an empty conversation = %q", buf.String())
 	}
 }
 
@@ -1395,7 +1564,7 @@ func TestAnimationRepaintsInPlace(t *testing.T) {
 	if !strings.Contains(out, spinnerFrames[1]) {
 		t.Fatalf("the new frame is missing: %q", out)
 	}
-	if !strings.HasSuffix(out, caretBackSeq()) {
+	if !strings.HasSuffix(out, caretBackSeqFor(pausePromptHint)) {
 		t.Fatalf("the caret is not parked at the input start: %q", out)
 	}
 }

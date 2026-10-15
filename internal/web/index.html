@@ -222,9 +222,13 @@
              hint would be clipped there), see app.js. -->
         <textarea id="input" rows="1" placeholder="Message lightagent…  (Ctrl+Enter = send)"
                   data-placeholder-short="Message…"
-                  title="Enter = newline · Ctrl+Enter = send" aria-label="message"></textarea>
+                  title="Enter = newline · Ctrl+Enter = send, or pause / continue when the box is empty"
+                  aria-label="message"></textarea>
         <button id="stop" class="stop" title="interrupt the running turn" aria-label="stop" type="button">Stop</button>
-        <button id="send" aria-label="send" type="button">Send</button>
+        <!-- The send button carries the composer's three states (app.js
+             updateComposer): Send what is typed, Pause the turn that is running,
+             or Continue a turn a pause held back. -->
+        <button id="send" aria-label="send" title="send · pause the running turn · continue it" type="button">Send</button>
       </div>
     </footer>
   </div>

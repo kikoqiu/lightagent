@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +84,10 @@ type Agent struct {
 	cancelTurn context.CancelFunc
 
 	steerCh chan steerMessage
+	// steerSeq numbers the queued messages, so the pending event that announces
+	// one and the user event that folds it into the conversation can be paired
+	// by a front-end (see pushSteer).
+	steerSeq int64
 
 	persist func(history []llm.Message, summary string)
 }
@@ -423,8 +428,57 @@ func (a *Agent) submit(source, text string, media []llm.ContentPart) {
 	a.cancelTurn = cancel
 	a.mu.Unlock()
 
+	// Messages a pause or a stop held back are part of this turn's input too:
+	// sending something is exactly what they were waiting for, and they were
+	// queued first, so they keep their order at the head (see Continue).
+	held, _ := splitPause(a.takeSteering())
+	inputs := make([]userInput, 0, len(held)+1)
+	for _, m := range held {
+		a.bus.Publish(Event{
+			Type:        EventUser,
+			ID:          m.id,
+			Text:        m.text,
+			Source:      m.source,
+			Attachments: llm.MediaAttachments(m.media),
+		})
+		inputs = append(inputs, userInput{text: m.text, media: m.media})
+	}
 	a.bus.Publish(Event{Type: EventUser, Text: text, Source: source, Attachments: llm.MediaAttachments(media)})
-	go a.runLoop(turnCtx, userInput{text: text, media: media})
+	inputs = append(inputs, userInput{text: text, media: media})
+	go a.runTurn(turnCtx, inputs)
+}
+
+// Continue resumes a turn a pause held back: the messages that were waiting are
+// sent — their rows were already drawn as pending, so each is announced here the
+// way drainSteering announces one — and, when nothing is queued, the model is
+// asked again with the conversation as it stands, without a new user message. It
+// reports whether a turn was started: a running turn is never disturbed, and an
+// empty conversation has nothing to continue.
+func (a *Agent) Continue() bool {
+	a.mu.Lock()
+	if a.busy || (len(a.history) == 0 && len(a.steerCh) == 0) {
+		a.mu.Unlock()
+		return false
+	}
+	a.busy = true
+	turnCtx, cancel := context.WithCancel(context.Background())
+	a.cancelTurn = cancel
+	a.mu.Unlock()
+
+	msgs, _ := splitPause(a.takeSteering())
+	inputs := make([]userInput, 0, len(msgs))
+	for _, m := range msgs {
+		a.bus.Publish(Event{
+			Type:        EventUser,
+			ID:          m.id,
+			Text:        m.text,
+			Source:      m.source,
+			Attachments: llm.MediaAttachments(m.media),
+		})
+		inputs = append(inputs, userInput{text: m.text, media: m.media})
+	}
+	go a.runTurn(turnCtx, inputs)
+	return true
 }
 
 // Interrupt cancels the turn in flight (the model call or the tool it is
@@ -441,29 +495,80 @@ func (a *Agent) Interrupt() bool {
 	return true
 }
 
-// steerMessage is one queued steering message: its text plus the client it came
-// from, which rides along to the user event published when the message is folded
-// into the conversation. media are the attachments the message carries (empty
-// for a plain message).
+// steerMessage is one queued entry: a steering message with its text plus the
+// client it came from, which rides along to the user event published when the
+// message is folded into the conversation, or a pause request (see Pause).
+// media are the attachments the message carries (empty for a plain message).
 type steerMessage struct {
+	// id pairs the pending event that announces the message with the user event
+	// that folds it into the conversation (see pushSteer and drainSteering).
+	id string
+	// pause marks a pause request rather than a message: reaching it pauses the
+	// pipeline (see Pause).
+	pause  bool
 	source string
 	text   string
 	media  []llm.ContentPart
 }
 
-// pushSteer queues a steering message for the running turn. Nothing is announced
-// here: the row is published when the turn folds the message into the
-// conversation (see drainSteering), which is the point the message actually
-// belongs at — after the reply it interrupted. Announcing it earlier would draw
-// it in the middle of that reply (and would replay in the wrong place too, since
-// the mirror records the rows the bus carries).
-func (a *Agent) pushSteer(source, text string, media []llm.ContentPart) {
+// Pause asks the running turn to stop asking the model once the round in flight
+// is done: the reply already streaming and the tool calls it carries still
+// finish, and the turn then ends instead of looping again. It is a queued entry
+// like a steering message (see steerMessage.pause), so the messages queued with
+// it stay queued — neither folded in nor sent — until the user sends something
+// or continues (see Continue). It reports whether a turn was running.
+func (a *Agent) Pause() bool {
+	a.mu.Lock()
+	busy := a.busy
+	a.mu.Unlock()
+	if !busy {
+		return false
+	}
 	select {
-	case a.steerCh <- steerMessage{source: source, text: text, media: media}:
+	case a.steerCh <- steerMessage{pause: true}:
+		// Every front-end shows that a pause is on its way; it carries no row.
+		a.bus.Publish(Event{Type: EventPending, Pause: true})
+	default:
+		// A queue that is full of messages keeps them: the pause request is what
+		// gets dropped, and the turn simply runs on.
+		a.bus.Publish(Event{Type: EventError, Text: "steering queue is full; pause request dropped"})
+		return false
+	}
+	return true
+}
+
+// pushSteer queues a steering message for the running turn. The message is
+// announced as pending right away — every front-end draws its row then, wherever
+// it is — while the official user event still waits for the point the message
+// actually joins the conversation (see drainSteering): after the reply it
+// interrupted, before the answer it steers. The two events share an id, so a
+// front-end settles the pending row it drew when the message really lands.
+func (a *Agent) pushSteer(source, text string, media []llm.ContentPart) {
+	m := steerMessage{id: a.nextSteerID(), source: source, text: text, media: media}
+	select {
+	case a.steerCh <- m:
+		a.bus.Publish(Event{
+			Type:        EventPending,
+			ID:          m.id,
+			Text:        text,
+			Source:      source,
+			Attachments: llm.MediaAttachments(media),
+		})
 	default:
 		a.bus.Publish(Event{Type: EventError, Text: "steering queue is full; message dropped"})
 	}
 }
+
+// nextSteerID hands out the numbers that pair a queued message with the event
+// that folds it in.
+func (a *Agent) nextSteerID() string {
+	a.mu.Lock()
+	a.steerSeq++
+	id := a.steerSeq
+	a.mu.Unlock()
+	return strconv.FormatInt(id, 10)
+}
+
 
 // SetToolResultsVisible toggles whether tool results are broadcast to the
 // frontends. It defaults to true.
@@ -494,32 +599,50 @@ type userInput struct {
 	media []llm.ContentPart
 }
 
-// runLoop executes a full turn: LLM call → tool calls → repeat. The turn's
-// context is cancelled by Interrupt, which stops the in-flight step and ends the
-// turn (see finishInterrupt).
-func (a *Agent) runLoop(ctx context.Context, input userInput) {
-	a.runTurn(ctx, []userInput{input})
-}
-
 // runTurn is the body of a turn: it records the turn's user messages (which the
 // caller has announced on the bus already), runs the LLM/tool loop and tears the
 // turn down. A turn that picks up queued steering messages passes them all at
 // once.
+//
+// The turn's context is cancelled by Interrupt, which stops the in-flight step
+// and ends the turn (see finishInterrupt). A pause (see Pause) ends it at the
+// next iteration boundary instead, with the round in flight finished first.
 func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
+	paused := false
 	defer func() {
 		a.mu.Lock()
 		a.busy = false
 		a.cancelTurn = nil
 		a.mu.Unlock()
 		a.save()
+		// A pause request left over by a step that ended the turn (or that
+		// arrived just as it did) has no iteration left to consume it: it is
+		// consumed here so it can never pause a later turn, and it holds the
+		// queue exactly like one the loop saw.
+		if leftover := a.holdPause(); leftover && ctx.Err() == nil && !paused {
+			paused = true
+			a.bus.Publish(a.pausedEvent())
+		}
 		a.bus.Publish(a.usageEvent())
 		a.bus.Publish(Event{Type: EventTurnDone})
 		// A steering message that arrived after the loop's last drain (the
 		// final reply was still streaming) has no iteration left to consume
 		// it: it is picked up as a turn of its own instead of sitting in the
 		// queue until the user types again.
-		a.startSteeringTurn()
+		//
+		// A turn that ended because the user paused it — or stopped it — keeps
+		// what is queued instead: an interrupt stops everything the user asked
+		// to stop, and a pause holds the messages until the user comes back
+		// (see Continue and Submit).
+		if ctx.Err() == nil && !paused {
+			a.startSteeringTurn()
+		}
 	}()
+
+	// Every front-end lights its running indicator from here: a turn that starts
+	// without a user message of its own (a continue after a pause) has no user
+	// event to do it.
+	a.bus.Publish(Event{Type: EventTurnStart})
 
 	for _, input := range inputs {
 		a.appendMessage(llm.Message{Role: "user", Content: input.text, Media: input.media})
@@ -551,7 +674,15 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 			a.finishInterrupt()
 			return
 		}
-		a.drainSteering()
+		if a.drainSteering() {
+			// A pause was requested while the round in flight was running: it
+			// has finished by now (its tool calls included), so the turn ends
+			// here — nothing else is asked of the model and nothing queued is
+			// sent (see Continue and Submit).
+			paused = true
+			a.bus.Publish(a.pausedEvent())
+			return
+		}
 
 		if skipCompact {
 			skipCompact = false
@@ -1062,19 +1193,69 @@ func (a *Agent) buildMessagesLocked() []llm.Message {
 // each of them as a user event right here: this is the moment the message becomes
 // part of the conversation, so the row every front-end draws (and the mirror
 // records for a later reload) sits exactly where the message sits in the history —
-// after the reply it interrupted, before the answer it steers.
-func (a *Agent) drainSteering() {
-	for _, m := range a.takeSteering() {
-		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source, Attachments: llm.MediaAttachments(m.media)})
+// after the reply it interrupted, before the answer it steers. The event carries
+// the message's id, which is what settles the pending row its pending event drew.
+//
+// A pause request in the batch pauses the pipeline instead: nothing is folded in
+// and nothing is sent, the messages stay queued (they wait for the user, see
+// Continue and Submit) and it reports true. The caller must end the turn then.
+func (a *Agent) drainSteering() bool {
+	msgs, paused := splitPause(a.takeSteering())
+	if paused {
+		a.requeueSteering(msgs)
+		return true
+	}
+	for _, m := range msgs {
+		a.bus.Publish(Event{
+			Type:        EventUser,
+			ID:          m.id,
+			Text:        m.text,
+			Source:      m.source,
+			Attachments: llm.MediaAttachments(m.media),
+		})
 		a.appendMessage(llm.Message{Role: "user", Content: m.text, Media: m.media})
 	}
+	return false
+}
+
+// holdPause consumes a pause request still sitting in the queue (a turn may end
+// without ever reaching the loop's check) and keeps the messages queued with it,
+// so a pause can never leak into a later turn. It reports whether one was there.
+func (a *Agent) holdPause() bool {
+	msgs, paused := splitPause(a.takeSteering())
+	// The batch goes straight back: this is a peek at what the queue holds, not a
+	// claim on the messages.
+	a.requeueSteering(msgs)
+	return paused
+}
+
+// pausedEvent reports the pause on the bus: both front-ends draw a marker row for
+// it, the way they draw an interrupt.
+func (a *Agent) pausedEvent() Event {
+	return Event{Type: EventPaused, Text: "paused; the round in flight finished and nothing was sent"}
 }
 
 // steeringPending reports whether a steering message is still waiting to be
 // folded into the conversation.
 func (a *Agent) steeringPending() bool { return len(a.steerCh) > 0 }
 
-// takeSteering removes and returns every queued steering message, oldest first.
+// splitPause separates the pause requests of one batch from its messages. A batch
+// that holds a request is a pause batch: the caller leaves the messages queued,
+// where they wait for the user.
+func splitPause(msgs []steerMessage) (messages []steerMessage, paused bool) {
+	for _, m := range msgs {
+		if m.pause {
+			paused = true
+			continue
+		}
+		messages = append(messages, m)
+	}
+	return messages, paused
+}
+
+// takeSteering removes and returns every queued entry, oldest first. Pause
+// requests are entries of the same queue, so they come along; callers that only
+// want the messages filter them with splitPause.
 func (a *Agent) takeSteering() []steerMessage {
 	var msgs []steerMessage
 	for {
@@ -1105,9 +1286,16 @@ func (a *Agent) requeueSteering(msgs []steerMessage) {
 // ones a running turn folds in: the message joins the conversation at this point,
 // so its row belongs after everything the previous turn produced. It is a no-op
 // when nothing is queued.
+//
+// A pause request that arrives just as the turn ends keeps the messages queued
+// instead: they wait for the user, exactly as a pause the loop saw does.
 func (a *Agent) startSteeringTurn() {
-	msgs := a.takeSteering()
+	msgs, paused := splitPause(a.takeSteering())
 	if len(msgs) == 0 {
+		return
+	}
+	if paused {
+		a.requeueSteering(msgs)
 		return
 	}
 	a.mu.Lock()
@@ -1125,7 +1313,13 @@ func (a *Agent) startSteeringTurn() {
 
 	inputs := make([]userInput, 0, len(msgs))
 	for _, m := range msgs {
-		a.bus.Publish(Event{Type: EventUser, Text: m.text, Source: m.source, Attachments: llm.MediaAttachments(m.media)})
+		a.bus.Publish(Event{
+			Type:        EventUser,
+			ID:          m.id,
+			Text:        m.text,
+			Source:      m.source,
+			Attachments: llm.MediaAttachments(m.media),
+		})
 		inputs = append(inputs, userInput{text: m.text, media: m.media})
 	}
 	go a.runTurn(turnCtx, inputs)

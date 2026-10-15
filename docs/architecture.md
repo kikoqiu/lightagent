@@ -29,13 +29,17 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 入口是 `Agent.Submit(text)`：
 
 1. `Submit` 用互斥锁判断当前是否忙碌。
-   * 空闲：置 `busy=true`，发布 `user` 事件，启动 `runLoop` 协程。
-   * 忙碌：把消息推入 `steerCh`（steering），并发布 `user` 事件。
-2. `runLoop` 执行：
-   1. 追加第一条 user 消息并广播一次 `usage`（前端立刻反映新消息带来的用量）。
+   * 空闲：置 `busy=true`，发布 `user` 事件（若队列里还留着暂停/停止时挂起的消息，它们在前、这条在后，
+     作为同一个回合一起发出），启动回合协程。
+   * 忙碌：把消息推入 `steerCh`（steering），并**立刻广播一条 `pending` 事件**（见下面的「steering」）。
+2. 回合体执行：
+   1. 广播 `turn_start`（不带行）：没有 user 消息的回合（暂停后 `Continue` 继续）也靠它点亮运行指示；
+      然后追加本回合的 user 消息并广播一次 `usage`（前端立刻反映新消息带来的用量）。
    2. 每轮开始时 `drainSteering()`：把 `steerCh` 中的消息按序追加为 user 消息，**并在此刻广播
       `user` 事件**——消息行出现在它真正进入对话的位置（它所打断的那条回复之后），因此各前端
       画出的顺序、以及 web 回放缓冲记录的顺序，都与模型看到的消息顺序一致。
+      队列里若有一个 **pause 请求**（见下面的「暂停」），`drainSteering()` 返回 true：本轮已经跑完
+      （含它带来的工具调用），回合在此结束——不并入任何消息、也不发送（它们留在队列里等用户）。
    3. `compactIfNeeded()`：请求用量超阈值则压缩（见下）。
    4. `callLLM()`：构造 `[system, ...history]`，附带工具定义，流式调用；模型可见回答的增量
       文本发布为 `assistant_delta`；若服务商返回思考内容（`reasoning_content` / `reasoning`），
@@ -85,6 +89,20 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 3. 结束时置 `busy=false`、保存会话、发布 `turn_done`；随后若 `steerCh` 仍非空（消息在最后一轮
    **之后**才到，已无轮次可并入），则由 `startSteeringTurn()` 立刻把它们作为**独立的新回合**继续
    处理，并在那里广播它们的 `user` 事件（与 `drainSteering` 同一时机语义），不会滞留到用户下次输入。
+   **回合因暂停或停止而结束时除外**：暂停把队列原样留下（等用户继续），中断同样（用户已经要求停下，
+   剩下的消息也不再自动发出）；两种情况都会跳过 `startSteeringTurn()`。
+
+> **暂停（pause）**：`Agent.Pause()` 把一个**暂停请求**当作一种特殊的 pending 条目推进 `steerCh`
+> （并广播一条 `pause: true` 的 `pending` 事件，不带行）。它**不是中断**：正在流式输出的这一轮
+> 照常跑完（服务商已经流出的回复、以及它带来的工具调用都会完成），然后由下一轮的 `drainSteering()`
+> 消费这条请求并结束回合，同时广播 `paused`（前端画一条 `[paused]` 标记行）。
+> * 暂停**不会**把队列里的消息并入对话，也不会发送它们；它们留在 `steerCh` 里等用户。
+> * `Agent.Continue()` 继续一个被暂停的回合：队列里的消息（若有）作为该回合的输入发出；没有消息时
+>   不追加任何用户消息，直接用现有上下文再问一次模型（这也是「工具结果之后继续」的用法）。
+> * 用户下次 `Submit` 时同样把挂起的消息带上（它们在前），作为同一个回合发出。
+> * 暂停请求若在回合收尾时才到（已无轮次可消费它），由收尾处的 `holdPause()` 消费并保持队列不被
+>   自动续跑——它绝不会泄漏到下一个回合上去。
+> * `maxIter` 用尽、正常结束等其余收尾路径保持原样：`startSteeringTurn()` 照旧把剩余消息开成新回合。
 
 > **中断**：每个回合有自己的可取消 context（`Agent.Interrupt()` 触发，CLI 的 Ctrl+C /
 > `/stop`、网页的 Stop 按钮 / `/stop`）。中断取消正在进行的模型调用或工具调用，语义按
@@ -128,15 +146,18 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 > steering 的语义：忙碌时用户输入不会丢失，而是在下一个安全点（下一轮 LLM 调用前）
 > 插入到对话里，因此 Agent 能在工具循环中途「听到」新的用户指令。若消息是在**最后一轮**
 > 的流式过程中到达（该轮之后已无轮次可并入），本回合会**再跑一轮**把它并进去；若连这一轮
-> 都来不及（消息在回合收尾时才到，例如工具轮次已用尽 `max_tool_iterations`、或回合被中断），
-> 则由 `startSteeringTurn()` **立即开一个新回合**处理它。
+> 都来不及（消息在回合收尾时才到，例如工具轮次已用尽 `max_tool_iterations`），
+> 则由 `startSteeringTurn()` **立即开一个新回合**处理它——**除非**这个回合是被暂停或被用户
+> 停止的（那时队列留给用户，见下面的「暂停」与上面的「中断」）。
 >
 > `user` 事件（也就是前端画的那条消息行）**不在入队时广播，而是在消息真正进入对话时**
 > （`drainSteering()` / `startSteeringTurn()`）才广播：这样消息行落在它进入对话的准确位置——
 > 它所打断的那条回复之后——前端无需任何"暂存/挪位"的猜测，刷新后的回放顺序也天然一致。
-> 在事件到达之前，发送方自己显示一条 **pending**（待发送）提示：网页是带 `· pending` 标记、
-> 且把本轮后续行都插在其之前的 pending 行（Agent 发送时原地转为普通行），终端是提示区里的
-> 灰色 `(pending)` 行（正式行随后按事件位置打印）。
+> 入队时广播的是**另一条事件**：`pending`（带 `id`、文本、来源与附件描述），两端据此**立刻**画出
+> 待发送提示，并把这条消息的暂挂状态**广播到所有终端**（不再只是发送方自己显示）：
+> 网页是带 `· pending` 标记、且把本轮后续行都插在其之前的 pending 行，终端是提示区里的
+> 灰色 `(pending)` 行。消息真正进入对话时，`user` 事件带**同一个 `id`**，前端据此把那条
+> pending 行**原地**转为普通行（终端则换掉提示区那一行）。
 
 ## 事件总线
 
@@ -144,7 +165,13 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 `Publish()` 非阻塞地投递给所有订阅者（订阅者过慢时丢弃，避免阻塞 Agent）。
 
 事件类型（`EventType`）：`user`、`assistant_delta`、`reasoning_delta`、`assistant`、`tool_call`、
-`tool_result`、`info`、`error`、`compacted`、`usage`、`turn_done`、`interrupted`。
+`tool_result`、`info`、`error`、`compacted`、`usage`、`turn_done`、`interrupted`、`pending`、
+`turn_start`、`paused`。
+
+`pending` 报告一条**已入队但尚未并入对话**的用户消息（带 `id`），两端的暂挂提示由它画出；
+`turn_start` 报告一个回合开始（不带行，供没有 user 消息的继续回合点亮运行指示）；
+`paused` 报告管线已暂停（前端画一条 `[paused]` 标记行）；三者都带 `id` / `pause` 等字段，
+详见上文的「暂停」与「steering」。
 
 `user` 事件带 `source` 字段（`cli` / `web` 等），前端据此决定标签与是否回显自己的输入；它由
 `drainSteering()` / `startSteeringTurn()` 在消息进入对话时广播（见上），因此各端的行顺序与

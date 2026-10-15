@@ -872,8 +872,16 @@ func (s *Server) recordLocked(ev agent.Event) {
 		}
 	case agent.EventInterrupted:
 		s.history = append(s.history, historyMessage{Role: "interrupted", Content: ev.Text})
+	case agent.EventPaused:
+		s.history = append(s.history, historyMessage{Role: "paused", Content: ev.Text})
 	case agent.EventError:
 		s.history = append(s.history, historyMessage{Role: "error", Content: ev.Text})
+	case agent.EventPending, agent.EventTurnStart:
+		// Neither carries a row: a pending message is a row the page draws out
+		// of order (it sits below the reply still streaming, see placeRow) so
+		// the scrollback cannot hold it — it is broadcast live, and the message
+		// it announces reaches the transcript when the matching user event
+		// folds it in — and turn_start only lights the running indicator.
 	}
 	// A row was added (or an empty thinking row was dropped above): the transcript
 	// a reconnecting page has to replay changed.
@@ -1345,6 +1353,16 @@ func (s *Server) handleCommand(text string) {
 		}
 		// The interrupted marker and the end of the turn are broadcast to every
 		// client by the agent.
+	case "/pause":
+		// A pause is not an interrupt: the round in flight finishes, and the
+		// messages queued behind it wait for the user (see /continue).
+		if !s.agent.Pause() {
+			s.info("nothing to pause")
+		}
+	case "/continue":
+		if !s.agent.Continue() {
+			s.info("nothing to continue")
+		}
 	case "/history":
 		s.info(slash.UsageText(s.agent.Stats()))
 	case "/result":

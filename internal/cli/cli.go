@@ -121,12 +121,20 @@ type CLI struct {
 	// reasoningBuf holds the still-arriving partial reasoning line: complete
 	// lines are committed dim as they arrive, the tail stays a preview.
 	reasoningBuf string
-	// pendingSends holds the messages typed here that the agent has not sent yet:
-	// they were queued behind a running turn. A terminal cannot move a row that is
-	// already printed, so the transcript row is the official one (printed when the
-	// message enters the conversation, i.e. after the reply it interrupted) while
-	// the pending line keeps the text visible in the prompt region until then.
-	pendingSends []string
+	// pendingSends holds the queued messages the agent has not folded into the
+	// conversation yet: they were queued behind a running turn (or held by a
+	// pause). A terminal cannot move a row that is already printed, so the
+	// transcript row is the official one (printed when the message enters the
+	// conversation, i.e. after the reply it interrupted) while the pending line
+	// keeps the text visible in the prompt region until then. The list is filled
+	// from the pending events on the bus, so a message another client sent is
+	// shown here too.
+	pendingSends []pendingSend
+	// lastKind is the type of the last event that drew a transcript row. The
+	// send key reads it: an idle prompt with an empty input has something to
+	// continue when that row is a user message, a tool result or a pause marker
+	// (see canContinueLocked).
+	lastKind agent.EventType
 	// ctxTokens/ctxWindow are the latest context-usage numbers reported by the
 	// agent. They are drawn on the prompt row so the usage stays visible while
 	// a turn runs (and after it ends); zero means nothing was reported yet.
@@ -355,6 +363,15 @@ const promptLabel = "> "
 // back over it so that it blinks where typing starts.
 const emptyPromptHint = "[Ctrl+J to Send]"
 
+// The two other states of the same hint: while a turn runs the send key asks the
+// round in flight to finish first (a pause), and once a pause — or any round that
+// ended on a tool answer — left something to answer, it takes the turn on (a
+// continue). They are the labels of the web page's Send button in the same states.
+const (
+	pausePromptHint    = "[Ctrl+J to Pause]"
+	continuePromptHint = "[Ctrl+J to Continue]"
+)
+
 // inputIndent aligns the continuation lines of a multi-line message under its
 // first line, i.e. one prompt label wide.
 var inputIndent = strings.Repeat(" ", displayColumns(promptLabel))
@@ -527,12 +544,12 @@ func (c *CLI) promptRegionLocked() []promptRow {
 	// does: a row wider than the terminal would be wrapped by the console itself,
 	// which the in-place repaint (it steps the caret between rows) cannot follow.
 	rows = append(rows, wrapPreviewRows(c.preview, c.rowLimit())...)
-	// Messages typed here that are still waiting behind the running turn: dim
-	// "(pending)" lines between the streaming preview and the prompt. They show
-	// the text right away without putting a row into the transcript, which stays
-	// ordered (the official row is printed when the message is sent).
-	for _, text := range c.pendingSends {
-		rows = append(rows, pendingMessageRows(text, c.rowLimit())...)
+	// Messages the agent has queued but not sent yet: dim "(pending)" lines
+	// between the streaming preview and the prompt. They show the text right away
+	// without putting a row into the transcript, which stays ordered (the official
+	// row is printed when the message is sent).
+	for _, pending := range c.pendingSends {
+		rows = append(rows, pendingMessageRows(pending.text, c.rowLimit())...)
 	}
 	head, headWidth := c.promptHeadLocked()
 	limit := c.rowLimit()
@@ -555,20 +572,35 @@ func (c *CLI) promptRegionLocked() []promptRow {
 		// terminal too narrow for it the hint is dropped instead of wrapping the
 		// row it shares with the prompt.
 		if c.hintFitsLocked() {
+			hint := c.emptyPromptHintLabel()
 			return append(rows, promptRow{
-				text:  head + termcolor.DarkGray(emptyPromptHint),
-				width: headWidth + displayColumns(emptyPromptHint),
+				text:  head + termcolor.DarkGray(hint),
+				width: headWidth + displayColumns(hint),
 			})
 		}
 	}
 	return append(rows, promptRow{text: head, width: headWidth})
 }
 
+// emptyPromptHintLabel is the gray hint drawn after an empty prompt. The send key
+// acts on the turn when there is nothing to send, so the hint names what it would
+// do right now — the three states of the web page's Send button. The caller must
+// hold c.mu.
+func (c *CLI) emptyPromptHintLabel() string {
+	if c.busy {
+		return pausePromptHint
+	}
+	if c.canContinueLocked() {
+		return continuePromptHint
+	}
+	return emptyPromptHint
+}
+
 // hintFitsLocked reports whether the empty-input hint still fits on the prompt
 // row. The caller must hold c.mu.
 func (c *CLI) hintFitsLocked() bool {
 	_, headWidth := c.promptHeadLocked()
-	return headWidth+displayColumns(emptyPromptHint) <= c.rowLimit()
+	return headWidth+displayColumns(c.emptyPromptHintLabel()) <= c.rowLimit()
 }
 
 // wrapInputRows lays one logical input line out as the physical rows the console
@@ -655,7 +687,7 @@ func (c *CLI) printPromptLocked() {
 	}
 	if len(c.input) == 0 && c.editing && c.hintFitsLocked() {
 		// Park the caret at the input start, not at the end of the hint.
-		c.cursorBackLocked(displayColumns(emptyPromptHint))
+		c.cursorBackLocked(displayColumns(c.emptyPromptHintLabel()))
 	}
 	c.promptActive = true
 	c.promptStale = false
@@ -1120,6 +1152,19 @@ func (c *CLI) runRaw(ctx context.Context, reader termReader) error {
 			c.mu.Unlock()
 
 			if text == "" {
+				// An empty box sends nothing: the send key acts on the turn
+				// instead. It pauses a running one, or continues the turn a pause
+				// (or a round that ended on a tool answer) left waiting — the two
+				// other states of the web page's Send button.
+				resume := false
+				if !c.agent.Pause() {
+					c.mu.Lock()
+					resume = c.canContinueLocked()
+					c.mu.Unlock()
+				}
+				if resume {
+					c.agent.Continue()
+				}
 				c.redrawInput()
 				continue
 			}
@@ -1255,46 +1300,72 @@ func longestPrefix(names []string) string {
 
 // dispatch routes one submitted line: slash commands are handled locally, every
 // other line goes to the agent. The message is not echoed here: the agent
-// announces it when it enters the conversation, so its row is drawn exactly where
-// it belongs — after the reply it interrupted when the turn was already running.
-// While such a message waits, its text stays visible as a pending line above the
-// prompt (see queuePendingSend). It returns true to exit.
+// announces it — as a pending row right away when it queues behind a running
+// turn, as the official row when it enters the conversation, which is where it
+// belongs (after the reply it interrupted when the turn was already running). It
+// returns true to exit.
 func (c *CLI) dispatch(ctx context.Context, line string) bool {
 	if slash.IsCommandLine(line) {
 		return c.handleCommand(ctx, line)
 	}
-	busy := c.agent.Busy()
 	c.agent.SubmitFrom("cli", line)
-	if busy {
-		c.queuePendingSend(line)
-	}
 	return false
 }
 
-// queuePendingSend shows a message typed here that is waiting behind the running
-// turn: the prompt region carries it as a dim "(pending)" line until the agent
-// sends it, when the official row is printed and the line goes away. Modes without
-// a prompt region (the line scanner, a one-shot run) get a dim note instead.
-func (c *CLI) queuePendingSend(text string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.editing {
-		c.pendingSends = append(c.pendingSends, text)
-		c.printPromptLocked()
-		return
-	}
-	c.outLocked(termcolor.DimText("(queued; it joins the conversation after the current reply)") + "\n")
+// pendingSend is one queued message the prompt region shows: its text plus the id
+// that pairs it with the user event that folds it into the conversation.
+type pendingSend struct {
+	id   string
+	text string
 }
 
-// settlePendingSendLocked drops the pending line of a message that has just been
-// sent, since the official row is written right after. The caller must hold c.mu.
-func (c *CLI) settlePendingSendLocked(text string) {
-	for i, pending := range c.pendingSends {
-		if pending == text {
-			c.pendingSends = append(c.pendingSends[:i], c.pendingSends[i+1:]...)
+// addPendingSendLocked queues one pending line for a message the agent announced
+// as pending. Modes without a prompt region (the line scanner, a one-shot run)
+// get a dim note instead. The caller must hold c.mu.
+func (c *CLI) addPendingSendLocked(ev agent.Event) {
+	if !c.editing {
+		c.outLocked(termcolor.DimText("(queued; it joins the conversation after the current reply)") + "\n")
+		return
+	}
+	for _, pending := range c.pendingSends {
+		if ev.ID != "" && pending.id == ev.ID {
 			return
 		}
 	}
+	c.pendingSends = append(c.pendingSends, pendingSend{id: ev.ID, text: ev.Text})
+	c.printPromptLocked()
+}
+
+// settlePendingSendLocked drops the pending line of a message that has just been
+// sent, since the official row is written right after. The pair is the id both
+// events carry (the text is the fallback of a line that has none). The caller must
+// hold c.mu.
+func (c *CLI) settlePendingSendLocked(ev agent.Event) {
+	for i, pending := range c.pendingSends {
+		if ev.ID != "" && pending.id != ev.ID {
+			continue
+		}
+		if ev.ID == "" && pending.text != ev.Text {
+			continue
+		}
+		c.pendingSends = append(c.pendingSends[:i], c.pendingSends[i+1:]...)
+		return
+	}
+}
+
+// canContinueLocked reports whether the send key on an empty input has something
+// to continue: a pause ended the turn, and the last message — a queued one, a tool
+// result or a user message — is still waiting for the model to answer it. The
+// caller must hold c.mu.
+func (c *CLI) canContinueLocked() bool {
+	if c.agent.Busy() {
+		return false
+	}
+	if len(c.pendingSends) > 0 {
+		return true
+	}
+	return c.lastKind == agent.EventUser || c.lastKind == agent.EventToolResult ||
+		c.lastKind == agent.EventPaused
 }
 
 // PromptResult is the JSON document printed by a one-shot run with --json.
@@ -1550,9 +1621,41 @@ func (c *CLI) render(ev agent.Event) {
 		c.flushReasoningLocked()
 	}
 
+	// The last row the transcript holds decides what the send key on an empty
+	// prompt can do next (see canContinueLocked): every event that prints a row
+	// records its type here, and the ones that print none leave it alone.
+	switch ev.Type {
+	case agent.EventUsage, agent.EventTurnDone, agent.EventTurnStart, agent.EventPending:
+	default:
+		c.lastKind = ev.Type
+	}
+
 	switch ev.Type {
 	case agent.EventReasoningDelta:
 		c.appendReasoningLocked(ev.Text, ev.Time)
+	case agent.EventPending:
+		// A queued message, or the pause request the user sent (which carries no
+		// text and no line of its own — the [paused] marker follows when the
+		// round in flight is done).
+		if ev.Pause {
+			c.flushMarkdownLocked()
+			c.endLineLocked()
+			c.outLocked(termcolor.DimText("(pause requested; the round in flight finishes first)") + "\n")
+			return
+		}
+		c.addPendingSendLocked(ev)
+	case agent.EventTurnStart:
+		// A turn that starts without a user message of its own (a continue after
+		// a pause) has no user event to light the prompt: do it here.
+		if !c.busy {
+			c.busySince = time.Now()
+		}
+		c.busy = true
+		c.spinner = spinnerFrames[0]
+	case agent.EventPaused:
+		c.flushMarkdownLocked()
+		c.endLineLocked()
+		c.outLocked(termcolor.Yellow("[paused] ") + displayText(ev.Text) + "\n")
 	case agent.EventUser:
 		// An engine-inserted note (an interrupt note) sits at the user
 		// position but is not a user turn: it neither marks the prompt busy
@@ -1579,11 +1682,9 @@ func (c *CLI) render(ev agent.Event) {
 		if (ev.Source == "" || ev.Source == "cli") && !c.editing {
 			return
 		}
-		// A message typed here was waiting as a pending line above the prompt:
-		// the official row replaces it now.
-		if ev.Source == "" || ev.Source == "cli" {
-			c.settlePendingSendLocked(ev.Text)
-		}
+		// The message was waiting as a pending line above the prompt (whichever
+		// client queued it): the official row replaces it now.
+		c.settlePendingSendLocked(ev)
 		c.flushMarkdownLocked()
 		c.writeStampedLocked(messageLine(ev.Source, displayText(ev.Text))+"\n", ev.Time)
 	case agent.EventAssistantDelta:
@@ -1676,14 +1777,11 @@ func (c *CLI) render(ev agent.Event) {
 		c.flushMarkdownLocked()
 		c.outLocked("\n")
 		c.streaming = false
-		// A queued message always turns into a row — the agent either folds it
-		// into this turn or starts a new one for it — so nothing should be
-		// pending once the agent is idle: drop what is left over (a message the
-		// steering queue had to reject) instead of leaving a stale line above the
-		// prompt.
-		if !c.agent.Busy() {
-			c.pendingSends = nil
-		}
+		// The pending lines stay: a turn that a pause or a stop ended leaves its
+		// queued messages waiting for the user, and each line goes away when the
+		// user event that folds its message in arrives (see
+		// settlePendingSendLocked). One the steering queue had to reject never
+		// gets that event, but it also never got a line (see pushSteer).
 		if !c.editing && !c.batch {
 			c.printPromptLocked()
 		}
@@ -1850,6 +1948,16 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 		}
 		// The interrupted marker and the end of the turn are rendered by the
 		// event loop.
+	case "/pause":
+		// A pause is not an interrupt: the round in flight finishes, and the
+		// messages queued behind it wait for the user (see /continue).
+		if !c.agent.Pause() {
+			c.write(termcolor.Gray("[info] nothing to pause") + "\n")
+		}
+	case "/continue":
+		if !c.agent.Continue() {
+			c.write(termcolor.Gray("[info] nothing to continue") + "\n")
+		}
 	case "/history":
 		c.write(termcolor.Cyan("[info] ") + slash.UsageText(c.agent.Stats()) + "\n")
 	case "/result":
@@ -2289,6 +2397,7 @@ func helpText() string {
 		"input: Enter inserts a newline; Ctrl+J sends (Ctrl+Enter and Alt+Enter where the terminal reports them).",
 		"Tab completes a file name after an @ (repeated Tabs walk the matches; type the next separator yourself).",
 		"while a turn runs, type a message to insert it into the loop (steering).",
+		"the send key on an empty input acts on the turn: Ctrl+J pauses a running one, or continues a paused one.",
 		"Ctrl+C interrupts a running turn; when idle it clears the input, then exits.",
 	}
 	b.WriteString(termcolor.Gray(strings.Join(notes, "\n")) + "\n")

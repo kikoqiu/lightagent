@@ -1384,6 +1384,271 @@ func TestQueuedSteeringStartsAFollowUpTurn(t *testing.T) {
 	}
 }
 
+// TestPauseLetsTheRoundFinishThenStops pins the pause contract: the round in
+// flight — the reply already streaming and the tool calls it carries — finishes,
+// and the turn then ends without asking the model again. Nothing the round
+// produced is dropped, and no interrupt is reported: a pause is not a stop.
+func TestPauseLetsTheRoundFinishThenStops(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			once.Do(func() { close(started) })
+			<-release
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"working",`+
+				`"tool_calls":[{"id":"c1","type":"function","function":{"name":"stub","arguments":"{}"}}]},`+
+				`"finish_reason":"tool_calls"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"after the pause"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "stub", desc: "stub"})
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
+
+	a.Submit("ask")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the model call never started")
+	}
+	if !a.Pause() {
+		t.Fatal("Pause reported no running turn")
+	}
+	close(release)
+
+	got := drainTurns(t, events, 1)
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("model calls = %d, want the paused turn to stop after its round", n)
+	}
+	if !hasEvent(got, EventPaused, "paused") {
+		t.Fatalf("no paused event was published: %+v", got)
+	}
+	if hasEvent(got, EventInterrupted, "") {
+		t.Fatalf("a pause must not report an interrupt: %+v", got)
+	}
+	wantOrder := "user:ask, assistant:working, tool_call:stub, tool_result:stub"
+	if order := strings.Join(eventOrder(got), ", "); order != wantOrder {
+		t.Fatalf("event order = %q, want %q", order, wantOrder)
+	}
+	hist := a.History()
+	roles := make([]string, 0, len(hist))
+	for _, m := range hist {
+		roles = append(roles, m.Role+":"+m.Content)
+	}
+	want := "user:ask, assistant:working, tool:ok"
+	if got := strings.Join(roles, ", "); got != want {
+		t.Fatalf("history = %q, want %q", got, want)
+	}
+}
+
+// TestPauseHoldsTheQueuedMessage pins the other half of a pause: the messages
+// queued with it wait for the user. They are neither folded into the
+// conversation nor sent, no follow-up turn is started for them, and the pending
+// row a front-end drew is settled only when the message finally lands — Continue
+// sends it, and a front-end pairs the two events by their id.
+func TestPauseHoldsTheQueuedMessage(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			once.Do(func() { close(started) })
+			<-release
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"working",`+
+				`"tool_calls":[{"id":"c1","type":"function","function":{"name":"stub","arguments":"{}"}}]},`+
+				`"finish_reason":"tool_calls"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"after the pause"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	reg := tools.NewRegistry()
+	reg.Register(agentStubTool{name: "stub", desc: "stub"})
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), reg, bus)
+
+	a.Submit("ask")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the model call never started")
+	}
+	a.Submit("steer")
+	if !a.Pause() {
+		t.Fatal("Pause reported no running turn")
+	}
+	close(release)
+
+	got := drainTurns(t, events, 1)
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("model calls = %d, want the queued message to wait for the user", n)
+	}
+	var pendingID string
+	for _, ev := range got {
+		if ev.Type == EventPending && ev.Text == "steer" {
+			pendingID = ev.ID
+		}
+		if ev.Type == EventUser && ev.Text == "steer" {
+			t.Fatalf("the queued message was folded in although the turn was paused: %+v", got)
+		}
+	}
+	if pendingID == "" {
+		t.Fatalf("the queued message was not announced as pending: %+v", got)
+	}
+	if len(a.steerCh) != 1 {
+		t.Fatalf("queued entries = %d, want the message still waiting", len(a.steerCh))
+	}
+	for _, m := range a.History() {
+		if m.Content == "steer" {
+			t.Fatalf("the paused turn folded the queued message into the history: %+v", a.History())
+		}
+	}
+
+	// Continuing is what sends it — and that is where a front-end settles the
+	// pending row: the user event carries the id of the pending event.
+	if !a.Continue() {
+		t.Fatal("Continue reported nothing to resume")
+	}
+	got = drainTurns(t, events, 1)
+	mu.Lock()
+	n = calls
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("model calls = %d, want the continued turn to ask the model", n)
+	}
+	landed := ""
+	for _, ev := range got {
+		if ev.Type == EventUser && ev.Text == "steer" {
+			landed = ev.ID
+		}
+	}
+	if landed != pendingID {
+		t.Fatalf("user event id = %q, want the pending id %q", landed, pendingID)
+	}
+	hist := a.History()
+	roles := make([]string, 0, len(hist))
+	for _, m := range hist {
+		roles = append(roles, m.Role+":"+m.Content)
+	}
+	want := "user:ask, assistant:working, tool:ok, user:steer, assistant:after the pause"
+	if got := strings.Join(roles, ", "); got != want {
+		t.Fatalf("history = %q, want %q", got, want)
+	}
+}
+
+// TestStopKeepsTheQueuedMessageWaiting pins the changed half of a stop: the
+// interrupt still ends the turn at once, but a message queued behind it is not
+// turned into a follow-up turn any more. It waits, and joins the next message the
+// user sends, ahead of it.
+func TestStopKeepsTheQueuedMessageWaiting(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	requested := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			once.Do(func() { close(requested) })
+			<-release
+			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"first"},"finish_reason":"stop"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"after"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	cfg := config.Default()
+	cfg.LLMs[0].APIBase = srv.URL
+	cfg.LLMs[0].Stream = false
+	bus := NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	a := New(cfg, llm.NewClient(cfg.LLMs[0].OpenAIConfig), tools.NewRegistry(), bus)
+
+	a.Submit("ask")
+	select {
+	case <-requested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the model call never started")
+	}
+	a.Submit("steer")
+	if !a.Interrupt() {
+		t.Fatal("Interrupt reported no running turn")
+	}
+	if !waitForTurnEnd(t, events) {
+		t.Fatal("no interrupted event was published")
+	}
+	if a.Busy() {
+		t.Fatal("the queued message started a turn of its own after the stop")
+	}
+	if len(a.steerCh) != 1 {
+		t.Fatalf("queued entries = %d, want the message still waiting", len(a.steerCh))
+	}
+
+	// The next message the user sends carries it along, ahead of itself.
+	a.Submit("next")
+	drainTurns(t, events, 1)
+	hist := a.History()
+	roles := make([]string, 0, len(hist))
+	for _, m := range hist {
+		roles = append(roles, m.Role+":"+m.Content)
+	}
+	want := "user:ask, user:steer, user:next, assistant:after"
+	if got := strings.Join(roles, ", "); got != want {
+		t.Fatalf("history = %q, want %q", got, want)
+	}
+}
+
 // eventOrder renders the events a front-end draws a row for as a compact
 // "kind:label" list, so a test can pin the order the transcript is drawn in.
 func eventOrder(events []Event) []string {

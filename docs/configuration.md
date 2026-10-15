@@ -349,6 +349,10 @@ user:   <历史里的第一条 user>
     `[engine]` 消息。
   * 中断落在**工具调用已经开始之后**时按工具轮逻辑处理（正在执行的调用跑完，其余记为 interrupted），
     与 `include_interrupted` 无关。细节见 [architecture.md](architecture.md#agent-回合循环)。
+* **暂停**（网页的 Pause 按钮 / `/pause`，终端空输入时的 Ctrl+J）与中断不同：正在输出的这一轮
+  （含它带来的工具调用）照常跑完，只是不再继续问模型；`include_interrupted` 不参与——这一轮是
+  正常完成的回复。中断**不再**把队列里挂起的消息自动开成新回合，暂停同样：它们留在队列里，
+  等用户的下一条消息或 Continue 一起发出（见 [web.md](web.md#暂停与继续)）。
 
 ### `ui`
 

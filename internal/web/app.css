@@ -477,11 +477,14 @@
   .reasoning .role { color:var(--fg-muted); }
   .reasoning .text:not(.md) { font-style:italic; }
 
-  .tool, .result, .error, .interrupted { border-left:2px solid transparent; padding-left:12px; font-size:12.5px; line-height:20px; }
+  .tool, .result, .error, .interrupted, .paused { border-left:2px solid transparent; padding-left:12px; font-size:12.5px; line-height:20px; }
   .tool { color:var(--yellow); border-left-color:var(--yellow); }
   .result { color:var(--fg-muted); border-left-color:var(--border); }
   .error { color:var(--red); border-left-color:var(--red); }
   .interrupted { color:var(--yellow); border-left-color:var(--yellow); }
+  /* A paused row marks the point a pause ended the turn: the model was not asked
+     again, and the composer's Continue takes the conversation on from there. */
+  .paused { color:var(--fg-muted); border-left-color:var(--border); }
   /* The result's inset box is the one text with a padding of its own, and that
      padding would push "[result] …" 10px past the shared left edge the thinking
      and tool rows share (2px border + 12px row padding). Pulling the box back by
@@ -500,6 +503,7 @@
   .result.marked .text { padding-left:calc(10px + 7ch); text-indent:-7ch; }
   .error.marked .text { padding-left:calc(10px + 8ch); text-indent:-8ch; }
   .interrupted.marked .text { padding-left:14ch; text-indent:-14ch; }
+  .paused.marked .text { padding-left:9ch; text-indent:-9ch; }
   /* tool call: the function name, then one line per argument, none indented.
      The line breaks are carried by the text (the row is pre-wrap), so these
      rules only colour the parts and never affect the layout. The palette
@@ -651,6 +655,14 @@
   button.stop { display:none; background:var(--bg-elev-2); color:var(--fg-muted); border-color:var(--border); box-shadow:none; }
   button.stop:hover { background:#22303f; color:var(--fg); }
   button.stop.on { display:inline-block; }
+  /* The composer's send button carries three states (see updateComposer in
+     app.js): Send, Pause the running turn, Continue a turn a pause held back.
+     The latter two take the Stop button's quieter palette, so the row reads as
+     "act on the turn" rather than "send something". */
+  button.pause, button.continue {
+    background:var(--bg-elev-2); color:var(--fg-muted); border-color:var(--border); box-shadow:none; font-weight:600;
+  }
+  button.pause:hover, button.continue:hover { background:#22303f; color:var(--fg); }
   /* ---- @file picker ---- */
   /* The one-level listing the composer opens on '@' (see app.js). It floats
      above the input line so a directory with many children never squeezes the

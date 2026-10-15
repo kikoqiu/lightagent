@@ -29,6 +29,18 @@ const (
 	EventTurnDone       EventType = "turn_done"
 	// EventInterrupted reports that a running turn was cancelled by the user.
 	EventInterrupted EventType = "interrupted"
+	// EventPending reports a user message that has been queued (steering) and
+	// not yet folded into the conversation. Front-ends draw it as a pending row
+	// right away; the matching user event settles that row (see Event.ID).
+	EventPending EventType = "pending"
+	// EventTurnStart reports that a turn began. It carries no row of its own: it
+	// exists for the turns that start without a user message (a continue after a
+	// pause), so every front-end lights its running indicator.
+	EventTurnStart EventType = "turn_start"
+	// EventPaused reports that the pipeline paused: the round in flight finished
+	// (its tool calls included) and the turn ends without asking the model
+	// again. The queued messages stay queued until the user sends something.
+	EventPaused EventType = "paused"
 )
 
 // Event is a single observable occurrence during a turn.
@@ -46,6 +58,14 @@ type Event struct {
 	// Source identifies who submitted a user message ("cli", "web"). It is
 	// empty for events that do not originate from user input.
 	Source string `json:"source,omitempty"`
+	// ID identifies a queued user message: the pending event that announces it
+	// and the user event that folds it into the conversation carry the same
+	// value, so a front-end can settle the pending row it drew (see pushSteer
+	// and drainSteering).
+	ID string `json:"id,omitempty"`
+	// Pause marks a pending event that is a pause request rather than a message
+	// (see Agent.Pause).
+	Pause bool `json:"pause,omitempty"`
 	// Attachments lists the files a user message carries (the web mirror's
 	// attachments). It holds names and paths only — never the payload — so a
 	// front-end can show what a message brought along.

@@ -938,6 +938,57 @@ func TestScrollbackTracksLiveEvents(t *testing.T) {
 	}
 }
 
+// TestPendingRowsAreNotInTheScrollback pins why the mirror broadcasts a queued
+// message instead of recording it: its row is drawn below the reply that is still
+// streaming (see placeRow), which an append-only scrollback cannot express — a
+// reload would replay it in the wrong place and then duplicate it. The message
+// reaches the transcript where it belongs, when the user event folds it in, and
+// the pause pair carries no row at all (the paused marker and the turn start do).
+func TestPendingRowsAreNotInTheScrollback(t *testing.T) {
+	srv := newTestServer(t, "")
+	bus := srv.agent.Bus()
+
+	bus.Publish(agent.Event{Type: agent.EventPending, ID: "7", Text: "queued while it ran"})
+	bus.Publish(agent.Event{Type: agent.EventTurnStart})
+	bus.Publish(agent.Event{Type: agent.EventPending, Pause: true})
+	bus.Publish(agent.Event{Type: agent.EventPaused, Text: "paused; nothing was sent"})
+	bus.Publish(agent.Event{Type: agent.EventUser, ID: "7", Text: "queued while it ran"})
+
+	rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) == 2 })
+	if got := rolesOf(rows); got != "paused,user" {
+		t.Fatalf("roles = %q, want the queued message to reach the transcript only when it lands", got)
+	}
+}
+
+// TestPauseAndContinueCommands pins the two commands behind the composer's other
+// states: /pause asks the running turn to stop after its round, /continue takes a
+// paused turn on — and each answers honestly when there is nothing to do.
+func TestPauseAndContinueCommands(t *testing.T) {
+	srv := newTestServer(t, "")
+	events, cancel := srv.agent.Bus().Subscribe()
+	defer cancel()
+
+	srv.handleCommand("/pause")
+	select {
+	case ev := <-events:
+		if ev.Type != agent.EventInfo || !strings.Contains(ev.Text, "nothing to pause") {
+			t.Fatalf("event = %+v, want an info about nothing to pause", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no feedback for /pause")
+	}
+
+	srv.handleCommand("/continue")
+	select {
+	case ev := <-events:
+		if ev.Type != agent.EventInfo || !strings.Contains(ev.Text, "nothing to continue") {
+			t.Fatalf("event = %+v, want an info about nothing to continue", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no feedback for /continue")
+	}
+}
+
 // TestPageStampsMessageTimes pins the page's side of the timestamp: a gray stamp
 // rides in the role line of user and agent messages (to the right of "agent", to
 // the left of "you"), it comes from the row's own time, and it keeps the date
@@ -1019,7 +1070,7 @@ func TestThinkingRowCarriesTheReplyStart(t *testing.T) {
 func TestResultBoxAlignsWithTheSharedLeftEdge(t *testing.T) {
 	page := pageSource()
 	for _, want := range []string{
-		".tool, .result, .error, .interrupted { border-left:2px solid transparent; padding-left:12px;",
+		".tool, .result, .error, .interrupted, .paused { border-left:2px solid transparent; padding-left:12px;",
 		"padding:6px 10px; margin-left:-10px;",
 	} {
 		if !strings.Contains(page, want) {
@@ -1089,32 +1140,79 @@ func TestScrollbackSkipsEmptyToolResult(t *testing.T) {
 // queued badge counts what is still waiting.
 func TestSteeringRowOrder(t *testing.T) {
 	for _, want := range []string{
-		"function addPendingRow(text)",
-		"function settlePendingRow(text, attachments, stamp)",
-		"addPendingRow(text);",
-		"settlePendingRow(ev.text || '', ev.attachments, stampOf(ev.time))",
+		"function addPendingRow(ev)",
+		"function settlePendingRow(ev, stamp)",
+		// A queued message is drawn from the event that announces it, so the rows
+		// of the messages other clients sent show up here too.
+		"function onPending(ev)",
+		"if (kind === 'pending') { onPending(ev); return; }",
+		"if (pendingRows[i].id === id) { return pendingRows[i]; }",
+		"settlePendingRow(ev, stampOf(ev.time))",
+		// The pairing is the id both events carry; the text is the fallback of a
+		// row that has none.
+		"if (id ? pending.id !== id : pending.text !== text) { continue; }",
 		// The files the settled message carried join its row there, and so does
 		// the start time it could not show while it was still pending.
 		"stampRow(row, stamp);",
-		"setRowMedia(row, attachments);",
+		"setRowMedia(row, ev.attachments);",
 		// Transcript rows are inserted before the pending messages.
 		"if (anchor) { log.insertBefore(row, anchor); } else { log.appendChild(row); }",
 		"pendingRows = [];",
-		// The badge counts the messages this page sent while the turn was running.
-		"var queued = 0;",
+		// The badge counts the messages waiting to be folded in.
+		"function queuedCount() { return pendingRows.length; }",
 		"queuedText()",
 		// ...and a phone keeps the number alone: the word is what would push the
 		// banner past the screen (see TestBannerNeverWidensThePage). The whole
 		// phrase rides in the pill's title.
-		"if (phoneQuery && phoneQuery.matches) { return ' · ' + queued; }",
-		"' · ' + queued + ' queued'",
-		"queued + ' queued; it joins the conversation after the current reply'",
+		"if (phoneQuery && phoneQuery.matches) { return ' · ' + n; }",
+		"' · ' + n + ' queued'",
+		"waiting + ' queued; it joins the conversation after the current reply'",
 	} {
 		if !strings.Contains(pageSource(), want) {
 			t.Errorf("the page is missing %q", want)
 		}
 	}
 	for _, want := range []string{".user.pending .role::after", `content:" · pending"`} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the stylesheet is missing %q", want)
+		}
+	}
+}
+
+// TestPauseComposerAffordances pins the composer's pause mode: the send button has
+// three states — Send, Pause while the turn is running, Continue when a pause (or
+// any round) left something to answer — and Ctrl+Enter goes through the same
+// dispatcher, so the shortcut pausing matters as much as the button's click.
+func TestPauseComposerAffordances(t *testing.T) {
+	for _, want := range []string{
+		`id="send"`,
+		"function composerMode()",
+		"if (input.value.trim() !== '' || readyAttachmentIds().length > 0) { return 'send'; }",
+		"if (running) { return 'pause'; }",
+		"if (canContinue()) { return 'continue'; }",
+		"return lastKind === 'user' || lastKind === 'tool_result' || lastKind === 'paused';",
+		"function updateComposer()",
+		"sendEl.className = mode === 'send' || mode === 'idle' ? '' : mode;",
+		"sendEl.disabled = !connected || mode === 'idle' || (mode === 'pause' && pausing);",
+		"function dispatchComposer()",
+		"sendEl.onclick = dispatchComposer;",
+		"dispatchComposer(); return; }",
+		"sendCommand('/pause');",
+		"sendCommand('/continue');",
+		// A pause that is on its way is answered either way by the end of the turn.
+		"pausing = false;",
+		"pausing ? 'pausing\u2026' : 'running'",
+		// The marker the agent publishes when the pipeline pauses is drawn like an
+		// interrupt, and the turn start (a continue has no user row of its own)
+		// lights the running indicator.
+		"else if (kind === 'paused') { addRow('paused marked', '', '[paused] ' + (ev.text || ''), false); }",
+		"if (kind === 'turn_start') { setRunning(true); return; }",
+	} {
+		if !strings.Contains(pageSource(), want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	for _, want := range []string{"button.pause, button.continue", ".paused.marked .text"} {
 		if !strings.Contains(pageSource(), want) {
 			t.Errorf("the stylesheet is missing %q", want)
 		}

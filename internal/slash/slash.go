@@ -82,6 +82,11 @@ var Commands = []Command{
 	{Name: "/pwd", Summary: "print the current working directory", Web: true},
 	{Name: "/cd", Args: "<dir>", Summary: "change the current working directory", Web: true},
 	{Name: "/ls", Args: "[dir]", Summary: "list a directory's contents (default: the current one)", Web: true},
+	// The pause pair: /pause stops the running turn after the round in flight
+	// finishes, /continue resumes what it held back. They are the two other
+	// states of the composer's send button, so the rail does not carry them.
+	{Name: "/pause", Summary: "stop asking the model once the running round finishes", Web: true, Hidden: true},
+	{Name: "/continue", Summary: "resume the turn a pause held back", Web: true, Hidden: true},
 	{Name: "/help", Aliases: []string{"/?"}, Summary: "show the command list", Web: true},
 	{Name: "/stop", Aliases: []string{"/interrupt"}, Summary: "interrupt the turn that is running", Web: true},
 	{Name: "/exit", Aliases: []string{"/quit", "/q"}, Summary: "quit (you are asked whether to save)"},

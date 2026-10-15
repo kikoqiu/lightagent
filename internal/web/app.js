@@ -5,6 +5,7 @@
   var statusEl = document.getElementById('status');
   var usageEl = document.getElementById('usage');
   var runEl = document.getElementById('run');
+  var runTextEl = document.getElementById('runText');
   var stopEl = document.getElementById('stop');
   var sendEl = document.getElementById('send');
   var attachEl = document.getElementById('attach');
@@ -15,13 +16,21 @@
   var copyNote = document.getElementById('copyNote');
   var current = null;
   var currentText = '';
-  // pendingRows holds the rows of messages this page submitted while the turn was
-  // running (steering). Such a row is drawn right away, marked as pending, and
-  // every row the running reply still produces is inserted *before* it: the
-  // previous round's feedback always stays above the inserted message. When the
-  // agent sends the message the row becomes an ordinary one (see the user case in
-  // render), because that is the moment the message joins the conversation.
+  // pendingRows holds the rows of queued messages (steering): a message sent
+  // while the turn is running is drawn right away, marked as pending, and every
+  // row the running reply still produces is inserted *before* it, so the previous
+  // round's feedback always stays above the inserted message. The pending event
+  // is broadcast, so the rows of the other clients' messages are drawn here too;
+  // each entry keeps the event's id, which is what settles it (see the user case
+  // in render) — that is the moment the message joins the conversation.
   var pendingRows = [];
+  // pausing is true between a pause request and the end of the turn it stops: the
+  // model still has the round in flight to finish.
+  var pausing = false;
+  // lastKind is the kind of the last event that drew a row. The composer's
+  // Continue state reads it: an empty box has something to continue when the last
+  // message is a pending one, a tool result or a user message (see canContinue).
+  var lastKind = '';
   var pendingRender = null;
   // reasoningRow/reasoningText stream the model's "thinking" (reasoning_delta);
   // it is finalized before the visible answer is drawn. reasoningStamp is the
@@ -531,11 +540,11 @@
 
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
-  // queued counts the messages this page sent while the turn was already
-  // running. Their rows appear when the agent folds them into the conversation
-  // (after the reply they interrupted), so until then this count in the running
-  // pill is the only acknowledgement that they went through.
-  var queued = 0;
+  // queuedCount is how many messages are waiting to be folded into the
+  // conversation. Their rows are the pending ones, whichever client sent them
+  // (the pending event is broadcast, see the server), so until a message lands
+  // this count in the running pill is its only acknowledgement.
+  function queuedCount() { return pendingRows.length; }
 
   // queuedText is the queued part of the running pill: the count and, where there
   // is room for it, the word. A phone-width banner keeps the number alone — its
@@ -545,9 +554,10 @@
   // app.css). The whole phrase stays in the pill's title, on every layout (see
   // tickTurn), the way the context badge keeps the words a phone drops.
   function queuedText() {
-    if (queued <= 0) { return ''; }
-    if (phoneQuery && phoneQuery.matches) { return ' · ' + queued; }
-    return ' · ' + queued + ' queued';
+    var n = queuedCount();
+    if (n <= 0) { return ''; }
+    if (phoneQuery && phoneQuery.matches) { return ' · ' + n; }
+    return ' · ' + n + ' queued';
   }
 
   function elapsedText(ms) {
@@ -561,7 +571,8 @@
     if (elapsedEl) { elapsedEl.textContent = elapsedText(Date.now() - turnStart) + queuedText(); }
     // The pill's title spells the queued count out whatever the layout shows (the
     // CLI prints the same sentence when it has to queue a message).
-    runEl.title = queued > 0 ? queued + ' queued; it joins the conversation after the current reply' : '';
+    var waiting = queuedCount();
+    runEl.title = waiting > 0 ? waiting + ' queued; it joins the conversation after the current reply' : '';
   }
 
   // The clock's cadence: the terminal redraws its spinner every 100ms and a
@@ -607,6 +618,8 @@
 
   // running reports whether a turn is in progress (see setRunning).
   var running = false;
+  // connected is the socket state: the composer sends nothing while it is down.
+  var connected = false;
 
   // setRunning shows or hides the "running" indicator (and the Stop button). A
   // turn is in progress between a user message and the matching turn_done.
@@ -619,10 +632,12 @@
     running = !!on;
     if (on) { runEl.classList.add('on'); stopEl.classList.add('on'); startTurnTimer(); }
     else {
-      // The turn is over: nothing can be waiting to be folded in any more.
-      queued = 0;
+      // The turn is over: a pause request has been answered one way or the
+      // other by now, so it is dropped with the turn.
+      pausing = false;
       runEl.classList.remove('on'); stopEl.classList.remove('on'); stopTurnTimer();
     }
+    updateComposer();
   }
 
   // setUsage renders the context-usage badge in the header and mirrors the
@@ -1315,33 +1330,38 @@
     return row;
   }
 
-  // addPendingRow draws a message submitted here while the turn was running. It is
-  // appended after the pending rows already waiting (submission order) and stays
-  // marked until the agent sends it: settlePendingRow then turns it into an
-  // ordinary row, in place.
-  function addPendingRow(text) {
-    var row = buildRow('user pending', 'you', text, false);
+  // addPendingRow draws one queued message. The row is appended after the pending
+  // rows already waiting (submission order) and stays marked until the agent sends
+  // the message: settlePendingRow then turns it into an ordinary row, in place. The
+  // event's id is kept, which is what pairs the row with that official one.
+  function addPendingRow(ev) {
+    var text = ev.text || '';
+    var row = buildRow('user pending', 'you', text, false, ev.attachments);
     appendRow(row);
-    pendingRows.push({ el: row, text: text });
+    pendingRows.push({ el: row, id: ev.id || '', text: text });
     return row;
   }
 
   // settlePendingRow turns the pending row of a message the agent has just sent
   // into an ordinary one. It reports whether a row was converted; the row keeps
-  // its place, which is where the message entered the conversation. attachments
-  // are the files the agent reports for it: the row was drawn from the composer's
-  // text alone, so the files it carried are added here. stamp is the message's
-  // start time, which the row could not show while it was still pending.
-  function settlePendingRow(text, attachments, stamp) {
+  // its place, which is where the message entered the conversation. The pairing is
+  // the event id the pending event announced (a row that carries none falls back
+  // to its text). attachments are the files the agent reports for it — the row was
+  // drawn from the text the sender submitted — and stamp is the message's start
+  // time, which the row could not show while it was still pending.
+  function settlePendingRow(ev, stamp) {
+    var id = ev.id || '';
+    var text = ev.text || '';
     for (var i = 0; i < pendingRows.length; i++) {
-      if (pendingRows[i].text !== text) { continue; }
-      var row = pendingRows[i].el;
+      var pending = pendingRows[i];
+      if (id ? pending.id !== id : pending.text !== text) { continue; }
+      var row = pending.el;
       pendingRows.splice(i, 1);
       // The pending mark rides on the class alone; the text is already the final
       // one, since it is the message the agent recorded.
       row.className = 'row user';
       stampRow(row, stamp);
-      setRowMedia(row, attachments);
+      setRowMedia(row, ev.attachments);
       return true;
     }
     return false;
@@ -2393,6 +2413,11 @@
   function isEngine(text) { return (/^\[engine\] /).test(text || ''); }
 
   function render(kind, ev) {
+    // A queued message and a turn that starts on its own carry no row of their
+    // own and must not close the thinking row that is still streaming (a message
+    // can be queued in the middle of a reply), so they are handled first.
+    if (kind === 'pending') { onPending(ev); return; }
+    if (kind === 'turn_start') { setRunning(true); return; }
     // Read-aloud follows the same event stream as the rows below (a replayed
     // history frame is skipped: reloading the page must not read the whole
     // conversation aloud).
@@ -2404,25 +2429,27 @@
     // block instead of an [info] line; it arrives either live with a compacted
     // event or replayed from the history frame. It carries the moment of the
     // compaction like any other message.
-    if (kind === 'summary') { addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, false, stampOf(ev.time)); return; }
+    if (kind === 'summary') { lastKind = kind; addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, false, stampOf(ev.time)); return; }
     if (kind === 'user' && !isEngine(ev.text)) {
       setRunning(true);
-      // A message this page sent while the turn was running is being sent now:
-      // Its pending row becomes an ordinary one, in place (it already sits after
-      // everything the interrupted reply produced), picking up the files the
-      // message carried. The files can make the row taller, so the bottom follows
-      // it the same way (see keepBottom) — only ever while the page is live: a
-      // replayed row reads no layout and writes nothing (see the replay path in
-      // setRow/placeRow), and pendingRows is empty during one, so the settle below
-      // misses anyway.
-      if (settlePendingRow(ev.text || '', ev.attachments, stampOf(ev.time))) {
-        if (queued) { queued--; tickTurn(); }
+      // A queued message is being sent now: its pending row becomes an ordinary
+      // one, in place (it already sits after everything the interrupted reply
+      // produced), picking up the files the message carried. The files can make
+      // the row taller, so the bottom follows it the same way (see keepBottom) —
+      // only ever while the page is live: a replayed row reads no layout and
+      // writes nothing (see the replay path in setRow/placeRow), and pendingRows
+      // is empty during one, so the settle below misses anyway.
+      lastKind = kind;
+      if (settlePendingRow(ev, stampOf(ev.time))) {
+        if (running) { tickTurn(); }
+        updateComposer();
         if (!replaying) { keepBottom(); }
         return;
       }
     }
     if (kind === 'turn_done' || kind === 'interrupted') { setRunning(false); }
     if (kind === 'reasoning_delta') {
+      lastKind = kind;
       if (!reasoningRow) {
         reasoningRow = addRow('reasoning', 'thinking', '', MARKDOWN, null, true);
         // The reply's start time, held back for this row until the reply ends
@@ -2437,6 +2464,7 @@
       return;
     }
     if (kind === 'assistant_delta') {
+      lastKind = 'assistant';
       if (!current) {
         // The message's start time is the first chunk of the reply — its
         // thinking included, so a reply that begins with thinking is stamped
@@ -2482,8 +2510,34 @@
       if (ev.summary) { render('summary', { text: ev.summary, time: ev.time }); }
     }
     else if (kind === 'interrupted') { addRow('interrupted marked', '', '[interrupted] ' + (ev.text || ''), false); }
+    else if (kind === 'paused') { addRow('paused marked', '', '[paused] ' + (ev.text || ''), false); }
     else if (kind === 'error') { addRow('error marked', '', '[error] ' + (ev.text || ''), false); }
     else if (kind === 'sessions') { addSessionsRow(ev.sessions || []); }
+    // The row above is the last one this event drew, and the composer's Continue
+    // state reads exactly that (see canContinue).
+    lastKind = kind;
+    updateComposer();
+  }
+
+  // onPending handles the event that announces a queued message: the row is drawn
+  // here, which is how a message sent from another terminal shows up on this page
+  // too. A pause request carries no row — it is a state the running pill shows
+  // (see updateComposer) — and the message it was queued with stays queued (see
+  // the paused marker).
+  function onPending(ev) {
+    if (ev.pause) { pausing = true; updateComposer(); return; }
+    if (ev.id && findPendingRow(ev.id)) { return; }
+    addPendingRow(ev);
+    updateComposer();
+  }
+
+  // findPendingRow reports the row of a queued message this page already drew,
+  // which is what keeps a redelivered pending event from drawing it twice.
+  function findPendingRow(id) {
+    for (var i = 0; i < pendingRows.length; i++) {
+      if (pendingRows[i].id === id) { return pendingRows[i]; }
+    }
+    return null;
   }
 
   // The snapshot's header carries whether a turn is already running; the
@@ -2535,7 +2589,12 @@
     reasoningStamp = '';
     reasoningRenderedAt = 0;
     if (pendingReasoningRender) { clearTimeout(pendingReasoningRender); pendingReasoningRender = null; }
+    // The rows are gone with the log, so the queued ones are forgotten too (the
+    // messages themselves are still queued in the agent: the pending event that
+    // drew a row here was live-only, and a message that lands after this rebuild
+    // simply draws its official row). lastKind goes with them.
     pendingRows = [];
+    lastKind = '';
     // The rows the voice was reading are gone: drop its buffers and silence it.
     TTS.reset();
     // The open copy menu points at a row that is being replaced.
@@ -2592,6 +2651,7 @@
       else if (m.role === 'summary') { render('summary', { text: m.content, time: m.time }); }
       else if (m.role === 'error') { render('error', { text: m.content }); }
       else if (m.role === 'interrupted') { render('interrupted', { text: m.content }); }
+      else if (m.role === 'paused') { render('paused', { text: m.content }); }
       else if (m.role === 'sessions') { render('sessions', { sessions: m.sessions }); }
     });
     flushReplayBatch();
@@ -2721,7 +2781,8 @@
       // (the dot covers that): restore the last known one, if any, and otherwise
       // leave "connecting…" until the snapshot arrives with the name.
       if (apiName && !stopped) { statusEl.textContent = apiName; statusEl.title = apiName; }
-      sendEl.disabled = false;
+      connected = true;
+      updateComposer();
       if (cameBack) { notifyReconnected(); }
     };
     ws.onclose = function () {
@@ -2730,7 +2791,8 @@
       // Keep the model name on the line: the dot is what reports the drop, so
       // there is no "offline" word. Only an in-flight restart says so.
       if (restarting) { statusEl.textContent = 'restarting…'; }
-      sendEl.disabled = true;
+      connected = false;
+      updateComposer();
       // A socket that dropped in the middle of a snapshot leaves a half-built
       // log: drop the replay state before clearing the indicator, so the
       // indicator is not swallowed by the replay guard.
@@ -2905,6 +2967,8 @@
       li.appendChild(x);
       attachmentsEl.appendChild(li);
     });
+    // A file that is ready to send is something to send: the button follows.
+    updateComposer();
   }
 
   // ---- the files a message carried ----
@@ -3261,6 +3325,73 @@
     closeComplete();
   }
 
+  // The composer's send button has three states, decided from the box and the
+  // conversation: send what is typed; pause the turn that is running (an empty box
+  // while the model is working); continue a turn a pause held back (an empty box
+  // with nothing to add). An empty box with nothing to continue leaves the button
+  // gray.
+  function composerMode() {
+    // A file that is ready to send is something to send, even with an empty box
+    // (the server writes a placeholder line for it).
+    if (input.value.trim() !== '' || readyAttachmentIds().length > 0) { return 'send'; }
+    if (running) { return 'pause'; }
+    if (canContinue()) { return 'continue'; }
+    return 'idle';
+  }
+
+  // canContinue reports whether an empty box still has something to continue: the
+  // last message is a pending one (a message queued behind a pause), a tool result
+  // or a user message — exactly the cases where the model is the one that has to
+  // answer again. A pause's own marker counts too: it is drawn after the round it
+  // stopped, and the point of a pause is that the turn can go on from there.
+  function canContinue() {
+    if (pendingRows.length > 0) { return true; }
+    return lastKind === 'user' || lastKind === 'tool_result' || lastKind === 'paused';
+  }
+
+  // updateComposer paints the button's state. It runs whenever the box, the turn
+  // or the last row changes.
+  function updateComposer() {
+    var mode = composerMode();
+    var label = mode === 'pause' ? 'Pause' : (mode === 'continue' ? 'Continue' : 'Send');
+    if (sendEl.textContent !== label) { sendEl.textContent = label; }
+    sendEl.className = mode === 'send' || mode === 'idle' ? '' : mode;
+    // A pause that is already on its way cannot be asked for again, and a page
+    // without a socket sends nothing at all.
+    sendEl.disabled = !connected || mode === 'idle' || (mode === 'pause' && pausing);
+    if (runTextEl) {
+      var text = pausing ? 'pausing…' : 'running';
+      if (runTextEl.textContent !== text) { runTextEl.textContent = text; }
+    }
+  }
+
+  // dispatchComposer is what the Send button and Ctrl+Enter do: the state of the
+  // box decides whether the turn is paused, continued or sent to.
+  function dispatchComposer() {
+    var mode = composerMode();
+    if (mode === 'pause') { pauseTurn(); return; }
+    if (mode === 'continue') { continueTurn(); return; }
+    send();
+  }
+
+  // pauseTurn asks the running turn to stop after the round in flight: the reply
+  // already streaming and the tool calls it carries still finish, and the messages
+  // queued behind it wait for the user (see the paused marker).
+  function pauseTurn() {
+    if (pausing) { return; }
+    pausing = true;
+    updateComposer();
+    sendCommand('/pause');
+  }
+
+  // continueTurn resumes a turn a pause held back. The turn starts again with the
+  // conversation as it stands — the queued messages go with it — so the page shows
+  // the running state right away rather than waiting for the frame that says so.
+  function continueTurn() {
+    setRunning(true);
+    sendCommand('/continue');
+  }
+
   // send submits the composer's content: its text plus the attachments still
   // pending (their ids — the server reads the stored files and hands them to the
   // model with this very message). A command line is a command, not a prompt, so
@@ -3281,17 +3412,17 @@
     // at-the-bottom) even when the reader had scrolled back through history.
     setFollowing(true);
     pinBottom();
-    // A message sent while a turn is running joins it (steering): its row is drawn
-    // right away, marked pending, and the running reply keeps streaming above it
-    // until the agent sends it (addPendingRow / settlePendingRow).
-    if (running) {
-      addPendingRow(text);
-      queued++;
-      tickTurn();
-    }
+    // A message sent while a turn is running joins it (steering): the agent
+    // announces it as pending, so its row is drawn right away (marked pending) by
+    // every page — this one included — and the running reply keeps streaming above
+    // it until the agent sends it (addPendingRow / settlePendingRow).
     var payload = { text: text };
     if (ids.length > 0) { payload.attachments = ids; }
     ws.send(JSON.stringify(payload));
+    // The box is empty again: the button goes gray until the turn this message
+    // starts reports itself (a page whose turn is already running gets the pause
+    // state back instead).
+    updateComposer();
     // The files just sent belong to the conversation now: their chips go.
     if (ids.length > 0) { clearAttachments(); }
   }
@@ -3317,7 +3448,7 @@
     else if (phoneQuery.addListener) { phoneQuery.addListener(setComposerPlaceholder); }
   }
   setComposerPlaceholder();
-  sendEl.onclick = send;
+  sendEl.onclick = dispatchComposer;
   stopEl.onclick = function () {
     if (ws && ws.readyState === 1) { ws.send(JSON.stringify({ text: '/stop' })); }
   };
@@ -3327,6 +3458,7 @@
     completeDismissed = null;
     autoGrow();
     refreshComplete();
+    updateComposer();
   });
   // Moving the caret (arrows, a click, a selection) can enter or leave an "@"
   // fragment, so the picker is re-resolved for those too.
@@ -3334,8 +3466,10 @@
   input.addEventListener('click', refreshComplete);
   input.addEventListener('blur', closeComplete);
   input.addEventListener('keydown', function (e) {
-    // Enter inserts a newline (default textarea behavior); Ctrl+Enter sends.
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); return; }
+    // Enter inserts a newline (default textarea behavior); Ctrl+Enter does what
+    // the Send button does — including pausing and continuing (see
+    // dispatchComposer).
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); dispatchComposer(); return; }
     // While the "@" picker is up it owns the arrows and the eol/accept keys:
     // Enter or Tab completes the highlighted row, Escape leaves the text alone.
     if (completeEl.hidden || completeItems.length === 0) { return; }
@@ -3371,7 +3505,8 @@
   setInterval(function () {
     if (!stopped) { renderSessionSaved(); }
   }, 30000);
-  sendEl.disabled = true;
+  // The composer starts gray: there is no socket yet (see updateComposer).
+  updateComposer();
   // Wait for the session state before dialing: the handshake fails without a
   // session, and the dialog may sign this browser in on its own with a stored
   // digest.
