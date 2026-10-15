@@ -1034,6 +1034,50 @@ func TestExecCommandUTF8ModeForcesPythonUTF8(t *testing.T) {
 	}
 }
 
+// TestExecCommandUTF8ModeForcesShellChildPythonUTF8 covers the reason PYTHONUTF8
+// is exported: a Python interpreter the script itself starts must also speak
+// UTF-8, because PYTHONIOENCODING only reaches the standard streams and the
+// filesystem/locale codecs would stay on the host code page. The default engine
+// is PowerShell on Windows, so the interpreter here is a child of the shell.
+// Windows-only, like the variable itself.
+func TestExecCommandUTF8ModeForcesShellChildPythonUTF8(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PYTHONUTF8 is exported on Windows only")
+	}
+	interpreter, err := exec.LookPath("python")
+	if err != nil {
+		t.Skip("python is not installed")
+	}
+
+	// The parent must not provide the variable: UTF-8 mode has to add it.
+	unsetEnvForTest(t, pythonUTF8Env)
+
+	probe := filepath.Join(t.TempDir(), "probe_utf8.py")
+	body := "import os, sys\n" +
+		"print(\"PYTHONUTF8=\" + os.environ.get(\"PYTHONUTF8\", \"<unset>\"))\n" +
+		"print(\"utf8_mode=%d\" % sys.flags.utf8_mode)\n"
+	if err := os.WriteFile(probe, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := NewExecEngine(60, 20, true)
+	defer engine.Close()
+	tool := NewRunScriptTool(engine)
+
+	// PowerShell needs the call operator to run a quoted path; the interpreter
+	// is what the script calls, so it inherits the shell's environment.
+	command := "& '" + interpreter + "' '" + probe + "'"
+	res := tool.Execute(context.Background(), map[string]any{"script": command})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	for _, want := range []string{"PYTHONUTF8=1", "utf8_mode=1"} {
+		if !strings.Contains(res.ForLLM, want) {
+			t.Fatalf("the shell child python did not get UTF-8 mode (%q missing): %s", want, res.ForLLM)
+		}
+	}
+}
+
 // TestWindowsCommandScriptPreamble checks the UTF-8 preamble prefixing.
 func TestWindowsCommandScriptPreamble(t *testing.T) {
 	const command = "Write-Output hi"
@@ -1078,12 +1122,20 @@ func TestShellInvocationUTF8Preamble(t *testing.T) {
 	}
 }
 
-// TestUTF8ChildEnvironment checks PYTHONIOENCODING injection: an inherited value
-// is replaced in place and a missing one is appended exactly once.
+// TestUTF8ChildEnvironment checks the forced Python UTF-8 variables: an
+// inherited value is replaced in place and a missing one is appended exactly
+// once. PYTHONIOENCODING is forced everywhere; PYTHONUTF8 is added on Windows
+// only, where PYTHONIOENCODING cannot reach Python's filesystem and locale
+// codecs (see pythonUTF8Env).
 func TestUTF8ChildEnvironment(t *testing.T) {
+	wantExtra := 0
+	if runtime.GOOS == "windows" {
+		wantExtra = 1
+	}
+
 	env := utf8ChildEnvironment([]string{"PATH=/bin", "PYTHONIOENCODING=cp936", "HOME=/root"})
-	if len(env) != 3 {
-		t.Fatalf("env = %v, want the same number of entries", env)
+	if len(env) != 3+wantExtra {
+		t.Fatalf("env = %v, want %d entries", env, 3+wantExtra)
 	}
 	if got := envValue(env, pythonIOEncodingEnv); got != "utf-8" {
 		t.Fatalf("%s = %q, want utf-8", pythonIOEncodingEnv, got)
@@ -1094,11 +1146,35 @@ func TestUTF8ChildEnvironment(t *testing.T) {
 	if got := envValue(env, "HOME"); got != "/root" {
 		t.Fatalf("HOME = %q, want /root", got)
 	}
+	if got := envValue(env, pythonUTF8Env); got != wantPythonUTF8() {
+		t.Fatalf("%s = %q, want %q", pythonUTF8Env, got, wantPythonUTF8())
+	}
 
 	appended := utf8ChildEnvironment([]string{"PATH=/bin"})
-	if len(appended) != 2 || envValue(appended, pythonIOEncodingEnv) != "utf-8" {
+	if len(appended) != 2+wantExtra || envValue(appended, pythonIOEncodingEnv) != "utf-8" {
 		t.Fatalf("appended env = %v, want %s appended once", appended, pythonIOEncodingEnv)
 	}
+	if runtime.GOOS == "windows" && envValue(appended, pythonUTF8Env) != "1" {
+		t.Fatalf("appended env = %v, want %s=1", appended, pythonUTF8Env)
+	}
+
+	// An inherited PYTHONUTF8 must be replaced, never duplicated.
+	replaced := utf8ChildEnvironment([]string{"PYTHONUTF8=0"})
+	if got := envValue(replaced, pythonUTF8Env); got != wantPythonUTF8() {
+		t.Fatalf("%s in %v = %q, want %q", pythonUTF8Env, replaced, got, wantPythonUTF8())
+	}
+	if runtime.GOOS == "windows" && len(replaced) != 2 {
+		t.Fatalf("env = %v, want the inherited PYTHONUTF8 replaced in place plus PYTHONIOENCODING", replaced)
+	}
+}
+
+// wantPythonUTF8 is the PYTHONUTF8 value UTF-8 mode forces, "" where the
+// variable is not exported at all.
+func wantPythonUTF8() string {
+	if runtime.GOOS == "windows" {
+		return "1"
+	}
+	return ""
 }
 
 // envValue returns the value of key in an environment slice ("" when absent).
@@ -1470,8 +1546,8 @@ func TestExecCommandPythonLanguage(t *testing.T) {
 }
 
 // TestExecCommandPythonLanguageANSIMode covers the legacy code page path with
-// python as the script engine: use_utf8=false exports no PYTHONIOENCODING, so
-// Python writes host code page bytes that Go must decode.
+// python as the script engine: use_utf8=false exports no PYTHONIOENCODING (and
+// no PYTHONUTF8), so Python writes host code page bytes that Go must decode.
 func TestExecCommandPythonLanguageANSIMode(t *testing.T) {
 	if !systemPython().Found {
 		t.Skip("python is not installed")
@@ -1482,6 +1558,7 @@ func TestExecCommandPythonLanguageANSIMode(t *testing.T) {
 	const sample = "中文输出"
 	skipIfHostCodePageIsLossy(t, sample)
 	unsetEnvForTest(t, pythonIOEncodingEnv)
+	unsetEnvForTest(t, pythonUTF8Env)
 
 	engine := NewExecEngine(60, 20, false)
 	defer engine.Close()

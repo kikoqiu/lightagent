@@ -459,7 +459,7 @@ Ctrl+J，`/pause` 同效）。它**不是中断**：正在输出的这一轮（�
   -NonInteractive -ExecutionPolicy Bypass` 运行，该组参数会原样写进工具描述（**仅当 PowerShell
   属于可选 `language` 时**才出现）。
 * 子进程 stdio 编码（仅 Windows 有 `use_utf8` 参数，默认取配置 `tools.exec.use_utf8`）：
-  `true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不做转码；
+  `true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不做转码；
   `false` 由 Go 按主机 ANSI 代码页（如 GBK）转换：输出解码为 UTF-8，输入编码为该代码页字节。
   非 Windows 主机始终 UTF-8。
 

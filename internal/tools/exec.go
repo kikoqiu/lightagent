@@ -38,8 +38,8 @@ type ExecEngine struct {
 // NewExecEngine builds an engine. timeoutSeconds drives the default run_timeout
 // and waitSeconds the default synchronous wait window. useUTF8 is the default
 // child stdio mode on Windows (run_script's `use_utf8` parameter overrides it
-// per call): child processes read and write UTF-8 (shell preamble plus
-// PYTHONIOENCODING) instead of the host ANSI code page; see childCodec. Hosts
+// per call): child processes read and write UTF-8 (shell preamble plus the
+// Python UTF-8 variables) instead of the host ANSI code page; see childCodec. Hosts
 // without an ANSI code page ignore it and always speak UTF-8, see execUseUTF8.
 func NewExecEngine(timeoutSeconds, waitSeconds int, useUTF8 bool) *ExecEngine {
 	if timeoutSeconds <= 0 {
@@ -292,32 +292,69 @@ func windowsCommandScript(script string, useUTF8 bool) string {
 	return windowsUTF8Preamble + script
 }
 
-// pythonIOEncodingEnv forces Python's stdin/stdout/stderr to UTF-8. The shell
-// preamble cannot reach an interpreter started as a child process, so the
-// variable is exported into the child environment instead.
-const pythonIOEncodingEnv = "PYTHONIOENCODING"
+// Python environment variables UTF-8 mode exports into a child. The shell
+// preamble cannot reach an interpreter started as a child process, and a
+// `python` the script itself calls is such a child too, so the variables are
+// exported into the child environment instead; every program the script spawns
+// inherits them.
+const (
+	// pythonIOEncodingEnv forces Python's stdin/stdout/stderr to UTF-8.
+	pythonIOEncodingEnv = "PYTHONIOENCODING"
+	// pythonUTF8Env turns on Python's UTF-8 mode. On Windows PYTHONIOENCODING
+	// only covers the standard streams: Python keeps reading the filesystem
+	// and locale through the ANSI code page, so an interpreter the script
+	// starts (a PowerShell one-liner, for instance) still garbles non-ASCII
+	// paths and arguments. PYTHONUTF8=1 makes Python speak UTF-8 for those
+	// too, so a shell engine that calls python is safe as well.
+	pythonUTF8Env = "PYTHONUTF8"
+)
 
-// utf8ChildEnvironment returns base with PYTHONIOENCODING forced to utf-8,
-// replacing an inherited value.
+// utf8ChildEnvironment returns base with the Python UTF-8 variables forced:
+// PYTHONIOENCODING=utf-8 always, plus PYTHONUTF8=1 on Windows (see the
+// pythonUTF8Env comment). An inherited value is replaced in place and a missing
+// one is appended exactly once.
 func utf8ChildEnvironment(base []string) []string {
-	const entry = pythonIOEncodingEnv + "=utf-8"
-	env := make([]string, 0, len(base)+1)
-	replaced := false
+	entries := []string{pythonIOEncodingEnv + "=utf-8"}
+	if runtime.GOOS == "windows" {
+		entries = append(entries, pythonUTF8Env+"=1")
+	}
+	env := make([]string, 0, len(base)+len(entries))
+	applied := make([]bool, len(entries))
 	for _, kv := range base {
 		name, _, found := strings.Cut(kv, "=")
-		if found && strings.EqualFold(name, pythonIOEncodingEnv) {
-			if !replaced {
-				env = append(env, entry)
-				replaced = true
-			}
+		index := -1
+		if found {
+			index = envEntryIndex(name, entries)
+		}
+		if index < 0 {
+			env = append(env, kv)
 			continue
 		}
-		env = append(env, kv)
+		// Keep the variable where it was, and only its first spelling, so an
+		// inherited duplicate does not survive next to the forced value.
+		if !applied[index] {
+			env = append(env, entries[index])
+			applied[index] = true
+		}
 	}
-	if !replaced {
-		env = append(env, entry)
+	for i, entry := range entries {
+		if !applied[i] {
+			env = append(env, entry)
+		}
 	}
 	return env
+}
+
+// envEntryIndex returns the index of the `NAME=value` entry whose name matches
+// name case-insensitively, or -1.
+func envEntryIndex(name string, entries []string) int {
+	for i, entry := range entries {
+		entryName, _, _ := strings.Cut(entry, "=")
+		if strings.EqualFold(name, entryName) {
+			return i
+		}
+	}
+	return -1
 }
 
 // windowsUTF8Preamble switches Windows PowerShell itself, and the console code
@@ -391,7 +428,8 @@ func (t *RunScriptTool) Description() string {
 	}
 	return description + fmt.Sprintf(" Stdio encoding is selected by `use_utf8` (default: %t): "+
 		"true forces PowerShell and Python onto UTF-8 (UTF-8 shell preamble plus "+
-		"PYTHONIOENCODING=utf-8) and returns the raw bytes; false makes the agent decode the "+
+		"PYTHONIOENCODING=utf-8, and PYTHONUTF8=1 on Windows so a python the script calls "+
+		"does not fall back to the host code page) and returns the raw bytes; false makes the agent decode the "+
 		"host ANSI code page automatically (stdin is encoded into it as well) - everything "+
 		"else behaves the same, but characters outside the host code page may not be displayed.",
 		t.engine.useUTF8)
@@ -435,7 +473,7 @@ func (t *RunScriptTool) Parameters() map[string]any {
 		properties["use_utf8"] = map[string]any{
 			"type":        "boolean",
 			"default":     t.engine.useUTF8,
-			"description": fmt.Sprintf("Stdio encoding for this command (default: %t). true forces PowerShell and Python onto UTF-8: the script gains a UTF-8 preamble ([Console] input/output code pages and $OutputEncoding), PYTHONIOENCODING=utf-8 is exported and the output bytes are returned unchanged. false makes the agent decode the host ANSI code page (CP_ACP, e.g. GBK on a zh-CN host) automatically and encode stdin into it; everything else behaves the same, but characters outside the host code page may not be displayed. Use false for a program that only writes the host code page.", t.engine.useUTF8),
+			"description": fmt.Sprintf("Stdio encoding for this command (default: %t). true forces PowerShell and Python onto UTF-8: the script gains a UTF-8 preamble ([Console] input/output code pages and $OutputEncoding), PYTHONIOENCODING=utf-8 and (on Windows) PYTHONUTF8=1 are exported, and the output bytes are returned unchanged. false makes the agent decode the host ANSI code page (CP_ACP, e.g. GBK on a zh-CN host) automatically and encode stdin into it; everything else behaves the same, but characters outside the host code page may not be displayed. Use false for a program that only writes the host code page.", t.engine.useUTF8),
 		}
 	}
 	properties["max_lines"] = map[string]any{

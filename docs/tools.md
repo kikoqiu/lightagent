@@ -49,14 +49,14 @@ type Tool interface {
     对 PowerShell：脚本前加一段 UTF-8 前置头——把 `[Console]::InputEncoding`、`[Console]::OutputEncoding`
     与 `$OutputEncoding` 设为无 BOM 的 UTF-8（前两者经由 `SetConsoleCP`/`SetConsoleOutputCP` 让子进程
     继承的控制台代码页也切到 UTF-8）；对 Python（`language=python` 时的直接引擎，以及脚本内部调用的
-    python）：向子进程注入 `PYTHONIOENCODING=utf-8`。子进程 stdout/stderr 字节原样返回。
+    python）：向子进程注入 `PYTHONIOENCODING=utf-8`，Windows 上**再加 `PYTHONUTF8=1`**——前置头只把控制台代码页切到 UTF-8，`PYTHONIOENCODING` 也只管标准流，二者都够不到 Python 的文件系统与 locale 编解码器（仍按 ANSI 代码页），加了这个变量后 PowerShell 里起的 python 处理非 ASCII 路径/参数也不再乱码。子进程 stdout/stderr 字节原样返回。
   * `false`：不注入任何前置语句与变量，改由 **agent（Go）按主机 ANSI 代码页自动解码**：
     stdout/stderr 从 `GetACP` 代码页（如 CP936→GBK）解码为 UTF-8，写入 stdin 的文本编码为该代码页字节。
     `language=python` 时 Python 会按主机代码页写 stdout，正好被解码。除此之外一切行为相同；但
     **非本地 ANSI 字符可能无法显示**——主机代码页表外的字符（例如 Latin-1 主机上的中文、GBK 主机上
     无法映射的符号）只能得到替换字符或乱码。
   * 非 Windows 主机**没有** `use_utf8` 参数（也没有可回退的 ANSI 代码页）：始终 UTF-8，
-    仅额外注入 `PYTHONIOENCODING=utf-8`。
+    仅额外注入 `PYTHONIOENCODING=utf-8`（没有 ANSI 代码页可回退，也不需要 `PYTHONUTF8`——该变量只在 Windows 导出）。
 * 同步等待最多 `wait_timeout` 秒（默认取 `exec.wait_seconds`，10s）：等的是**进程退出**，窗口内写出的
   内容不会提前结束等待。**`run_script` 就是「启动 + 一次 `poll`」**：窗口结束后的输出处理与
   `manage_session` 的 `poll` 完全一致——把缓冲区当前内容整份交给模型并清空，所以窗口内完成就直接
@@ -108,7 +108,7 @@ type Tool interface {
 | `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
-| `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |
+| `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |
 | `max_lines` | int | `exec.max_lines`（50） | **本次调用**返回的行数上限（头尾折叠；不跨调用累计）。最多可以给到 `exec.max_lines_max`（100），要得更多**自动截断到最大值**。重要输出建议重定向到文件（`> out.txt` / `2>&1`）再用文件工具读回 |
 | `max_chars` | int | `30000` | **本次调用**返回的字符上限（不跨调用累计） |
 

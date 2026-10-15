@@ -183,7 +183,7 @@
 | `exec.wait_seconds` | int | `10` | `wait_timeout` 的默认同步等待秒数 |
 | `exec.max_lines` | int | `50` | `run_script` / `manage_session` 的 `max_lines` **参数的默认值**。一次回答最多带多少行。`0`/负数回退到内置 50 |
 | `exec.max_lines_max` | int | `100` | 上面那个参数的**最大值**。调用要得更多就截断到它。`0`/负数回退到内置 100。小于 `max_lines` 时把 `max_lines` 降到它 |
-| `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `run_script` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8，Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示 |
+| `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `run_script` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示 |
 | `read_file_lines.enabled` | bool | `true` | 启用行读取工具 |
 | `read_file_lines.max_read_file_size` | int | `32000` | 单次读取字节预算 |
 | `read_file_lines.max_read_file_lines` | int | `200` | 单次读取行数预算 |
