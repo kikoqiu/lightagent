@@ -657,12 +657,9 @@
   button.stop.on { display:inline-block; }
   /* The composer's send button carries three states (see updateComposer in
      app.js): Send, Pause the running turn, Continue a turn a pause held back.
-     The latter two take the Stop button's quieter palette, so the row reads as
-     "act on the turn" rather than "send something". */
-  button.pause, button.continue {
-    background:var(--bg-elev-2); color:var(--fg-muted); border-color:var(--border); box-shadow:none; font-weight:600;
-  }
-  button.pause:hover, button.continue:hover { background:#22303f; color:var(--fg); }
+     All three inherit the base button's green — the state lives in the label,
+     not in the palette; only the Stop button (the interrupt) keeps the quieter
+     one. */
   /* ---- @file picker ---- */
   /* The one-level listing the composer opens on '@' (see app.js). It floats
      above the input line so a directory with many children never squeezes the

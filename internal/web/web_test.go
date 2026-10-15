@@ -289,7 +289,7 @@ func TestMobileChrome(t *testing.T) {
 		`class="signout-glyph"`, // the icon-only way out...
 		`class="signout-label"`, // ...that replaces the word
 		".signout .signout-glyph { display:block; }",
-		".head-right { gap:4px; }", // the badges and the icon buttons stand closer
+		".head-right { gap:4px; }",         // the badges and the icon buttons stand closer
 		`data-placeholder-short`,           // the composer's short hint
 		"setComposerPlaceholder",           // it is swapped by app.js...
 		"matchMedia('(max-width: 480px)')", // ...at the stylesheet's phone breakpoint
@@ -1212,10 +1212,14 @@ func TestPauseComposerAffordances(t *testing.T) {
 			t.Errorf("the page is missing %q", want)
 		}
 	}
-	for _, want := range []string{"button.pause, button.continue", ".paused.marked .text"} {
-		if !strings.Contains(pageSource(), want) {
-			t.Errorf("the stylesheet is missing %q", want)
-		}
+	// Pause and Continue inherit the Send button's green (the state lives in the
+	// label, not the palette); only the Stop button keeps the quieter one. The
+	// stylesheet must therefore carry no palette override for the two classes.
+	if strings.Contains(pageSource(), "button.pause, button.continue {") {
+		t.Errorf("the stylesheet still overrides the pause/continue palette")
+	}
+	if !strings.Contains(pageSource(), ".paused.marked .text") {
+		t.Errorf("the stylesheet is missing %q", ".paused.marked .text")
 	}
 }
 
