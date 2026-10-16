@@ -301,3 +301,163 @@ func TestManageSessionKillReportsAProcessThatAlreadyExited(t *testing.T) {
 		t.Fatalf("the released session is still in the pool (err = %v)", err)
 	}
 }
+
+// stdinEchoCommand is a child that echoes every line it reads on stdin back with
+// an "echo:" prefix and exits once it reads the "quit" sentinel. It is what lets
+// a test confirm that manage_session input really reached the process, rather
+// than merely reporting that it wrote.
+func stdinEchoCommand() string {
+	if runtime.GOOS == "windows" {
+		return "while ($null -ne ($line = [Console]::In.ReadLine())) { " +
+			"Write-Output \"echo:$line\"; if ($line -eq 'quit') { break } }"
+	}
+	return "while IFS= read -r line; do echo \"echo:$line\"; [ \"$line\" = quit ] && break; done"
+}
+
+// writeInput performs one manage_session input call and requires the write to be
+// acknowledged as successful.
+func writeInput(t *testing.T, tool *ManageSessionTool, sessionID, data string) {
+	t.Helper()
+	res := tool.Execute(context.Background(), map[string]any{
+		"action": "input", "session_id": sessionID, "data": data,
+	})
+	if res.IsError {
+		t.Fatalf("input %q error: %s", data, res.ForLLM)
+	}
+	cr := commandResultFromResult(t, res.ForLLM)
+	if cr.Status != statusCompleted || !strings.Contains(cr.Output, "Input written to session") {
+		t.Fatalf("input %q = %s, want the write acknowledged", data, res.ForLLM)
+	}
+}
+
+// pollOutput runs one successful manage_session poll and returns its contract.
+func pollOutput(t *testing.T, tool *ManageSessionTool, sessionID string, waitSeconds int) commandResult {
+	t.Helper()
+	res := tool.Execute(context.Background(), map[string]any{
+		"action": "poll", "session_id": sessionID, "wait_timeout": waitSeconds,
+	})
+	if res.IsError {
+		t.Fatalf("poll error: %s", res.ForLLM)
+	}
+	return commandResultFromResult(t, res.ForLLM)
+}
+
+// TestManageSessionInputWritesToStdin is the input action end to end: what the
+// call sends must reach the child's stdin — the child echoes it back and the
+// poll reports that echo — and a sentinel line makes it exit, so the same
+// session can be driven to completion through a second input.
+func TestManageSessionInputWritesToStdin(t *testing.T) {
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	manageTool := NewManageSessionTool(engine)
+
+	sessionID := startBackground(t, engine, stdinEchoCommand())
+
+	writeInput(t, manageTool, sessionID, "hello\n")
+	if cr := pollOutput(t, manageTool, sessionID, 1); !strings.Contains(cr.Output, "echo:hello") {
+		t.Fatalf("poll = %+v, want the child's echo of the line just written", cr)
+	}
+
+	writeInput(t, manageTool, sessionID, "quit\n")
+	cr := pollOutput(t, manageTool, sessionID, 2)
+	if cr.Status != statusCompleted {
+		t.Fatalf("poll = %+v, want the child to have exited on the sentinel line", cr)
+	}
+	if !strings.Contains(cr.Output, "echo:quit") {
+		t.Fatalf("poll = %+v, want the echo of the sentinel line too", cr)
+	}
+}
+
+// TestManageSessionInputControlTokenReachesTheChild pins the control-key half of
+// the data contract: a bare token such as 'enter' is turned into its byte
+// sequence before it is written. The child reads one raw character and prints
+// its code, so it sees the byte itself — a line reader such as .NET's
+// [Console]::In.ReadLine() would instead block on a lone CR while it peeks for a
+// trailing LF, which is a property of that reader rather than of the write.
+func TestManageSessionInputControlTokenReachesTheChild(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the raw-character child is the Windows console shape under test")
+	}
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	manageTool := NewManageSessionTool(engine)
+
+	child := "$c = [Console]::In.Read(); Write-Output \"code:$c\""
+	sessionID := startBackground(t, engine, child)
+
+	writeInput(t, manageTool, sessionID, "enter")
+
+	cr := pollOutput(t, manageTool, sessionID, 2)
+	if cr.Status != statusCompleted || !strings.Contains(cr.Output, "code:13") {
+		t.Fatalf("poll = %+v, want 'enter' to have delivered byte 13 (CR) to the child", cr)
+	}
+}
+
+// TestManageSessionInputRejectsBadCalls covers the input action's failure paths:
+// a missing session id, a missing payload, and a session whose process already
+// exited. The last one fails without releasing the session, so the exit state is
+// still there for the poll that collects it.
+func TestManageSessionInputRejectsBadCalls(t *testing.T) {
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	manageTool := NewManageSessionTool(engine)
+
+	sessionID := startBackground(t, engine, sleepThenPrintExit(2, "late", 3))
+
+	noID := manageTool.Execute(context.Background(), map[string]any{
+		"action": "input", "data": "hi\n",
+	})
+	if !noID.IsError || !strings.Contains(noID.ForLLM, "session_id is required for action='input'") {
+		t.Fatalf("input without session_id = %s, want the session_id error", noID.ForLLM)
+	}
+
+	noData := manageTool.Execute(context.Background(), map[string]any{
+		"action": "input", "session_id": sessionID,
+	})
+	if !noData.IsError || !strings.Contains(noData.ForLLM, "data is required for action='input'") {
+		t.Fatalf("input without data = %s, want the data error", noData.ForLLM)
+	}
+
+	session, err := engine.sessions.Get(sessionID)
+	if err != nil {
+		t.Fatalf("session %s is gone: %v", sessionID, err)
+	}
+	waitForSessionExit(t, session)
+
+	exited := manageTool.Execute(context.Background(), map[string]any{
+		"action": "input", "session_id": sessionID, "data": "hi\n",
+	})
+	if !exited.IsError {
+		t.Fatalf("input to an exited session = %s, want a failure", exited.ForLLM)
+	}
+	if cr := commandResultFromResult(t, exited.ForLLM); !strings.Contains(cr.Output, "process already exited with code 3") {
+		t.Fatalf("input to an exited session = %s, want the exit code and the poll hint", exited.ForLLM)
+	}
+	if _, err := engine.sessions.Get(sessionID); err != nil {
+		t.Fatalf("session %s was dropped by the failed input: %v", sessionID, err)
+	}
+}
+
+// TestEncodeControlInput pins the control-key table behind the input action's
+// data parameter: known names map to their bytes (trimmed, case-insensitively),
+// while ordinary text — including text that already carries its own newline —
+// goes out verbatim.
+func TestEncodeControlInput(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"enter", "\r"},
+		{" Enter ", "\r"},
+		{"ctrl-c", "\x03"},
+		{"CTRL-D", "\x04"},
+		{"up", "\x1b[A"},
+		{"tab", "\t"},
+		{"hello", "hello"},
+		{"yes\n", "yes\n"},
+		{"two words", "two words"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := encodeControlInput(tc.in); got != tc.want {
+			t.Errorf("encodeControlInput(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
