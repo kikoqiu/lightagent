@@ -491,7 +491,10 @@
       // The new card is the one about to be filled in, so it opens. The flags are
       // padded first, so appending lands on the new card's position.
       syncOpenFlags(llms.length);
-      llms.push({ name: 'api-' + (llms.length + 1), type: 'openai', enabled: true });
+      // temperature starts at its sentinel (-1 = omit), written explicitly so the
+      // JSON mode shows the same value the saved file keeps; the slider renders
+      // the sentinel as its leftmost "omitted (provider default)" position.
+      llms.push({ name: 'api-' + (llms.length + 1), type: 'openai', enabled: true, temperature: -1 });
       llmOpen.push(true);
       touchLLM(record);
     };

@@ -6,17 +6,19 @@ import (
 )
 
 // legacyLLMInput captures the pre-multi-interface layout of a document: whether
-// a "providers" array is present at all, the raw single "openai" block, and the
-// context window that used to live under "context".
+// a "providers" array is present at all, its raw entries, the raw single
+// "openai" block, and the context window that used to live under "context".
 type legacyLLMInput struct {
 	hasLLMs       bool
+	entries       []json.RawMessage
 	openai        json.RawMessage
 	contextWindow int
 }
 
 // probeLegacyLLM reads the legacy shape out of a raw document without touching
 // the parsed config: the caller uses it to decide whether the seeded default
-// interface has to be replaced by a migrated one.
+// interface has to be replaced by a migrated one, and to tell which providers
+// entries mention temperature (see restoreOmittedTemperatures).
 func probeLegacyLLM(data []byte) legacyLLMInput {
 	var probe struct {
 		LLMs    json.RawMessage `json:"providers"`
@@ -26,11 +28,15 @@ func probeLegacyLLM(data []byte) legacyLLMInput {
 		} `json:"context"`
 	}
 	_ = json.Unmarshal(data, &probe) // a malformed document is reported by the caller
-	return legacyLLMInput{
+	in := legacyLLMInput{
 		hasLLMs:       len(bytes.TrimSpace(probe.LLMs)) > 0,
 		openai:        probe.OpenAI,
 		contextWindow: probe.Context.ContextWindow,
 	}
+	if in.hasLLMs {
+		_ = json.Unmarshal(probe.LLMs, &in.entries)
+	}
+	return in
 }
 
 // migrateLegacyLLM folds a legacy single-endpoint document into cfg.LLMs. It is

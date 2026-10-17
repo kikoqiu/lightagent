@@ -78,6 +78,11 @@ const LLMTypeOpenAI = "openai"
 // the one the migration from the legacy single-endpoint block uses.
 const DefaultLLMName = "default"
 
+// temperatureOmit is the stored "unset" sentinel of an interface's temperature:
+// a negative value keeps the field out of the request body, so the provider
+// applies its own default. 0 is a real value (deterministic sampling).
+const temperatureOmit = -1.0
+
 // LLMConfig is one LLM interface: its identity (name, type, enabled), the
 // request shape it carries and the context window of the model behind it. The
 // OpenAI-compatible fields are embedded, so an entry reads
@@ -515,7 +520,7 @@ func Default() *Config {
 			OpenAIConfig: OpenAIConfig{
 				APIBase:     "https://api.openai.com/v1",
 				Model:       "gpt-4o-mini",
-				Temperature: -1.0,
+				Temperature: temperatureOmit,
 				MaxTokens:   40960,
 				TimeoutSec:  4800,
 				Stream:      true,
@@ -735,12 +740,31 @@ func decode(data []byte, strict bool) (*Config, bool, error) {
 		}
 	}
 	migrated := cfg.migrateLegacyLLM(legacy)
+	cfg.restoreOmittedTemperatures(legacy.entries)
 	changed, err := cfg.ensureWebSalt()
 	if err != nil {
 		return nil, false, err
 	}
 	cfg.applyDefaults()
 	return cfg, migrated || changed, nil
+}
+
+// restoreOmittedTemperatures gives a providers entry that does not mention
+// temperature the "unset" sentinel back. Decoding starts from Default(), but
+// only the first entry of a "providers" array reuses the seeded slice element;
+// the later ones are decoded from zero values, so an omitted key would otherwise
+// read — and be written back by the config editor — as an explicit 0 (which
+// means deterministic sampling). A value an entry does set, 0 included, wins.
+func (c *Config) restoreOmittedTemperatures(entries []json.RawMessage) {
+	for i := 0; i < len(entries) && i < len(c.LLMs); i++ {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(entries[i], &fields); err != nil {
+			continue // a broken entry is reported by the decode above
+		}
+		if _, ok := fields["temperature"]; !ok {
+			c.LLMs[i].Temperature = temperatureOmit
+		}
+	}
 }
 
 // ensureWebSalt makes sure a password is always paired with a salt and that an
@@ -976,11 +1000,10 @@ func (c *Config) applyDefaults() {
 		if api.Model == "" {
 			api.Model = defAPI.Model
 		}
-		// temperature is deliberately not defaulted here: the built-in default
-		// of -1 is the "unset" sentinel (a negative value is left out of the
-		// request so the provider decides), and any value a document sets — 0
-		// included — must survive. An omitted key already keeps -1 because
-		// decoding starts from Default().
+		// temperature is deliberately not defaulted here: -1 is the "unset"
+		// sentinel (a negative value is left out of the request so the provider
+		// decides), and any value a document sets — 0 included — must survive.
+		// An omitted key is restored to -1 by restoreOmittedTemperatures.
 		if api.MaxTokens <= 0 {
 			api.MaxTokens = defAPI.MaxTokens
 		}

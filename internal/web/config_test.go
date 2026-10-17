@@ -189,6 +189,43 @@ func TestConfigPutKeepsTheKeyWhenAnInterfaceIsRenamed(t *testing.T) {
 	}
 }
 
+// TestConfigPutKeepsAnOmittedTemperature covers a provider added through the
+// editor: the new card shows "omitted (provider default)" and its entry carries
+// no temperature key, so the saved file — and the reply the page reloads — must
+// hold the -1 sentinel instead of an explicit 0 (deterministic sampling).
+func TestConfigPutKeepsAnOmittedTemperature(t *testing.T) {
+	srv := newTestServer(t, "")
+	seed := `{"providers":[{"name":"default","type":"openai","enabled":true,"api_key":"sk-secret","model":"m1"}]}`
+	path := seedConfigFile(t, srv, seed)
+
+	body := fmt.Sprintf(
+		`{"providers":[{"name":"default","type":"openai","enabled":true,"api_key":%q,"model":"m1"},`+
+			`{"name":"api-2","type":"openai","enabled":true,"api_key":"sk-two"}]}`,
+		config.MaskedSecret)
+	status, reply := callConfig(t, srv, http.MethodPut, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", status, reply.Error)
+	}
+	if got := reply.Config.LLMs[1].Temperature; got != -1 {
+		t.Fatalf("reply temperature = %v, want -1 (omitted by the page)", got)
+	}
+
+	saved, err := config.Parse([]byte(readConfigString(t, path)))
+	if err != nil {
+		t.Fatalf("parse the saved config: %v", err)
+	}
+	if got := saved.LLMs[1].Temperature; got != -1 {
+		t.Fatalf("file temperature = %v, want -1 (omitted by the page)", got)
+	}
+	if got := saved.LLMs[0].Temperature; got != -1 {
+		t.Fatalf("stored interface temperature = %v, want -1", got)
+	}
+	// The file itself carries the sentinel the next start reads as "omit".
+	if text := readConfigString(t, path); !strings.Contains(text, `"temperature": -1`) {
+		t.Fatalf("the saved file does not record the sentinel:\n%s", text)
+	}
+}
+
 // TestConfigRetentionPolicyRoundTrip covers the editor's half of the compaction
 // retention options: a file that omits them reports the default (keep nothing),
 // and a document that sets them is accepted, written back and echoed — so the
@@ -461,6 +498,9 @@ func TestLLMRepeaterWiring(t *testing.T) {
 		"key: 'api_base'",
 		"key: 'context_window'",
 		"key: 'media_types'",
+		// A provider the page adds starts on the "omitted" sentinel, so the file
+		// must never get an accidental 0 (deterministic sampling).
+		"temperature: -1",
 	} {
 		if !strings.Contains(configJS, want) {
 			t.Errorf("the providers repeater is missing %q", want)

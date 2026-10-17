@@ -108,6 +108,36 @@ func TestLoadFileTemperatureOverride(t *testing.T) {
 	}
 }
 
+// TestLoadFileProvidersTemperatureOmitted verifies the same rule for the
+// multi-interface layout: a "providers" array replaces the seeded default slice,
+// so its entries do not inherit the -1 sentinel from the defaults. An entry that
+// does not mention temperature must still read as "unset" instead of an explicit
+// 0 (deterministic sampling), while any value the entry sets survives.
+func TestLoadFileProvidersTemperatureOmitted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	doc := `{"providers":[
+		{"name":"a","type":"openai","enabled":true,"model":"m"},
+		{"name":"b","type":"openai","enabled":true,"model":"m","temperature":0},
+		{"name":"c","type":"openai","enabled":true,"model":"m"},
+		{"name":"d","type":"openai","enabled":true,"model":"m","temperature":0.4}
+	]}`
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// The first entry happens to reuse the seeded default slice element (which
+	// carries -1); the later ones are decoded from zero values.
+	want := []float64{-1, 0, -1, 0.4}
+	for i, temperature := range want {
+		if cfg.LLMs[i].Temperature != temperature {
+			t.Fatalf("providers[%d].temperature = %v, want %v", i, cfg.LLMs[i].Temperature, temperature)
+		}
+	}
+}
+
 func TestSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -817,6 +847,11 @@ func TestParseToleratesUnknownFields(t *testing.T) {
 func TestParseStrictRejectsUnknownFields(t *testing.T) {
 	if _, err := ParseStrict([]byte(`{"openai":{"api_key":"sk-x","modle":"typo"}}`)); err == nil {
 		t.Fatal(`ParseStrict should reject the unknown field "modle"`)
+	}
+	// A typo inside a providers entry is a mistake too: the entry belongs to the
+	// document the editor writes back.
+	if _, err := ParseStrict([]byte(`{"providers":[{"name":"a","api_key":"sk-x","modle":"typo"}]}`)); err == nil {
+		t.Fatal(`ParseStrict should reject the unknown field "modle" inside a providers entry`)
 	}
 	// A document pasted twice would silently keep only the first value.
 	two := `{"openai":{"api_key":"sk-x"}}{"context":{"context_window":100}}`
