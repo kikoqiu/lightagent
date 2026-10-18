@@ -34,7 +34,7 @@
 | 12 | 多行输入 | CLI 与 Web 均为 **Enter 换行**；CLI 发送用 **Ctrl+J**（Windows 本地也可 Ctrl+Enter；Linux/SSH 下终端支持 kitty 键盘协议时也可 Ctrl+Enter，另有 Alt+Enter），Web 用 **Ctrl+Enter** |
 | 13 | MCP 客户端 + 工具发现 / unlock | 纯标准库 MCP 客户端（stdio / Streamable HTTP / HTTP+SSE），server 在 `tools.mcp` 中配置；MCP 工具**恒为锁定函数**（永不进 `tools` 声明）：`tool_search_tool_bm25` 发现 → `unlock_tool` 下发 schema 并授权（TTL）→ `dynamic_call` 间接调用；系统提示词只注入 1 条全局 unlock 规则 + 每 server 1 条 MCP 全局信息（含 server 返回的 `serverInfo`/`instructions`） |
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板）；模型只产出思考（可见正文为空、无工具调用，**无论 `finish_reason`**）时不再多问模型，是否记入历史由 `agent.include_interrupted` 决定（默认关闭）；被中断的不完整回复同理——开启时保留并追加一条 `[engine]` 提示、关闭时整体丢弃；带正文的 `length` 截断自动续跑上限连续 3 次 |
-| 15 | 系统提示词 | 超短的系统提示词，并支持程序目录的agent.md自动注入  |
+| 15 | 系统提示词 | 超短的系统提示词：只写工作方式与规则（各工具的用法在工具自己的描述里），并约定临时文件放 `.lightagent/temp/`、项目记忆放 `.lightagent/memo/`；支持程序目录的agent.md自动注入  |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
 | 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；`method` 决定反馈放什么（`fetch_as_md` 默认 / `save_as_md` / `save_as_html` / `ignore`），正文里的站内链接写成根相对路径（`/docs/other`，状态行给出抓取的地址），反馈默认**最多 100 行**（`max_lines`，可关）且**优先只回填正文**（`<article>`/`<main>`/`class=main` 之类的容器，导航/侧栏/页脚用 `...(omitted)` 标记代替），定位不到正文时回填中间的 100 行；`invokejs` 可在**页面加载后、抓取前**在页面里跑一段脚本（浏览器取法限定），用注入的 `_invokejs_done(value)` 结束并把值放在反馈最前面（拿 Cookie/token，供后续命令用同一身份）；整页存到工作目录 `.lightagent/webfetch/<时间>.md`（Markdown 正文）并在反馈里给出路径 |
 | 18 | 多媒体附件 | 模型侧 `providers[].media_types` 声明**本模型可读的媒体类型**（如 `image/png`、`image/*`、`audio/wav`、`application/pdf`）。配置后：Web 输入框出现 **📎 附加按钮**，文件上传到工作目录 `.lightagent/uploads/`，**随下一条输入一起发给模型**（发送前点 ✕ 可取消并删掉已存文件），消息行会把带的附件显示出来（上传目录里的图片直接画成图片，取不回来时退回文件名）；若同时打开 `tools.upload_media.enabled`（两边都为真才启用），模型还拿到 `upload_media` 工具，可自行指定路径上传（类型不符 / 超限 / 空文件 / 目录都只报错，参数提示里列出可接收类型）。载荷：图片走 `image_url`（data URI）、音频走 `input_audio`（wav/mp3）、其余走 `file`（文件名 + data URI）；**会话文件只记附件路径与类型，不落 base64**（恢复时按路径读回，文件没了就只留名字） |
@@ -232,6 +232,8 @@ source <(lightagent completion bash)       # bash 补全
       session-20260912-153000.json # 选择不恢复历史时归档的旧会话（带归档时间）
     uploads/                     # Web 附加文件
     browser-profile/             # webfetch 的浏览器 profile
+    temp/                        # 模型放的临时文件（自建，退出时保留）
+    memo/                        # 模型放的项目记忆（自建，跨会话保留）
 ```
 
 * **目录锁**：启动时在 `.lightagent/.lock` 上加独占锁（Unix 用 `flock`、Windows 用
@@ -244,6 +246,9 @@ source <(lightagent completion bash)       # bash 补全
 * 会话只在**内存**中维护：对话过程中不会写盘，`/save` 可随时手动保存一次。
 * `.lightagent/` 目录**启动时创建**（放锁文件），**退出时若目录里只剩锁文件，整个目录一并删除**：
   `--no-save`、一次性 `-p` 运行或退出时选择不保存都不会留下 `.lightagent/`。
+* **模型自己的目录**：内置提示词约定临时文件放 `.lightagent/temp/`、项目记忆放 `.lightagent/memo/`。
+  两者都由模型按需创建（程序既不创建也不清理），因此它们一旦存在，上面那条「只剩锁文件就删目录」
+  就不会触发，临时文件与记忆会保留到下次启动；不需要时手动删除即可。
 * **会话文件都在 `.lightagent/sessions/` 下**：每个会话有自己的文件名（`/saveas` 起的名字），
   `session.json` 只是**没有名字**的新会话的默认名。`/list` 列出的就是这里的内容。旧布局
   （会话文件直接放在 `.lightagent/`）会在启动时自动移入 `sessions/`。

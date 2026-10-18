@@ -37,18 +37,32 @@ func TestWorkingDirectoryInfoEmpty(t *testing.T) {
 
 // TestDefaultSystemPromptHasNoHostState verifies the built-in template carries no
 // host-specific data, so an agent.md exported from it stays valid on another
-// machine. It still has to point the model at the run_script language
-// parameter and at non-interactive execution.
+// machine. It still has to ask for non-interactive execution and point the model
+// at the agent's scratch directories.
 func TestDefaultSystemPromptHasNoHostState(t *testing.T) {
 	prompt := DefaultSystemPrompt()
 	if strings.Contains(prompt, "Runtime:") {
 		t.Fatalf("built-in prompt must not embed the runtime line:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "language") {
-		t.Fatalf("built-in prompt must mention the run_script language parameter:\n%s", prompt)
-	}
 	if !strings.Contains(prompt, "non-interactive") {
 		t.Fatalf("built-in prompt must ask for non-interactive commands:\n%s", prompt)
+	}
+	for _, dir := range []string{".lightagent/temp", ".lightagent/memo"} {
+		if !strings.Contains(prompt, dir) {
+			t.Fatalf("built-in prompt must point at %s:\n%s", dir, prompt)
+		}
+	}
+}
+
+// TestDefaultSystemPromptLeavesToolUsageToToolDescriptions verifies the template
+// stays a behavior guide: every tool documents its own arguments and edge cases,
+// so the prompt must not enumerate tools or repeat their mechanics.
+func TestDefaultSystemPromptLeavesToolUsageToToolDescriptions(t *testing.T) {
+	prompt := DefaultSystemPrompt()
+	for _, name := range []string{"read_file", "write_file", "edit_file", "run_script", "manage_session", "webfetch"} {
+		if strings.Contains(prompt, name) {
+			t.Fatalf("built-in prompt must not describe tool %q (its own description does):\n%s", name, prompt)
+		}
 	}
 }
 
