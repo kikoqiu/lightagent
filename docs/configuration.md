@@ -264,7 +264,7 @@ MCP unlock 发现机制：**锁定函数**（deferred）默认不下发给模型
 | `min_match_rate` | float | `0.5` | 关键词匹配率下限：函数必须命中的查询关键词占比（`0`~`1`），低于它的一律不返回。查询里**重复的关键词按出现次数各算 1 个词**，重复词既让分母变大也让权重变高。`0`（未配置）或大于 `1` 的取值回退到默认值 |
 | `use_bm25` | bool | `true` | 启用 BM25 自然语言搜索；lightagent 只有这一个发现搜索工具，故必须为 `true` |
 
-> * 控制面（`tool_search_tool_bm25` / `unlock_tool` / `dynamic_call`）与系统提示词里的机制说明、MCP 全局信息**只在存在锁定函数时**出现；没有锁定函数时不会往上下文插入任何多余内容。
+> * 控制面（`tool_search_tool_bm25` / `unlock_tool` / `dynamic_call`）与系统提示词里的机制说明**只在存在锁定函数时**出现；MCP 使用建议与 MCP 全局信息**只在至少一个 MCP server 贡献了工具时**出现——未启用 MCP 或没有任何 MCP 工具时，提示词里不出现任何 MCP 内容。
 > * `mode` 非 `unlock` 或 `use_bm25=false`（在 `enabled=true` 或 `mcp.enabled=true` 时）会导致配置校验失败。
 
 #### `tools.mcp`（MCP 客户端）
@@ -294,7 +294,7 @@ lightagent 内置一个**纯标准库**的 MCP 客户端。启动时按 `servers
 > * 传输支持：**stdio**（子进程、按行分隔 JSON-RPC）、**Streamable HTTP**（每次请求一个 POST，响应为 JSON 或 SSE，回传并复用 `Mcp-Session-Id`）、**legacy HTTP+SSE**（长连接事件流 + endpoint POST）。
 > * 单个 server 连接失败会在启动时打印 `mcp: …` 并继续，不影响其他 server。
 > * 校验：`mcp.enabled=true` 时，stdio server 需要 `command`，http/sse server 需要 `url`，否则配置校验失败。
-> * 启动只往系统提示词注入两类“机制说明”：一条**全局 unlock 规则**（只注入 1 次）+ 每个连上的 server 一条 **MCP 全局信息**。MCP 全局信息 = 配置键名 + 工具数 + `registered as locked tools; … unlock_tool … dynamic_call`，再附上 **server 在 initialize 里返回的信息**（`serverInfo.name/title/version` 与可选的 `instructions`）。二者都不列出任何函数名。
+> * 启动只往系统提示词注入两类“机制说明”，且都**只在至少一个 MCP server 贡献了工具时**出现：一条**全局 unlock 规则**（只注入 1 次）+ 每个贡献了工具的 server 一条 **MCP 全局信息**，并在此之前附一句 MCP 使用建议。MCP 全局信息 = 配置键名 + 工具数 + `registered as locked tools; … unlock_tool … dynamic_call`，再附上 **server 在 initialize 里返回的信息**（`serverInfo.name/title/version` 与可选的 `instructions`）。二者都不列出任何函数名。未启用 MCP 或没有任何 MCP 工具（server 未连上 / 返回 0 个工具）时，系统提示词里不会出现任何 MCP 内容。
 > * MCP 工具**永远**是锁定函数：搜索发现不注册、不授权；只有 `unlock_tool` 才下发 schema 并授权；授权过期后重新 `unlock_tool` 即可。
 
 ### `agent`
@@ -320,7 +320,7 @@ working directory: D:\work\demo
 `summary_in_system_prompt` 决定发送时累积摘要的位置，默认 `false`（第一条用户消息）：
 
 ```
-system: <基础提示词 + unlock 规则 + MCP 信息 + 运行时行 + 工作目录行>
+system: <基础提示词 + [unlock 规则] + [MCP 使用建议与 MCP 信息] + 运行时行 + 工作目录行>
 user:   [engine] CONVERSATION SUMMARY:
         <累积摘要>
 user:   <历史里的第一条 user>
@@ -387,7 +387,8 @@ user:   <历史里的第一条 user>
 
 优先级：`agent.md` > `config.agent.system_prompt` > 内置默认。
 
-程序会在基础提示词之后**自动按顺序追加能力段落** —— unlock 规则、MCP 信息、运行时环境行
+程序会在基础提示词之后**自动按顺序追加能力段落** —— unlock 规则（存在锁定函数时）、MCP 使用建议
+与 MCP 信息（至少一个 MCP server 贡献了工具时）、运行时环境行
 `Runtime: <GOOS>/<GOARCH>.`、工作目录行 `working directory: <绝对路径>`（后者由
 `agent.include_working_dir` 控制，默认开启）—— 因此 `agent.md` / `agent.system_prompt`
 **不需要也不应**写这些内容：

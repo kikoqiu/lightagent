@@ -2672,6 +2672,56 @@ func TestSystemPromptMCPGlobalInfo(t *testing.T) {
 	}
 }
 
+// TestSystemPromptMCPContentOnlyWithMCPTools verifies no MCP wording reaches
+// the system prompt while MCP is off or no server contributes tools, and that
+// the usage rule appears together with the per-server info once tools exist.
+func TestSystemPromptMCPContentOnlyWithMCPTools(t *testing.T) {
+	promptOf := func(a *Agent) string {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.buildMessagesLocked()[0].Content
+	}
+	hasMCP := func(content string) bool {
+		return strings.Contains(content, "MCP")
+	}
+
+	// MCP off: no server info was recorded at all.
+	off := New(config.Default(), nil, tools.NewRegistry(), NewBus())
+	if content := promptOf(off); hasMCP(content) {
+		t.Fatalf("system prompt mentions MCP while MCP is off:\n%s", content)
+	}
+
+	// MCP off while the host defers its own function: the unlock rule is still
+	// injected, but it must stay free of MCP wording.
+	hostDeferred := tools.NewRegistry()
+	hostDeferred.RegisterDeferred(agentStubTool{name: "host_export", desc: "export host data"})
+	hostAgent := New(config.Default(), nil, hostDeferred, NewBus())
+	hostContent := promptOf(hostAgent)
+	if !strings.Contains(hostContent, "**Tool Discovery & Unlock**") {
+		t.Fatalf("host-deferred tools must still get the unlock rule:\n%s", hostContent)
+	}
+	if hasMCP(hostContent) {
+		t.Fatalf("unlock rule mentions MCP while only host tools are deferred:\n%s", hostContent)
+	}
+
+	// MCP on but tool-less: a server with no contributed tools is ignored.
+	toolLess := New(config.Default(), nil, tools.NewRegistry(), NewBus())
+	toolLess.SetMCPServers([]MCPServerInfo{{Server: "empty", ToolCount: 0}})
+	if content := promptOf(toolLess); hasMCP(content) {
+		t.Fatalf("system prompt mentions MCP while no MCP tool is registered:\n%s", content)
+	}
+
+	// At least one contributed tool: the usage rule and the server line show up.
+	withTools := New(config.Default(), nil, tools.NewRegistry(), NewBus())
+	withTools.SetMCPServers([]MCPServerInfo{{Server: "playwright", ToolCount: 2}})
+	content := promptOf(withTools)
+	for _, want := range []string{MCPToolsRule(), "MCP server `playwright` is connected."} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("system prompt missing %q:\n%s", want, content)
+		}
+	}
+}
+
 // TestSystemPromptWorkingDirectory verifies the working-directory line is
 // injected by default, suppressed when agent.include_working_dir is off, and
 // states the path only — the directory's children are never listed.

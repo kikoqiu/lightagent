@@ -679,15 +679,16 @@ tool: <真实执行结果>
 
 ### 系统提示词注入
 
-启动时只注入两类**机制说明**（不含任何函数名，保证前缀稳定）：
+基础提示词本身**不含任何 MCP 文案**。只有确实存在 MCP 工具（至少一个连上的 server 贡献了工具）时，才注入以下**机制说明**（不含任何函数名，保证前缀稳定）：
 
-* **全局 unlock 规则**：整段提示词里**只出现 1 次**，说明 search → `unlock_tool` → `dynamic_call` 的用法（`agent.ToolUnlockRule()`）。
-* **MCP 全局信息**：每个连上的 server 一条，含三部分——
+* **MCP 使用建议**：一句 `Use MCP tools when they offer a capability the native tools lack.`（`agent.MCPToolsRule()`），与下面的全局信息一起出现。
+* **全局 unlock 规则**：存在锁定函数时整段提示词里**只出现 1 次**，说明 search → `unlock_tool` → `dynamic_call` 的用法（`agent.ToolUnlockRule()`；措辞对 MCP 工具与宿主自行注册的 deferred 工具通用）。
+* **MCP 全局信息**：每个贡献了工具的 server 一条，含三部分——
   * 原项目句式：`MCP server \`<配置键名>\` is connected. It contributes N tool(s), currently registered as locked tools; discover … unlock … dynamic_call.`
   * **server 返回的信息**（来自 MCP `initialize` 结果）：`Reported by: name "…", title "…", version …`（有则显示）。
   * **server instructions**（`initialize` 的 `instructions`，有则显示）：`Server instructions: …`。
 
-两类都只在**存在锁定函数**时出现；没有锁定函数时不会往上下文插入任何多余内容。
+未启用 MCP、或没有任何 MCP 工具（server 未连上 / 返回 0 个工具）时，系统提示词中**不会出现任何 MCP 内容**；全局 unlock 规则也只在确有锁定函数时出现。没有这些内容时不会往上下文插入任何多余文字。
 
 ### 调用与结果
 

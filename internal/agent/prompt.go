@@ -29,7 +29,6 @@ its own arguments and behavior, so those details are not repeated here.
 ## Rules
 - Run programs and commands non-interactively: pass every argument and input in the same call, and never start something that waits for a prompt.
 - Use git for version control when the project is a repository.
-- Use MCP tools when they offer a capability the native tools lack.
 - State in one line what you are about to do before making a tool call.
 - Think and reply in the language the user uses.
 
@@ -58,15 +57,24 @@ func WorkingDirectoryInfo(dir string) string {
 	return "working directory: " + dir
 }
 
+// MCPToolsRule returns the guidance that accompanies the per-server MCP
+// global info. It is injected only while at least one MCP server actually
+// contributes tools, so a prompt never mentions MCP otherwise.
+func MCPToolsRule() string {
+	return "Use MCP tools when they offer a capability the native tools lack."
+}
+
 // ToolUnlockRule renders the static system-prompt rule that explains the
-// MCP unlock discovery mechanism.
+// unlock discovery mechanism.
 // It only describes the mechanism and the BM25 discovery search tool; it never
 // enumerates which functions are currently locked, so the rendered text stays
 // byte-identical across lock/unlock cycles and the startup context stays small
-// regardless of how many functions the locked library holds.
+// regardless of how many functions the locked library holds. The wording stays
+// generic: locked functions can come from MCP servers or from the host itself,
+// so the rule must not claim MCP when only host tools are deferred.
 func ToolUnlockRule() string {
 	return fmt.Sprintf(
-		`**Tool Discovery & Unlock** - Some capabilities are contributed by MCP servers as locked functions: they are NOT part of your native tool list and are NOT enumerated here. Locked functions never get execution access until you unlock them. When you need a capability that is not in your native tool list, first discover which locked function matches: search with %[3]q — matches return the exact function names and one-line descriptions as their result. Then activate the exact function with %[1]q: that call grants temporary execution access and returns the function's complete definition as a standardized XML <tools> block. If that block already exists earlier in this conversation, the activation reply points to it instead of resending the schema. After activation, invoke the function through the %[2]q tool with name set to the function's exact name and arguments set to a JSON object built from the delivered <parameters> schema — never emit a direct tool_use for a locked function, because your output template only allows calls to tools declared in your native tool list. Calling a function without an active grant returns a "tool is locked" error - when you see it, call %[1]q first, then retry via %[2]q. Grants expire after a limited number of turns; re-activate with %[1]q when that happens.`,
+		`**Tool Discovery & Unlock** - Some capabilities are provided as locked functions: they are NOT part of your native tool list and are NOT enumerated here. Locked functions never get execution access until you unlock them. When you need a capability that is not in your native tool list, first discover which locked function matches: search with %[3]q — matches return the exact function names and one-line descriptions as their result. Then activate the exact function with %[1]q: that call grants temporary execution access and returns the function's complete definition as a standardized XML <tools> block. If that block already exists earlier in this conversation, the activation reply points to it instead of resending the schema. After activation, invoke the function through the %[2]q tool with name set to the function's exact name and arguments set to a JSON object built from the delivered <parameters> schema — never emit a direct tool_use for a locked function, because your output template only allows calls to tools declared in your native tool list. Calling a function without an active grant returns a "tool is locked" error - when you see it, call %[1]q first, then retry via %[2]q. Grants expire after a limited number of turns; re-activate with %[1]q when that happens.`,
 		tools.UnlockToolName,
 		tools.DynamicCallToolName,
 		tools.BM25SearchToolName,

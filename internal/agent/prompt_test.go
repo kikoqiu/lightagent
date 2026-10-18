@@ -66,6 +66,16 @@ func TestDefaultSystemPromptLeavesToolUsageToToolDescriptions(t *testing.T) {
 	}
 }
 
+// TestDefaultSystemPromptHasNoMCPContent verifies the built-in template never
+// mentions MCP: the MCP usage rule is a capability section injected only while
+// an MCP server actually contributes tools (see MCPToolsRule).
+func TestDefaultSystemPromptHasNoMCPContent(t *testing.T) {
+	prompt := DefaultSystemPrompt()
+	if strings.Contains(prompt, "MCP") {
+		t.Fatalf("built-in prompt must not mention MCP without MCP tools:\n%s", prompt)
+	}
+}
+
 // TestRuntimeInfo verifies the runtime line reports the platform the binary
 // actually runs on.
 func TestRuntimeInfo(t *testing.T) {

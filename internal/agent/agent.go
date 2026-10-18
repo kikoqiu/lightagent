@@ -43,7 +43,9 @@ type Agent struct {
 	// so it is injected exactly once and only when it is meaningful.
 	unlockRule string
 	// mcpInfo holds one "MCP global info" entry per connected MCP server. It
-	// never lists the servers' functions.
+	// never lists the servers' functions. Entries without contributed tools are
+	// ignored, so no MCP wording reaches the prompt while MCP is off or no MCP
+	// tool is registered.
 	mcpInfo []MCPServerInfo
 	summary string
 	// summaryInSystem says where a request carries the accumulated summary:
@@ -218,7 +220,8 @@ func (a *Agent) SwitchLLM(client *llm.Client, contextWindow, maxTokens int) erro
 // SetMCPServers records the connected MCP servers rendered into the system
 // prompt as the per-server "MCP global info" (server name, tool count and the
 // locked-tools availability note). It must be called before the first turn; it
-// never lists the servers' functions.
+// never lists the servers' functions. Entries whose ToolCount is zero are
+// ignored, so a server that contributed nothing adds no prompt content.
 func (a *Agent) SetMCPServers(servers []MCPServerInfo) {
 	a.mu.Lock()
 	a.mcpInfo = append([]MCPServerInfo(nil), servers...)
@@ -238,24 +241,32 @@ func (a *Agent) SetWorkingDir(dir string) {
 }
 
 // systemPrompt renders the system prompt: the base prompt followed by the
-// capability sections — the single global unlock rule and, per connected server,
-// the MCP global info line — and closing with the host sections, the runtime
-// line and the working-directory line. The host sections are generated here
-// rather than coming from the base prompt, so an agent.md never carries a
-// hard-coded platform or path. The caller must hold a.mu.
+// capability sections — the single global unlock rule and, only while at least
+// one MCP server contributes tools, the MCP usage rule and the per-server
+// global info — and closing with the host sections, the runtime line and the
+// working-directory line. The host sections are generated here rather than
+// coming from the base prompt, so an agent.md never carries a hard-coded
+// platform or path. The caller must hold a.mu.
 func (a *Agent) systemPrompt() string {
-	parts := make([]string, 0, len(a.mcpInfo)+4)
+	parts := make([]string, 0, len(a.mcpInfo)+5)
 	if trimmed := strings.TrimRight(a.base, "\n"); trimmed != "" {
 		parts = append(parts, trimmed)
 	}
 	if a.unlockRule != "" {
 		parts = append(parts, a.unlockRule)
 	}
-	if len(a.mcpInfo) > 0 {
-		lines := make([]string, 0, len(a.mcpInfo))
-		for _, info := range a.mcpInfo {
-			lines = append(lines, mcpServerInfoLine(info))
+	// MCP wording — the usage rule and the per-server global info — is emitted
+	// only while at least one server actually contributes tools. With MCP off
+	// (or every server tool-less) the prompt carries no MCP content at all.
+	lines := make([]string, 0, len(a.mcpInfo))
+	for _, info := range a.mcpInfo {
+		if info.ToolCount <= 0 {
+			continue
 		}
+		lines = append(lines, mcpServerInfoLine(info))
+	}
+	if len(lines) > 0 {
+		parts = append(parts, MCPToolsRule())
 		parts = append(parts, strings.Join(lines, "\n"))
 	}
 	if a.runtimeInfo != "" {

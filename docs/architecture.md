@@ -459,12 +459,14 @@ tool 循环里一条超长的反馈（整份文件、读回的图片）、带图
 `agent.md` 支持 `@include("路径")` 片段导入（文件/目录、相对/绝对、可嵌套），在读取时展开。
 详见 [configuration.md](configuration.md)。
 
-基础提示词之后按顺序追加能力段落：① 存在锁定函数时的全局 unlock 规则；② 每个已连接 MCP server 的
-MCP 全局信息；③ 运行时环境行（`agent.RuntimeInfo()`，每次运行生成，**不写进** `agent.md`）；
+基础提示词之后按顺序追加能力段落：① 存在锁定函数时的全局 unlock 规则；② 存在 MCP 工具时的一句 MCP
+使用建议（`agent.MCPToolsRule()`）与每个贡献了工具的 MCP server 的全局信息；③ 运行时环境行
+（`agent.RuntimeInfo()`，每次运行生成，**不写进** `agent.md`）；
 ④ 工作目录行（`agent.include_working_dir`，默认开启，`agent.WorkingDirectoryInfo()` 在 `agent.New`
 时生成一次，**只有路径**，不列出目录内容）；⑤ 累积的上下文摘要（**仅** `agent.summary_in_system_prompt = true`；
 默认摘要不在系统提示里，而是作为一条独立的 `[engine]` 消息紧跟其后，见
-[上下文压缩](#摘要的放置agentsummary_in_system_prompt)）。
+[上下文压缩](#摘要的放置agentsummary_in_system_prompt)）。内置基础提示词本身不含任何 MCP 文案，
+未启用 MCP 或没有任何 MCP 工具时系统提示词里不会出现 MCP 内容。
 
 ## MCP 工具发现 / unlock 控制面
 
@@ -475,7 +477,7 @@ MCP unlock 发现机制，由注册表 + 三个控制面工具组成：
 * **`unlock_tool`**（`unlock_tool.go`）写入 TTL grant 并下发规范化 XML `<tools>` schema；`ctx` 携带的 `UnlockLookup` 检查该 schema 是否仍在**当前有效（未压缩）上下文**里——在就只刷新授权并提示“之前已发过”，被压缩/淘汰则重新下发。
 * **`dynamic_call`**（`dynamic_call.go`）按名转发 `ExecuteArgs`，复用注册表的授权闸门。
 * **TTL**：`Agent.runLoop` 在**每个工具执行轮结束**调用 `reg.TickTTL()` 递减授权（与原 unlock 模式一致）；授权过期不影响函数仍可被搜索发现，模型重新 `unlock_tool` 即可。
-* **系统提示词**：只在**存在锁定函数**时注入两节——① 一条**全局 unlock 规则**（`agent.ToolUnlockRule()`，整个提示词里只出现 1 次）；② 每个连上的 MCP server 一条 **MCP 全局信息**（配置键名 + 工具数 + `registered as locked tools; … unlock_tool … dynamic_call`，再附上 server 在 `initialize` 里返回的 `serverInfo.name/title/version` 与 `instructions`）。两节都不列出任何函数名，故前后缀字节稳定（KV 前缀友好）。
+* **系统提示词**：全局 unlock 规则只在**存在锁定函数**时注入（`agent.ToolUnlockRule()`，整个提示词里只出现 1 次）；MCP 使用建议与每个 server 的 **MCP 全局信息**只在 **server 实际贡献了工具**时注入（配置键名 + 工具数 + `registered as locked tools; … unlock_tool … dynamic_call`，再附上 server 在 `initialize` 里返回的 `serverInfo.name/title/version` 与 `instructions`）。两节都不列出任何函数名，故前后缀字节稳定（KV 前缀友好）。未启用 MCP 或没有任何 MCP 工具时，提示词里不出现任何 MCP 内容。
 
 ### MCP 客户端
 
