@@ -39,6 +39,34 @@ func TestReadFileDescriptionNamesCompleteEndings(t *testing.T) {
 	}
 }
 
+// TestFileToolTextNamesEndingsByLabel pins how the three file tools talk about
+// line endings: always by label (LF, CRLF, CR), never by a backslash escape. A
+// tool call is not always JSON — an XML call carries the value between tags
+// literally — so a description that spells an ending as an escape teaches a
+// model to send two literal characters instead of a break.
+func TestFileToolTextNamesEndingsByLabel(t *testing.T) {
+	for _, tool := range []Tool{NewReadFileLinesTool(FsConfig{}), NewWriteFileTool(FsConfig{}), NewEditFileTool()} {
+		text := tool.Description()
+		props, _ := tool.Parameters()["properties"].(map[string]any)
+		for name, raw := range props {
+			prop, _ := raw.(map[string]any)
+			desc, _ := prop["description"].(string)
+			text += " | " + name + ": " + desc
+		}
+		if strings.Contains(text, "\\n") || strings.Contains(text, "\\r") {
+			t.Errorf("%s spells a line ending as a backslash escape: %s", tool.Name(), text)
+		}
+		for _, want := range []string{"LF", "CRLF"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s does not name %s: %s", tool.Name(), want, text)
+			}
+		}
+		if strings.Contains(text, "backslash") || strings.Contains(text, "JSON escaping") {
+			t.Errorf("%s talks about argument escaping instead of line endings: %s", tool.Name(), text)
+		}
+	}
+}
+
 // TestParseEOLArg pins the spellings the eol argument accepts: following the file
 // ('auto', the default), leaving the payload alone ('keep'), the three ending
 // labels, and an ending's own bytes. Anything else is rejected with a message
@@ -90,9 +118,9 @@ func TestWriteFileEOLExplicit(t *testing.T) {
 		name, eol, content, want, spelling string
 		reported                           bool
 	}{
-		{name: "crlf", eol: "crlf", content: "a\nb\n", want: "a\r\nb\r\n", spelling: "\\r\\n (CRLF)", reported: true},
-		{name: "lf", eol: "lf", content: "a\r\nb\r\n", want: "a\nb\n", spelling: "\\n (LF)", reported: true},
-		{name: "cr", eol: "cr", content: "a\nb\n", want: "a\rb\r", spelling: "\\r (CR)", reported: true},
+		{name: "crlf", eol: "crlf", content: "a\nb\n", want: "a\r\nb\r\n", spelling: "CRLF", reported: true},
+		{name: "lf", eol: "lf", content: "a\r\nb\r\n", want: "a\nb\n", spelling: "LF", reported: true},
+		{name: "cr", eol: "cr", content: "a\nb\n", want: "a\rb\r", spelling: "CR", reported: true},
 		{name: "single-line", eol: "crlf", content: "one line", want: "one line"},
 		{name: "already-that-ending", eol: "crlf", content: "a\r\n", want: "a\r\n"},
 	}
@@ -152,7 +180,7 @@ func TestWriteFileEOLAutoFollowsTheFile(t *testing.T) {
 	if got := readFile(t, p); got != "a\r\nb\r\nc\r\nd\r\n" {
 		t.Errorf("appended file = %q, want CRLF throughout", got)
 	}
-	if !strings.Contains(res.ForLLM, eolRewriteField+"\\r\\n (CRLF), following the file") {
+	if !strings.Contains(res.ForLLM, eolRewriteField+"CRLF, following the file") {
 		t.Errorf("the rewrite was not reported: %s", res.ForLLM)
 	}
 
@@ -193,7 +221,7 @@ func TestWriteFileEOLAutoFollowsTheFile(t *testing.T) {
 	if got := readFile(t, mixed); got != "a\nb\r\nx\ny\n" {
 		t.Errorf("mixed file = %q, want the payload written with its first break", got)
 	}
-	if !strings.Contains(res.ForLLM, eolRewriteField+"\\n (LF), following the file") {
+	if !strings.Contains(res.ForLLM, eolRewriteField+"LF, following the file") {
 		t.Errorf("the first-break rewrite was not reported: %s", res.ForLLM)
 	}
 }
@@ -239,7 +267,7 @@ func TestEditFileEOLAutoKeepsTheFileUniform(t *testing.T) {
 	if strings.Contains(res.ForLLM, "mix endings") {
 		t.Errorf("content was rewritten but a mix was reported: %s", res.ForLLM)
 	}
-	if !strings.Contains(res.ForLLM, eolRewriteField+"\\r\\n (CRLF), following the file") {
+	if !strings.Contains(res.ForLLM, eolRewriteField+"CRLF, following the file") {
 		t.Errorf("the rewrite was not reported: %s", res.ForLLM)
 	}
 }
@@ -277,7 +305,7 @@ func TestEditFileEOLExplicitAndKeep(t *testing.T) {
 	if got := readFile(t, p); got != "one\r\nmid\r\ntwo\r\n" {
 		t.Errorf("file = %q, want CRLF throughout", got)
 	}
-	if !strings.Contains(res.ForLLM, eolRewriteField+"\\r\\n (CRLF), as asked") {
+	if !strings.Contains(res.ForLLM, eolRewriteField+"CRLF, as asked") {
 		t.Errorf("the rewrite was not reported: %s", res.ForLLM)
 	}
 }
@@ -312,7 +340,7 @@ func TestEditFileEOLAutoFollowsTheFirstBreak(t *testing.T) {
 	if got := readFile(t, p); got != "a\r\nB\r\n" {
 		t.Errorf("file = %q, want the content written with the first break", got)
 	}
-	if !strings.Contains(res.ForLLM, eolRewriteField+"\\r\\n (CRLF), following the file") {
+	if !strings.Contains(res.ForLLM, eolRewriteField+"CRLF, following the file") {
 		t.Errorf("the rewrite was not reported: %s", res.ForLLM)
 	}
 }

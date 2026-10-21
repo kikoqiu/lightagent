@@ -21,6 +21,13 @@ import (
 // stable NUL pattern.
 const readSampleSize = 4096
 
+// eolScanBytes bounds read_file's ending scan: at most 1 MiB of decoded text, and
+// it stops as soon as the file is known to mix endings, whichever comes first.
+// The window is never cut by it — rows after the scan are still returned — and
+// the header does not announce the cap: a file's convention is normally decided
+// long before it. docs/tools.md owns the detail.
+const eolScanBytes = 1 << 20
+
 // FsConfig carries the file-tool limits.
 type FsConfig struct {
 	MaxReadFileSize  int
@@ -52,12 +59,14 @@ func (t *ReadFileLinesTool) Description() string {
 	return fmt.Sprintf("Read a text file line by line (source, markdown, logs, configs). "+
 		"Rows come back exactly as the file holds them, each with its complete line ending (LF, CRLF "+
 		"or CR) — only a final row the file leaves unterminated comes back without one — and without "+
-		"line numbers; the header states the file line of the first row and spells the ending bytes "+
-		"out when they are not plain LF. start_line is 1-indexed and inclusive, max_lines is a row "+
-		"count, so one call returns [start_line, start_line + rows - 1]; continue with "+
-		"start_line = last returned file line + 1. With the default 'auto' encoding the header "+
-		"also names the charset that was detected (UTF-8, UTF-16/UTF-32, or a legacy code page). "+
-		"Per-call limit: up to %d lines / %d bytes.",
+		"line numbers; the header states the file line of the first row and reports eol for the "+
+		"whole file: a file that mixes endings names its first break. "+
+		"start_line is 1-indexed and inclusive, max_lines is a row count, so one call returns "+
+		"[start_line, start_line + rows - 1]; continue with start_line = last returned file line + 1. "+
+		"Line endings are byte-exact: LF and CRLF are matched and written exactly as the file holds "+
+		"them, so a multi-line find copied from here stays byte for byte. With the default 'auto' "+
+		"encoding the header also names the charset that was detected (UTF-8, UTF-16/UTF-32, or a "+
+		"legacy code page). Per-call limit: up to %d lines / %d bytes.",
 		t.fs.MaxReadFileLines, t.fs.MaxReadFileSize)
 }
 
@@ -229,25 +238,16 @@ func binaryReadHint() string {
 // readWindow reads [startLine, startLine+limit-1] honoring the byte budget and
 // returns the content plus a header/footer describing the window. Every line
 // number here counts decoded lines.
+//
+// The window limits what is returned, not what is examined: the decoded stream is
+// read ahead so the header's ending report describes the file — the ending of its
+// very first break, and whether the file mixes conventions — instead of one page.
+// The scan is bounded (see eolScanBytes) and ends as soon as both the window and
+// the report are settled, so reading a page near the top of a large file does not
+// read the whole file to its end.
 func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodingName string, startLine, limit, sizeBudget int64, stripBOM, hasBOM bool) (string, string, error) {
 	lr := newLineReader(reader, int(sizeBudget), stripBOM)
-	lineIndex := int64(1)
-	reachedEOF := false
-
-	for lineIndex < startLine {
-		_, _, _, err := lr.next()
-		if err == io.EOF {
-			reachedEOF = true
-			break
-		}
-		if err != nil {
-			return "", "", fmt.Errorf("failed to read file content: %v", err)
-		}
-		lineIndex++
-	}
-	if reachedEOF {
-		return "", "", nil
-	}
+	lineIndex := int64(0)
 
 	// Rows come back verbatim, each with its own terminator: what the model reads
 	// is what the file holds, so a find copied from here matches byte for byte.
@@ -255,29 +255,51 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	var content strings.Builder
 	var outputBytes, linesRead int64
 	var byteTruncated, lineTruncated bool
-	var lf, crlf, cr int
+	var endings fileEndings
+	windowOpen := true
+	scanOpen := true
+	scannedBytes := int64(0)
+	moreRows := false
 
-	for (limit < 0 || linesRead < limit) && !reachedEOF {
-		remaining := sizeBudget - outputBytes
-		if remaining <= 0 {
-			byteTruncated = true
+	for {
+		if !windowOpen && !scanOpen {
+			// The output and the ending report are both settled. One more row
+			// tells whether anything follows the window; the rest is not read.
+			if _, _, _, err := lr.next(); err == nil {
+				moreRows = true
+			}
 			break
 		}
 		line, term, truncated, err := lr.next()
 		if err == io.EOF {
-			reachedEOF = true
 			break
 		}
 		if err != nil {
 			return "", "", fmt.Errorf("failed to read file content: %v", err)
 		}
-		switch term {
-		case termLF:
-			lf++
-		case termCRLF:
-			crlf++
-		case termCR:
-			cr++
+		lineIndex++
+		if scanOpen {
+			endings.add(term)
+			scannedBytes += int64(len(line) + len(term.seq()))
+			if endings.mixed() || scannedBytes >= eolScanBytes {
+				scanOpen = false
+			}
+		}
+
+		// Rows before the window and rows after it are only counted: the
+		// ending report needs the file's conventions, the output does not.
+		if lineIndex < startLine || !windowOpen {
+			continue
+		}
+		if limit > 0 && linesRead >= limit {
+			windowOpen = false
+			continue
+		}
+		remaining := sizeBudget - outputBytes
+		if remaining <= 0 {
+			byteTruncated = true
+			windowOpen = false
+			continue
 		}
 		sep := term.seq()
 		if truncated {
@@ -289,7 +311,8 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 			linesRead++
 			byteTruncated = true
 			lineTruncated = true
-			break
+			windowOpen = false
+			continue
 		}
 		if int64(len(line)+len(sep)) > remaining {
 			// The row no longer fits together with its terminator. The line is
@@ -304,13 +327,13 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 			outputBytes += int64(len(line))
 			linesRead++
 			byteTruncated = true
-			break
+			windowOpen = false
+			continue
 		}
 		content.WriteString(line)
 		content.WriteString(sep)
 		outputBytes += int64(len(line) + len(sep))
 		linesRead++
-		lineIndex++
 	}
 
 	if linesRead == 0 {
@@ -318,7 +341,7 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	}
 
 	endLine := startLine + linesRead - 1
-	eolLabel := lineEndingLabel(lf, crlf, cr)
+	eolLabel, eolHint := endings.report()
 	header := fmt.Sprintf("[file: %s | lines %d-%d | first row below = file line %d",
 		displayName, startLine, endLine, startLine)
 	if encodingName != "" {
@@ -329,8 +352,8 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	// The rows carry their endings (often invisible on screen), so the header
 	// spells them out whenever they are not plain LF: what a multi-line find or
 	// content has to reproduce.
-	if hint := eolHeaderHint(eolLabel); hint != "" {
-		header += " (" + hint + ")"
+	if eolHint != "" {
+		header += " (" + eolHint + ")"
 	}
 	header += "]"
 
@@ -342,7 +365,8 @@ func (t *ReadFileLinesTool) readWindow(reader *bufio.Reader, displayName, encodi
 	case byteTruncated:
 		footer = fmt.Sprintf("%s\n[TRUNCATED - byte budget reached; call read_file start_line=%d max_lines=%d]",
 			header, startLine+linesRead, limit)
-	case !reachedEOF && limit > 0 && linesRead >= limit:
+	case moreRows || lineIndex > startLine+linesRead-1:
+		// The window filled before the file ended: rows after it remain.
 		footer = fmt.Sprintf("%s\n[PARTIAL - more content remains; call read_file start_line=%d max_lines=%d]",
 			header, startLine+linesRead, limit)
 	default:
@@ -490,8 +514,9 @@ func yesNo(v bool) string {
 	return "no"
 }
 
-// lineEndingLabel names the line ending of the returned window: the single kind
-// that occurred, "mixed" when several did, or "none" when no line ended.
+// lineEndingLabel names the single row ending a text holds, "mixed" when several
+// kinds occur, or "none" when no row ended. read_file's header is built from
+// fileEndings instead, because it also remembers which ending came first.
 func lineEndingLabel(lf, crlf, cr int) string {
 	kinds := 0
 	for _, n := range []int{lf, crlf, cr} {
@@ -513,28 +538,92 @@ func lineEndingLabel(lf, crlf, cr int) string {
 	}
 }
 
-// lineEndingLabelOf names the row endings of a whole decoded text (the reader's
-// own label is per window).
+// lineEndingLabelOf names the row endings of a whole decoded text payload. The
+// reader's header comes from fileEndings, which also keeps the first break.
 func lineEndingLabelOf(text string) string {
 	lf, crlf, cr := lineEndingCounts(text)
 	return lineEndingLabel(lf, crlf, cr)
 }
 
-// eolHeaderHint spells out the bytes that end a row when the window's endings
-// are worth naming: read_file returns rows verbatim, and a CR or CRLF is
-// invisible once the text is drawn, so only the header can tell the model what a
-// multi-line find or content has to reproduce. Plain LF (the default) says
-// nothing, and neither does a window without any break.
-func eolHeaderHint(label string) string {
-	switch label {
-	case "CRLF":
-		return "rows end with \\r\\n"
-	case "CR":
-		return "rows end with a single \\r"
-	case "mixed":
-		return "rows mix \\n, \\r\\n and \\r"
+// fileEndings counts the row terminators of the decoded prefix read_file scans.
+// The header reports the ending of the file's very first break — the break an
+// eol=auto write follows — and says so when the scanned rows mix conventions.
+// Counting only the returned window would label a page by its own rows, which is
+// not what a find has to reproduce.
+type fileEndings struct {
+	first string // label of the first break: "LF", "CRLF", "CR" or ""
+	lf    int
+	crlf  int
+	cr    int
+}
+
+// add records the terminator a row ended with. termNone (a final row without a
+// break) is not an ending and adds nothing.
+func (e *fileEndings) add(term lineTerm) {
+	switch term {
+	case termLF:
+		e.lf++
+		if e.first == "" {
+			e.first = "LF"
+		}
+	case termCRLF:
+		e.crlf++
+		if e.first == "" {
+			e.first = "CRLF"
+		}
+	case termCR:
+		e.cr++
+		if e.first == "" {
+			e.first = "CR"
+		}
 	}
-	return ""
+}
+
+// mixed reports whether the file holds more than one kind of row ending.
+func (e *fileEndings) mixed() bool {
+	kinds := 0
+	for _, count := range []int{e.lf, e.crlf, e.cr} {
+		if count > 0 {
+			kinds++
+		}
+	}
+	return kinds > 1
+}
+
+// kinds names the endings the file really holds, in a fixed order, for the mixed
+// report.
+func (e *fileEndings) kinds() string {
+	var names []string
+	if e.lf > 0 {
+		names = append(names, "LF")
+	}
+	if e.crlf > 0 {
+		names = append(names, "CRLF")
+	}
+	if e.cr > 0 {
+		names = append(names, "CR")
+	}
+	switch len(names) {
+	case 0:
+		return "no row break"
+	case 1:
+		return names[0]
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+}
+
+// report is the two pieces the header carries: the label, which is the ending
+// of the file's very first break ("LF", "CRLF", "CR") or "none", and — only when
+// the file mixes conventions — the note that names the mix and points at that
+// first break. A uniform file needs no note: the label is the whole story.
+func (e *fileEndings) report() (label, hint string) {
+	if e.first == "" {
+		return "none", ""
+	}
+	if !e.mixed() {
+		return e.first, ""
+	}
+	return e.first, fmt.Sprintf("the file mixes %s; follow its first line break", e.kinds())
 }
 
 // AutoSplitWriteTool is implemented by a write tool that can spread a payload
@@ -573,7 +662,10 @@ func (t *WriteFileTool) Description() string {
 		"lines beyond the limit are TRUNCATED and DISCARDED. For long files, write one part at a "+
 		"time and continue with mode='a'; the newline that ended the last written line is kept, so "+
 		"the next call starts with the next line's text directly. You're suggested to write one function(or several small functions) at a time for writing code. "+
-		"Mode: 'o' overwrite (default), 'a' append, 'c' create  only if the file does not exist. Line endings are written with the ending the file's own first row break uses by default (eol='auto'); eol='keep' writes them exactly as given and eol='lf'/'crlf'/'cr' picks one. The system never "+
+		"Mode: 'o' overwrite (default), 'a' append, 'c' create  only if the file does not exist. Line endings are byte-exact: "+
+		"content written with LF or CRLF keeps exactly those breaks unless eol asks for a rewrite. By default (eol='auto') "+
+		"they are written with the ending the file's own first row break uses; eol='keep' writes them exactly as given and "+
+		"eol='lf'/'crlf'/'cr' picks one. The system never "+
 		"adds a trailing newline automatically.", t.fs.MaxWriteLines)
 }
 
@@ -588,7 +680,7 @@ func (t *WriteFileTool) Parameters() map[string]any {
 			},
 			"content": map[string]any{
 				"type":        "string",
-				"description": fmt.Sprintf("Content to write. Any line beyond the limit [%d lines] is truncated and discarded.", t.fs.MaxWriteLines),
+				"description": fmt.Sprintf("Content to write. Any line beyond the limit [%d lines] is truncated and discarded. Line endings are written byte for byte (LF or CRLF as given, unless eol rewrites them).", t.fs.MaxWriteLines),
 			},
 			"mode": map[string]any{
 				"type":        "string",
@@ -874,7 +966,7 @@ func truncationNote(dropped []string, written, total int) string {
 // adds on its own.
 func noFinalNewlineNote() string {
 	return "\n[no trailing newline: the system never adds one. If the next call appends " +
-		"(mode='a'), start its content with one newline: \\n, or \\r\\n for a CRLF file.]"
+		"(mode='a'), begin its content with a line break (CRLF for a CRLF file, LF otherwise).]"
 }
 
 // Edit modes accepted by the "mode" argument of EditFileTool.
@@ -902,17 +994,15 @@ func (t *EditFileTool) Name() string { return "edit_file" }
 func (t *EditFileTool) Description() string {
 	return "Edit a file by locating find and writing content at that spot; the `mode` parameter says " +
 		"how find is matched and where content lands. find and content are matched and written byte for " +
-		"byte, line endings included: read_file returns rows verbatim, so a multi-line find has to spell " +
-		"out the endings the header reports (\\r\\n for a CRLF file). content's line endings follow the file's own first row break by default " +
-		"(eol='auto'); eol='keep' writes them exactly as given and eol='lf'/'crlf'/'cr' picks one. find " +
-		"is matched byte for byte first and is never rewritten: a find the file only holds with other " +
-		"row endings is matched anyway, with the file's own endings, and the result says so in a " +
-		"warning — send the endings the file has (copy the rows read_file returned) to edit without " +
-		"one. Every edit reports what it " +
-		"did — the file is never rewritten " +
-		"outside the match. A find that is not unique, or that matches nothing, is reported as an error " +
-		"so the call can be retried with more context. JSON escaping applies to the arguments: \\n is a " +
-		"newline and \\\\n is a literal backslash-n."
+		"byte, line endings included: LF and CRLF are taken exactly as they are, so a multi-line find " +
+		"has to carry the same line endings as the rows read_file returned. content's line endings " +
+		"follow the file's own first row break by default (eol='auto'); eol='keep' writes them exactly " +
+		"as given and eol='lf'/'crlf'/'cr' picks one. find is matched byte for byte first and is never " +
+		"rewritten: a find the file only holds with other row endings is matched anyway, with the " +
+		"file's own endings, and the result says so in a warning — send the endings the file has " +
+		"(copy the rows read_file returned) to edit without one. Every edit reports what it did — the " +
+		"file is never rewritten outside the match. A find that is not unique, or that matches " +
+		"nothing, is reported as an error so the call can be retried with more context."
 }
 
 // Parameters implements Tool.
@@ -926,11 +1016,11 @@ func (t *EditFileTool) Parameters() map[string]any {
 			},
 			"find": map[string]any{
 				"type":        "string",
-				"description": "Text to locate: an exact literal for mode='replace'/'insert' (must occur exactly once; a multi-line literal should carry the file's own line endings, as the read_file header reports them — copy the rows read_file returned. A literal the file only holds with other row endings is still matched, with the file's own endings, and the result carries a warning), an RE2 pattern for mode='regex', or the hex/base64 byte sequence when encoding is a binary representation.",
+				"description": "Text to locate: an exact literal for mode='replace'/'insert' (must occur exactly once; a multi-line literal must carry the file's own line endings — LF or CRLF, byte for byte, as copied from the rows read_file returned. A literal the file only holds with other row endings is still matched, with the file's own endings, and the result carries a warning), an RE2 pattern for mode='regex', or the hex/base64 byte sequence when encoding is a binary representation.",
 			},
 			"content": map[string]any{
 				"type":        "string",
-				"description": "Text written at the match: the replacement for mode='replace'/'regex', or the text inserted before the match for mode='insert'. In mode='regex' it may reference capture groups with $1, $2, ... ($$ = literal $). JSON escaping applies (\\n = newline, \\\\n = literal backslash-n).",
+				"description": "Text written at the match: the replacement for mode='replace'/'regex', or the text inserted before the match for mode='insert'. Line endings are written byte for byte (LF or CRLF as given; eol='auto' follows the file's first break). In mode='regex' it may reference capture groups with $1, $2, ... ($$ = literal $).",
 			},
 			"mode": map[string]any{
 				"type":        "string",
@@ -1178,25 +1268,23 @@ func findEndingsWarning(text, find string) string {
 		rowEndingPhrase(lineEndingLabelOf(find)), rowEndingPhrase(lineEndingLabelOf(text)))
 }
 
-// rowEndingPhrase spells a row-ending label out for a sentence: the escape the
-// text carries together with the label's name ("\\r\\n (CRLF)"), and a plain
-// phrase for a text that mixes endings or has none.
+// rowEndingPhrase spells a row-ending label out for a sentence: its name (LF,
+// CRLF or CR), and a plain phrase for a text that mixes endings or has none.
+// Endings are always named by label, never by an escape sequence, so the name
+// cannot be mistaken for text that has to be typed.
 func rowEndingPhrase(label string) string {
-	if esc := eolBytes(label); esc != "" {
-		return fmt.Sprintf("%s (%s)", esc, label)
-	}
-	if label == "mixed" {
+	switch label {
+	case "LF", "CRLF", "CR":
+		return label
+	case "mixed":
 		return "mixed endings"
 	}
 	return "no row ending at all"
 }
 
-// eolSpelling renders a row ending the way a result talks about it: the escape
-// text a payload carries together with the ending's name ("\r\n (CRLF)").
-func eolSpelling(sep string) string {
-	label := lineEndingLabelOf(sep)
-	return fmt.Sprintf("%s (%s)", eolBytes(label), label)
-}
+// eolSpelling renders a row ending the way a result talks about it: its name
+// alone (CRLF, LF or CR), never an escape sequence.
+func eolSpelling(sep string) string { return lineEndingLabelOf(sep) }
 
 // eolTarget resolves an eol request into the ending the payload has to be written
 // with: "" means it is written exactly as given. fileEnding is the ending the
@@ -1259,8 +1347,8 @@ func editLineEndingNote(after, beforeLabel string) string {
 	switch {
 	case beforeLabel != afterLabel && afterLabel == "mixed":
 		b.WriteString(" | note: the file's rows now mix endings — the content's row endings differ from the file's")
-		if seq := eolBytes(beforeLabel); seq != "" {
-			fmt.Fprintf(&b, " (write them as %s to match)", seq)
+		if isUniformEOL(beforeLabel) {
+			fmt.Fprintf(&b, " (write them as %s to match)", beforeLabel)
 		}
 		b.WriteString("; use mode='regex' to change a file's endings on purpose")
 	case isUniformEOL(beforeLabel) && isUniformEOL(afterLabel) && beforeLabel != afterLabel:
@@ -1271,21 +1359,12 @@ func editLineEndingNote(after, beforeLabel string) string {
 
 // isUniformEOL reports whether a label names one row ending a payload can be
 // written with ("LF", "CRLF" or "CR"); "mixed" and "none" name no convention.
-func isUniformEOL(label string) bool { return eolBytes(label) != "" }
-
-// eolBytes is the escape a payload has to carry for a uniform row-ending label
-// ("\n" for an LF file, and so on); an empty string when the label names no
-// single convention.
-func eolBytes(label string) string {
+func isUniformEOL(label string) bool {
 	switch label {
-	case "LF":
-		return "\\n"
-	case "CRLF":
-		return "\\r\\n"
-	case "CR":
-		return "\\r"
+	case "LF", "CRLF", "CR":
+		return true
 	}
-	return ""
+	return false
 }
 
 // editResultMessage reports what the edit did, including how many occurrences
@@ -1401,11 +1480,11 @@ func findDiffersOnlyByEndings(text, find string) bool {
 func eolFindHint(text string) string {
 	switch lineEndingLabelOf(text) {
 	case "CRLF":
-		return "The file's rows end with \\r\\n; a multi-line find has to spell that out. "
+		return "The file's rows end with CRLF; a multi-line find has to carry the same endings byte for byte. "
 	case "CR":
-		return "The file's rows end with a single \\r; a multi-line find has to spell that out. "
+		return "The file's rows end with CR; a multi-line find has to carry the same ending byte for byte. "
 	case "mixed":
-		return "The file's rows mix endings; a multi-line find has to match them as they are. "
+		return "The file's rows mix endings; a multi-line find has to carry the same endings as the rows it copies. "
 	}
 	return ""
 }

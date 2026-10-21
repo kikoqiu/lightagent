@@ -1,8 +1,10 @@
 package tools
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,20 +68,22 @@ func TestReadFileLinesEOF(t *testing.T) {
 // come back exactly as the file holds them, each with its own ending, so a find
 // copied from a read matches byte for byte and a file that ends without a break
 // says so. The header spells the endings out (they are invisible once drawn),
-// and it adds no note for the plain LF default.
+// names the file's first break when the file mixes conventions, and adds no note
+// for the plain LF default.
 func TestReadFileRowsAreVerbatim(t *testing.T) {
 	cases := []struct {
-		name     string
-		content  string
-		wantEOL  string
-		wantHint bool
+		name      string
+		content   string
+		wantEOL   string
+		wantFirst string
+		wantHint  bool
 	}{
-		{"lf", "one\ntwo\n", "LF", false},
-		{"crlf", "one\r\ntwo\r\n", "CRLF", true},
-		{"cr", "one\rtwo\r", "CR", true},
-		{"mixed", "one\ntwo\r\nthree\r", "mixed", true},
-		{"no-final-newline", "one\ntwo", "LF", false},
-		{"single-row", "only", "none", false},
+		{"lf", "one\ntwo\n", "LF", "", false},
+		{"crlf", "one\r\ntwo\r\n", "CRLF", "", false},
+		{"cr", "one\rtwo\r", "CR", "", false},
+		{"mixed", "one\ntwo\r\nthree\r", "LF", "follow its first line break", true},
+		{"no-final-newline", "one\ntwo", "LF", "", false},
+		{"single-row", "only", "none", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,8 +101,105 @@ func TestReadFileRowsAreVerbatim(t *testing.T) {
 			if got := strings.Contains(res.ForLLM, "eol: "+tc.wantEOL+" ("); got != tc.wantHint {
 				t.Errorf("ending hint present = %v, want %v: %s", got, tc.wantHint, res.ForLLM)
 			}
+			if tc.wantFirst != "" && !strings.Contains(res.ForLLM, tc.wantFirst) {
+				t.Errorf("header does not name the first break: %s", res.ForLLM)
+			}
 		})
 	}
+}
+
+// TestReadFileEOLReportsTheWholeFile pins the ending report against pagination:
+// a page holding only LF rows of a file whose first break is CRLF still names
+// CRLF, because that is the break edit_file's eol='auto' follows.
+func TestReadFileEOLReportsTheWholeFile(t *testing.T) {
+	tool := NewReadFileLinesTool(FsConfig{})
+
+	mixed := writeFile(t, t.TempDir(), "mixed.txt", "a\r\nb\r\nc\nd\r\n")
+	res := tool.Execute(context.Background(), map[string]any{"path": mixed, "start_line": 4, "max_lines": 1})
+	if res.IsError {
+		t.Fatalf("read failed: %s", res.ForLLM)
+	}
+	for _, want := range []string{
+		"eol: CRLF",
+		"the file mixes LF and CRLF",
+		"follow its first line break",
+	} {
+		if !strings.Contains(res.ForLLM, want) {
+			t.Errorf("header is missing %q: %s", want, res.ForLLM)
+		}
+	}
+	if got := readFileBody(t, res.ForLLM); got != "d\r\n" {
+		t.Errorf("window = %q, want only the last row", got)
+	}
+
+	// A file with one convention reports it, with no note, no matter which page
+	// is read.
+	uniform := writeFile(t, t.TempDir(), "crlf.txt", "a\r\nb\r\nc\r\n")
+	res = tool.Execute(context.Background(), map[string]any{"path": uniform, "start_line": 3, "max_lines": 1})
+	if res.IsError {
+		t.Fatalf("read failed: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "eol: CRLF") || strings.Contains(res.ForLLM, "eol: CRLF (") {
+		t.Errorf("a uniform CRLF file must be labelled CRLF, with no note, on every page: %s", res.ForLLM)
+	}
+}
+
+// countingReader counts the bytes a reader really pulled, so a test can pin how
+// much of a file the ending scan examined.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// TestReadFileEOLScanIsBounded pins the two limits of the ending scan: it stops
+// as soon as the file is known to mix endings, and otherwise after eolScanBytes
+// of decoded text. The window keeps working either way, and a page near the top
+// of a big file never reads the whole file.
+func TestReadFileEOLScanIsBounded(t *testing.T) {
+	const budget = 65536
+	tool := NewReadFileLinesTool(FsConfig{})
+
+	t.Run("mixed stops early", func(t *testing.T) {
+		src := &countingReader{r: strings.NewReader("a\r\nb\n" + strings.Repeat("x\n", 1<<18))}
+		content, footer, err := tool.readWindow(bufio.NewReader(src), "mixed.txt", "", 1, 1, budget, true, false)
+		if err != nil {
+			t.Fatalf("readWindow failed: %v", err)
+		}
+		if content != "a\r\n" {
+			t.Errorf("window = %q, want the first row", content)
+		}
+		for _, want := range []string{"eol: CRLF", "the file mixes LF and CRLF", "follow its first line break", "PARTIAL"} {
+			if !strings.Contains(footer, want) {
+				t.Errorf("footer is missing %q: %s", want, footer)
+			}
+		}
+		if src.n > 64<<10 {
+			t.Errorf("the scan read %d bytes, want only the head of the file", src.n)
+		}
+	})
+
+	t.Run("scan cap", func(t *testing.T) {
+		body := strings.Repeat("x\n", 3<<20) // 6 MiB of uniform LF
+		src := &countingReader{r: strings.NewReader(body)}
+		_, footer, err := tool.readWindow(bufio.NewReader(src), "big.txt", "", 1, 1, budget, true, false)
+		if err != nil {
+			t.Fatalf("readWindow failed: %v", err)
+		}
+		for _, want := range []string{"eol: LF", "PARTIAL"} {
+			if !strings.Contains(footer, want) {
+				t.Errorf("footer is missing %q: %s", want, footer)
+			}
+		}
+		if src.n > eolScanBytes+64<<10 {
+			t.Errorf("the scan read %d bytes, want at most about %d", src.n, eolScanBytes)
+		}
+	})
 }
 
 // TestReadFileToolName pins the advertised tool name.
@@ -971,7 +1072,7 @@ func TestEditFileFindEndingsRelaxedMatch(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("a find with other row endings was not matched: %s", res.ForLLM)
 	}
-	for _, want := range []string{"warning:", "\\n (LF)", "\\r\\n (CRLF)", "only the matched range"} {
+	for _, want := range []string{"warning:", "(LF vs CRLF)", "only the matched range"} {
 		if !strings.Contains(res.ForLLM, want) {
 			t.Errorf("the relaxed match does not report %q: %s", want, res.ForLLM)
 		}
@@ -1023,7 +1124,7 @@ func TestEditFileFindEndingsRelaxedMatch(t *testing.T) {
 	if got := readFile(t, p); got != "X\n" {
 		t.Fatalf("file = %q, want the match replaced", got)
 	}
-	if !strings.Contains(res.ForLLM, "\\r\\n (CRLF)") || !strings.Contains(res.ForLLM, "\\n (LF)") {
+	if !strings.Contains(res.ForLLM, "(CRLF vs LF)") {
 		t.Errorf("the warning does not name both spellings: %s", res.ForLLM)
 	}
 }
@@ -1081,7 +1182,7 @@ func TestEditFileLoneCREndingIsMatched(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("a find with other row endings was not matched: %s", res.ForLLM)
 	}
-	if !strings.Contains(res.ForLLM, "\\r (CR)") {
+	if !strings.Contains(res.ForLLM, "(LF vs CR)") {
 		t.Fatalf("the warning does not name the CR ending: %s", res.ForLLM)
 	}
 	if got := readFile(t, p); got != "X\r" {
