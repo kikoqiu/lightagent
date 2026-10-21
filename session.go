@@ -86,6 +86,14 @@ func runSession(o *options, stdout io.Writer) error {
 	}
 	defer func() { _ = lk.Release() }()
 	onShutdown(func() { _ = lk.Release() })
+	// Temporary files are scratch: the ones the model neither wrote nor read
+	// for store.TempMaxAge are dropped on the way out. Scratch worth keeping
+	// belongs in .lightagent/archive (the built-in prompt says so). The same
+	// hook cleans up on a signal exit and on the restart hand-over, which never
+	// reach the defer.
+	pruneTemp := func() { _, _ = store.PruneTemp(workdir, time.Now(), store.TempMaxAge) }
+	defer pruneTemp()
+	onShutdown(pruneTemp)
 	// An earlier layout kept the session files directly in .lightagent/; move
 	// them into sessions/ so a resumed conversation is still found. A failure
 	// is reported but not fatal: the run simply starts without them.

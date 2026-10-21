@@ -54,6 +54,18 @@ func TestDefaultSystemPromptHasNoHostState(t *testing.T) {
 	}
 }
 
+// TestDefaultSystemPromptArchivesValuableTempFiles verifies the built-in
+// template tells the model to move scratch files worth keeping out of the
+// temporary folder, because what stays there for 180 days is cleaned up.
+func TestDefaultSystemPromptArchivesValuableTempFiles(t *testing.T) {
+	prompt := DefaultSystemPrompt()
+	for _, want := range []string{".lightagent/archive", ".lightagent/temp", "180 days"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("built-in prompt must carry the archive rule (%q missing):\n%s", want, prompt)
+		}
+	}
+}
+
 // TestDefaultSystemPromptRequiresMarkdownMemos verifies the built-in template
 // states how the memo folder is written: Markdown files (.md) with a heading
 // structure of every level, so the notes stay readable and easy to skim.
