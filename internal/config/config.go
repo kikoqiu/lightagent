@@ -484,10 +484,11 @@ type ToggleToolConfig struct {
 type AgentConfig struct {
 	MaxToolIterations int    `json:"max_tool_iterations"`
 	SystemPrompt      string `json:"system_prompt"`
-	// IncludeWorkingDir appends the working-directory line (the absolute
-	// directory the process runs in, the path only) to the system prompt. It
-	// defaults to true; loading starts from the defaults, so an explicit false
-	// is required to turn it off.
+	// IncludeWorkingDir makes the engine meta info block of a user message
+	// state the working directory (the absolute path the process runs in, the
+	// path only) — the system prompt itself never carries it. It defaults to
+	// true; loading starts from the defaults, so an explicit false is required
+	// to turn it off. The memo folder below the directory is listed either way.
 	IncludeWorkingDir bool `json:"include_working_dir"`
 	// SummaryInSystemPrompt selects where a request carries the accumulated
 	// context summary: false (the default) sends it as the first user message,

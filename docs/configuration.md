@@ -92,7 +92,7 @@
   "agent": {
     "max_tool_iterations": 200,
     "system_prompt": "",
-    "include_working_dir": true,
+    "include_working_dir": true,          // 用户消息的引擎信息块里是否带 working directory 一行（系统提示词里没有）
     "summary_in_system_prompt": false,    // 发送时摘要的位置：默认第一条用户消息；true 则写进系统提示词
     "include_interrupted": false          // 中断时不完整回复（思考/正文）是否保留；默认关闭，开启可能让部分模型异常
   },
@@ -303,24 +303,31 @@ lightagent 内置一个**纯标准库**的 MCP 客户端。启动时按 `servers
 |------|------|------|------|
 | `max_tool_iterations` | int | `200` | 单个回合内工具循环的最大轮数 |
 | `system_prompt` | string | 空 | 自定义系统提示词；空则用内置默认（`agent.md` 优先级更高）。运行时环境行由程序自动追加，不必写在这里 |
-| `include_working_dir` | bool | `true` | 启动时把**工作目录行**（仅进程所在目录的绝对路径，不列目录内容）追加到系统提示词末尾。省略即开启，显式 `false` 关闭 |
+| `include_working_dir` | bool | `true` | 用户消息的 `[engine meta info]` 块是否带 `working directory: <路径>` 一行（仅进程所在目录的绝对路径，不列目录内容）。系统提示词里**没有**工作目录行。省略即开启，显式 `false` 关闭（memo 清单照旧） |
 | `summary_in_system_prompt` | bool | `false` | 发送时累积摘要的位置：`false` = 第一条用户消息（`[engine] CONVERSATION SUMMARY:` 开头）；`true` = 系统提示词末尾的 `# CONVERSATION SUMMARY` 段 |
 | `include_interrupted` | bool | `false` | 被中断的**不完整回复**（已流出的思考/正文）是否记入历史。默认 `false`（显式写 `true` 才开启）；关闭时中断导致的不完整回复——正文、思考、tool 调用一起——**完全丢弃**，也不追加 `[engine]` 消息。开启时保留已流出的思考/正文（其中携带的 tool 调用照旧全部丢弃），并在其后追加一条 `[engine]` 用户消息告知模型「上次被打断、尚未完成」。该开关也决定「只有思考就自然结束」的回复是否记入历史。**开启可能让部分模型异常**（模仿半截片段、或误读下一条提示），故默认关闭 |
 
-`include_working_dir` 插入的段落只有一行，即进程的工作目录：
+`include_working_dir` 控制的是**用户消息**里的 `[engine meta info]` 块（系统提示词里没有工作目录）：
 
-```
+```text
+[engine meta info]
 working directory: D:\work\demo
+The memo folder holds these files:
+file     updated    size
+plan.md  1 day ago  1.2 KB
 ```
 
-目录里的子目录与文件**不再列出**（无论项目多大，这一段都是一行），需要时由模型用文件工具查看。
+这一段只在**每个工作目录的第一条用户消息**的请求里出现（会话第一条，以及 `/cd` 之后的第一条；
+memo 目录不存在或为空时只有 `working directory:` 这一行），内容固化在该消息的 `meta` 字段里、
+不显示给用户。目录里的子目录与文件**不再列出**（无论项目多大，这里都只有一行路径），需要时由模型用
+文件工具查看。详见 [architecture.md](architecture.md#用户消息的引擎信息工作目录与-memo-清单)。
 
 由于加载时先取默认值再合并文件，省略 `include_working_dir` 即保持开启；关闭需显式写 `"include_working_dir": false`。
 
 `summary_in_system_prompt` 决定发送时累积摘要的位置，默认 `false`（第一条用户消息）：
 
 ```
-system: <基础提示词 + [unlock 规则] + [MCP 使用建议与 MCP 信息] + 运行时行 + 工作目录行>
+system: <基础提示词 + [unlock 规则] + [MCP 使用建议与 MCP 信息] + 运行时行>
 user:   [engine] CONVERSATION SUMMARY:
         <累积摘要>
 user:   <历史里的第一条 user>
@@ -389,10 +396,11 @@ user:   <历史里的第一条 user>
 
 程序会在基础提示词之后**自动按顺序追加能力段落** —— unlock 规则（存在锁定函数时）、MCP 使用建议
 与 MCP 信息（至少一个 MCP server 贡献了工具时）、运行时环境行
-`Runtime: <GOOS>/<GOARCH>.`、工作目录行 `working directory: <绝对路径>`（后者由
-`agent.include_working_dir` 控制，默认开启）—— 因此 `agent.md` / `agent.system_prompt`
+`Runtime: <GOOS>/<GOARCH>.` —— 因此 `agent.md` / `agent.system_prompt`
 **不需要也不应**写这些内容：
 `gen-agent-prompt` 导出的模板已不再包含它们（旧模板里残留的 `Runtime: ...` 行可以直接删掉）。
+工作目录**不在**系统提示词里：它由用户消息的 `[engine meta info]` 块声明（`agent.include_working_dir`，
+默认开启），因此 `/cd` 不改动提示词。
 
 内置提示词只写**工作方式与行为规则**（先看再做、非交互执行、回答简短等），不重复任何工具的
 用法——参数、行尾、脚本语言这些细节都在对应工具自己的描述里。它另外约定：临时文件放
@@ -401,10 +409,11 @@ user:   <历史里的第一条 user>
 且 memo 里的内容都按 **Markdown** 存储（`.md`，带各级标题）。
 用 `agent.md` 覆盖时可以沿用、改写或去掉这些约定。
 
-memo 清单：会话的**第一条用户消息**发出时，程序先扫描 `.lightagent/memo/`，有文件就把清单
-（文件名、英文友好时间如 `1 day ago`、可读大小，按更新时间逆序）附加在请求里这条消息的文字之后，
-并把它存进该消息的 `meta` 字段——不显示给用户，后续消息也不再附加。详见
-[architecture.md](architecture.md#首条用户消息的引擎信息memo-清单)。
+引擎信息块（工作目录 + memo 清单）：**每个工作目录的第一条用户消息**发出时，程序把
+`working directory: <绝对路径>` 一行与 `.lightagent/memo/` 的清单（文件名、英文友好时间如 `1 day ago`、
+可读大小，按更新时间逆序；memo 为空时不带清单）附加在请求里这条消息的文字之后，并把它存进该消息的
+`meta` 字段——不显示给用户，同一目录的后续消息不再附加；`/cd` 之后的第一条消息会带上新目录与新目录下的清单。
+详见 [architecture.md](architecture.md#用户消息的引擎信息工作目录与-memo-清单)。
 
 删除纪律：**脚本里**删文件时，不得让裸变量直接充当删除目标——变量一旦赋值错了，删掉的就是别的东西。
 必须给目标加上固定的前缀或后缀（如 `"$folder/TARGET"`、`"FOLDER/$children"`），这样错误的值也只能
@@ -450,6 +459,7 @@ lightagent gen-agent-prompt -f     # 强制覆盖
    `(0,100]` 时回退；`summarize_keep` 的 `budget_percent` 不在 `[0,100]`、`turns` 为负时回退
    （默认两者都是 0，即不保留原始消息）。
 4. 若存在 `agent.md`，覆盖 `agent.system_prompt`（文件中的 `@include` 会先展开）。
-5. `ui.markdown`、`agent.include_working_dir` 默认 `true`，仅在文件中显式写 `false` 才会关闭；
+5. `ui.markdown`、`agent.include_working_dir` 默认 `true`，仅在文件中显式写 `false` 才会关闭（后者只去掉
+   `[engine meta info]` 块里的目录行，系统提示词本来就没有它）；
    `agent.summary_in_system_prompt`、`agent.include_interrupted` 反之默认 `false`，
    显式写 `true` 才开启（后者：中断时保留不完整回复）。

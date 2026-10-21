@@ -16,6 +16,7 @@ import (
 	"lightagent/internal/agent"
 	"lightagent/internal/config"
 	"lightagent/internal/llm"
+	"lightagent/internal/lock"
 	"lightagent/internal/slash"
 	"lightagent/internal/store"
 	"lightagent/internal/termcolor"
@@ -982,6 +983,156 @@ func TestWorkingDirectoryCommandsMoveTheProcess(t *testing.T) {
 	}
 	if got, _ := os.Getwd(); got != dir {
 		t.Fatalf("a refused /cd moved the directory to %q, want %q", got, dir)
+	}
+}
+
+// TestWorkingDirectoryCommandsMoveTheLock pins the other half of /cd: the run's
+// directory lock follows the working directory, so the directory it leaves is
+// free again and a directory another instance runs in is refused — with the
+// process left where it was.
+func TestWorkingDirectoryCommandsMoveTheLock(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	base := t.TempDir()
+	start := filepath.Join(base, "start")
+	target := filepath.Join(base, "target")
+	taken := filepath.Join(base, "taken")
+	for _, dir := range []string{start, target, taken} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chdir(start); err != nil {
+		t.Fatal(err)
+	}
+
+	holder := lock.NewHolder(store.DirName)
+	if err := holder.Hold(filepath.Join(start, store.DirName)); err != nil {
+		t.Fatalf("hold the starting directory: %v", err)
+	}
+	defer func() { _ = holder.Release() }()
+
+	c := newTestCLI(t)
+	c.SetDirGuard(holder)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.handleCommand(context.Background(), "/cd "+target)
+	if got, _ := os.Getwd(); got != target {
+		t.Fatalf("working directory = %q, want %q", got, target)
+	}
+	freed, err := lock.Acquire(filepath.Join(start, store.DirName))
+	if err != nil {
+		t.Fatalf("the directory left behind must be free again: %v", err)
+	}
+	_ = freed.Release()
+	if guarded, err := lock.Acquire(filepath.Join(target, store.DirName)); err == nil {
+		_ = guarded.Release()
+		t.Fatal("the new directory must be locked")
+	}
+
+	// A directory another instance runs in is refused before anything moves.
+	other, err := lock.Acquire(filepath.Join(taken, store.DirName))
+	if err != nil {
+		t.Fatalf("lock the other instance's directory: %v", err)
+	}
+	defer func() { _ = other.Release() }()
+	buf.Reset()
+	c.handleCommand(context.Background(), "/cd "+taken)
+	if got, _ := os.Getwd(); got != target {
+		t.Fatalf("a refused /cd moved the directory to %q, want %q", got, target)
+	}
+	for _, want := range []string{"cannot change directory", "already running"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("/cd into a held directory = %q, want it to mention %q", buf.String(), want)
+		}
+	}
+
+	// /cd into the directory the instance already guards is not a conflict with
+	// its own lock.
+	buf.Reset()
+	c.handleCommand(context.Background(), "/cd .")
+	if !strings.Contains(buf.String(), "working directory:") {
+		t.Fatalf("/cd . = %q, want the confirmation", buf.String())
+	}
+}
+
+// TestCDMovesTheSessionStore pins the session half of a /cd: the store follows
+// the directory, so the next save writes the conversation into the new
+// directory's .lightagent/sessions. Nothing is copied — a session saved before
+// the /cd stays where it was — and the conversation no longer belongs to the
+// file it came from.
+func TestCDMovesTheSessionStore(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	base := t.TempDir()
+	start := filepath.Join(base, "start")
+	target := filepath.Join(base, "target")
+	for _, dir := range []string{start, target} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chdir(start); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+	// The program hangs the mirror's refresh on this hook; it must run once per
+	// successful /cd and never for a refused one.
+	var changed []string
+	c.SetDirChanged(func(dir string) { changed = append(changed, dir) })
+
+	// A conversation saved before the /cd stays in the directory it was saved
+	// in.
+	c.agent.Load([]llm.Message{{Role: "user", Content: "before"}}, "")
+	if _, err := c.SaveSession(); err != nil {
+		t.Fatalf("save before /cd: %v", err)
+	}
+	savedBefore := c.store.Path()
+
+	c.handleCommand(context.Background(), "/cd "+target)
+	wantDir := filepath.Join(target, store.DirName, store.SessionsDirName)
+	if got := c.store.Dir(); !strings.EqualFold(got, wantDir) {
+		t.Fatalf("session directory = %q, want %q", got, wantDir)
+	}
+	if name, _ := c.CurrentSession(); name != "" {
+		t.Fatalf("a /cd must forget the file the conversation belonged to, got %q", name)
+	}
+
+	c.agent.Load([]llm.Message{{Role: "user", Content: "after"}}, "")
+	path, err := c.SaveSession()
+	if err != nil {
+		t.Fatalf("save after /cd: %v", err)
+	}
+	want := filepath.Join(wantDir, "session.json")
+	if !strings.EqualFold(path, want) {
+		t.Fatalf("save after /cd wrote %q, want %q", path, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("the session file was not written under the new directory: %v", err)
+	}
+	if _, err := os.Stat(savedBefore); err != nil {
+		t.Fatalf("the session saved before the /cd must stay in place: %v", err)
+	}
+
+	if len(changed) != 1 || !strings.EqualFold(changed[0], target) {
+		t.Fatalf("the directory-change hook ran with %v, want [%s]", changed, target)
+	}
+	buf.Reset()
+	c.handleCommand(context.Background(), "/cd "+filepath.Join(target, "missing"))
+	if len(changed) != 1 {
+		t.Fatalf("a refused /cd must not run the directory-change hook, got %v", changed)
 	}
 }
 

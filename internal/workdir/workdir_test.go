@@ -1,6 +1,7 @@
 package workdir
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,73 @@ func TestSetMovesTheWorkingDirectory(t *testing.T) {
 	}
 	if _, err := Set("  "); err == nil {
 		t.Fatal("Set with a blank path should fail")
+	}
+}
+
+// fakeGuard stands in for the run's directory lock in a /cd test: it records the
+// target and performs the directory change through enter, the way
+// lock.Holder.Move does between taking the new lock and giving up the old one.
+type fakeGuard struct {
+	target string
+	err    error
+}
+
+func (g *fakeGuard) Move(target string, enter func(string) (string, error)) (string, error) {
+	g.target = target
+	if g.err != nil {
+		return "", g.err
+	}
+	return enter(target)
+}
+
+// TestChangeGoesThroughTheGuard pins the /cd contract: with a guard registered
+// the directory change is the guard's job (it moves the lock), the target is
+// expanded before it sees it, and a refusal leaves the process where it was. A
+// nil guard keeps the plain directory change (the --session case).
+func TestChangeGoesThroughTheGuard(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	dir := t.TempDir()
+	guard := &fakeGuard{}
+	got, err := Change(dir, guard)
+	if err != nil {
+		t.Fatalf("Change(%q): %v", dir, err)
+	}
+	if guard.target != dir {
+		t.Fatalf("the guard was asked for %q, want %q", guard.target, dir)
+	}
+	now, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if now != got {
+		t.Fatalf("working directory = %q, want %q", now, got)
+	}
+
+	// A guard that refuses the move (a directory another instance holds) keeps
+	// the process where it is.
+	refused := errors.New("another lightagent instance is already running there")
+	if _, err := Change(t.TempDir(), &fakeGuard{err: refused}); !errors.Is(err, refused) {
+		t.Fatalf("Change = %v, want the guard's refusal", err)
+	}
+	if after, _ := os.Getwd(); after != now {
+		t.Fatalf("a refused /cd moved the directory to %q, want %q", after, now)
+	}
+
+	// Without a guard it is the plain directory change.
+	plain := t.TempDir()
+	if _, err := Change(plain, nil); err != nil {
+		t.Fatalf("Change(%q) without a guard: %v", plain, err)
+	}
+	if after, _ := os.Getwd(); after != plain {
+		t.Fatalf("working directory = %q, want %q", after, plain)
+	}
+	if _, err := Change("  ", nil); err == nil {
+		t.Fatal("Change with a blank path should fail")
 	}
 }
 

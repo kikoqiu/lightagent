@@ -323,3 +323,70 @@ func TestSaveStoresMediaAsPathsNotBytes(t *testing.T) {
 		t.Fatalf("resolved payload = %q", url)
 	}
 }
+
+// TestRebaseMovesTheStoreToAnotherWorkingDirectory pins what a /cd does to the
+// session files: the store reads, lists and saves below the new working
+// directory afterwards, nothing is moved on disk, and the conversation no
+// longer belongs to the file it was saved to.
+func TestRebaseMovesTheStoreToAnotherWorkingDirectory(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	st, err := New(first)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := st.SaveAs("before", State{Messages: []llm.Message{{Role: "user", Content: "hi"}}}); err != nil {
+		t.Fatalf("SaveAs: %v", err)
+	}
+	before := st.Path()
+
+	if !st.Rebase(second) {
+		t.Fatal("a working-directory store must follow a /cd")
+	}
+	wantDir := filepath.Join(second, DirName, SessionsDirName)
+	if got := st.Dir(); got != wantDir {
+		t.Fatalf("Dir = %q, want %q", got, wantDir)
+	}
+	if got, want := st.Root(), filepath.Join(second, DirName); got != want {
+		t.Fatalf("Root = %q, want %q", got, want)
+	}
+	if got, want := st.Default(), filepath.Join(wantDir, stateFile); got != want {
+		t.Fatalf("Default = %q, want %q", got, want)
+	}
+	if st.Named() {
+		t.Fatal("the conversation must no longer belong to the file it was saved to")
+	}
+	if infos, err := st.List(); err != nil || len(infos) != 0 {
+		t.Fatalf("the new directory must start empty, got %v (err %v)", infos, err)
+	}
+
+	if err := st.Save(State{Messages: []llm.Message{{Role: "user", Content: "next"}}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if got, want := st.Path(), filepath.Join(wantDir, stateFile); got != want {
+		t.Fatalf("save after the rebase wrote %q, want %q", got, want)
+	}
+	if _, err := os.Stat(before); err != nil {
+		t.Fatalf("the session saved before the rebase must stay in place: %v", err)
+	}
+	if infos, err := st.List(); err != nil || len(infos) != 1 || !infos[0].Current {
+		t.Fatalf("the new directory must list the saved session as current, got %v (err %v)", infos, err)
+	}
+}
+
+// TestRebaseLeavesAnExplicitSessionFileAlone pins --session: a store the user
+// pointed at a file keeps its place, because its state is not the working
+// directory's own.
+func TestRebaseLeavesAnExplicitSessionFileAlone(t *testing.T) {
+	st, err := NewFile(filepath.Join(t.TempDir(), "session.json"))
+	if err != nil {
+		t.Fatalf("NewFile: %v", err)
+	}
+	root, dir, file := st.Root(), st.Dir(), st.Path()
+	if st.Rebase(t.TempDir()) {
+		t.Fatal("an explicit session store must not follow a /cd")
+	}
+	if st.Root() != root || st.Dir() != dir || st.Path() != file {
+		t.Fatalf("an explicit session store moved: %q/%q/%q", st.Root(), st.Dir(), st.Path())
+	}
+}

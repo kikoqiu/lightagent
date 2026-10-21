@@ -51,18 +51,6 @@ func RuntimeInfo() string {
 	return "Runtime: " + runtime.GOOS + "/" + runtime.GOARCH + "."
 }
 
-// WorkingDirectoryInfo returns the working-directory line the agent appends to
-// its system prompt: the absolute path of the directory the process runs in. It
-// states the path only — the directory's children are deliberately left out, so
-// the section stays a single line however large the project is; the model uses
-// the file tools to inspect what it needs. It returns "" for an empty dir.
-func WorkingDirectoryInfo(dir string) string {
-	if dir == "" {
-		return ""
-	}
-	return "working directory: " + dir
-}
-
 // MCPToolsRule returns the guidance that accompanies the per-server MCP
 // global info. It is injected only while at least one MCP server actually
 // contributes tools, so a prompt never mentions MCP otherwise.

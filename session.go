@@ -24,6 +24,7 @@ import (
 	"lightagent/internal/tools"
 	"lightagent/internal/utils"
 	"lightagent/internal/web"
+	"lightagent/internal/workdir"
 )
 
 // runSession wires up the agent and runs either the interactive REPL or a
@@ -68,30 +69,31 @@ func runSession(o *options, stdout io.Writer) error {
 		return fmt.Errorf("%v (config: %s)", err, cfgPath)
 	}
 
-	workdir, err := os.Getwd()
+	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("resolve working directory: %w", err)
 	}
-	st, err := resolveStore(o, workdir)
+	st, err := resolveStore(o, cwd)
 	if err != nil {
 		return err
 	}
 	// One instance per state directory: the lock is taken before anything else
 	// touches the directory and released on the way out. A signal exit and the
 	// restart hand-over release it through the shutdown hooks as well, so the
-	// replacement process (which resumes this session) can take it over.
-	lk, err := lock.Acquire(st.Root())
-	if err != nil {
+	// replacement process (which resumes this session) can take it over. The
+	// holder is what a /cd moves to the new working directory (see dirGuard).
+	holder := lock.NewHolder(store.DirName)
+	if err := holder.Hold(st.Root()); err != nil {
 		return err
 	}
-	defer func() { _ = lk.Release() }()
-	onShutdown(func() { _ = lk.Release() })
+	defer func() { _ = holder.Release() }()
+	onShutdown(func() { _ = holder.Release() })
 	// Temporary files are scratch: the ones the model neither wrote nor read
 	// for store.TempMaxAge are dropped on the way out. Scratch worth keeping
 	// belongs in .lightagent/archive (the built-in prompt says so). The same
 	// hook cleans up on a signal exit and on the restart hand-over, which never
 	// reach the defer.
-	pruneTemp := func() { _, _ = store.PruneTemp(workdir, time.Now(), store.TempMaxAge) }
+	pruneTemp := func() { _, _ = store.PruneTemp(cwd, time.Now(), store.TempMaxAge) }
 	defer pruneTemp()
 	onShutdown(pruneTemp)
 	// An earlier layout kept the session files directly in .lightagent/; move
@@ -252,6 +254,16 @@ func runSession(o *options, stdout io.Writer) error {
 
 	c := cli.New(ag, st, client.Model(), cfg.UI.Markdown)
 	c.SetOutput(out)
+	// A /cd moves the directory lock along with the working directory: the
+	// instance keeps guarding the directory it runs in, and a directory another
+	// instance already runs in is refused. With --session the state directory is
+	// the session file's own (not the working directory's), so a /cd has no lock
+	// of its own to take over and the change stays a plain chdir.
+	var dirGuard workdir.Guard
+	if strings.TrimSpace(o.session) == "" {
+		dirGuard = holder
+	}
+	c.SetDirGuard(dirGuard)
 	// /switchapi reaches the same runtime selection as the web dropdown; the
 	// CLI's model label follows whatever interface becomes active.
 	runtime.onModel = c.SetModel
@@ -302,6 +314,13 @@ func runSession(o *options, stdout io.Writer) error {
 		// The page can edit config.json through /api/config. A save is written
 		// to the file and only takes effect on the next start.
 		srv.SetConfigPath(cfgPath)
+		// /cd from the page goes through the terminal's command, so it moves
+		// exactly what a /cd typed there moves (directory lock, agent, session
+		// store).
+		srv.SetDirChanger(c.ChangeDir)
+		// A /cd typed in the terminal moves the same state; the page sees the
+		// new directory and session lines through this hook.
+		c.SetDirChanged(func(string) { srv.RefreshDirectory() })
 		// The login is a salted digest the browser computes, so the password and
 		// its public salt are all the mirror needs.
 		srv.SetPassword(cfg.Web.Password, cfg.Web.PasswordSalt)
@@ -509,11 +528,11 @@ func runSessions(o *options, args []string, out io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: lightagent sessions <list|show|prune>")
 	}
-	workdir, err := os.Getwd()
+	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("resolve working directory: %w", err)
 	}
-	st, err := resolveStore(o, workdir)
+	st, err := resolveStore(o, cwd)
 	if err != nil {
 		return err
 	}

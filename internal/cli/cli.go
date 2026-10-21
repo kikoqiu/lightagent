@@ -51,6 +51,15 @@ type CLI struct {
 	// for the listing. Both are wired by the program.
 	apiSwitch func(spec string) (string, error)
 	apiList   func() []config.APIInfo
+	// dirGuard is the directory lock /cd has to move along with the working
+	// directory (see workdir.Change). It is nil when the run's state directory
+	// is not the working directory's own (--session) and in tests, where /cd is
+	// a plain directory change.
+	dirGuard workdir.Guard
+	// dirChanged is run after a successful /cd (see ChangeDir). The program
+	// uses it to refresh an open mirror's directory and session lines, so the
+	// terminal and the page always show the same directory.
+	dirChanged func(dir string)
 
 	// out receives all rendered output (defaults to stdout; --log wraps it).
 	out io.Writer
@@ -262,6 +271,45 @@ func (c *CLI) SetAPISwitcher(fn func(spec string) (string, error)) { c.apiSwitch
 // SetAPIList registers the callback that describes the configured LLM
 // interfaces, backing /switchapi with no argument.
 func (c *CLI) SetAPIList(fn func() []config.APIInfo) { c.apiList = fn }
+
+// SetDirGuard registers the directory lock /cd moves along with the working
+// directory, so the instance keeps guarding the directory it runs in and a
+// directory another instance holds is refused (see workdir.Change).
+func (c *CLI) SetDirGuard(g workdir.Guard) { c.dirGuard = g }
+
+// SetDirChanged registers a callback run after /cd moved the process into a
+// directory (see ChangeDir). The program uses it to push the new directory and
+// session lines to an open mirror, so a /cd typed in the terminal refreshes the
+// page exactly like one typed there.
+func (c *CLI) SetDirChanged(fn func(dir string)) { c.dirChanged = fn }
+
+// ChangeDir moves the process into dir and everything that belongs to the
+// directory follows: the directory lock (when the run holds one, see
+// SetDirGuard), the agent's working directory and the session store. A save
+// after a /cd therefore writes the conversation into the new directory's
+// .lightagent/sessions; nothing is moved on disk, so sessions saved before the
+// change stay where they were (and can still be loaded by path).
+//
+// Both front-ends go through it — the mirror registers it with
+// web.Server.SetDirChanger — so a /cd typed in the browser moves exactly what
+// one typed in the terminal moves.
+func (c *CLI) ChangeDir(dir string) (string, error) {
+	abs, err := workdir.Change(dir, c.dirGuard)
+	if err != nil {
+		return "", err
+	}
+	c.agent.SetWorkingDir(abs)
+	if c.store.Rebase(abs) {
+		// The conversation has no file in the new directory yet: the next save
+		// writes the new directory's default session.json (archiving whatever
+		// it held, see backUpDefault).
+		c.setHome("")
+	}
+	if c.dirChanged != nil {
+		c.dirChanged(abs)
+	}
+	return abs, nil
+}
 
 // Interactive reports whether in is attached to an interactive terminal.
 func Interactive(in *os.File) bool { return isInteractive(in) }
@@ -1915,14 +1963,11 @@ func (c *CLI) handleCommand(ctx context.Context, line string) bool {
 			c.write(termcolor.Red("[error] ") + "usage: /cd <dir>\n")
 			break
 		}
-		dir, err := workdir.Set(target)
+		dir, err := c.ChangeDir(target)
 		if err != nil {
 			c.write(termcolor.Red("[error] ") + "cannot change directory: " + err.Error() + "\n")
 			break
 		}
-		// The directory is process state: the next request's system prompt has
-		// to state the new one too.
-		c.agent.SetWorkingDir(dir)
 		c.write(termcolor.Cyan("[info] ") + "working directory: " + dir + "\n")
 	case "/ls":
 		text, err := workdir.Listing(strings.Join(args, " "))

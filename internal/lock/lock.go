@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -85,4 +87,122 @@ func (l *Lock) removeDirIfEmpty() {
 		return
 	}
 	_ = os.Remove(l.dir)
+}
+
+// Holder is the one directory lock a running instance holds. The lock follows
+// the working directory a /cd moves to (see Move), so an instance keeps
+// guarding the directory it actually runs in — and refuses to move into one
+// another instance already guards — instead of leaving a stale lock behind.
+type Holder struct {
+	// stateDirName is the directory a working directory keeps its state in
+	// (".lightagent"), so Move can find the state directory of the directory
+	// the process moves to.
+	stateDirName string
+
+	mu sync.Mutex
+	l  *Lock
+}
+
+// NewHolder creates an empty holder. stateDirName is the state directory below
+// a working directory (store.DirName), which Move locks.
+func NewHolder(stateDirName string) *Holder {
+	return &Holder{stateDirName: stateDirName}
+}
+
+// Hold takes the lock of the state directory dir, releasing a lock held before
+// only after the new one is in hand. A directory another instance already holds
+// fails here and leaves the previous lock — and everything else — as it was.
+func (h *Holder) Hold(dir string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next, err := Acquire(dir)
+	if err != nil {
+		return err
+	}
+	h.swapLocked(next)
+	return nil
+}
+
+// Move takes the state-directory lock of workdir, enters that directory through
+// enter and only then gives up the previous lock: the instance guards exactly
+// the directory it runs in, and the directory it left is free again. Nothing
+// changes when another instance already holds the new directory — enter is not
+// called and the previous lock stays — and a failed enter hands the new lock
+// back, leaving no trace behind when its state directory had to be created for
+// the attempt. It returns the absolute directory the process now runs in.
+func (h *Holder) Move(workdir string, enter func(dir string) (string, error)) (string, error) {
+	abs, err := filepath.Abs(workdir)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", workdir, err)
+	}
+	// The state directory is created below the target, so that directory has to
+	// exist first: a mistyped path must fail here instead of being created just
+	// to hold the lock.
+	if info, err := os.Stat(abs); err != nil {
+		return "", fmt.Errorf("enter %s: %w", abs, err)
+	} else if !info.IsDir() {
+		return "", fmt.Errorf("enter %s: not a directory", abs)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.l != nil && sameDirectory(h.l.dir, filepath.Join(abs, h.stateDirName)) {
+		// Moving to the directory already guarded needs no new lock: taking it
+		// again would conflict with this very process.
+		return enter(abs)
+	}
+	next, err := Acquire(filepath.Join(abs, h.stateDirName))
+	if err != nil {
+		return "", err
+	}
+	now, err := enter(abs)
+	if err != nil {
+		// The process did not move: hand the new lock back, so the directory
+		// stays as free as it was found.
+		_ = next.Release()
+		return "", err
+	}
+	h.swapLocked(next)
+	return now, nil
+}
+
+// Release gives up the held lock. It is safe to call more than once, from the
+// exit path and a signal exit at the same time.
+func (h *Holder) Release() error {
+	h.mu.Lock()
+	prev := h.l
+	h.l = nil
+	h.mu.Unlock()
+	return prev.Release()
+}
+
+// swapLocked makes next the held lock and releases the previous one. The caller
+// must hold h.mu.
+func (h *Holder) swapLocked(next *Lock) {
+	prev := h.l
+	h.l = next
+	_ = prev.Release()
+}
+
+// sameDirectory reports whether two paths name the same directory: both are
+// asked for their file identity when they exist, so a working directory reached
+// through a symbolic link counts as the directory itself. A path that does not
+// exist falls back to the cleaned spelling (folded on Windows, where paths are
+// case-insensitive).
+func sameDirectory(a, b string) bool {
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	if aerr == nil && berr == nil {
+		return os.SameFile(ai, bi)
+	}
+	return samePath(a, b)
+}
+
+// samePath reports whether two cleaned paths spell the same directory. Windows
+// paths are case-insensitive, so they compare folded there.
+func samePath(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }

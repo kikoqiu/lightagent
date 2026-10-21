@@ -122,6 +122,11 @@ type Server struct {
 	// unavailable.
 	apiSwitch func(spec string) (string, error)
 	apiList   func() []config.APIInfo
+	// changeDir moves the process into a directory for /cd. The program wires it
+	// to the terminal's command (cli.CLI.ChangeDir), so the mirror moves the
+	// directory lock, the agent and the session store exactly like a /cd typed
+	// in the terminal; a nil one changes only the mirror's own directory.
+	changeDir func(dir string) (string, error)
 	// restart starts a replacement of this program and hands the run over to it.
 	// It is registered by the program (SetRestarter) and backs the page's
 	// Restart button; the zero value means restarting is unavailable (see
@@ -262,6 +267,42 @@ func (s *Server) SetAPISwitcher(fn func(spec string) (string, error)) { s.apiSwi
 // SetAPIList registers the callback that describes the configured LLM
 // interfaces, backing the page's model dropdown and /switchapi with no argument.
 func (s *Server) SetAPIList(fn func() []config.APIInfo) { s.apiList = fn }
+
+// SetDirChanger registers the callback behind the page's /cd: it moves the
+// process into the given directory and returns the absolute directory it now
+// runs in. The program wires it to cli.CLI.ChangeDir, so the browser moves the
+// directory lock, the agent and the session store exactly like the terminal
+// does (see workdir.Change). Without it the mirror changes its own directory
+// and nothing else, which is what a server built without a terminal can do.
+func (s *Server) SetDirChanger(fn func(dir string) (string, error)) { s.changeDir = fn }
+
+// RefreshDirectory pushes the rail's directory line and session line to every
+// connected page. A /cd moves both (the directory and the session store), and
+// the program calls this when the terminal runs it — the mirror cannot see a
+// command typed there — while the mirror's own /cd reaches it through the
+// registered changer.
+func (s *Server) RefreshDirectory() {
+	s.broadcastDir()
+	s.broadcastSession()
+}
+
+// changeDirectory moves the process into target for /cd. The program's changer
+// does the whole move (and refreshes the rail through the terminal's
+// directory-change hook); a mirror without one still changes its own directory,
+// because the working directory is process state both front-ends share, and
+// pushes the new state itself.
+func (s *Server) changeDirectory(target string) (string, error) {
+	if s.changeDir != nil {
+		return s.changeDir(target)
+	}
+	abs, err := workdir.Change(target, nil)
+	if err != nil {
+		return "", err
+	}
+	s.agent.SetWorkingDir(abs)
+	s.RefreshDirectory()
+	return abs, nil
+}
 
 // apiInfos returns the interface list the picker shows, or nil when the mirror
 // runs without one.
@@ -1318,16 +1359,11 @@ func (s *Server) handleCommand(text string) {
 			s.fail("usage: /cd <dir>")
 			return
 		}
-		dir, err := workdir.Set(target)
+		dir, err := s.changeDirectory(target)
 		if err != nil {
 			s.fail("cannot change directory: " + err.Error())
 			return
 		}
-		// The directory is process state both front-ends share: tell the agent
-		// so the next request's system prompt states the new one, and push the
-		// rail's directory line to every open page.
-		s.agent.SetWorkingDir(dir)
-		s.broadcastDir()
 		s.info("working directory: " + dir)
 	case "/ls":
 		text, err := workdir.Listing(strings.Join(args, " "))

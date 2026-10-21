@@ -15,10 +15,10 @@ lightagent 是一个单进程、多协程的微型 Agent。除 `golang.org/x/tex
 | `internal/mcp` | MCP 客户端（纯标准库）：JSON-RPC 2.0 over stdio / Streamable HTTP / HTTP+SSE；配置驱动的 `Manager` 与 `tools.Tool` 适配器 |
 | `internal/proc` | 子进程启动与停止：**树模式**（`Start`，Windows 用 Job Object「kill-on-close」、Unix 用独立进程组 `SIGTERM`→`SIGKILL`，exec 会话用）与**单进程模式**（`StartProcess`，只停止自己启动的那个进程，stdio MCP server 用）；`Shutdown` 在主进程退出或收到信号时按各自模式停止所有仍存活的进程 |
 | `internal/store` | 多会话持久化（会话文件在 `CWD/.lightagent/sessions/`，当前会话为 `session.json`） |
-| `internal/lock` | 目录锁（纯 `syscall`）：`<状态目录>/.lock` 上 `flock`（Unix）/ `LockFileEx`（Windows），使一个目录只运行一个实例；释放时删锁文件，目录里再没别的就删目录 |
+| `internal/lock` | 目录锁（纯 `syscall`）：`<状态目录>/.lock` 上 `flock`（Unix）/ `LockFileEx`（Windows），使一个目录只运行一个实例；释放时删锁文件，目录里再没别的就删目录；`Holder` 让锁随 `/cd` 换到新工作目录，目标目录已被占用时拒绝这次切换 |
 | `internal/cli` | 彩色 REPL、斜杠命令、Markdown 流式渲染（未完成行作为预览绘制在提示符上方，按终端宽度折行、最多 8 行，因此超出首行的文本也边收边显示）、提示区原地逐行重绘（不整块擦除，老式 Windows 控制台才不会闪屏）、`[thinking]` 思考流式块（同样应用 Markdown）、异步渲染事件、Tab 对输入末尾 `@名字` 的补全（先补到候选的最长公共前缀，多个候选时重复 Tab 依次轮换并回卷；目录不带分隔符，分隔符用户自己打） |
 | `internal/slash` | 斜杠命令表（名称 / 别名 / 参数 / 说明 / 网页是否常显）：CLI 的 `/help`、网页的 `/help` 与左侧命令栏都由此生成；同时提供命令解析（全角斜杠、别名归一）、on/off 参数解析与 `/history` 用量文案 |
-| `internal/workdir` | 当前工作目录服务：`/pwd`、`/cd`、`/ls` 的共用实现（读取/切换进程工作目录、`~` 展开、目录列表文案），以及 `@` 路径补全的一层候选（CLI 的 Tab 与网页浮层共用同一份实现），使终端与网页操作的是同一个目录 |
+| `internal/workdir` | 当前工作目录服务：`/pwd`、`/cd`、`/ls` 的共用实现（读取/切换进程工作目录、`~` 展开、目录列表文案），以及 `@` 路径补全的一层候选（CLI 的 Tab 与网页浮层共用同一份实现），使终端与网页操作的是同一个目录；`/cd`（`Change`）在注册了目录锁时把锁一起搬到新目录 |
 | `internal/web` | HTTP + WebSocket 实时镜像；stdlib 实现 RFC6455；内嵌 marked + DOMPurify 供浏览器渲染 Markdown；出站流式增量按 50ms 合帧（`web.go`），后台节流、手机隐藏超时后停表断连（`app.js`）；输入框 `@` 补全的一层候选经 `GET /api/complete` 取（`web/complete.go`），选中目录后顺手展开该目录的下一级 |
 | `internal/markdown` | 无依赖的 Markdown → ANSI 渲染（CLI 用），按行流式输出并暴露未完成行（`Pending`）供预览 |
 | `internal/termcolor` | ANSI 彩色封装（检测到终端支持才着色） |
@@ -267,14 +267,16 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
   符号链接与取不到访问时间的宿主不动，缺失 `temp/` 不算错。因此临时文件不再永久保留，值得留存的
   先移进 `archive/`，而 `archive/` 与 `memo/` 永不自动清理；它们一旦存在，上面那条「只剩锁文件就
   整个删除」的清理不再触发。memo 里的文件按 Markdown 存储（每条一个 `.md`，带各级标题）；
-  会话的第一条用户消息发出时，程序会扫描该目录并把文件清单作为引擎信息附加在请求里（见
-  [首条用户消息的引擎信息](#首条用户消息的引擎信息memo-清单)）。
+  每个工作目录的第一条用户消息发出时，程序会扫描该目录并把工作目录与文件清单作为引擎信息附加在请求里（见
+  [用户消息的引擎信息](#用户消息的引擎信息工作目录与-memo-清单)）。
 * 会话文件放在 `.lightagent/sessions/`：每个会话有自己的文件名（`/saveas` 起的名字），
   `session.json` 只是**没有名字**的新会话的默认名；`/list` 列出的即这里的内容。旧布局把会话文件
   直接放在 `.lightagent/`，启动时（持锁后）会**自动移入 `sessions/`**，老会话不会丢。`--session PATH`
   仍用指定文件所在的目录，不建 `sessions/` 子目录。当前会话文件是**可变**的：`/saveas`、`/load`、
   启动恢复都会把它指向具体文件，之后的 `/save` 更新那个文件；`/new` 指回默认的 `session.json`，
   `/clear` 只清空对话、保留当前文件（之后的 `/save` 仍更新同一个文件）。
+  **`/cd` 之后**整套会话目录换成新工作目录的 `.lightagent/sessions/`（见[目录锁](#目录锁)）：
+  不迁移任何文件，只是之后的保存落到新目录。
 * 时机：运行时**只保存在内存**（不再有每回合 persist 回调）。写盘只有两条路径：
   `/save` 命令，或退出时询问「是否保存」并确认（默认是）；`/saveas` 则写到新文件。
 * `/save` 与退出保存都写回**会话自己的文件名**；没有名字的新会话写 `session.json`，并先把已存在的
@@ -317,6 +319,16 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 * 没有原生锁原语的宿主（AIX、Plan 9、js/wasm 等）退回 `O_CREATE|O_EXCL` 独占创建。
 * 释放：正常退出与信号退出（`shutdown.go` 的钩子）都会解锁、删 `.lock`，并在目录里再没别的
   文件/目录时把目录一起删掉；Web 重启交接也会释放，好让用 `--resume` 起的替换进程接管。
+* **锁跟着 `/cd` 走**：`Agent` 之外，运行中的实例用 `lock.Holder` 持有锁。`/cd`（两端的
+  `workdir.Change`）先取目标目录状态目录的锁——那里已有实例在跑就**失败，进程留在原目录**，
+  也不会留下为这次尝试新建的空 `.lightagent/`；取到锁之后才切入新目录，再释放原目录的锁。因此
+  实例始终只锁着它正在运行的目录，离开的目录立刻可以被另一个实例接管。`/cd` 到当前所在的目录
+  不会与自己冲突（同一目录不再二次加锁）。用 `--session` 时状态目录是会话文件所在目录、与工作
+  目录无关，`/cd` 只切目录、不动锁。
+* **会话目录也跟着 `/cd` 走**：切换成功后 `store.Rebase` 把会话目录换成新目录的
+  `.lightagent/sessions/`（`Root`/`Dir`/默认文件一起换），之后的 `/save`、`/saveas`、`/list` 都在
+  那里，当前对话也不再属于原来的会话文件（第一次保存写 `session.json`，新目录里已有同名文件则先
+  归档）。**不迁移任何文件**：切换前保存的会话留在原目录，可用 `/load <绝对路径>` 打开。
 * 锁是 advisory 的且绑定在打开的文件上：进程被强杀时操作系统会自动解锁，遗留的 `.lock`
   文件不影响下次启动（下一次直接复用并重新加锁）。
 
@@ -368,7 +380,7 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 重发的请求装得下。
 
 被压缩的部分（切点之前）按 append_instruction 模式交给模型总结：总结请求原样复用**实时请求的
-请求头** —— 系统提示（基础提示词 + unlock 规则 + MCP 全局信息 + 运行时行 + 工作目录行）与同一份
+请求头** —— 系统提示（基础提示词 + unlock 规则 + MCP 全局信息 + 运行时行）与同一份
 tools 声明都由 `Agent.livePrefixLocked()` 这一处渲染（实时请求 `callLLM` 也从同一个快照取消息列表与
 tools，两侧因此不可能来自不同状态），摘要由 `headMessages()` 放到配置指定的位置，
 只是把它放到被压缩消息之前、并在末尾追加压缩指令：请求因此是实时请求的**单侧延长**——被压缩消息
@@ -394,7 +406,7 @@ CLI `/compact` 会以**手动模式**触发，保留策略取自 `summarize_keep
 该开关决定**发送时**累积摘要放在哪里，默认 `false`（第一条用户消息）：
 
 ```
-system: <基础提示词 + unlock 规则 + MCP 信息 + 运行时行 + 工作目录行>
+system: <基础提示词 + unlock 规则 + MCP 信息 + 运行时行>
 user:   [engine] CONVERSATION SUMMARY:
         <累积摘要>
 user:   <历史里的第一条 user>
@@ -467,35 +479,43 @@ tool 循环里一条超长的反馈（整份文件、读回的图片）、带图
 
 基础提示词之后按顺序追加能力段落：① 存在锁定函数时的全局 unlock 规则；② 存在 MCP 工具时的一句 MCP
 使用建议（`agent.MCPToolsRule()`）与每个贡献了工具的 MCP server 的全局信息；③ 运行时环境行
-（`agent.RuntimeInfo()`，每次运行生成，**不写进** `agent.md`）；
-④ 工作目录行（`agent.include_working_dir`，默认开启，`agent.WorkingDirectoryInfo()` 在 `agent.New`
-时生成一次，**只有路径**，不列出目录内容）；⑤ 累积的上下文摘要（**仅** `agent.summary_in_system_prompt = true`；
-默认摘要不在系统提示里，而是作为一条独立的 `[engine]` 消息紧跟其后，见
+（`agent.RuntimeInfo()`，每次运行生成，**不写进** `agent.md`）；④ 累积的上下文摘要（**仅**
+`agent.summary_in_system_prompt = true`；默认摘要不在系统提示里，而是作为一条独立的 `[engine]` 消息紧跟其后，见
 [上下文压缩](#摘要的放置agentsummary_in_system_prompt)）。内置基础提示词本身不含任何 MCP 文案，
-未启用 MCP 或没有任何 MCP 工具时系统提示词里不会出现 MCP 内容。
+未启用 MCP 或没有任何 MCP 工具时系统提示词里不会出现 MCP 内容。系统提示词里**没有工作目录**：
+它由用户消息的引擎信息块声明（见下节），因此 `/cd` 不改动提示词，服务端的提示缓存前缀也不受它影响。
 
-## 首条用户消息的引擎信息（memo 清单）
+## 用户消息的引擎信息（工作目录与 memo 清单）
 
-会话的**第一条用户消息**发出时，先扫描工作目录下的 `.lightagent/memo/`：若有文件，就把一份清单
-追加在这条消息的文字之后（只在请求里渲染，CLI / Web 都不显示）。清单按文件更新时间**逆序**，用
-**英文**友好时间（`just now` / `5 minutes ago` / `1 day ago` / `2 months ago` …）与可读大小列出——
-引擎附加的文字一律用英文，不随用户使用的语言变化：
+引擎信息块（`[engine meta info]`）跟着**用户消息**走，一个工作目录只发一次：
+
+* 会话的第一条用户消息发出时，以及 `Agent.SetWorkingDir`（`/cd`）之后的**第一条用户消息**发出时，
+  在请求里该消息的文字之后追加一个块（CLI / Web 都不显示）。块的第一行是
+  `working directory: <绝对路径>`（`agent.include_working_dir`，默认开启；只有路径，不列目录内容），
+  接下来是 memo 目录的清单。
+* memo 清单来自 `<工作目录>/.lightagent/memo/`：按文件更新时间**逆序**，用**英文**友好时间
+  （`just now` / `5 minutes ago` / `1 day ago` / `2 months ago` …）与可读大小列出——引擎附加的文字
+  一律用英文，不随用户使用的语言变化。memo 目录不存在或为空时**不带清单**，块里只有目录那一行：
 
 ```text
 [engine meta info]
+working directory: D:\work\demo
 The memo folder holds these files:
 file     updated    size
 plan.md  1 day ago  1.2 KB
 ```
 
-* 清单**只属于第一条用户消息**：扫描结果写进该消息的 `meta` 字段（会话 JSON 里即
-  `{"role":"user","content":"…","meta":"…"}`），随会话保存、恢复后仍在；后续用户消息没有 `meta`，
-  也就不会被追加。恢复一个首条消息没有 `meta` 的旧会话时不再扫描。
+* 块的内容写进该消息的 `meta` 字段（会话 JSON 里即 `{"role":"user","content":"…","meta":"…"}`），
+  随会话保存、恢复后仍在。引擎按工作目录判定「发过没有」：同一个目录的后续消息不再附加，
+  `/cd` 到新目录后第一条消息重新附加（新目录 + 新目录下的 memo 清单）；离开又切回来的目录也会再报一次。
+  `Agent.Reset` 清空对话后，下一条消息像新会话一样重新附加。
+* 恢复（`Agent.Load`）一个已有内容的会话不重新扫描：它记录时的第一条消息已经带过这份信息。
 * `meta` 是引擎侧信息：`llm.requestMessages` 在发请求前清掉它，模型的请求里只有被渲染进 `content`
   的文本；前端、`/history` 与会话列表都只看 `content`，因此用户看到的仍是自己输入的原文。
-* memo 文件夹不存在或为空时**不附加任何内容**。
+* 回合进行中 `/cd` 后发来的 steering 消息同样由**第一条**带块（`drainSteering`），与下一回合的第一条消息一致。
 * 追加发生在唯一的请求头构建处（`livePrefix.head` → `withEngineMeta`），压缩摘要的调用同样经过它，
   因此摘要请求的前缀仍与活请求逐字节相同（见[摘要的放置](#摘要的放置agentsummary_in_system_prompt)）。
+* 系统提示词里没有工作目录行，所以 `/cd` 不会改动提示词——服务端缓存的前缀在切目录后仍然有效。
 * memo 里的每个文件按 Markdown 存储（`.md`，带各级标题）——内置提示词里的约定，见
   [configuration.md](configuration.md)。
 

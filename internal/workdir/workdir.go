@@ -2,6 +2,8 @@
 // /cd and /ls slash commands. Both front-ends go through it, so a /cd typed in
 // the terminal and one clicked in the mirror move the same directory: it wraps
 // the process working directory instead of keeping a copy that could drift.
+// A /cd also moves the run's directory lock, so the instance keeps guarding the
+// directory it runs in (see Change).
 package workdir
 
 import (
@@ -40,12 +42,49 @@ func Expand(path string) string {
 // Set changes the process working directory to dir (a leading ~ is expanded)
 // and returns the absolute directory the process now runs in. An empty path or
 // one that cannot be entered is an error; the working directory is then left
-// alone.
+// alone. /cd uses Change, which also moves the run's directory lock along.
 func Set(dir string) (string, error) {
 	target := Expand(dir)
 	if target == "" {
 		return "", errors.New("no directory given")
 	}
+	return Enter(target)
+}
+
+// Guard is the directory lock a /cd has to move along with the working
+// directory. Main hands the run's lock holder over as one (see
+// lock.Holder.Move); a nil guard leaves /cd a plain directory change.
+type Guard interface {
+	// Move takes the state-directory lock of workdir, enters it through enter
+	// and gives up the previous lock, returning the absolute directory the
+	// process now runs in. A directory another instance already holds fails
+	// before anything changes.
+	Move(workdir string, enter func(dir string) (string, error)) (string, error)
+}
+
+// Change changes the process working directory to dir (a leading ~ is expanded)
+// and returns the absolute directory the process now runs in. The run's
+// directory lock moves along with it (see Guard): a directory another instance
+// already runs in fails here, leaving the process where it was, and the
+// directory it leaves is free again. With a nil guard it is a plain directory
+// change. An empty path or one that cannot be entered is an error; the working
+// directory is then left alone.
+func Change(dir string, guard Guard) (string, error) {
+	target := Expand(dir)
+	if target == "" {
+		return "", errors.New("no directory given")
+	}
+	if guard == nil {
+		return Enter(target)
+	}
+	return guard.Move(target, Enter)
+}
+
+// Enter changes the process working directory to target, which must already be
+// expanded, and returns the absolute directory the process now runs in. It is
+// the step a Guard performs between taking the new lock and giving up the old
+// one.
+func Enter(target string) (string, error) {
 	if err := os.Chdir(target); err != nil {
 		return "", err
 	}

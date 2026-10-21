@@ -57,7 +57,8 @@ type State struct {
 // Store manages the session files for a working directory (or an explicit
 // path). The current session file is mutable: /saveas and /load point it at a
 // different file, and Save then updates that one. The mutex guards the current
-// file so the terminal and the web mirror can drive it concurrently.
+// file so the terminal and the web mirror can drive it concurrently, and it
+// guards the directories too, because /cd moves them (see Rebase).
 type Store struct {
 	// root is the state directory (.lightagent): the lock, uploads and other
 	// state live here.
@@ -65,6 +66,11 @@ type Store struct {
 	// dir is the directory that holds the session files (root/sessions for the
 	// default layout; for --session it is the session file's own directory).
 	dir string
+
+	// explicit is true for a store created for a session file the user named
+	// (--session): its place does not depend on the working directory, so a
+	// /cd leaves it alone (see Rebase).
+	explicit bool
 
 	mu   sync.Mutex
 	file string // absolute path of the current session file
@@ -98,15 +104,46 @@ func NewFile(path string) (*Store, error) {
 		return nil, fmt.Errorf("resolve session path: %w", err)
 	}
 	dir := filepath.Dir(abs)
-	return &Store{root: dir, dir: dir, file: abs, initial: abs}, nil
+	return &Store{root: dir, dir: dir, file: abs, initial: abs, explicit: true}, nil
 }
 
 // Root returns the state directory (.lightagent): the directory lock, the
 // uploads and the other run state live here.
-func (s *Store) Root() string { return s.root }
+func (s *Store) Root() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.root
+}
 
 // Dir returns the directory that holds the session files.
-func (s *Store) Dir() string { return s.dir }
+func (s *Store) Dir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dir
+}
+
+// Rebase moves the store to the working directory workdir, which must be
+// absolute: from now on the session files are read from and written to
+// workdir/.lightagent/sessions and a save writes the conversation there. It is
+// what a /cd does, and it moves nothing on disk — sessions saved before the
+// change stay in the directory they were written to (and can still be loaded by
+// path). The current session file becomes the new directory's default
+// session.json, so the conversation no longer belongs to the old file.
+//
+// A store created for an explicit session file (--session) keeps its place: its
+// state is not the working directory's, so it reports false and changes nothing.
+func (s *Store) Rebase(workdir string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.explicit {
+		return false
+	}
+	root := filepath.Join(workdir, DirName)
+	dir := filepath.Join(root, SessionsDirName)
+	file := filepath.Join(dir, stateFile)
+	s.root, s.dir, s.file, s.initial = root, dir, file, file
+	return true
+}
 
 // Path returns the current session file path.
 func (s *Store) Path() string {
@@ -119,6 +156,7 @@ func (s *Store) Path() string {
 // part lives in the sessions directory; one carrying a separator (or an
 // absolute path) is used as given. A missing .json suffix is added.
 func (s *Store) ResolvePath(name string) string {
+	dir := s.Dir()
 	name = strings.TrimSpace(name)
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		name += ".json"
@@ -126,7 +164,7 @@ func (s *Store) ResolvePath(name string) string {
 	if filepath.IsAbs(name) || strings.ContainsAny(name, `/\`) {
 		return name
 	}
-	return filepath.Join(s.dir, name)
+	return filepath.Join(dir, name)
 }
 
 // UseFile makes path the current session file, so a later Save updates it
@@ -154,13 +192,16 @@ func (s *Store) Reset() {
 // directory, or when there is nothing to move. The caller holds the directory
 // lock, so the move cannot race a second instance.
 func (s *Store) MigrateLegacy() error {
-	if s.dir == s.root {
+	s.mu.Lock()
+	root, dir := s.root, s.dir
+	s.mu.Unlock()
+	if dir == root {
 		return nil
 	}
-	if _, err := os.Stat(filepath.Join(s.dir, stateFile)); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, stateFile)); err == nil {
 		return nil
 	}
-	entries, err := os.ReadDir(s.root)
+	entries, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -180,11 +221,11 @@ func (s *Store) MigrateLegacy() error {
 	if len(legacy) == 0 {
 		return nil
 	}
-	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	for _, name := range legacy {
-		_ = os.Rename(filepath.Join(s.root, name), filepath.Join(s.dir, name))
+		_ = os.Rename(filepath.Join(root, name), filepath.Join(dir, name))
 	}
 	return nil
 }
@@ -257,6 +298,7 @@ func (s *Store) LoadPath(path string) (*State, error) {
 // archive.
 func (s *Store) Archive(now time.Time) (string, error) {
 	path := s.Path()
+	dir := s.Dir()
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return "", nil
 	} else if err != nil {
@@ -265,12 +307,12 @@ func (s *Store) Archive(now time.Time) (string, error) {
 
 	base := strings.TrimSuffix(filepath.Base(path), ".json")
 	stamp := now.Format("20060102-150405")
-	target := filepath.Join(s.dir, fmt.Sprintf("%s-%s.json", base, stamp))
+	target := filepath.Join(dir, fmt.Sprintf("%s-%s.json", base, stamp))
 	for i := 1; ; i++ {
 		if _, err := os.Stat(target); os.IsNotExist(err) {
 			break
 		}
-		target = filepath.Join(s.dir, fmt.Sprintf("%s-%s-%d.json", base, stamp, i))
+		target = filepath.Join(dir, fmt.Sprintf("%s-%s-%d.json", base, stamp, i))
 	}
 	if err := os.Rename(path, target); err != nil {
 		return "", fmt.Errorf("archive session: %w", err)
@@ -295,7 +337,9 @@ type SessionInfo struct {
 // the current session flagged. Files that cannot be parsed are still listed
 // (with Messages left at 0).
 func (s *Store) List() ([]SessionInfo, error) {
-	entries, err := os.ReadDir(s.dir)
+	dir := s.Dir()
+	current := s.Path()
+	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		// The sessions directory is created lazily, so a missing directory
 		// simply means nothing has been saved yet.
@@ -304,13 +348,12 @@ func (s *Store) List() ([]SessionInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	current := s.Path()
 	infos := make([]SessionInfo, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		path := filepath.Join(s.dir, e.Name())
+		path := filepath.Join(dir, e.Name())
 		info := SessionInfo{Path: path, Name: e.Name(), Current: path == current}
 		if fi, statErr := os.Stat(path); statErr == nil {
 			info.ModTime = fi.ModTime()
@@ -376,7 +419,11 @@ func (s *Store) Named() bool {
 // Default returns the default session file path: session.json (or the --session
 // file). It is the name a nameless conversation is saved under, and the file
 // whose previous content a nameless save may back up.
-func (s *Store) Default() string { return s.initial }
+func (s *Store) Default() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.initial
+}
 
 // PruneArchives removes archived sessions, keeping the newest keep of them
 // (keep <= 0 removes every archive). The current session file is never touched.

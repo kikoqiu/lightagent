@@ -2105,7 +2105,6 @@ func TestCompactionRequestReusesLiveSystemPrompt(t *testing.T) {
 	for _, want := range []string{
 		"custom base",
 		RuntimeInfo(),
-		"working directory: ",
 		"**Tool Discovery & Unlock**",
 		"MCP server `playwright` is connected.",
 	} {
@@ -2722,40 +2721,31 @@ func TestSystemPromptMCPContentOnlyWithMCPTools(t *testing.T) {
 	}
 }
 
-// TestSystemPromptWorkingDirectory verifies the working-directory line is
-// injected by default, suppressed when agent.include_working_dir is off, and
-// states the path only — the directory's children are never listed.
-func TestSystemPromptWorkingDirectory(t *testing.T) {
+// TestSystemPromptHasNoWorkingDirectory pins where the working directory is
+// reported: never in the system prompt — that keeps the prompt byte-stable, so a
+// /cd cannot invalidate a provider's cached prefix — but in the engine meta info
+// block of a user message (see memo_test.go).
+func TestSystemPromptHasNoWorkingDirectory(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
-	on := New(config.Default(), nil, tools.NewRegistry(), NewBus())
-	on.mu.Lock()
-	enabled := on.buildMessagesLocked()[0].Content
-	on.mu.Unlock()
-	if want := "working directory: " + cwd; !strings.HasSuffix(enabled, want) {
-		t.Fatalf("system prompt must end with %q:\n%s", want, enabled)
-	}
-	if n := strings.Count(enabled, "working directory: "); n != 1 {
-		t.Fatalf("working-directory line count = %d, want 1:\n%s", n, enabled)
-	}
+	a := New(config.Default(), nil, tools.NewRegistry(), NewBus())
+	a.SetWorkingDir(t.TempDir())
 
-	cfg := config.Default()
-	cfg.Agent.IncludeWorkingDir = false
-	off := New(cfg, nil, tools.NewRegistry(), NewBus())
-	off.mu.Lock()
-	disabled := off.buildMessagesLocked()[0].Content
-	off.mu.Unlock()
-	if strings.Contains(disabled, "working directory: ") {
-		t.Fatalf("working-directory line present while disabled:\n%s", disabled)
+	a.mu.Lock()
+	content := a.buildMessagesLocked()[0].Content
+	a.mu.Unlock()
+	for _, unwanted := range []string{"working directory: ", cwd} {
+		if strings.Contains(content, unwanted) {
+			t.Fatalf("system prompt must not carry %q:\n%s", unwanted, content)
+		}
 	}
 }
 
 // TestSystemPromptSectionOrder pins the layout of the system prompt: the base
 // prompt first, then the tool/machine capability sections (unlock rule, MCP
-// global info) and finally the host sections — the runtime line and the working
-// directory — at the bottom.
+// global info) and finally the host section — the runtime line — at the bottom.
 func TestSystemPromptSectionOrder(t *testing.T) {
 	cfg := config.Default()
 	cfg.Agent.SystemPrompt = "custom base"
@@ -2775,7 +2765,6 @@ func TestSystemPromptSectionOrder(t *testing.T) {
 		"**Tool Discovery & Unlock**",
 		"MCP server `playwright` is connected.",
 		RuntimeInfo(),
-		"working directory: ",
 	} {
 		at := strings.Index(content, section)
 		if at < 0 {
@@ -2803,9 +2792,11 @@ func TestSystemPromptRuntimeLine(t *testing.T) {
 	if !strings.HasPrefix(content, "custom base\n\n") {
 		t.Fatalf("system prompt should start with the base prompt:\n%s", content)
 	}
-	want := RuntimeInfo() + "\n\nworking directory: "
-	if !strings.Contains(content, want) {
-		t.Fatalf("system prompt should carry %q at the bottom:\n%s", want, content)
+	// The runtime line closes the prompt: the working directory is reported by
+	// the engine meta info block of a user message, not here.
+	want := "custom base\n\n" + RuntimeInfo()
+	if content != want {
+		t.Fatalf("system prompt = %q, want %q", content, want)
 	}
 	if n := strings.Count(content, "Runtime: "); n != 1 {
 		t.Fatalf("runtime line count = %d, want 1:\n%s", n, content)
@@ -3115,14 +3106,19 @@ func TestOverflowRejectionRollsBackTheToolRoundAndRetries(t *testing.T) {
 	}
 
 	// The retry is the same user message in front of the history that is left:
-	// the rejected tool round is gone (nothing else had to be compressed).
+	// the rejected tool round is gone (nothing else had to be compressed). The
+	// message travels with its engine meta block, which the request renders.
 	mu.Lock()
 	retry := bodies[len(bodies)-1]
 	mu.Unlock()
-	if len(retry) != 2 || retry[0].Role != "system" || retry[1].Role != "user" || retry[1].Content != userText {
+	hist := a.History()
+	wantUser := userText
+	if meta := strings.TrimSpace(hist[0].Meta); meta != "" {
+		wantUser += "\n\n" + meta
+	}
+	if len(retry) != 2 || retry[0].Role != "system" || retry[1].Role != "user" || retry[1].Content != wantUser {
 		t.Fatalf("retry request = %+v, want system + the user message alone", retry)
 	}
-	hist := a.History()
 	if len(hist) != 2 || hist[0].Role != "user" || hist[1].Content != "done" {
 		t.Fatalf("history = %+v, want the user message and the retry's reply", hist)
 	}

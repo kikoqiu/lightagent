@@ -22,7 +22,7 @@
 |---|------|------|
 | 1 | OpenAI 兼容接口 | `chat/completions`，支持 `tools` / `tool_calls`，默认流式（SSE） |
 | 2 | 全局配置 | 程序目录下的 `config.json`：接口、上下文长度、web、工具限制 |
-| 3 | 运行状态在 CWD | 所有状态/记录写入**当前工作目录**的 `.lightagent/`；**一个目录一个实例**：启动时在 `.lightagent/.lock` 上加独占锁（Unix `flock` / Windows `LockFileEx`，纯 `syscall`），同一目录再启第二个实例直接报错退出，退出时解锁并（目录里只剩锁文件则）删掉 `.lightagent/`；不同目录仍可并行多实例 |
+| 3 | 运行状态在 CWD | 所有状态/记录写入**当前工作目录**的 `.lightagent/`；**一个目录一个实例**：启动时在 `.lightagent/.lock` 上加独占锁（Unix `flock` / Windows `LockFileEx`，纯 `syscall`），同一目录再启第二个实例直接报错退出，退出时解锁并（目录里只剩锁文件则）删掉 `.lightagent/`；不同目录仍可并行多实例；**锁与会话目录都跟着 `/cd` 走**——先取新目录的锁，取不到就拒绝这次 `/cd`（留在原目录），取到后切入新目录并释放原目录的锁，之后的保存写到新目录的 `.lightagent/sessions/`（旧文件不迁移） |
 | 4 | CLI 工具循环 | 彩色 REPL，循环期间可继续输入插入用户消息 |
 | 5 | Web 镜像 | 配置了 web 端口即启动（`web.host` 可选绑定 IP，默认 `127.0.0.1`）；端口被占用时自动递增；**WebSocket 实时双向镜像**；页面内置配置编辑器（控件表单 + JSON 双模式，`/api/config`，**重启生效**）与**一键重启**（`/api/restart`：先保存会话，新进程自动恢复）；**登录对话框**（密码明文保存在配置里、浏览器只发送加盐摘要，HttpOnly 会话 cookie + 记住我，**改密码立即生效**） |
 | 6 | 会话记录 | **一个目录一个会话**：启动询问是否恢复历史（默认是），退出询问是否保存（默认是），运行中只存内存，`/save` 手动落盘 |
@@ -34,7 +34,7 @@
 | 12 | 多行输入 | CLI 与 Web 均为 **Enter 换行**；CLI 发送用 **Ctrl+J**（Windows 本地也可 Ctrl+Enter；Linux/SSH 下终端支持 kitty 键盘协议时也可 Ctrl+Enter，另有 Alt+Enter），Web 用 **Ctrl+Enter** |
 | 13 | MCP 客户端 + 工具发现 / unlock | 纯标准库 MCP 客户端（stdio / Streamable HTTP / HTTP+SSE），server 在 `tools.mcp` 中配置；MCP 工具**恒为锁定函数**（永不进 `tools` 声明）：`tool_search_tool_bm25` 发现 → `unlock_tool` 下发 schema 并授权（TTL）→ `dynamic_call` 间接调用；系统提示词只注入 1 条全局 unlock 规则 + 每 server 1 条 MCP 全局信息（含 server 返回的 `serverInfo`/`instructions`） |
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板）；模型只产出思考（可见正文为空、无工具调用，**无论 `finish_reason`**）时不再多问模型，是否记入历史由 `agent.include_interrupted` 决定（默认关闭）；被中断的不完整回复同理——开启时保留并追加一条 `[engine]` 提示、关闭时整体丢弃；带正文的 `length` 截断自动续跑上限连续 3 次 |
-| 15 | 系统提示词 | 超短的系统提示词：只写工作方式与规则（各工具的用法在工具自己的描述里），并约定临时文件放 `.lightagent/temp/`（程序退出时删除修改与访问都超过 180 天的）、值得留存的结果移入 `.lightagent/archive/`、项目记忆放 `.lightagent/memo/`（按 `.md` 存储、带各级标题）；支持程序目录的agent.md自动注入；会话**第一条用户消息**发出时扫描 memo 目录，把文件清单（英文友好时间如 `1 day ago`、大小，按更新时间逆序）追加在该消息的请求文本之后并固化到它的 `meta` 字段（不显示给用户）；另有删文件纪律——脚本里不得用裸变量当删除目标，必须加固定前后缀，必须用变量时写成支持 dry-run 的脚本文件并先试运行核实 |
+| 15 | 系统提示词 | 超短的系统提示词：只写工作方式与规则（各工具的用法在工具自己的描述里），并约定临时文件放 `.lightagent/temp/`（程序退出时删除修改与访问都超过 180 天的）、值得留存的结果移入 `.lightagent/archive/`、项目记忆放 `.lightagent/memo/`（按 `.md` 存储、带各级标题）；支持程序目录的agent.md自动注入；**系统提示词里没有工作目录**——每个工作目录的**第一条用户消息**发出时，在该消息的请求文本之后追加一个 `[engine meta info]` 块：先一行 `working directory: <路径>`，再列 memo 目录里的文件清单（英文友好时间如 `1 day ago`、大小，按更新时间逆序；memo 为空则只有目录这一行）。块固化到该消息的 `meta` 字段（不显示给用户），`/cd` 之后的**第一条消息**再附一次（新目录 + 新 memo 清单），系统提示词因此不随 `/cd` 变化；另有删文件纪律——脚本里不得用裸变量当删除目标，必须加固定前后缀，必须用变量时写成支持 dry-run 的脚本文件并先试运行核实 |
 | 16 | 浏览器朗读（TTS） | Web 镜像内置**浏览器原生语音合成**（Web Speech API）：**默认不启用**，侧栏/面板开关启用（浏览器不支持时强制为关），可选语言/语音（按语音包分组、可 Test），朗读内容二选一或多选（**回合最终文本** / **思考过程** / **工具调用名称** / **文本反馈**），设置存浏览器 `localStorage`（仅当前浏览器、刷新后保留） |
 | 17 | 网页抓取 | `webfetch`：抓网页 → 转 Markdown（只收网页与文本，二进制内容直接报错）。`tools.webfetch.mode` 取 `auto`（默认，可见浏览器）/ `chrome-headful` / `chrome-headless` / `chrome-attached`（挂到已在运行的浏览器，端点可配）/ `http`；浏览器路径、User-Agent、源码字节上限均可配；`method` 决定反馈放什么（`fetch_as_md` 默认 / `save_as_md` / `save_as_html` / `ignore`），正文里的站内链接写成根相对路径（`/docs/other`，状态行给出抓取的地址），反馈默认**最多 100 行**（`max_lines`，可关）且**优先只回填正文**（`<article>`/`<main>`/`class=main` 之类的容器，导航/侧栏/页脚用 `...(omitted)` 标记代替），定位不到正文时回填中间的 100 行；`invokejs` 可在**页面加载后、抓取前**在页面里跑一段脚本（浏览器取法限定），用注入的 `_invokejs_done(value)` 结束并把值放在反馈最前面（拿 Cookie/token，供后续命令用同一身份）；整页存到工作目录 `.lightagent/webfetch/<时间>.md`（Markdown 正文）并在反馈里给出路径 |
 | 18 | 多媒体附件 | 模型侧 `providers[].media_types` 声明**本模型可读的媒体类型**（如 `image/png`、`image/*`、`audio/wav`、`application/pdf`）。配置后：Web 输入框出现 **📎 附加按钮**，文件上传到工作目录 `.lightagent/uploads/`，**随下一条输入一起发给模型**（发送前点 ✕ 可取消并删掉已存文件），消息行会把带的附件显示出来（上传目录里的图片直接画成图片，取不回来时退回文件名）；若同时打开 `tools.upload_media.enabled`（两边都为真才启用），模型还拿到 `upload_media` 工具，可自行指定路径上传（类型不符 / 超限 / 空文件 / 目录都只报错，参数提示里列出可接收类型）。载荷：图片走 `image_url`（data URI）、音频走 `input_audio`（wav/mp3）、其余走 `file`（文件名 + data URI）；**会话文件只记附件路径与类型，不落 base64**（恢复时按路径读回，文件没了就只留名字） |
@@ -196,8 +196,10 @@ source <(lightagent completion bash)       # bash 补全
 * 配置文件位置 = 可执行文件所在目录（可用 `LIGHTAGENT_CONFIG` 覆盖）。
 * `web.port > 0` 即开启 web 服务；`web.host` 为空时绑定 `127.0.0.1`；`web.password` 非空时要求**登录**。
 * 系统提示词优先级：`agent.md`（程序目录）> `agent.system_prompt` > 内置默认。
-* 运行时环境行 `Runtime: <os>/<arch>.` 与工作目录行 `working directory: <路径>`（以及可选的 unlock 规则、
+* 运行时环境行 `Runtime: <os>/<arch>.`（以及可选的 unlock 规则、
   MCP 信息）由程序在基础提示词之后自动追加，`agent.md` / `agent.system_prompt` 不需要（也不应）写它们。
+  工作目录**不在**系统提示词里：它由用户消息的 `[engine meta info]` 块声明（见上表第 15 条），
+  所以 `/cd` 不会改动提示词（服务端的提示缓存前缀因此不受影响）。
 * `agent.md` 支持片段导入：独占一行的 `@include("路径")` 会替换为对应文件（或目录下所有文件）的内容，
   相对路径基于该文件目录，支持嵌套与绝对路径。详见
   [configuration.md](docs/configuration.md#系统提示词覆盖agentmd)。
@@ -242,6 +244,14 @@ source <(lightagent completion bash)       # bash 补全
   `another lightagent instance is already running in <目录>` 并以状态码 1 退出，不会两个实例
   共用同一个会话文件。锁会在正常退出、Ctrl+C / SIGTERM 以及 Web 重启交接时释放，好让用
   `--resume` 起的替换进程接管。
+* **锁跟着 `/cd` 走**：`/cd` 到另一个目录时先在新目录的 `.lightagent/.lock` 上取锁，取不到（那里
+  已有实例在跑）就**失败且不改目录**；取到后才切入新目录、再释放原目录的锁——实例始终只锁着它正在
+  运行的目录，离开的目录随即空出来。`/cd` 回自己已在的目录不会与自己冲突。用 `--session` 指定会话
+  文件时，状态目录是那个文件所在的目录、与工作目录无关，因此 `/cd` 只切换工作目录、不动锁。
+* **会话目录也跟着 `/cd` 走**：切换成功后，之后的保存写到**新目录**的 `.lightagent/sessions/`
+  （`/list`、`/saveas` 也落到那里），当前对话不再属于原来的会话文件——默认文件名 `session.json`，
+  若新目录里已有同名文件则先归档。**不迁移任何文件**：切换前保存的会话仍留在原目录，可用
+  `/load <绝对路径>` 打开。
 * 锁文件只是**锁的载体**：进程被强杀（崩溃、`taskkill`）时操作系统会自动解锁，遗留的
   `.lock` 不影响下次启动（直接复用并重新加锁）。
 * 会话只在**内存**中维护：对话过程中不会写盘，`/save` 可随时手动保存一次。
@@ -252,9 +262,10 @@ source <(lightagent completion bash)       # bash 补全
   每次程序退出时（正常退出、Ctrl+C / SIGTERM、Web 重启交接）都会清理 `temp/`：只删除**修改时间与
   访问时间都超过 180 天**的文件（子目录递归扫描），所以临时文件不再永久保留。`archive/` 与 `memo/`
   永不自动清理；它们或 `temp/` 一旦存在，上面那条「只剩锁文件就删目录」就不会触发。memo 里的内容按
-  Markdown 存储（`.md`，带各级标题）；会话**第一条用户消息**发出时，程序扫描该目录并把文件清单
-  （英文友好时间如 `1 day ago`、大小，按更新时间逆序）附加在这条消息的请求文本之后，同时存进它的
-  `meta` 字段（用户看不到，后续消息不再附加）。
+  Markdown 存储（`.md`，带各级标题）；**每个工作目录的第一条用户消息**发出时，程序把
+  `working directory: <路径>` 与 `.lightagent/memo/` 的文件清单（英文友好时间如 `1 day ago`、大小，
+  按更新时间逆序；memo 为空时只有目录这一行）附加在这条消息的请求文本之后，同时存进它的
+  `meta` 字段（用户看不到，同一目录的后续消息不再附加；`/cd` 之后的第一条消息重新附加）。
 * **会话文件都在 `.lightagent/sessions/` 下**：每个会话有自己的文件名（`/saveas` 起的名字），
   `session.json` 只是**没有名字**的新会话的默认名。`/list` 列出的就是这里的内容。旧布局
   （会话文件直接放在 `.lightagent/`）会在启动时自动移入 `sessions/`。
@@ -287,7 +298,7 @@ source <(lightagent completion bash)       # bash 补全
 | `/list` `[n]` | 列出最近 n 条保存记录（序号 + 文件名 + 最后修改时间），默认 10 |
 | `/rm` `<name>` | 按**文件名**删除一条保存记录（不接受序号，也不会删当前会话） |
 | `/pwd` | 打印进程当前工作目录 |
-| `/cd` `<dir>` | 切换进程当前工作目录（`~` 展开为主目录）；目录不存在或没给参数会拒绝。它改的是两端共享的进程状态，系统提示词里的工作目录行也随之更新 |
+| `/cd` `<dir>` | 切换进程当前工作目录（`~` 展开为主目录）；目录不存在或没给参数会拒绝。切换时先取目标目录 `.lightagent/.lock` 的锁：那里已有实例在跑就**失败并留在原目录**，否则进入新目录并释放原目录的锁（用 `--session` 时状态目录与工作目录无关，锁不动）。**之后的保存也写到新目录**的 `.lightagent/sessions/`（不迁移旧文件，旧会话仍可用绝对路径 `/load`）。它改的是两端共享的进程状态：**之后的第一条用户消息**会在 `[engine meta info]` 块里声明新目录与新目录下的 memo 清单（系统提示词不变） |
 | `/ls` `[dir]` | 列出目录内容（默认当前目录；隐藏项不列，目录带 `/` 后缀） |
 | `/switchapi` `<name\|序号>` | 切换当前 LLM 接口（无参列出接口）；只改内存，不写回配置 |
 | `/stop` `/interrupt` | 中断正在运行的回合（模型调用或工具调用）。挂起的消息**不再自动发成新回合**，留到你下一条消息一起发出 |
@@ -427,7 +438,7 @@ Ctrl+J，`/pause` 同效）。它**不是中断**：正在输出的这一轮（�
   进度条说明行显示 `tokens / window` 与右侧百分比。进度条下方是**会话行**：`session: <文件名>` 与
   `saved: <相对时间>`（`just now` / `N minutes ago` / `N hours ago` / `N days ago`，超过一个月
   显示日期；未保存的 `/new` 显示 `(unsaved)` 与 `saved: never`），`/save`、`/saveas`、`/load`、`/new`
-  之后随之刷新；会话行下是**目录行** `dir: <当前工作目录>`（`/cd` 之后随之刷新，**路径过长时隐藏前部、
+  之后随之刷新；会话行下是**目录行** `dir: <当前工作目录>`（终端或网页里执行 `/cd` 都会随之刷新，**路径过长时隐藏前部、
   只留尾部**，完整路径在 `title` 里）。切换会话、切换接口（模型）与上下文压缩后，上下文用量都会立即刷新。
   标题栏 logo 下的小字显示**当前接口名**（连接状态由右侧绿点表示，不再显示 `online` / `offline`）。
 * 右上角 **⚙** 打开配置编辑器（左侧栏不再有 Configuration 卡片），右上角可在 **Form / JSON** 两种模式间切换：

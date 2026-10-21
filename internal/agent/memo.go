@@ -15,11 +15,14 @@ import (
 // the built-in prompt names it.
 const memoDirRel = ".lightagent/memo"
 
-// memoInfoHeader opens the engine meta info block the first user message of a
-// conversation carries when the memo folder holds files. It is English like
-// every other engine message: the block is appended to the request on its own,
-// so it must read the same way whatever language the user writes in.
-const memoInfoHeader = "[engine meta info]\nThe memo folder holds these files:"
+// engineMetaHeader opens the engine meta info block a user message carries. It
+// is English like every other engine message: the block is appended to the
+// request on its own, so it must read the same way whatever language the user
+// writes in.
+const engineMetaHeader = "[engine meta info]"
+
+// memoInfoHeader introduces the memo listing, below the working-directory line.
+const memoInfoHeader = "The memo folder holds these files:"
 
 // memoFile is one file of the memo folder.
 type memoFile struct {
@@ -29,15 +32,27 @@ type memoFile struct {
 	size    int64
 }
 
-// memoInfo renders the engine meta info block a fresh conversation's first user
-// message carries: every file below workdir/.lightagent/memo, newest change
-// first, with a friendly age and a human-readable size. It returns "" when the
-// folder is missing or holds no file, so a conversation without memo notes adds
-// nothing.
-func memoInfo(workdir string, now time.Time) string {
+// memoInfo renders the engine meta info block a user message carries: the
+// directory the process runs in (the path only, while includeDir asks for it)
+// and every file below workdir/.lightagent/memo, newest change first, with a
+// friendly age and a human-readable size. It returns "" when there is nothing
+// to report — no working directory at all, or a block that would neither name
+// the directory nor list a memo file.
+func memoInfo(workdir string, includeDir bool, now time.Time) string {
+	if workdir == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(engineMetaHeader)
+	if includeDir {
+		b.WriteString("\nworking directory: " + workdir)
+	}
 	files := memoFiles(workdir)
 	if len(files) == 0 {
-		return ""
+		if !includeDir {
+			return ""
+		}
+		return b.String()
 	}
 	nameWidth := textwidth.Width("file")
 	ageWidth := textwidth.Width("updated")
@@ -45,7 +60,7 @@ func memoInfo(workdir string, now time.Time) string {
 		nameWidth = max(nameWidth, textwidth.Width(f.name))
 		ageWidth = max(ageWidth, textwidth.Width(memoAge(now.Sub(f.modTime))))
 	}
-	var b strings.Builder
+	b.WriteByte('\n')
 	b.WriteString(memoInfoHeader)
 	b.WriteByte('\n')
 	fmt.Fprintf(&b, "%s  %s  %s\n",

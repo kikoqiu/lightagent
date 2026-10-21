@@ -23,6 +23,7 @@ import (
 	"lightagent/internal/llm"
 	"lightagent/internal/passwd"
 	"lightagent/internal/tools"
+	"lightagent/internal/workdir"
 )
 
 // newTestServer builds a web server bound to a free loopback port.
@@ -1969,6 +1970,9 @@ func TestWorkingDirectoryCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForServerFrame(t, reader, `"type":"dir"`)
+	// The conversation belongs to no file in the new directory yet, so the
+	// rail's session line is refreshed as well.
+	waitForServerFrame(t, reader, `"type":"session"`)
 	if got, err := os.Getwd(); err != nil || got != dir {
 		t.Fatalf("working directory = %q (err %v), want %q", got, err, dir)
 	}
@@ -2008,6 +2012,64 @@ func TestWorkingDirectoryCommands(t *testing.T) {
 	}
 	if srv.agent.Busy() {
 		t.Fatal("a directory command must not start a turn")
+	}
+}
+
+// TestCDGoesThroughTheChanger pins the mirror's /cd: it runs the changer the
+// program registers (the terminal's ChangeDir, which moves the directory lock,
+// the agent and the session store), reports a refusal without moving anything,
+// and the directory it lands on is what the confirmation and the rail show.
+func TestCDGoesThroughTheChanger(t *testing.T) {
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	base := t.TempDir()
+	start := filepath.Join(base, "start")
+	target := filepath.Join(base, "target")
+	taken := filepath.Join(base, "taken")
+	for _, dir := range []string{start, target, taken} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chdir(start); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, "")
+	var asked []string
+	srv.SetDirChanger(func(dir string) (string, error) {
+		asked = append(asked, dir)
+		if dir == taken {
+			return "", errors.New("another lightagent instance is already running in " + taken)
+		}
+		return workdir.Change(dir, nil)
+	})
+	nextRow := func(text string) historyRow {
+		t.Helper()
+		before := len(decodeHistory(t, srv))
+		srv.handleCommand(text)
+		rows := waitForHistory(t, srv, func(rows []historyRow) bool { return len(rows) > before })
+		return rows[len(rows)-1]
+	}
+
+	if row := nextRow("/cd " + target); row.Role != "info" || !strings.Contains(row.Content, "working directory:") {
+		t.Fatalf("/cd row = %+v, want the confirmation", row)
+	}
+	if got, _ := os.Getwd(); got != target {
+		t.Fatalf("working directory = %q, want %q", got, target)
+	}
+	if row := nextRow("/cd " + taken); row.Role != "error" || !strings.Contains(row.Content, "already running") {
+		t.Fatalf("/cd into a held directory = %+v, want the refusal", row)
+	}
+	if got, _ := os.Getwd(); got != target {
+		t.Fatalf("a refused /cd moved the directory to %q, want %q", got, target)
+	}
+	if len(asked) != 2 || asked[0] != target || asked[1] != taken {
+		t.Fatalf("the changer was asked for %v, want [%s %s]", asked, target, taken)
 	}
 }
 
