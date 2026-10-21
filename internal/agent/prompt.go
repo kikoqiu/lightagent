@@ -34,7 +34,8 @@ its own arguments and behavior, so those details are not repeated here.
 
 ## Files
 - Temporary files (scratch scripts, intermediate output) go in .lightagent/temp/ under the working directory; create the directory when it is missing.
-- Project notes and memory go in .lightagent/memo/: consult them when you start working on this project, and update them when you learn something worth keeping.`
+- Project notes and memory go in .lightagent/memo/: consult them when you start working on this project, and update them when you learn something worth keeping.
+- Store memo content as Markdown files (.md), with a proper heading structure for every level: a single # title, then ##, ###, ... for its sections, so a file stays readable and easy to skim.`
 }
 
 // RuntimeInfo returns the environment line the agent appends after its base

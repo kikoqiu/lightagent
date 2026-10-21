@@ -34,6 +34,11 @@ type Agent struct {
 	// agent.include_working_dir is off or the directory cannot be resolved. It
 	// is set in New and then follows a /cd through SetWorkingDir.
 	workingDirInfo string
+	// workingDir is the absolute directory the process runs in. It follows a
+	// /cd like workingDirInfo, but it is tracked even while the prompt carries
+	// no working-directory line: the memo folder lives below it (see
+	// memoListing).
+	workingDir string
 	// includeWorkingDir records agent.include_working_dir: whether the prompt
 	// carries the working-directory line at all. SetWorkingDir keeps a prompt
 	// without it without one.
@@ -107,10 +112,12 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 	}
 	// The working-directory line tells the model where the process runs without
 	// spending a tool call. Only the path is reported: the directory's children
-	// are not listed.
-	var workingDirInfo string
-	if cfg.Agent.IncludeWorkingDir {
-		if cwd, err := os.Getwd(); err == nil {
+	// are not listed. The path itself is tracked either way, because the memo
+	// folder lives below it.
+	var workingDir, workingDirInfo string
+	if cwd, err := os.Getwd(); err == nil {
+		workingDir = cwd
+		if cfg.Agent.IncludeWorkingDir {
 			workingDirInfo = WorkingDirectoryInfo(cwd)
 		}
 	}
@@ -146,6 +153,7 @@ func New(cfg *config.Config, client *llm.Client, reg *tools.Registry, bus *Bus) 
 		bus:                bus,
 		base:               base,
 		runtimeInfo:        RuntimeInfo(),
+		workingDir:         workingDir,
 		workingDirInfo:     workingDirInfo,
 		includeWorkingDir:  cfg.Agent.IncludeWorkingDir,
 		unlockRule:         unlockRule,
@@ -230,10 +238,12 @@ func (a *Agent) SetMCPServers(servers []MCPServerInfo) {
 
 // SetWorkingDir records a new working directory for the system prompt, so the
 // /cd either front-end runs is told to the model on the next request. dir is the
-// absolute path the process now runs in. It is a no-op while
-// agent.include_working_dir is off: the prompt carries no such line then.
+// absolute path the process now runs in. The path also decides where the memo
+// folder is looked up, whether or not the prompt carries a working-directory
+// line (agent.include_working_dir).
 func (a *Agent) SetWorkingDir(dir string) {
 	a.mu.Lock()
+	a.workingDir = dir
 	if a.includeWorkingDir {
 		a.workingDirInfo = WorkingDirectoryInfo(dir)
 	}
@@ -664,9 +674,7 @@ func (a *Agent) runTurn(ctx context.Context, inputs []userInput) {
 	// event to do it.
 	a.bus.Publish(Event{Type: EventTurnStart})
 
-	for _, input := range inputs {
-		a.appendMessage(llm.Message{Role: "user", Content: input.text, Media: input.media})
-	}
+	a.recordInputs(inputs)
 	// Report the context size right away so the frontends show the new user
 	// message while the model call is still in flight.
 	a.bus.Publish(a.usageEvent())
@@ -1245,6 +1253,54 @@ func (a *Agent) appendMessage(m llm.Message) int {
 	idx := len(a.history) - 1
 	a.mu.Unlock()
 	return idx
+}
+
+// recordInputs records the turn's user messages. The first user message of a
+// conversation also carries the memo listing as its engine meta: the folder is
+// scanned right before that message is sent, the listing is stored on the
+// message (a session file keeps it as the message's "meta" field) and every
+// request carrying the message has it appended to the text (see
+// withEngineMeta) — the model reads it, no front-end shows it. Later messages,
+// and the messages of a resumed conversation, add nothing.
+func (a *Agent) recordInputs(inputs []userInput) {
+	if len(inputs) == 0 {
+		return
+	}
+	// The folder is scanned outside the history lock; only the decision "is
+	// this the first user message" needs it.
+	var meta string
+	if !a.hasUserMessage() {
+		meta = a.memoListing()
+	}
+	for i, input := range inputs {
+		msg := llm.Message{Role: "user", Content: input.text, Media: input.media}
+		if i == 0 {
+			msg.Meta = meta
+		}
+		a.appendMessage(msg)
+	}
+}
+
+// hasUserMessage reports whether the conversation already holds a user message,
+// so the turn about to be recorded is a continuation rather than its first one.
+func (a *Agent) hasUserMessage() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, m := range a.history {
+		if m.Role == "user" {
+			return true
+		}
+	}
+	return false
+}
+
+// memoListing renders the memo listing of the conversation's working directory,
+// or "" when the memo folder holds no file.
+func (a *Agent) memoListing() string {
+	a.mu.Lock()
+	dir := a.workingDir
+	a.mu.Unlock()
+	return memoInfo(dir, time.Now())
 }
 
 // buildMessagesLocked renders the full request message list: the system message,

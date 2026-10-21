@@ -263,6 +263,9 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
 * **模型自己的目录**：内置提示词约定临时文件写 `.lightagent/temp/`、项目记忆写
   `.lightagent/memo/`。两者由模型按需创建，程序既不创建也不清理；它们一旦存在，上面那条
   「只剩锁文件就整个删除」的清理不再触发，于是临时文件与记忆跨会话保留（不需要时手动删）。
+  memo 里的文件按 Markdown 存储（每条一个 `.md`，带各级标题）；会话的第一条用户消息发出时，
+  程序会扫描该目录并把文件清单作为引擎信息附加在请求里（见
+  [首条用户消息的引擎信息](#首条用户消息的引擎信息memo-清单)）。
 * 会话文件放在 `.lightagent/sessions/`：每个会话有自己的文件名（`/saveas` 起的名字），
   `session.json` 只是**没有名字**的新会话的默认名；`/list` 列出的即这里的内容。旧布局把会话文件
   直接放在 `.lightagent/`，启动时（持锁后）会**自动移入 `sessions/`**，老会话不会丢。`--session PATH`
@@ -467,6 +470,31 @@ tool 循环里一条超长的反馈（整份文件、读回的图片）、带图
 默认摘要不在系统提示里，而是作为一条独立的 `[engine]` 消息紧跟其后，见
 [上下文压缩](#摘要的放置agentsummary_in_system_prompt)）。内置基础提示词本身不含任何 MCP 文案，
 未启用 MCP 或没有任何 MCP 工具时系统提示词里不会出现 MCP 内容。
+
+## 首条用户消息的引擎信息（memo 清单）
+
+会话的**第一条用户消息**发出时，先扫描工作目录下的 `.lightagent/memo/`：若有文件，就把一份清单
+追加在这条消息的文字之后（只在请求里渲染，CLI / Web 都不显示）。清单按文件更新时间**逆序**，用
+**英文**友好时间（`just now` / `5 minutes ago` / `1 day ago` / `2 months ago` …）与可读大小列出——
+引擎附加的文字一律用英文，不随用户使用的语言变化：
+
+```text
+[engine meta info]
+The memo folder holds these files:
+file     updated    size
+plan.md  1 day ago  1.2 KB
+```
+
+* 清单**只属于第一条用户消息**：扫描结果写进该消息的 `meta` 字段（会话 JSON 里即
+  `{"role":"user","content":"…","meta":"…"}`），随会话保存、恢复后仍在；后续用户消息没有 `meta`，
+  也就不会被追加。恢复一个首条消息没有 `meta` 的旧会话时不再扫描。
+* `meta` 是引擎侧信息：`llm.requestMessages` 在发请求前清掉它，模型的请求里只有被渲染进 `content`
+  的文本；前端、`/history` 与会话列表都只看 `content`，因此用户看到的仍是自己输入的原文。
+* memo 文件夹不存在或为空时**不附加任何内容**。
+* 追加发生在唯一的请求头构建处（`livePrefix.head` → `withEngineMeta`），压缩摘要的调用同样经过它，
+  因此摘要请求的前缀仍与活请求逐字节相同（见[摘要的放置](#摘要的放置agentsummary_in_system_prompt)）。
+* memo 里的每个文件按 Markdown 存储（`.md`，带各级标题）——内置提示词里的约定，见
+  [configuration.md](configuration.md)。
 
 ## MCP 工具发现 / unlock 控制面
 

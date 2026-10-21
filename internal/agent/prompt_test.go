@@ -54,6 +54,19 @@ func TestDefaultSystemPromptHasNoHostState(t *testing.T) {
 	}
 }
 
+// TestDefaultSystemPromptRequiresMarkdownMemos verifies the built-in template
+// states how the memo folder is written: Markdown files (.md) with a heading
+// structure of every level, so the notes stay readable and easy to skim.
+func TestDefaultSystemPromptRequiresMarkdownMemos(t *testing.T) {
+	prompt := DefaultSystemPrompt()
+	if !strings.Contains(prompt, ".md") || !strings.Contains(prompt, "Markdown") {
+		t.Fatalf("built-in prompt must ask for Markdown (.md) memo files:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "heading") {
+		t.Fatalf("built-in prompt must ask for memo headings:\n%s", prompt)
+	}
+}
+
 // TestDefaultSystemPromptLeavesToolUsageToToolDescriptions verifies the template
 // stays a behavior guide: every tool documents its own arguments and edge cases,
 // so the prompt must not enumerate tools or repeat their mechanics.

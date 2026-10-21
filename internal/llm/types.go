@@ -91,6 +91,13 @@ type Message struct {
 	// back on later requests, so a provider with a preserve-thinking chat
 	// template can see the model's own earlier reasoning.
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// Meta is engine-side information stored with the message instead of its
+	// text — the listing of the memo folder the first user message carries, for
+	// instance. A session file keeps it (it is its own json field), no
+	// front-end displays it, and requestMessages drops it, so it never reaches
+	// the provider as a message field: what the model reads is the message
+	// content the agent renders from it.
+	Meta string `json:"meta,omitempty"`
 }
 
 // MarshalJSON encodes the message the way the API expects it: content is a

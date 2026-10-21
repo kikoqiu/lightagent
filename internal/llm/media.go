@@ -286,7 +286,7 @@ func dataURIMime(uri string) string {
 // travel as media, so it travels as a short note naming it. A message that is
 // already wire-shaped comes back unchanged.
 func requestMessages(msgs []Message) []Message {
-	return transformMedia(msgs, func(p ContentPart) (ContentPart, bool) {
+	out := transformMedia(msgs, func(p ContentPart) (ContentPart, bool) {
 		if !p.HasPayload() {
 			return TextPart(missingMediaNote(p)), true
 		}
@@ -297,6 +297,21 @@ func requestMessages(msgs []Message) []Message {
 		p.Mime = ""
 		return p, true
 	})
+	// The engine meta is bookkeeping of the same kind: a session file records
+	// it, the provider never sees it as a field of its own (the agent renders
+	// what the model should read into the message content).
+	copied := false
+	for i, m := range out {
+		if m.Meta == "" {
+			continue
+		}
+		if !copied {
+			out = append([]Message(nil), out...)
+			copied = true
+		}
+		out[i].Meta = ""
+	}
+	return out
 }
 
 // missingMediaNote tells the model about an attachment whose content is gone: its

@@ -167,14 +167,38 @@ type livePrefix struct {
 
 // head renders the fixed head of a request followed by rest: the live system
 // prompt and rest's messages, with the accumulated summary in the place this
-// prefix came with. Both the live calls and the summarizing one build their
-// message list here, so the two cannot drift apart and the summarizing call's
-// prefix stays byte-identical to the live one. The summarizing call is therefore
-// a one-sided (tail-only) extension of the live request: the head it sends is the
-// head the live requests send, the messages being compressed follow unchanged,
-// and the only tokens appended are the summarize instruction at the very end.
+// prefix came with and every message's engine meta appended to its text. Both
+// the live calls and the summarizing one build their message list here, so the
+// two cannot drift apart and the summarizing call's prefix stays byte-identical
+// to the live one. The summarizing call is therefore a one-sided (tail-only)
+// extension of the live request: the head it sends is the head the live requests
+// send, the messages being compressed follow unchanged, and the only tokens
+// appended are the summarize instruction at the very end.
 func (p livePrefix) head(rest []llm.Message) []llm.Message {
-	return headMessages(p.systemPrompt, rest, p.summary, p.summaryInSystemPrompt)
+	return headMessages(p.systemPrompt, withEngineMeta(rest), p.summary, p.summaryInSystemPrompt)
+}
+
+// withEngineMeta returns the messages with each message's engine meta appended
+// to its text: the meta (see llm.Message.Meta) is information the model reads
+// but that no front-end displays and that a session file keeps in its own
+// field, so it is rendered into the content here — the one place every request
+// head is built, the summarizing call included — and nowhere else. Messages
+// without meta are shared, not copied.
+func withEngineMeta(msgs []llm.Message) []llm.Message {
+	out := msgs
+	copied := false
+	for i, m := range msgs {
+		meta := strings.TrimSpace(m.Meta)
+		if meta == "" {
+			continue
+		}
+		if !copied {
+			out = append([]llm.Message(nil), msgs...)
+			copied = true
+		}
+		out[i].Content = strings.TrimRight(m.Content, "\n") + "\n\n" + meta
+	}
+	return out
 }
 
 // headMessages renders the messages a request starts with: the system message,
