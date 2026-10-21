@@ -67,6 +67,19 @@ func TestDefaultSystemPromptRequiresMarkdownMemos(t *testing.T) {
 	}
 }
 
+// TestDefaultSystemPromptGuardsVariableDeletion verifies the built-in template
+// carries the deletion discipline: a script never uses a bare variable as the
+// whole delete target, and a deletion that has to use one goes through a
+// dry-run script file first.
+func TestDefaultSystemPromptGuardsVariableDeletion(t *testing.T) {
+	prompt := DefaultSystemPrompt()
+	for _, want := range []string{"deletion in a script", "prefix or suffix", "dry-run", "script file"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("built-in prompt must carry the deletion discipline (%q missing):\n%s", want, prompt)
+		}
+	}
+}
+
 // TestDefaultSystemPromptLeavesToolUsageToToolDescriptions verifies the template
 // stays a behavior guide: every tool documents its own arguments and edge cases,
 // so the prompt must not enumerate tools or repeat their mechanics.

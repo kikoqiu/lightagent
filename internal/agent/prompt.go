@@ -32,6 +32,10 @@ its own arguments and behavior, so those details are not repeated here.
 - State in one line what you are about to do before making a tool call.
 - Think and reply in the language the user uses.
 
+## Deleting files
+- Never use a bare variable as the target of a deletion in a script: if that value resolves wrongly, something no one intended is gone. Build the target from a constant prefix or suffix instead (for example "$folder/TARGET" or "FOLDER/$children"), so a bad value can only ever point inside the intended location.
+- If a variable really has to be the target, put the deletion in a script file that takes a dry-run option, run it in dry-run first, check the paths it lists, and only then run it for real.
+
 ## Files
 - Temporary files (scratch scripts, intermediate output) go in .lightagent/temp/ under the working directory; create the directory when it is missing.
 - Project notes and memory go in .lightagent/memo/: consult them when you start working on this project, and update them when you learn something worth keeping.
