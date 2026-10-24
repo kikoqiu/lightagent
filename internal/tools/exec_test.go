@@ -1309,8 +1309,9 @@ func skipIfHostCodePageIsLossy(t *testing.T, sample string) {
 }
 
 // TestScriptLanguageSelection covers the selectable `language` set: it starts
-// with the host script engine and gains python exactly when an interpreter was
-// found, advertised together with its version.
+// with the host script engine and gains busybox ash exactly when busybox64u.exe
+// is on PATH and python exactly when an interpreter was found, advertised
+// together with where they live (and, for python, its version).
 func TestScriptLanguageSelection(t *testing.T) {
 	host := hostScriptLanguageID()
 	if host != ScriptLanguagePowerShell && host != ScriptLanguageShell {
@@ -1322,21 +1323,54 @@ func TestScriptLanguageSelection(t *testing.T) {
 		t.Fatalf("language ids = %v, want the host engine %q first", ids, host)
 	}
 
+	// The engine is optional, so the expected set is built from what the host
+	// actually offers; the order is the advertisement order.
+	busybox := systemBusyBox()
 	python := systemPython()
-	if !python.Found {
-		if len(ids) != 1 {
-			t.Fatalf("language ids = %v, want only the host engine when python is absent", ids)
+	want := []string{host}
+	if busybox.Found {
+		want = append(want, ScriptLanguageBusyBox)
+	}
+	if python.Found {
+		want = append(want, ScriptLanguagePython)
+	}
+	if len(ids) != len(want) {
+		t.Fatalf("language ids = %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("language ids = %v, want %v", ids, want)
 		}
-		if summary := scriptLanguageSummary(); strings.Contains(summary, ScriptLanguagePython) {
+	}
+
+	summary := scriptLanguageSummary()
+	if busybox.Found {
+		for _, want := range []string{busyBoxExecutable, busyBoxApplet} {
+			if !strings.Contains(summary, want) {
+				t.Errorf("the summary does not carry %q: %s", want, summary)
+			}
+		}
+		// The BusyBox engine is a choice only: an omitted `language` still
+		// runs the host shell.
+		if got, err := resolveScriptLanguage(""); err != nil || got != host {
+			t.Errorf("resolveScriptLanguage(%q) = %q, %v; want the host engine %q, not busybox", "", got, err, host)
+		}
+	} else {
+		if runtime.GOOS != "windows" && busybox.Path != "" {
+			t.Errorf("a non-Windows host detected %s: %q", busyBoxExecutable, busybox.Path)
+		}
+		if strings.Contains(summary, ScriptLanguageBusyBox) {
+			t.Fatalf("busybox is advertised without an executable: %s", summary)
+		}
+	}
+	if !python.Found {
+		if strings.Contains(summary, ScriptLanguagePython) {
 			t.Fatalf("python is advertised without an interpreter: %s", summary)
 		}
 		return
 	}
-	if len(ids) != 2 || ids[1] != ScriptLanguagePython {
-		t.Fatalf("language ids = %v, want %q after the host engine", ids, ScriptLanguagePython)
-	}
-	if python.Version == "" || !strings.Contains(scriptLanguageSummary(), "Python "+python.Version) {
-		t.Fatalf("the summary does not carry the python version: %s", scriptLanguageSummary())
+	if python.Version == "" || !strings.Contains(summary, "Python "+python.Version) {
+		t.Fatalf("the summary does not carry the python version: %s", summary)
 	}
 }
 
@@ -1522,6 +1556,15 @@ func TestResolveScriptLanguage(t *testing.T) {
 	} else if got, err := resolveScriptLanguage("bash"); err == nil {
 		t.Errorf("resolveScriptLanguage(%q) = %q, %v; want a rejection on a host without a POSIX shell", "bash", got, err)
 	}
+	// The BusyBox alias follows the same rule: it reaches ash only when the
+	// executable is on PATH, and is rejected otherwise.
+	if systemBusyBox().Found {
+		if got, err := resolveScriptLanguage("ash"); err != nil || got != ScriptLanguageBusyBox {
+			t.Errorf("resolveScriptLanguage(%q) = %q, %v; want %q", "ash", got, err, ScriptLanguageBusyBox)
+		}
+	} else if got, err := resolveScriptLanguage("ash"); err == nil {
+		t.Errorf("resolveScriptLanguage(%q) = %q, %v; want a rejection without %s", "ash", got, err, busyBoxExecutable)
+	}
 	if _, err := resolveScriptLanguage("ruby"); err == nil {
 		t.Error("resolveScriptLanguage accepted an unknown language")
 	}
@@ -1662,5 +1705,65 @@ func TestExecCommandPythonLanguageANSIMode(t *testing.T) {
 	})
 	if res.IsError || !strings.Contains(res.ForLLM, sample) {
 		t.Fatalf("python ANSI output was not decoded: %s", res.ForLLM)
+	}
+}
+
+// TestExecCommandBusyBoxLanguage runs a script through the ash interpreter of
+// busybox64u.exe. The engine is optional, so the test skips when the executable
+// is missing. The script prints UTF-8 text and the engine runs with
+// use_utf8=false on purpose: busybox speaks UTF-8 itself, so its bytes must come
+// back unchanged instead of being decoded as the host ANSI code page.
+func TestExecCommandBusyBoxLanguage(t *testing.T) {
+	busybox := systemBusyBox()
+	if !busybox.Found {
+		t.Skipf("%s is not on PATH", busyBoxExecutable)
+	}
+	const script = "echo line-1\necho 中文输出\necho line-3"
+
+	name, args, err := scriptInvocation(ScriptLanguageBusyBox, script, false)
+	if err != nil {
+		t.Fatalf("scriptInvocation: %v", err)
+	}
+	if name != busybox.Path {
+		t.Fatalf("engine = %q, want %q", name, busybox.Path)
+	}
+	wantArgs := []string{busyBoxApplet, "-c", script}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %q, want %q", args, wantArgs)
+	}
+	for i := range wantArgs {
+		if args[i] != wantArgs[i] {
+			t.Fatalf("args = %q, want %q", args, wantArgs)
+		}
+	}
+
+	engine := NewExecEngine(60, 20, false)
+	defer engine.Close()
+	tool := NewRunScriptTool(engine)
+	// The canonical identifier, its alias and a sloppy spelling all reach ash.
+	for _, language := range []string{ScriptLanguageBusyBox, "ash", " BUSYBOX "} {
+		res := tool.Execute(context.Background(), map[string]any{"script": script, "language": language})
+		if res.IsError || !strings.Contains(res.ForLLM, `"status":"completed"`) {
+			t.Fatalf("language %q = %+v, want a completed run", language, res)
+		}
+		for _, want := range []string{"line-1", "中文输出", "line-3"} {
+			if !strings.Contains(res.ForLLM, want) {
+				t.Fatalf("language %q output does not contain %q: %s", language, want, res.ForLLM)
+			}
+		}
+	}
+}
+
+// TestScriptLanguageAlwaysUTF8 pins the engines whose stdio is never converted:
+// only busybox ash speaks UTF-8 by itself, so it keeps the raw bytes in legacy
+// mode too (see ExecEngine.launch).
+func TestScriptLanguageAlwaysUTF8(t *testing.T) {
+	if !scriptLanguageAlwaysUTF8(ScriptLanguageBusyBox) {
+		t.Fatalf("%q must always speak UTF-8", ScriptLanguageBusyBox)
+	}
+	for _, id := range []string{ScriptLanguagePowerShell, ScriptLanguageShell, ScriptLanguagePython, ""} {
+		if scriptLanguageAlwaysUTF8(id) {
+			t.Errorf("%q must follow the use_utf8 mode", id)
+		}
 	}
 }

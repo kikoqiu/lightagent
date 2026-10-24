@@ -172,11 +172,13 @@ func resolveWorkingDir(cwd string) string {
 }
 
 // launch starts script and returns its session. language (see
-// resolveScriptLanguage) selects the script engine: the host shell or a Python
-// interpreter started directly. The returned session is already registered in
-// the session manager. useUTF8 selects the child stdio mode: the bytes are
-// either passed through untouched or converted in Go with the host ANSI code
-// page; see childCodec.
+// resolveScriptLanguage) selects the script engine: the host shell, the ash
+// interpreter of busybox64u, or a Python interpreter started directly. The
+// returned session is already registered in the session manager. useUTF8 selects
+// the child stdio mode: the bytes are either passed through untouched or
+// converted in Go with the host ANSI code page; see childCodec. An engine that
+// speaks UTF-8 itself (busybox ash, see scriptLanguageAlwaysUTF8) always keeps
+// its raw bytes, whatever the mode - converting them would only garble them.
 func (e *ExecEngine) launch(language, script, cwd string, useUTF8 bool) (*ProcessSession, error) {
 	name, args, err := scriptInvocation(language, script, useUTF8)
 	if err != nil {
@@ -187,7 +189,8 @@ func (e *ExecEngine) launch(language, script, cwd string, useUTF8 bool) (*Proces
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
-	if useUTF8 {
+	utf8Stdio := useUTF8 || scriptLanguageAlwaysUTF8(language)
+	if utf8Stdio {
 		cmd.Env = utf8ChildEnvironment(os.Environ())
 	}
 
@@ -196,7 +199,7 @@ func (e *ExecEngine) launch(language, script, cwd string, useUTF8 bool) (*Proces
 		return nil, fmt.Errorf("stdin pipe: %w", err)
 	}
 
-	codec := childCodec(useUTF8)
+	codec := childCodec(utf8Stdio)
 	session := &ProcessSession{
 		ID:        generateSessionID(),
 		Command:   script,
@@ -464,7 +467,8 @@ func (t *RunScriptTool) Description() string {
 		"PYTHONIOENCODING=utf-8, and PYTHONUTF8=1 on Windows so a python the script calls "+
 		"does not fall back to the host code page) and returns the raw bytes; false makes the agent decode the "+
 		"host ANSI code page automatically (stdin is encoded into it as well) - everything "+
-		"else behaves the same, but characters outside the host code page may not be displayed.",
+		"else behaves the same, but characters outside the host code page may not be displayed. "+
+		"The busybox engine speaks UTF-8 itself, so its stdio is returned unchanged in either mode.",
 		t.engine.useUTF8)
 }
 
@@ -508,7 +512,7 @@ func (t *RunScriptTool) Parameters() map[string]any {
 		properties["use_utf8"] = map[string]any{
 			"type":        "boolean",
 			"default":     t.engine.useUTF8,
-			"description": fmt.Sprintf("Stdio encoding for this command (default: %t). true forces PowerShell and Python onto UTF-8: the script gains a UTF-8 preamble ([Console] input/output code pages and $OutputEncoding), PYTHONIOENCODING=utf-8 and (on Windows) PYTHONUTF8=1 are exported, and the output bytes are returned unchanged. false makes the agent decode the host ANSI code page (CP_ACP, e.g. GBK on a zh-CN host) automatically and encode stdin into it; everything else behaves the same, but characters outside the host code page may not be displayed. Use false for a program that only writes the host code page.", t.engine.useUTF8),
+			"description": fmt.Sprintf("Stdio encoding for this command (default: %t). true forces PowerShell and Python onto UTF-8: the script gains a UTF-8 preamble ([Console] input/output code pages and $OutputEncoding), PYTHONIOENCODING=utf-8 and (on Windows) PYTHONUTF8=1 are exported, and the output bytes are returned unchanged. false makes the agent decode the host ANSI code page (CP_ACP, e.g. GBK on a zh-CN host) automatically and encode stdin into it; everything else behaves the same, but characters outside the host code page may not be displayed. Use false for a program that only writes the host code page. The busybox engine always speaks UTF-8, so it is unaffected by either value.", t.engine.useUTF8),
 		}
 	}
 	properties["max_lines"] = map[string]any{

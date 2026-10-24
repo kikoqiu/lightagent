@@ -37,12 +37,17 @@ type Tool interface {
     以 `-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` 运行；该组参数会原样写进
     工具描述（提示已带该参数，**仅当 PowerShell 属于可选 `language` 时**才出现）。非 Windows 为
     `sh`（别名 `bash`/`shell`，`sh -c`）。
+  * `busybox`（别名 `ash`）：**仅在 Windows 上、PATH 里存在 `busybox64u.exe` 时可选**，以
+    `busybox64u.exe ash -c <源码>` 运行 busybox 的 `ash` 解释器（POSIX shell，源码按 sh 脚本写）。
+    该 Unicode 构建**自己就按 UTF-8 读写重定向的 stdio**，所以在任何主机代码页下都不会乱码
+    （见下面的 stdio 编码）。它**只是可选项，不是默认引擎**：省 `language` 仍然走宿主 shell。
   * `python`（别名 `python3`/`py`）：**直接把 Python 解释器当作脚本引擎**（不经 shell，源码以 `-c`
     传给解释器，因此脚本必须是自包含的 Python 程序）。仅当 PATH 上存在可用的 Python 时才可选，并把
     探测到的**版本**与解释器路径写进 **`language` 参数的 `description`**；未安装时该取值**完全不出现**
     ——探测执行一次 `python -V`（5s 超时），Windows 的 Microsoft Store 占位程序会非零退出且不打印
     版本，故不会被误认。
-  * 别名只在对应引擎可选时命中：Windows 上的 `bash`、非 Windows 上的 `ps`，与未知取值一样被拒。
+  * 别名只在对应引擎可选时命中：Windows 上的 `bash`、非 Windows 上的 `ps`、PATH 里没有
+    `busybox64u.exe` 时的 `ash`，与未知取值一样被拒。
   * 其它取值：返回 `unsupported language ...; available: ...`（列出规范全名），不执行任何命令。
 * 子进程 stdio 编码：**参数 `use_utf8` 仅 Windows 存在**，默认取 `tools.exec.use_utf8`，可按次覆盖。
   * `true`：**强制脚本引擎使用 UTF-8**，Go **不做任何转码**。
@@ -55,6 +60,8 @@ type Tool interface {
     `language=python` 时 Python 会按主机代码页写 stdout，正好被解码。除此之外一切行为相同；但
     **非本地 ANSI 字符可能无法显示**——主机代码页表外的字符（例如 Latin-1 主机上的中文、GBK 主机上
     无法映射的符号）只能得到替换字符或乱码。
+  * `language=busybox` 时两种取值都一样：busybox64u 自己就按 UTF-8 读写重定向的 stdio，Go
+    **不做任何转码**（按 ANSI 代码页解码只会把它的输出变成乱码），Python 的 UTF-8 变量照常注入。
   * 非 Windows 主机**没有** `use_utf8` 参数（也没有可回退的 ANSI 代码页）：始终 UTF-8，
     仅额外注入 `PYTHONIOENCODING=utf-8`（没有 ANSI 代码页可回退，也不需要 `PYTHONUTF8`——该变量只在 Windows 导出）。
 * 同步等待最多 `wait_timeout` 秒（默认取 `exec.wait_seconds`，10s）：等的是**进程退出**，窗口内写出的
@@ -72,7 +79,7 @@ type Tool interface {
   **之前**就已入队，长等也不会开始——信号在那时已经触发。
 * 硬超时 `run_timeout`（默认取 `exec.timeout_seconds`，3600s）到点强制结束进程；
   `run_timeout=0` 关闭硬超时。
-* 每次调用都是一个会话，会话的根进程（宿主 shell 或 Python 解释器）是它**自己进程树的根**：
+* 每次调用都是一个会话，会话的根进程（宿主 shell、busybox 或 Python 解释器）是它**自己进程树的根**：
   结束会话 / 硬超时 / lightagent 退出时整棵树一起结束（[进程树与退出](architecture.md#进程树与退出)）。
   窗口内就等到退出时，退出状态（输出 + `exit_code`）已在回答里，会话当场离开会话池；转后台的会话
   保留到 `poll` 取走它的退出状态为止（没人取走的僵尸最多留 24 小时，见 [`manage_session`](#manage_session)）。
@@ -109,12 +116,12 @@ type Tool interface {
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `script` | string | 必填 | **脚本源码**：`language` 所选语言的源代码——**是文本本身，不是脚本文件路径**；原样交给该引擎当作一个程序执行（shell 引擎即 shell 脚本，`python` 即 Python 源码） |
-| `language` | string | 宿主引擎（`powershell` / `sh`，即宿主 shell） | **解释 `script` 的引擎**：决定源码是哪种语言、由什么执行（是引擎选择，不是调用标签）；**省略/留空即用宿主 shell**。可选值由 schema 的 `enum` 按主机给出（`powershell`/`sh`，以及存在时的 `python`——规范全名，另接受别名 `ps`/`pwsh`、`bash`/`shell`、`python3`/`py`）；参数自带的 `description` 逐条说明各取值含义、别名与 Python 版本，**工具描述只讲机制** |
+| `script` | string | 必填 | **脚本源码**：`language` 所选语言的源代码——**是文本本身，不是脚本文件路径**；原样交给该引擎当作一个程序执行（shell 引擎即 shell 脚本，`busybox` 即 ash 脚本，`python` 即 Python 源码） |
+| `language` | string | 宿主引擎（`powershell` / `sh`，即宿主 shell） | **解释 `script` 的引擎**：决定源码是哪种语言、由什么执行（是引擎选择，不是调用标签）；**省略/留空即用宿主 shell**（`busybox` 不是默认引擎）。可选值由 schema 的 `enum` 按主机给出（`powershell`/`sh`，PATH 里有 `busybox64u.exe` 时的 `busybox`，以及存在时的 `python`——规范全名，另接受别名 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py`）；参数自带的 `description` 逐条说明各取值含义、别名与 Python 版本，**工具描述只讲机制** |
 | `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回）。**大于默认值**时这段等待还会让位于新的用户消息：消息到达即结束等待，进程留在后台（`status=running` + `session_id`），回答带 `warning` 与到那一刻的输出（见上） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |
-| `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。见上 |
+| `use_utf8` | bool | `exec.use_utf8` | **仅 Windows**：`true` 强制脚本引擎使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 自动按主机 ANSI 代码页解码（其余行为相同，但非本地 ANSI 字符可能无法显示）。`busybox` 引擎两种取值都按 UTF-8 原样交付。见上 |
 | `max_lines` | int | `exec.max_lines`（50） | **本次调用**返回的行数上限（头尾折叠；不跨调用累计）。最多可以给到 `exec.max_lines_max`（100），要得更多**自动截断到最大值**。重要输出建议重定向到文件（`> out.txt` / `2>&1`）再用文件工具读回 |
 | `max_chars` | int | `30000` | **本次调用**返回的字符上限（不跨调用累计） |
 
@@ -148,6 +155,12 @@ type Tool interface {
 
 ```json
 { "script": "import sys\nprint(sys.version)\nprint(2 ** 10)", "language": "python" }
+```
+
+示例（busybox ash，仅在 Windows 上 PATH 里有 `busybox64u.exe` 时可选）：
+
+```json
+{ "script": "ls -la", "language": "busybox" }
 ```
 
 ---

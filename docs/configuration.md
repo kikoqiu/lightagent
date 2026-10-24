@@ -183,7 +183,7 @@
 | `exec.wait_seconds` | int | `10` | `wait_timeout` 的默认同步等待秒数 |
 | `exec.max_lines` | int | `50` | `run_script` / `manage_session` 的 `max_lines` **参数的默认值**。一次回答最多带多少行。`0`/负数回退到内置 50 |
 | `exec.max_lines_max` | int | `100` | 上面那个参数的**最大值**。调用要得更多就截断到它。`0`/负数回退到内置 100。小于 `max_lines` 时把 `max_lines` 降到它 |
-| `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `run_script` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示 |
+| `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `run_script` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示。`busybox` 引擎自己就写/读 UTF-8，两种取值下都原样交付 |
 | `read_file_lines.enabled` | bool | `true` | 启用行读取工具 |
 | `read_file_lines.max_read_file_size` | int | `32000` | 单次读取字节预算 |
 | `read_file_lines.max_read_file_lines` | int | `200` | 单次读取行数预算 |
@@ -206,8 +206,9 @@
   需要旧的 ANSI 代码页转换时显式写 `"use_utf8": false`。它只是默认值——`run_script` 的
   `use_utf8` 参数可由模型按次调用覆盖。该字段与参数**只在 Windows 生效**（非 Windows 无 ANSI
   代码页可回退，始终 UTF-8）。`run_script` 的脚本语言由 `language` 参数选择（宿主引擎
-  `powershell`/`sh`，以及系统存在 Python 时的 `python`；规范全名，另接受 `ps`/`pwsh`、
-  `bash`/`shell`、`python3`/`py` 等别名），细节见 [tools.md](tools.md#run_script)。
+  `powershell`/`sh`，Windows 上 PATH 里有 `busybox64u.exe` 时的 `busybox`，以及系统存在 Python 时的
+  `python`；规范全名，另接受 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py` 等别名；`busybox`
+  只是可选项，**省略 `language` 仍走宿主 shell**），细节见 [tools.md](tools.md#run_script)。
 
 * `exec.max_lines` / `exec.max_lines_max` 是同一对参数（默认值 / 最大值）。两者一起管
   `run_script` 与 `manage_session` 的 `max_lines`。省略参数时用 `max_lines`。要得比

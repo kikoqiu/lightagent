@@ -23,6 +23,11 @@ const (
 	// engine is the POSIX shell; it is the non-Windows counterpart of
 	// ScriptLanguagePowerShell.
 	ScriptLanguageShell = "sh"
+	// ScriptLanguageBusyBox runs the script through the ash interpreter of
+	// busybox64u.exe found on PATH. ash is a POSIX shell, so the source reads
+	// like a sh script; the busybox64u build speaks UTF-8 on redirected stdio,
+	// so its bytes never go through the host code page conversion.
+	ScriptLanguageBusyBox = "busybox"
 	// ScriptLanguagePython runs the script with a Python interpreter started
 	// directly, without a shell in between.
 	ScriptLanguagePython = "python"
@@ -110,6 +115,49 @@ func pythonVersion(path string) (string, bool) {
 	return match[1], true
 }
 
+// busyBoxExecutable is the binary probed for the BusyBox script engine on
+// Windows. Only the Unicode build (the trailing "u") is supported: it reads and
+// writes UTF-8 on redirected stdio, so the host ANSI code page never garbles its
+// output.
+const busyBoxExecutable = "busybox64u.exe"
+
+// busyBoxApplet is the applet the BusyBox script engine runs: ash, the POSIX
+// shell of busybox. It receives the whole source through `-c`.
+const busyBoxApplet = "ash"
+
+// busyBoxProgram is a busybox64u binary found on PATH.
+type busyBoxProgram struct {
+	Path  string
+	Found bool
+}
+
+var (
+	systemBusyBoxOnce sync.Once
+	systemBusyBoxVal  busyBoxProgram
+)
+
+// systemBusyBox returns the cached busybox64u detection result.
+func systemBusyBox() busyBoxProgram {
+	systemBusyBoxOnce.Do(func() { systemBusyBoxVal = detectBusyBox() })
+	return systemBusyBoxVal
+}
+
+// detectBusyBox looks for busybox64u.exe on PATH. The engine is Windows-only:
+// the binary is a Windows build and the ANSI host code page is what makes its
+// always-UTF-8 stdio worth offering, so every other host reports none. Found
+// stays false when the executable is missing, so the language is then never
+// advertised.
+func detectBusyBox() busyBoxProgram {
+	if runtime.GOOS != "windows" {
+		return busyBoxProgram{}
+	}
+	path, err := exec.LookPath(busyBoxExecutable)
+	if err != nil || path == "" {
+		return busyBoxProgram{}
+	}
+	return busyBoxProgram{Path: path, Found: true}
+}
+
 // hostScriptLanguageID is the `language` value that runs the script through the
 // host shell: PowerShell on Windows, the POSIX shell elsewhere.
 func hostScriptLanguageID() string {
@@ -136,11 +184,21 @@ func hostScriptLanguageOption() scriptLanguageOption {
 }
 
 // scriptLanguageOptions lists the selectable languages: the host script engine
-// first, then Python once a usable interpreter was found on PATH. Python is
-// omitted entirely when it is not installed, so the model never picks an engine
-// that cannot run.
+// first, then busybox ash when busybox64u.exe is on PATH, then Python once a
+// usable interpreter was found on PATH. An engine that cannot run here is
+// omitted entirely, so the model never picks one that is missing. The host
+// engine stays first because it is what a call that omits `language` runs; the
+// BusyBox engine is offered as a choice only, never as the default.
 func scriptLanguageOptions() []scriptLanguageOption {
 	options := []scriptLanguageOption{hostScriptLanguageOption()}
+	if busybox := systemBusyBox(); busybox.Found {
+		options = append(options, scriptLanguageOption{
+			ID:      ScriptLanguageBusyBox,
+			Aliases: []string{"ash"},
+			Hint: "POSIX shell script, ash interpreter of " + busybox.Path +
+				" (busybox64u, always UTF-8)",
+		})
+	}
 	if python := systemPython(); python.Found {
 		options = append(options, scriptLanguageOption{
 			ID:      ScriptLanguagePython,
@@ -249,9 +307,19 @@ func resolveScriptLanguage(raw string) (string, error) {
 // scriptInvocation resolves the program and argument vector that runs script in
 // the given language. language must come from resolveScriptLanguage; useUTF8 only
 // affects the host shell, which gains the UTF-8 preamble in that mode (Python is
-// told to speak UTF-8 through the child environment, see launch).
+// told to speak UTF-8 through the child environment, see launch; busybox ash
+// always speaks UTF-8, see scriptLanguageAlwaysUTF8).
 func scriptInvocation(language, script string, useUTF8 bool) (string, []string, error) {
 	switch language {
+	case ScriptLanguageBusyBox:
+		busybox := systemBusyBox()
+		if !busybox.Found {
+			return "", nil, fmt.Errorf("language %q is unavailable: %s was not found on PATH", ScriptLanguageBusyBox, busyBoxExecutable)
+		}
+		// The busybox binary is started directly and names the applet, so
+		// the process tree is rooted at busybox itself; ash receives the
+		// whole source through `-c`.
+		return busybox.Path, []string{busyBoxApplet, "-c", script}, nil
 	case ScriptLanguagePython:
 		python := systemPython()
 		if !python.Found {
@@ -281,4 +349,13 @@ func execUseUTF8(requested bool) bool {
 		return true
 	}
 	return requested
+}
+
+// scriptLanguageAlwaysUTF8 reports whether the engine speaks UTF-8 on redirected
+// stdio no matter what the host code page is, so its bytes must never be
+// converted. busybox64u is a Unicode build: it reads and writes UTF-8 even on an
+// ANSI host, which is why the language is useful there. A call that runs it in
+// legacy mode therefore still gets the raw bytes (see ExecEngine.launch).
+func scriptLanguageAlwaysUTF8(language string) bool {
+	return language == ScriptLanguageBusyBox
 }
