@@ -1767,3 +1767,169 @@ func TestScriptLanguageAlwaysUTF8(t *testing.T) {
 		}
 	}
 }
+
+// defaultLanguageScript is the source that prints marker in the given engine,
+// for the tests that exercise a configured default engine end to end.
+func defaultLanguageScript(language, marker string) string {
+	switch language {
+	case ScriptLanguagePython:
+		return "print(\"" + marker + "\")"
+	case ScriptLanguagePowerShell:
+		return "Write-Output '" + marker + "'"
+	}
+	return "echo " + marker
+}
+
+// languageParameter returns the `language` parameter of a run_script schema
+// together with its description.
+func languageParameter(t *testing.T, tool *RunScriptTool) (map[string]any, string) {
+	t.Helper()
+	props, _ := tool.Parameters()["properties"].(map[string]any)
+	param, ok := props["language"].(map[string]any)
+	if !ok {
+		t.Fatal("language is missing from the run_script parameters")
+	}
+	description, _ := param["description"].(string)
+	return param, description
+}
+
+// TestExecDefaultLanguageResolution covers tools.exec.default_language at the
+// engine level: a new engine keeps the host shell, every engine this host can
+// run becomes the default when configured (by identifier or alias), and an empty
+// value, an unknown name or an engine this host cannot offer falls back to the
+// host shell.
+func TestExecDefaultLanguageResolution(t *testing.T) {
+	host := hostScriptLanguageID()
+	engine := NewExecEngine(60, 10, true)
+	defer engine.Close()
+
+	if got := engine.DefaultLanguage(); got != host {
+		t.Fatalf("a new engine defaults to %q, want the host shell %q", got, host)
+	}
+	if got, err := engine.resolveLanguage(""); err != nil || got != host {
+		t.Fatalf("resolveLanguage(%q) = %q, %v; want the host engine %q", "", got, err, host)
+	}
+
+	// Nothing configured (empty or blank) keeps the host shell and reports that
+	// it applied as asked.
+	for _, name := range []string{"", "   "} {
+		if got, ok := engine.SetDefaultLanguage(name); !ok || got != host {
+			t.Fatalf("SetDefaultLanguage(%q) = %q, %v; want the host engine %q", name, got, ok, host)
+		}
+	}
+	// The other host's shell, an unknown name and a typo all fall back, and say
+	// so through ok=false.
+	absent := ScriptLanguageShell
+	if host == ScriptLanguageShell {
+		absent = ScriptLanguagePowerShell
+	}
+	for _, name := range []string{absent, "ruby", " pythn "} {
+		if got, ok := engine.SetDefaultLanguage(name); ok || got != host {
+			t.Fatalf("SetDefaultLanguage(%q) = %q, %v; want the host fallback %q with ok=false", name, got, ok, host)
+		}
+	}
+
+	// Every engine this host actually offers is accepted, spelled as the
+	// identifier or as one of its aliases, and becomes what an omitted
+	// `language` resolves to; an explicit value still wins over the default.
+	for _, option := range scriptLanguageOptions() {
+		for _, spelling := range append([]string{option.ID}, option.Aliases...) {
+			if got, ok := engine.SetDefaultLanguage(spelling); !ok || got != option.ID {
+				t.Fatalf("SetDefaultLanguage(%q) = %q, %v; want %q", spelling, got, ok, option.ID)
+			}
+			if got := engine.DefaultLanguage(); got != option.ID {
+				t.Fatalf("DefaultLanguage() = %q, want %q", got, option.ID)
+			}
+			if got, err := engine.resolveLanguage(""); err != nil || got != option.ID {
+				t.Fatalf("resolveLanguage(%q) = %q, %v; want the configured default %q", "", got, err, option.ID)
+			}
+			if got, err := engine.resolveLanguage(" " + strings.ToUpper(host) + " "); err != nil || got != host {
+				t.Fatalf("an explicit language must win over the default: %q, %v", got, err)
+			}
+		}
+	}
+	// An unknown explicit value is still rejected, whatever the default is.
+	if _, err := engine.resolveLanguage("ruby"); err == nil {
+		t.Error("resolveLanguage accepted an unknown language")
+	}
+}
+
+// TestExecDefaultLanguageToolSurface covers the prompt side and a real run: the
+// `language` schema default, its description and the example all name the engine
+// that is actually in effect, a call that omits `language` runs it, an explicit
+// language still overrides it, and an engine this host cannot offer is neither
+// adopted nor advertised.
+func TestExecDefaultLanguageToolSurface(t *testing.T) {
+	host := hostScriptLanguageID()
+	chosen, script := "", ""
+	for _, option := range scriptLanguageOptions() {
+		if option.ID == host {
+			continue
+		}
+		if option.ID == ScriptLanguageBusyBox || option.ID == ScriptLanguagePython {
+			chosen, script = option.ID, defaultLanguageScript(option.ID, "default-engine-ok")
+			break
+		}
+	}
+	if chosen == "" {
+		t.Skip("no configurable script engine besides the host shell on this host")
+	}
+
+	engine := NewExecEngine(60, 20, true)
+	defer engine.Close()
+	if got, ok := engine.SetDefaultLanguage(chosen); !ok || got != chosen {
+		t.Fatalf("SetDefaultLanguage(%q) = %q, %v", chosen, got, ok)
+	}
+	tool := NewRunScriptTool(engine)
+	param, paramDesc := languageParameter(t, tool)
+	if param["default"] != chosen {
+		t.Fatalf("language default = %v, want the configured engine %q", param["default"], chosen)
+	}
+	if !strings.Contains(paramDesc, "(`"+chosen+"`") || strings.Contains(paramDesc, "the host shell") {
+		t.Fatalf("the parameter description does not name the effective default engine: %s", paramDesc)
+	}
+	if !strings.Contains(paramDesc, "the default engine (`"+chosen+"`)") {
+		t.Fatalf("the parameter description does not state the default engine plainly: %s", paramDesc)
+	}
+	// The model cannot act on a configuration key: the description names the
+	// engine only, never how the host was configured.
+	if strings.Contains(paramDesc, "tools.exec.") {
+		t.Fatalf("the parameter description leaks a configuration key: %s", paramDesc)
+	}
+	if desc := tool.Description(); !strings.Contains(desc, "default engine `"+chosen+"`") ||
+		!strings.Contains(desc, runScriptExample(chosen)) {
+		t.Fatalf("the tool description does not show the effective default engine: %s", desc)
+	}
+
+	// A call that omits `language` really runs the configured engine.
+	res := tool.Execute(context.Background(), map[string]any{"script": script})
+	if res.IsError || !strings.Contains(res.ForLLM, `"status":"completed"`) ||
+		!strings.Contains(res.ForLLM, "default-engine-ok") {
+		t.Fatalf("the configured default engine did not run the script: %+v", res)
+	}
+	// An explicit language still overrides the default.
+	res = tool.Execute(context.Background(), map[string]any{
+		"script": defaultLanguageScript(host, "explicit-engine-ok"), "language": host,
+	})
+	if res.IsError || !strings.Contains(res.ForLLM, "explicit-engine-ok") {
+		t.Fatalf("an explicit language did not override the default: %+v", res)
+	}
+
+	// An engine this host cannot run is not adopted and not advertised: the
+	// prompt keeps naming the engine that is really in effect.
+	absent := ScriptLanguageShell
+	if host == ScriptLanguageShell {
+		absent = ScriptLanguagePowerShell
+	}
+	if got, ok := engine.SetDefaultLanguage(absent); ok || got != host {
+		t.Fatalf("SetDefaultLanguage(%q) = %q, %v; want the host fallback", absent, got, ok)
+	}
+	param, paramDesc = languageParameter(t, tool)
+	if param["default"] != host || !strings.Contains(paramDesc, "the host shell (`"+host+"`)") {
+		t.Fatalf("the prompt did not fall back to the host shell: default %v, %s", param["default"], paramDesc)
+	}
+	if desc := tool.Description(); strings.Contains(desc, "default engine `"+absent+"`") ||
+		!strings.Contains(desc, "default engine `"+host+"`") {
+		t.Fatalf("the tool description advertises an engine that is not in effect: %s", desc)
+	}
+}

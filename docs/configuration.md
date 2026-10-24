@@ -65,7 +65,9 @@
     "password": ""                         // 登录密码（明文保存）；非空时程序再补上 password_salt
   },
   "tools": {
-    "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10, "max_lines": 50, "max_lines_max": 100, "use_utf8": true },
+    // default_language：省略 language 时运行的引擎（powershell/sh/busybox/python 或别名 ash/py/...）；
+    // 空 = 宿主 shell，配置的引擎本机不可用时同样回退宿主 shell
+    "exec":            { "enabled": true, "timeout_seconds": 3600, "wait_seconds": 10, "max_lines": 50, "max_lines_max": 100, "use_utf8": true, "default_language": "" },
     "read_file_lines": { "enabled": true, "max_read_file_size": 32000, "max_read_file_lines": 200 },
     "write_file":      { "enabled": true, "max_lines": 200, "auto_split": true },
     "edit_file":       { "enabled": true },
@@ -181,6 +183,7 @@
 | `exec.enabled` | bool | `true` | 启用 `run_script` 与 `manage_session` |
 | `exec.timeout_seconds` | int | `3600` | `run_timeout` 的默认硬超时 |
 | `exec.wait_seconds` | int | `10` | `wait_timeout` 的默认同步等待秒数 |
+| `exec.default_language` | string | 空（宿主 shell） | `run_script` **省略 `language` 时运行的引擎**：`powershell`/`sh`/`busybox`/`python`，或别名 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py`。**只有本机真能运行的引擎才生效**：留空、拼错、`busybox64u.exe` 不在 PATH、没装 Python 都回退到宿主 shell（启动时有一行提示）；实际生效的引擎会写进工具 schema 的 `default`、参数描述与示例。**重启后生效** |
 | `exec.max_lines` | int | `50` | `run_script` / `manage_session` 的 `max_lines` **参数的默认值**。一次回答最多带多少行。`0`/负数回退到内置 50 |
 | `exec.max_lines_max` | int | `100` | 上面那个参数的**最大值**。调用要得更多就截断到它。`0`/负数回退到内置 100。小于 `max_lines` 时把 `max_lines` 降到它 |
 | `exec.use_utf8` | bool | `true` | **仅 Windows**：stdio 编码模式（默认值，可被 `run_script` 的同名参数按次覆盖）：`true` 强制脚本引擎（PowerShell 与 Python）使用 UTF-8（PowerShell 前置头 + `PYTHONIOENCODING=utf-8`，Windows 上另加 `PYTHONUTF8=1`），Go 不转码；`false` 由 agent 按主机 ANSI 代码页（`GetACP`）自动解码，其余行为相同，但非本地 ANSI 字符可能无法显示。`busybox` 引擎自己就写/读 UTF-8，两种取值下都原样交付 |
@@ -208,7 +211,16 @@
   代码页可回退，始终 UTF-8）。`run_script` 的脚本语言由 `language` 参数选择（宿主引擎
   `powershell`/`sh`，Windows 上 PATH 里有 `busybox64u.exe` 时的 `busybox`，以及系统存在 Python 时的
   `python`；规范全名，另接受 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py` 等别名；`busybox`
-  只是可选项，**省略 `language` 仍走宿主 shell**），细节见 [tools.md](tools.md#run_script)。
+  只是可选项，**省略 `language` 默认仍走宿主 shell**，除非配置了 `exec.default_language`——见下一条），
+  细节见 [tools.md](tools.md#run_script)。
+
+* `exec.default_language` 决定**省略 `language` 时用哪个引擎**（默认空 = 宿主 shell）。取值按
+  `language` 的同一套表解析（规范全名或别名），并在**启动时**与本机实际能运行的引擎对照：
+  空值、拼错、`busybox64u.exe` 不在 PATH、没装 Python 都**回退到宿主 shell**，启动日志里会有一行
+  说明（例如 `run_script: default script language "busybox" is not available on this host; using
+  "powershell"`）。工具 schema 里 `language` 的 `default`、参数描述的 `Omit to use ...` 与工具描述
+  里的示例都取**实际生效**的那个引擎，因此提示词不会指向跑不了的引擎；显式给出 `language` 时仍以
+  调用为准。**改完需重启**（Web 配置编辑器同样提示）。
 
 * `exec.max_lines` / `exec.max_lines_max` 是同一对参数（默认值 / 最大值）。两者一起管
   `run_script` 与 `manage_session` 的 `max_lines`。省略参数时用 `max_lines`。要得比

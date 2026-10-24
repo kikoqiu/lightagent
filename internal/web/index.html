@@ -10,15 +10,17 @@
   // as markdown in the browser, whether tool results are shown, the command
   // rail (the shared slash catalogue, so the page and the CLI agree), the
   // media capability (which types an attachment may have, and how large one may
-  // be), the active interface name and the provider list (the line under the
-  // logo and the model dropdown), and whether the mirror can restart the
-  // program at all (the config panel's Restart needs it). Sessions are cookie
-  // based, so no token is needed here (see auth.js).
+  // be), the script engines run_script offers here (the config panel's default
+  // engine control is picked from them), the active interface name and the
+  // provider list (the line under the logo and the model dropdown), and whether
+  // the mirror can restart the program at all (the config panel's Restart needs
+  // it). Sessions are cookie based, so no token is needed here (see auth.js).
   window.__LIGHTAGENT__ = {
     markdown: __LIGHTAGENT_MARKDOWN__,
     result: __LIGHTAGENT_RESULT__,
     commands: __LIGHTAGENT_COMMANDS__,
     media: __LIGHTAGENT_MEDIA__,
+    scripts: __LIGHTAGENT_SCRIPTS__,
     restart: __LIGHTAGENT_RESTART__,
     name: __LIGHTAGENT_NAME__,
     apis: __LIGHTAGENT_APIS__

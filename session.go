@@ -111,6 +111,13 @@ func runSession(o *options, stdout io.Writer) error {
 	if cfg.Tools.Exec.Enabled {
 		engine := tools.NewExecEngine(cfg.Tools.Exec.TimeoutSeconds, cfg.Tools.Exec.WaitSeconds, cfg.Tools.Exec.UseUTF8)
 		engine.SetMaxLines(cfg.Tools.Exec.MaxLines, cfg.Tools.Exec.MaxLinesMax)
+		// The engine a call that omits `language` runs (tools.exec.default_language).
+		// An engine this host cannot run is not adopted: the host shell stays the
+		// default, and the line below says why the setting did not apply.
+		if language, ok := engine.SetDefaultLanguage(cfg.Tools.Exec.DefaultLanguage); !ok {
+			info("run_script: default script language %q is not available on this host; using %q\n",
+				cfg.Tools.Exec.DefaultLanguage, language)
+		}
 		defer engine.Close()
 		reg.Register(tools.NewRunScriptTool(engine))
 		reg.Register(tools.NewManageSessionTool(engine))

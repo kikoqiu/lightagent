@@ -29,7 +29,11 @@ type Tool interface {
 执行脚本，采用「等待后转后台」模型。
 
 * 脚本语言由 `language` 选择，可选值**按当前主机动态生成**（探测不到的引擎不会出现在提示词里）；
-  **省略该参数时使用宿主 shell**（即下面的宿主脚本引擎，与旧版行为一致）。取值是**规范全名**（schema 的
+  **省略该参数时使用默认引擎**：没配置 `tools.exec.default_language` 时就是宿主 shell（即下面的
+  宿主脚本引擎，与旧版行为一致），配置了且该引擎在本机真能运行时则用配置的那个——跑不了的取值
+  （空值、拼错、解释器缺失）回退到宿主 shell，见
+  [configuration.md](configuration.md#tools)。默认引擎只决定「省略 `language`」时跑什么，`enum`
+  里的可选值与顺序不变。取值是**规范全名**（schema 的
   `enum` 列出的就是它们），同时接受常见别名——模型按引擎惯用写法给出的值照样命中；别名逐条列在
   `language` 参数的 `description` 里（**工具描述只讲机制，不再列举取值**，可选值由 `enum` 与参数自己
   的 `description` 表达）：
@@ -40,7 +44,8 @@ type Tool interface {
   * `busybox`（别名 `ash`）：**仅在 Windows 上、PATH 里存在 `busybox64u.exe` 时可选**，以
     `busybox64u.exe ash -c <源码>` 运行 busybox 的 `ash` 解释器（POSIX shell，源码按 sh 脚本写）。
     该 Unicode 构建**自己就按 UTF-8 读写重定向的 stdio**，所以在任何主机代码页下都不会乱码
-    （见下面的 stdio 编码）。它**只是可选项，不是默认引擎**：省 `language` 仍然走宿主 shell。
+    （见下面的 stdio 编码）。它**不会自动成为默认引擎**：是否作为默认只由 `tools.exec.default_language`
+    决定（未配置时省略 `language` 仍走宿主 shell）。
   * `python`（别名 `python3`/`py`）：**直接把 Python 解释器当作脚本引擎**（不经 shell，源码以 `-c`
     传给解释器，因此脚本必须是自包含的 Python 程序）。仅当 PATH 上存在可用的 Python 时才可选，并把
     探测到的**版本**与解释器路径写进 **`language` 参数的 `description`**；未安装时该取值**完全不出现**
@@ -117,7 +122,7 @@ type Tool interface {
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `script` | string | 必填 | **脚本源码**：`language` 所选语言的源代码——**是文本本身，不是脚本文件路径**；原样交给该引擎当作一个程序执行（shell 引擎即 shell 脚本，`busybox` 即 ash 脚本，`python` 即 Python 源码） |
-| `language` | string | 宿主引擎（`powershell` / `sh`，即宿主 shell） | **解释 `script` 的引擎**：决定源码是哪种语言、由什么执行（是引擎选择，不是调用标签）；**省略/留空即用宿主 shell**（`busybox` 不是默认引擎）。可选值由 schema 的 `enum` 按主机给出（`powershell`/`sh`，PATH 里有 `busybox64u.exe` 时的 `busybox`，以及存在时的 `python`——规范全名，另接受别名 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py`）；参数自带的 `description` 逐条说明各取值含义、别名与 Python 版本，**工具描述只讲机制** |
+| `language` | string | 默认引擎（未配置时即宿主 shell `powershell` / `sh`） | **解释 `script` 的引擎**：决定源码是哪种语言、由什么执行（是引擎选择，不是调用标签）；**省略/留空即用默认引擎**（`tools.exec.default_language`，未配置或该引擎在本机不可用时为宿主 shell；`busybox` 也不会自动成为默认）。可选值由 schema 的 `enum` 按主机给出（`powershell`/`sh`，PATH 里有 `busybox64u.exe` 时的 `busybox`，以及存在时的 `python`——规范全名，另接受别名 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py`）；参数自带的 `description` 逐条说明各取值含义、别名、Python 版本与**实际生效**的默认引擎，**工具描述只讲机制** |
 | `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回）。**大于默认值**时这段等待还会让位于新的用户消息：消息到达即结束等待，进程留在后台（`status=running` + `session_id`），回答带 `warning` 与到那一刻的输出（见上） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |
 | `cwd` | string | 进程工作目录 | 子进程工作目录 |

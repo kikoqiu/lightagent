@@ -60,6 +60,29 @@
   // array; providers is the ordered interface array, which the flat path model
   // cannot express and a dedicated repeater owns (see the providers repeater
   // below).
+
+  // The engines run_script offers on this host (its `language` enum, injected by
+  // the server). The default-language control is picked from them, so the form
+  // never offers an engine this host cannot run; a value already in the file that
+  // is not in the list is added as its own option by syncForm, so an old setting
+  // stays visible until it is changed.
+  var SCRIPT_LANGUAGES = (window.__LIGHTAGENT__ && window.__LIGHTAGENT__.scripts) || [];
+  var SCRIPT_LANGUAGE_NOTES = {
+    powershell: 'host shell',
+    sh: 'host shell',
+    busybox: 'ash from busybox64u.exe, always UTF-8',
+    python: 'detected Python interpreter'
+  };
+
+  function scriptLanguageChoices() {
+    var options = [{ value: '', label: 'auto — the host shell' }];
+    for (var i = 0; i < SCRIPT_LANGUAGES.length; i++) {
+      var id = SCRIPT_LANGUAGES[i];
+      options.push({ value: id, label: SCRIPT_LANGUAGE_NOTES[id] ? id + ' — ' + SCRIPT_LANGUAGE_NOTES[id] : id });
+    }
+    return options;
+  }
+
   var SCHEMA = [
     {
       title: 'Providers', note: 'one entry per endpoint; the first enabled one is used at startup', open: true,
@@ -94,6 +117,7 @@
       title: 'Tools · shell', note: 'run_script / manage_session',
       fields: [
         { path: 'tools.exec.enabled', type: 'bool', help: 'register the shell tools' },
+        { path: 'tools.exec.default_language', type: 'select', options: scriptLanguageChoices(), help: 'engine an omitted language runs; only the engines this host can run are offered, and a value whose engine is missing (or a typo) falls back to the host shell' },
         { path: 'tools.exec.timeout_seconds', type: 'number', min: 1, help: 'hard limit for one command' },
         { path: 'tools.exec.wait_seconds', type: 'number', min: 1, help: 'how long to wait before a command moves to a background session' },
         { path: 'tools.exec.max_lines', type: 'number', min: 1, help: 'default of the max_lines parameter of run_script and manage_session: lines one answer may carry' },

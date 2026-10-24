@@ -363,6 +363,16 @@ type ExecToolConfig struct {
 	// true; loading starts from the defaults, so an explicit "use_utf8": false
 	// is required to fall back to the legacy ANSI code page conversion.
 	UseUTF8 bool `json:"use_utf8"`
+	// DefaultLanguage picks the script engine run_script uses when a call
+	// leaves `language` out: an engine identifier the tool offers (powershell,
+	// sh, busybox, python) or one of its aliases (ps, pwsh, bash, shell, ash,
+	// python3, py). It only takes effect when that engine can actually run
+	// here - an empty value, an unknown name, or an engine whose interpreter
+	// is not installed all fall back to the host shell, so the default is
+	// always runnable. The engine that is actually in effect (not the
+	// configured spelling) is what the tool schema and its description
+	// advertise. The setting is read at startup: restart to apply a change.
+	DefaultLanguage string `json:"default_language,omitempty"`
 }
 
 // FsToolConfig configures the line-oriented reader.

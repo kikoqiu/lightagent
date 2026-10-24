@@ -287,16 +287,25 @@ func scriptLanguageSummary() string {
 // resolveScriptLanguage normalizes a `language` argument and checks it against
 // the selectable set. The spelling is matched case-insensitively against the
 // canonical identifiers and their aliases (ps/pwsh for powershell, bash/shell
-// for sh, python3/py for python), so a model that spells an engine the way it is
-// usually written still reaches it; an alias of an engine this host does not
-// offer is rejected like any other unavailable value. An empty value (the
-// parameter's default) selects the host script engine, i.e. the shell -
-// PowerShell on Windows, sh elsewhere - which keeps calls that omit the
-// parameter behaving as before.
+// for sh, ash for busybox, python3/py for python), so a model that spells an
+// engine the way it is usually written still reaches it; an alias of an engine
+// this host does not offer is rejected like any other unavailable value. An
+// empty value (the parameter's default) selects the host script engine, i.e.
+// the shell - PowerShell on Windows, sh elsewhere. A run_script call resolves
+// its parameter through ExecEngine.resolveLanguage instead, which uses the
+// configured default engine (see SetDefaultLanguage).
 func resolveScriptLanguage(raw string) (string, error) {
+	return scriptLanguageForRequest(raw, hostScriptLanguageID())
+}
+
+// scriptLanguageForRequest resolves one `language` value against the selectable
+// set: a known spelling maps to its canonical identifier, an empty value selects
+// fallback, and any other value is rejected together with the available list.
+// fallback is the engine an omitted value runs (see ExecEngine.DefaultLanguage).
+func scriptLanguageForRequest(raw, fallback string) (string, error) {
 	language := strings.ToLower(trimSpace(raw))
 	if language == "" {
-		return hostScriptLanguageID(), nil
+		return fallback, nil
 	}
 	if id, ok := scriptLanguageAliasTarget(language); ok {
 		return id, nil
@@ -304,11 +313,40 @@ func resolveScriptLanguage(raw string) (string, error) {
 	return "", fmt.Errorf("unsupported language %q; available: %s", raw, strings.Join(scriptLanguageIDs(), ", "))
 }
 
+// resolveConfiguredScriptLanguage resolves the configured default engine
+// (tools.exec.default_language) against what this host can run: the named engine
+// when the tool offers it (identifier or alias), the host shell otherwise. An
+// empty value counts as "nothing configured" and keeps the host shell, so ok is
+// true; an unknown name or an engine whose interpreter is missing also falls
+// back to the host shell but reports ok=false, which lets the caller say why the
+// setting did not apply.
+func resolveConfiguredScriptLanguage(name string) (language string, ok bool) {
+	fallback := hostScriptLanguageID()
+	if trimSpace(name) == "" {
+		return fallback, true
+	}
+	id, err := scriptLanguageForRequest(name, fallback)
+	if err != nil {
+		return fallback, false
+	}
+	return id, true
+}
+
+// AvailableScriptLanguages lists the engines run_script offers on this host, in
+// advertisement order: the host script engine first, then whichever optional
+// engines were found (busybox, python). The web config editor builds its
+// tools.exec.default_language choices from it, so the control never offers an
+// engine this host cannot run.
+func AvailableScriptLanguages() []string {
+	return scriptLanguageIDs()
+}
+
 // scriptInvocation resolves the program and argument vector that runs script in
-// the given language. language must come from resolveScriptLanguage; useUTF8 only
-// affects the host shell, which gains the UTF-8 preamble in that mode (Python is
-// told to speak UTF-8 through the child environment, see launch; busybox ash
-// always speaks UTF-8, see scriptLanguageAlwaysUTF8).
+// the given language. language must come from resolveScriptLanguage or
+// ExecEngine.resolveLanguage; useUTF8 only affects the host shell, which gains the
+// UTF-8 preamble in that mode (Python is told to speak UTF-8 through the child
+// environment, see launch; busybox ash always speaks UTF-8, see
+// scriptLanguageAlwaysUTF8).
 func scriptInvocation(language, script string, useUTF8 bool) (string, []string, error) {
 	switch language {
 	case ScriptLanguageBusyBox:

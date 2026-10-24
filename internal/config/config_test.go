@@ -337,7 +337,42 @@ func TestExecMaxLinesDefaultsAndOverride(t *testing.T) {
 	}
 }
 
-// TestLoadFileExplicitPath covers -c/--config: an explicit path is used as-is
+// TestExecDefaultLanguageDefaultAndOverride verifies tools.exec.default_language
+// starts empty (the host shell) and keeps a configured spelling as written, so
+// the runtime can resolve it against the engines the host actually offers.
+func TestExecDefaultLanguageDefaultAndOverride(t *testing.T) {
+	if got := Default().Tools.Exec.DefaultLanguage; got != "" {
+		t.Fatalf("tools.exec.default_language defaults to %q, want empty", got)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("LIGHTAGENT_CONFIG", path)
+
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"exec":{"default_language":"ash"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Tools.Exec.DefaultLanguage != "ash" {
+		t.Fatalf("tools.exec.default_language = %q, want the configured spelling preserved", cfg.Tools.Exec.DefaultLanguage)
+	}
+
+	// A file without the key keeps the empty default.
+	if err := os.WriteFile(path, []byte(`{"openai":{"api_key":"sk-x"},"tools":{"exec":{"wait_seconds":5}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, _, err = Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Tools.Exec.DefaultLanguage != "" {
+		t.Fatalf("tools.exec.default_language = %q, want empty when the key is absent", cfg.Tools.Exec.DefaultLanguage)
+	}
+}
+
 // and a missing file is created from defaults.
 func TestLoadFileExplicitPath(t *testing.T) {
 	dir := t.TempDir()

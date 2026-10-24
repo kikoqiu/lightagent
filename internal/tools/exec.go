@@ -33,6 +33,10 @@ type ExecEngine struct {
 	maxLinesDefault int
 	maxLinesMax     int
 	useUTF8         bool
+	// defaultLanguage is the engine an omitted `language` runs: the host shell
+	// unless tools.exec.default_language picked another engine this host can
+	// run (see SetDefaultLanguage).
+	defaultLanguage string
 }
 
 // NewExecEngine builds an engine. timeoutSeconds drives the default run_timeout
@@ -41,6 +45,8 @@ type ExecEngine struct {
 // per call): child processes read and write UTF-8 (shell preamble plus the
 // Python UTF-8 variables) instead of the host ANSI code page; see childCodec. Hosts
 // without an ANSI code page ignore it and always speak UTF-8, see execUseUTF8.
+// The default script language starts at the host shell; SetDefaultLanguage
+// applies tools.exec.default_language.
 func NewExecEngine(timeoutSeconds, waitSeconds int, useUTF8 bool) *ExecEngine {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 3600
@@ -55,6 +61,7 @@ func NewExecEngine(timeoutSeconds, waitSeconds int, useUTF8 bool) *ExecEngine {
 		maxLinesDefault: runScriptDefaultMaxLines,
 		maxLinesMax:     runScriptMaxLinesCap,
 		useUTF8:         useUTF8,
+		defaultLanguage: hostScriptLanguageID(),
 	}
 }
 
@@ -91,6 +98,37 @@ func (e *ExecEngine) effectiveMaxLines(args map[string]any) int {
 // Sessions exposes the shared session manager.
 func (e *ExecEngine) Sessions() *SessionManager { return e.sessions }
 
+// SetDefaultLanguage configures the engine a run_script call runs when it omits
+// `language` (tools.exec.default_language): the named engine when this host
+// offers it, the host shell otherwise. An empty value, an unknown name and an
+// engine whose interpreter is missing all keep the host shell, so the default is
+// always an engine that can run. It returns the engine now in effect and whether
+// that is the one the configuration asked for (false = fell back to the host
+// shell), which lets the caller report a setting that did not apply. The tool
+// schema and description read the effective engine, so the prompt never names
+// one that cannot run; the value is read at startup, so a change applies after a
+// restart.
+func (e *ExecEngine) SetDefaultLanguage(name string) (string, bool) {
+	language, ok := resolveConfiguredScriptLanguage(name)
+	e.defaultLanguage = language
+	return language, ok
+}
+
+// DefaultLanguage returns the engine an omitted `language` runs.
+func (e *ExecEngine) DefaultLanguage() string {
+	if e.defaultLanguage == "" {
+		return hostScriptLanguageID()
+	}
+	return e.defaultLanguage
+}
+
+// resolveLanguage resolves a run_script `language` argument the way resolveScriptLanguage
+// does, except that an omitted value selects the configured default engine
+// instead of always the host shell.
+func (e *ExecEngine) resolveLanguage(raw string) (string, error) {
+	return scriptLanguageForRequest(raw, e.DefaultLanguage())
+}
+
 // Close terminates every session that is still running and stops the session
 // cleanup goroutine, so no child process tree outlives the engine.
 func (e *ExecEngine) Close() {
@@ -116,18 +154,46 @@ func (e *ExecEngine) maxLinesRule() string {
 }
 
 // runScriptExamplesHint returns a short example pair for the run_script
-// description. It always shows the default (shell) engine and, only when a
-// Python interpreter was found, the recommended way to run Python source
-// directly instead of a shell wrapper with a `cd` and an inline one-liner. The
-// wording is advisory: the tool still runs whatever source the model sends.
-func runScriptExamplesHint() string {
-	hint := " Example (default shell engine): {\"script\":\"ls -la\"}."
-	if !systemPython().Found {
+// description. The first example is written in the default engine's own
+// language (tools.exec.default_language, the host shell unless configured
+// otherwise), so it is source that engine can actually run; when Python is
+// selectable but is not the default, the recommended Python call follows, which
+// keeps a model from wrapping Python in a shell with a `cd` at the front or an
+// inline one-liner. The wording is advisory: the tool still runs whatever source
+// the model sends.
+func runScriptExamplesHint(defaultLanguage string) string {
+	hint := " The default engine `" + defaultLanguage + "` runs a call that omits `language`." +
+		" Example: " + runScriptExample(defaultLanguage) + "."
+	if defaultLanguage == ScriptLanguagePython || !systemPython().Found {
 		return hint
 	}
 	return hint + " For Python prefer {\"language\":\"python\",\"script\":\"print(1)\"}," +
 		" or {\"language\":\"python\",\"cwd\":\"src\",\"script\":\"...\"} for another directory," +
 		" over a shell wrapper such as {\"script\":\"cd src; python -c 'print(1)'\"}."
+}
+
+// runScriptExample is the example call for an engine: the source matches the
+// language, so the default-engine example never hands Python source to a shell
+// or a shell command to an interpreter.
+func runScriptExample(language string) string {
+	switch language {
+	case ScriptLanguagePython:
+		return `{"script":"print(1)"}`
+	case ScriptLanguagePowerShell:
+		return `{"script":"Get-ChildItem -Name"}`
+	}
+	return `{"script":"ls -la"}`
+}
+
+// defaultEngineDescription states which engine an omitted `language` runs, so
+// the parameter description names the engine that is actually in effect. It
+// deliberately names no configuration key: the model only needs to know which
+// engine runs, not how the host was configured.
+func defaultEngineDescription(defaultLanguage string) string {
+	if defaultLanguage == hostScriptLanguageID() {
+		return "the host shell (`" + defaultLanguage + "`)"
+	}
+	return "the default engine (`" + defaultLanguage + "`)"
 }
 
 // childCodec returns the stdio conversion used for child processes in the given
@@ -456,7 +522,7 @@ func (t *RunScriptTool) Description() string {
 		"by `run_timeout` (default: %d seconds). Output is cleaned and truncated by "+
 		"`max_lines`/`max_chars`, which bound what a call returns rather than the process lifetime.",
 		t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
-	description += runScriptExamplesHint()
+	description += runScriptExamplesHint(t.engine.DefaultLanguage())
 	description += t.engine.maxLinesRule()
 	description += powerShellFlagsHint()
 	if !useUTF8ParamAvailable() {
@@ -475,7 +541,7 @@ func (t *RunScriptTool) Description() string {
 // Parameters implements Tool.
 func (t *RunScriptTool) Parameters() map[string]any {
 	runDefault := int(t.engine.runTimeoutDefault() / time.Second)
-	hostLanguage := hostScriptLanguageID()
+	defaultLanguage := t.engine.DefaultLanguage()
 	properties := map[string]any{
 		"script": map[string]any{
 			"type": "string",
@@ -485,10 +551,10 @@ func (t *RunScriptTool) Parameters() map[string]any {
 		"language": map[string]any{
 			"type":    "string",
 			"enum":    scriptLanguageIDs(),
-			"default": hostLanguage,
+			"default": defaultLanguage,
 			"description": "The engine that interprets `script`, i.e. the language its source is written " +
 				"in: it selects what runs the text, not a label for the call. Available here: " +
-				scriptLanguageSummary() + ". Omit to use the host shell (`" + hostLanguage + "`).",
+				scriptLanguageSummary() + ". Omit to use " + defaultEngineDescription(defaultLanguage) + ".",
 		},
 		"wait_timeout": map[string]any{
 			"type":    "integer",
@@ -550,7 +616,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 		return fail("script is required")
 	}
 	rawLanguage, _ := stringArg(args, "language")
-	language, err := resolveScriptLanguage(rawLanguage)
+	language, err := t.engine.resolveLanguage(rawLanguage)
 	if err != nil {
 		return fail(err.Error())
 	}

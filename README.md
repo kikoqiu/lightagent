@@ -481,7 +481,9 @@ Ctrl+J，`/pause` 同效）。它**不是中断**：正在输出的这一轮（�
   `bash`/`shell`，宿主 shell），系统装了 Python 时的 `python`（别名 `python3`/`py`；
   **直接以解释器为引擎**，源码经 `-c` 传入），以及 **Windows 上 PATH 里有 `busybox64u.exe` 时的
   `busybox`**（别名 `ash`；以 `busybox64u.exe ash -c` 运行 POSIX shell 脚本，该 Unicode 构建的
-  stdio **始终是 UTF-8**）；**省略该参数即用宿主 shell**，busybox **不作为默认引擎**。规范全名由 schema 的
+  stdio **始终是 UTF-8**）。**省略该参数时用默认引擎**：没配置 `tools.exec.default_language` 时是
+  宿主 shell；配置了且那个引擎在本机真能运行时改用它（跑不了的取值回退宿主 shell，启动时有一行
+  提示），实际生效的引擎写进 schema 的 `default`、参数描述与示例（**重启生效**）。规范全名由 schema 的
   `enum` 按主机动态生成，探测不到的引擎（未安装的 Python、PATH 里没有的 `busybox64u.exe`）不出现；
   各取值的含义、别名与探测到的 Python 版本写在
   **`language` 参数自己的描述里**（工具描述只讲机制）。Windows 宿主 shell 以 `-NoProfile

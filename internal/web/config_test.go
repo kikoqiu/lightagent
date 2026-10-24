@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"lightagent/internal/config"
+	"lightagent/internal/tools"
 )
 
 // seedConfigFile points the mirror's config editor at a temporary config.json
@@ -154,6 +155,29 @@ func TestConfigPutWritesTheFileWithoutApplyingIt(t *testing.T) {
 	// the panel keeps warning about it.
 	if _, again := callConfig(t, srv, http.MethodGet, ""); !again.PendingRestart {
 		t.Fatal("pending_restart must survive a later read")
+	}
+}
+
+// TestConfigPutSavesTheDefaultScriptLanguage covers the editor's default-engine
+// control: the server accepts tools.exec.default_language and writes it as sent,
+// so the select's value reaches the file unchanged.
+func TestConfigPutSavesTheDefaultScriptLanguage(t *testing.T) {
+	srv := newTestServer(t, "")
+	path := seedConfigFile(t, srv, `{"openai":{"api_key":"sk-secret","model":"m1"}}`)
+
+	body := fmt.Sprintf(
+		`{"openai":{"api_key":%q,"model":"m1"},"tools":{"exec":{"default_language":"busybox"}}}`,
+		config.MaskedSecret)
+	status, reply := callConfig(t, srv, http.MethodPut, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", status, reply.Error)
+	}
+	saved, err := config.Parse([]byte(readConfigString(t, path)))
+	if err != nil {
+		t.Fatalf("parse the saved config: %v", err)
+	}
+	if saved.Tools.Exec.DefaultLanguage != "busybox" {
+		t.Fatalf("file default_language = %q, want busybox", saved.Tools.Exec.DefaultLanguage)
 	}
 }
 
@@ -449,7 +473,7 @@ func TestConfigEditorWiring(t *testing.T) {
 		"context.summarize_keep.auto.budget_percent", "context.summarize_keep.auto.turns",
 		"context.summarize_keep.manual.budget_percent", "context.summarize_keep.manual.turns",
 		"web.host", "web.port", "web.password",
-		"tools.exec.enabled", "tools.exec.timeout_seconds", "tools.exec.wait_seconds", "tools.exec.use_utf8",
+		"tools.exec.enabled", "tools.exec.default_language", "tools.exec.timeout_seconds", "tools.exec.wait_seconds", "tools.exec.use_utf8",
 		"tools.exec.max_lines", "tools.exec.max_lines_max",
 		"tools.read_file_lines.enabled", "tools.read_file_lines.max_read_file_size", "tools.read_file_lines.max_read_file_lines",
 		"tools.write_file.enabled", "tools.write_file.max_lines", "tools.write_file.auto_split", "tools.edit_file.enabled",
@@ -480,6 +504,38 @@ func TestConfigEditorWiring(t *testing.T) {
 	}
 	if strings.Contains(pageSource(), "position:fixed") {
 		t.Error("the config panel must be absolutely positioned, not fixed: a fixed overlay breaks the mobile viewport")
+	}
+}
+
+// TestConfigEditorOffersAvailableScriptLanguages pins the default-engine
+// control: its choices are built from the engines injected into the page, so the
+// form never offers an engine this host cannot run, and the served page carries
+// that list for tools.exec.default_language.
+func TestConfigEditorOffersAvailableScriptLanguages(t *testing.T) {
+	for _, want := range []string{
+		"scriptLanguageChoices", // the control's option builder
+		"SCRIPT_LANGUAGES",      // the injected engine list it reads
+		"'tools.exec.default_language'",
+	} {
+		if !strings.Contains(configJS, want) {
+			t.Errorf("the editor does not wire the default engine control: missing %q", want)
+		}
+	}
+	if !strings.Contains(indexHTML, "scripts: __LIGHTAGENT_SCRIPTS__") {
+		t.Error("the page does not ask the server for the available script engines")
+	}
+
+	body := getPage(t, newTestServer(t, ""))
+	if strings.Contains(body, "__LIGHTAGENT_SCRIPTS__") {
+		t.Error("the script engine placeholder must be replaced before the page is served")
+	}
+	if !strings.Contains(body, "scripts: [") {
+		t.Error("the served page does not carry the script engine list")
+	}
+	for _, id := range tools.AvailableScriptLanguages() {
+		if !strings.Contains(body, `"`+id+`"`) {
+			t.Errorf("the page does not offer the %q engine", id)
+		}
 	}
 }
 

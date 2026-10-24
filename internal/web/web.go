@@ -1685,9 +1685,9 @@ func (s *Server) broadcastSettings() {
 
 // handleIndex serves the single-page UI. The page is public (it carries no data
 // and its sign-in dialog has to be reachable before there is a session); the
-// runtime switches, the command rail, the media capability and whether the mirror
-// can be told to restart are injected, and every endpoint that touches the agent
-// asks for a session of its own.
+// runtime switches, the command rail, the media capability, the script engines
+// run_script offers and whether the mirror can be told to restart are injected,
+// and every endpoint that touches the agent asks for a session of its own.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -1702,6 +1702,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_RESULT__", strconv.FormatBool(s.agent.ToolResultsVisible()))
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_COMMANDS__", commandsJSON())
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_MEDIA__", s.mediaJSON())
+	body = strings.ReplaceAll(body, "__LIGHTAGENT_SCRIPTS__", scriptLanguagesJSON())
 	body = strings.ReplaceAll(body, "__LIGHTAGENT_RESTART__", strconv.FormatBool(s.canRestart()))
 	// The active interface name (shown under the logo) and the interface list
 	// (the model dropdown) travel with the page, so the header is right before
@@ -1749,6 +1750,18 @@ func (s *Server) mediaJSON() string {
 // mark primary.
 func commandsJSON() string {
 	data, err := json.Marshal(slash.WebCommands())
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
+}
+
+// scriptLanguagesJSON lists the script engines run_script offers on this host
+// (its `language` enum). The config editor builds the choices of
+// tools.exec.default_language from it, so the control never offers an engine
+// this host cannot run.
+func scriptLanguagesJSON() string {
+	data, err := json.Marshal(tools.AvailableScriptLanguages())
 	if err != nil {
 		return "[]"
 	}
