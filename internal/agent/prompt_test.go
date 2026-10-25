@@ -50,6 +50,31 @@ func TestDefaultSystemPromptRequiresMarkdownMemos(t *testing.T) {
 	}
 }
 
+// TestDefaultSystemPromptChecksIrreversibleOperations verifies the built-in
+// template makes the model check its authority before an irreversible
+// operation — killing a process it did not create, deleting files outside the
+// working or temporary directories, and bulk-deleting many files (including
+// inside the working directory) — with an explicit request or authorization
+// exempting the operation.
+func TestDefaultSystemPromptChecksIrreversibleOperations(t *testing.T) {
+	prompt := DefaultSystemPrompt()
+	for _, want := range []string{
+		"Irreversible dangerous operations", "authority", "did not create",
+		"outside the working or temporary directories", "bulk-deleting",
+		"including inside the working directory", "manage_session", "system's kill",
+		"explicit request", "authorization",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("built-in prompt must carry the irreversible-operation check (%q missing):\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{"Impactful system commands", "is there a tool that already does it"} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("built-in prompt must not carry %q:\n%s", unwanted, prompt)
+		}
+	}
+}
+
 // TestDefaultSystemPromptGuardsVariableDeletion verifies the built-in template
 // carries the deletion discipline: a script never uses a bare variable as the
 // whole delete target, and a deletion that has to use one goes through a
@@ -65,10 +90,13 @@ func TestDefaultSystemPromptGuardsVariableDeletion(t *testing.T) {
 
 // TestDefaultSystemPromptLeavesToolUsageToToolDescriptions verifies the template
 // stays a behavior guide: every tool documents its own arguments and edge cases,
-// so the prompt must not enumerate tools or repeat their mechanics.
+// so the prompt must not enumerate tools or repeat their mechanics. The one tool
+// it does name is manage_session, cited by the irreversible-operation rule as the
+// preferred alternative to the system's kill (see
+// TestDefaultSystemPromptChecksIrreversibleOperations).
 func TestDefaultSystemPromptLeavesToolUsageToToolDescriptions(t *testing.T) {
 	prompt := DefaultSystemPrompt()
-	for _, name := range []string{"read_file", "write_file", "edit_file", "run_script", "manage_session", "webfetch"} {
+	for _, name := range []string{"read_file", "write_file", "edit_file", "run_script", "webfetch"} {
 		if strings.Contains(prompt, name) {
 			t.Fatalf("built-in prompt must not describe tool %q (its own description does):\n%s", name, prompt)
 		}

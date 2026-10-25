@@ -206,8 +206,11 @@ type Tool interface {
   * 进程**仍在运行** → 终止成功（`completed`），`exit_code = -1`（不是自己退出的，没有真实退出码），`output` = 终止说明 + 最后输出的内容；
   * 进程**已经退出** → 没有树可结束，报 `failed`（`exit_code` 为**实际退出码**），`output` = `process already exited with code N` + 最后输出的内容——失败只是说明没杀到东西，退出状态照旧交出、不丢。
   两种情形都会释放会话（此后同一 `session_id` 报 not found）。
-* `list`：列出当前会话（id/command/status/pid；已退出的会话带 `exit_code`）。进程已退出但退出状态
-  **还没被取走**的会话状态显示为 `zombie`，并附一行说明（poll 即可取走）。
+* `list`：列出当前会话（`script`/`language`/`status`/`pid`/`elapsed_seconds`；已退出的会话另带
+  `exit_code`）。`script` 与 `run_script` 的参数同名，只显示**前 5 行**，还有更多行时以 `...` 收尾
+  （完整源码仍留在会话里，模型需要时可重新查看自己的调用参数）；`language` 是启动该会话时实际生效的
+  引擎；`elapsed_seconds` 是已执行秒数（运行中的会话按当前时刻计，已退出的按退出时刻计）。
+  进程已退出但退出状态**还没被取走**的会话状态显示为 `zombie`，并附一行说明（poll 即可取走）。
 
 > **僵尸与清理**：会话的进程退出时**不立即清理**——退出前写出的输出与 `exit_code` 还留在池里等着
 > 被取走，这正是 `list` 里的 `zombie`（只有「输出 + 退出码等」这些状态，没有进程）。取走（poll 或

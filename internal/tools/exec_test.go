@@ -189,6 +189,17 @@ func TestExecCommandBackgroundThenManageSession(t *testing.T) {
 	if !strings.Contains(list.ForLLM, sessionID) {
 		t.Fatalf("session %s not listed: %s", sessionID, list.ForLLM)
 	}
+	// The listing names the source and the engine run_script used, and how long
+	// the session has been running.
+	for _, want := range []string{
+		"  script: " + command,
+		"  language: " + engine.DefaultLanguage(),
+		"  elapsed_seconds: ",
+	} {
+		if !strings.Contains(list.ForLLM, want) {
+			t.Fatalf("list = %s, want it to carry %q", list.ForLLM, want)
+		}
+	}
 
 	// Kill must succeed.
 	kill := manageTool.Execute(context.Background(), map[string]any{

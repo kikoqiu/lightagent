@@ -42,7 +42,7 @@ func (t *ManageSessionTool) Parameters() map[string]any {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        []string{"poll", "input", "kill", "list"},
-				"description": "'poll': take the buffered output and the status; an exited session reports its exit code with its last output and ends there, so poll a finished session to avoid losing that output. 'input': write to stdin. 'kill': terminate the process tree and release the session, reporting the output it had produced (exit_code -1: the process did not exit on its own); a process that already exited is a failure, still reported with its last output and its real exit code. 'list': list the sessions, a finished session whose output was not collected yet showing status=zombie.",
+				"description": "'poll': take the buffered output and the status; an exited session reports its exit code with its last output and ends there, so poll a finished session to avoid losing that output. 'input': write to stdin. 'kill': terminate the process tree and release the session, reporting the output it had produced (exit_code -1: the process did not exit on its own); a process that already exited is a failure, still reported with its last output and its real exit code. 'list': list the sessions, each with its script (first 5 lines), the language it runs and elapsed_seconds, a finished session whose output was not collected yet showing status=zombie.",
 			},
 			"data": map[string]any{
 				"type":        "string",
@@ -142,9 +142,13 @@ func (t *ManageSessionTool) executeList(start time.Time) *Result {
 	} else {
 		for _, info := range infos {
 			sb.WriteString(fmt.Sprintf("session: %s\n", info.ID))
-			sb.WriteString(fmt.Sprintf("  command: %s\n", info.Command))
+			writeSessionScript(&sb, info.Script)
+			if info.Language != "" {
+				sb.WriteString(fmt.Sprintf("  language: %s\n", info.Language))
+			}
 			sb.WriteString(fmt.Sprintf("  status: %s\n", info.Status))
 			sb.WriteString(fmt.Sprintf("  pid: %d\n", info.PID))
+			sb.WriteString(fmt.Sprintf("  elapsed_seconds: %d\n", info.ElapsedSeconds))
 			if info.ExitCode != nil {
 				sb.WriteString(fmt.Sprintf("  exit_code: %d\n", *info.ExitCode))
 			}
@@ -167,6 +171,39 @@ func (t *ManageSessionTool) executeList(start time.Time) *Result {
 		TotalBytes:     len(text),
 		ElapsedSeconds: elapsedSeconds(start),
 	}).toResultInfo()
+}
+
+// sessionScriptDisplayLines is how many rows of a session's script list shows
+// before the rest is folded into an ellipsis.
+const sessionScriptDisplayLines = 5
+
+// sessionScriptRows splits a script into the rows list may show. CRLF and CR
+// are read as line breaks, and a final newline does not add a trailing row.
+func sessionScriptRows(script string) []string {
+	normalized := strings.ReplaceAll(script, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	return splitFoldLines(normalized)
+}
+
+// writeSessionScript writes the script of one session under the "script" key,
+// named after the run_script parameter that started it: at most
+// sessionScriptDisplayLines rows with an ellipsis standing in for the rest,
+// the first row sharing the key's line and the following ones indented. The
+// full source stays available to the model, so the list only needs enough to
+// identify the session.
+func writeSessionScript(sb *strings.Builder, script string) {
+	rows := sessionScriptRows(script)
+	if len(rows) == 0 {
+		sb.WriteString("  script:\n")
+		return
+	}
+	sb.WriteString("  script: " + rows[0] + "\n")
+	for _, row := range rows[1:min(len(rows), sessionScriptDisplayLines)] {
+		sb.WriteString("    " + row + "\n")
+	}
+	if len(rows) > sessionScriptDisplayLines {
+		sb.WriteString("    ...\n")
+	}
 }
 
 func (t *ManageSessionTool) executePoll(ctx context.Context, start time.Time, args map[string]any, waitTimeout time.Duration, maxLines, maxChars int) *Result {

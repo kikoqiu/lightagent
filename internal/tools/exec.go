@@ -268,7 +268,8 @@ func (e *ExecEngine) launch(language, script, cwd string, useUTF8 bool) (*Proces
 	codec := childCodec(utf8Stdio)
 	session := &ProcessSession{
 		ID:        generateSessionID(),
-		Command:   script,
+		Script:    script,
+		Language:  language,
 		StartTime: time.Now().Unix(),
 		Status:    "running",
 		stdin:     codec.wrapStdin(stdin),

@@ -39,7 +39,8 @@ type ProcessSession struct {
 	mu        sync.Mutex
 	ID        string
 	PID       int
-	Command   string
+	Script    string
+	Language  string
 	StartTime int64
 	ExitCode  int
 	Status    string // "running" or "done"
@@ -62,11 +63,17 @@ type ProcessSession struct {
 
 // SessionInfo is a snapshot used by manage_session list.
 type SessionInfo struct {
-	ID        string `json:"id"`
-	Command   string `json:"command"`
+	ID string `json:"id"`
+	// Script is the source the session was started with (the same text
+	// run_script received), not a shell command line.
+	Script    string `json:"script"`
+	Language  string `json:"language"`
 	Status    string `json:"status"`
 	PID       int    `json:"pid"`
 	StartedAt int64  `json:"started_at"`
+	// ElapsedSeconds is how long the process has run: up to now while it is
+	// still running, up to the exit once it is done.
+	ElapsedSeconds int64 `json:"elapsed_seconds"`
 	// ExitCode is set once the process exited (nil while it is still running).
 	ExitCode *int `json:"exit_code"`
 }
@@ -280,23 +287,32 @@ func (s *ProcessSession) Kill() error {
 
 // ToSessionInfo snapshots the session for listing. A done session whose exit
 // state has not been collected yet is reported as a zombie: it is still in the
-// pool only to be polled, and its exit code is already known.
+// pool only to be polled, and its exit code is already known. The elapsed time
+// stops at the exit for a finished process and keeps counting for a running one.
 func (s *ProcessSession) ToSessionInfo() SessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	info := SessionInfo{
 		ID:        s.ID,
-		Command:   s.Command,
+		Script:    s.Script,
+		Language:  s.Language,
 		Status:    s.Status,
 		PID:       s.PID,
 		StartedAt: s.StartTime,
 	}
+	end := time.Now().Unix()
 	if s.Status == sessionStatusDone {
 		if s.zombieLocked() {
 			info.Status = sessionStatusZombie
 		}
 		code := s.ExitCode
 		info.ExitCode = &code
+		end = s.exitAt
+	}
+	if s.StartTime > 0 {
+		if elapsed := end - s.StartTime; elapsed > 0 {
+			info.ElapsedSeconds = elapsed
+		}
 	}
 	return info
 }

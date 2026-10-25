@@ -138,6 +138,64 @@ func TestManageSessionListReportsZombies(t *testing.T) {
 	}
 }
 
+// TestManageSessionListShowsScriptLanguageAndElapsed pins the list contract:
+// the source is listed under the `script` key of run_script (capped at five
+// rows with an ellipsis), together with the engine that ran it and how long the
+// process has been running — up to the exit for a finished process.
+func TestManageSessionListShowsScriptLanguageAndElapsed(t *testing.T) {
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	manageTool := NewManageSessionTool(engine)
+
+	exit := time.Now()
+	engine.sessions.Add(&ProcessSession{
+		ID:        "long",
+		Script:    "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\n",
+		Language:  ScriptLanguagePowerShell,
+		Status:    sessionStatusDone,
+		StartTime: exit.Add(-42 * time.Second).Unix(),
+		ExitCode:  0,
+		exitAt:    exit.Unix(),
+	})
+	engine.sessions.Add(&ProcessSession{
+		ID:        "short",
+		Script:    "one\ntwo",
+		Language:  ScriptLanguageShell,
+		Status:    sessionStatusRunning,
+		StartTime: time.Now().Unix(),
+	})
+
+	list := manageTool.Execute(context.Background(), map[string]any{"action": "list"})
+	if list.IsError {
+		t.Fatalf("list error: %s", list.ForLLM)
+	}
+	// The answer travels as the commandResult JSON contract, so the checks read
+	// the rendered text rather than the escaped ForLLM payload.
+	text := commandResultFromResult(t, list.ForLLM).Output
+	for _, want := range []string{
+		"session: long",
+		"  script: line1\n    line2\n    line3\n    line4\n    line5\n    ...\n",
+		"  language: powershell",
+		"  status: zombie",
+		"  elapsed_seconds: 42",
+		"  exit_code: 0",
+		"session: short",
+		"  script: one\n    two\n",
+		"  language: sh",
+		"  status: running",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("list = %q, want it to carry %q", text, want)
+		}
+	}
+	if strings.Contains(text, "line6") || strings.Contains(text, "line7") {
+		t.Fatalf("list = %q, want the script folded after five rows", text)
+	}
+	if strings.Contains(text, "command:") {
+		t.Fatalf("list = %q, want the old `command` key gone", text)
+	}
+}
+
 // TestSessionZombieSurvivesCleanupUntilPolled is the regression the pool rule
 // fixes: a session that started long ago and has just exited — exactly the shape
 // of a long-running background command — keeps its last output and exit code
