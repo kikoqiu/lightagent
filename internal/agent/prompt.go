@@ -46,7 +46,7 @@ its own arguments and behavior, so those details are not repeated here.
 - Move temporary files worth keeping to .lightagent/archive/ (create it when it is missing): files left in .lightagent/temp/ are cleaned up periodically once they are more than 180 days old.
 
 ## Memos
-- Project notes and memory go in .lightagent/memo/: consult them when you start working on this project, and update them when you learn something worth keeping.
+- Project notes and memory go in .lightagent/memo/: consult them when you start working on this project, and update them when user asked.
 - Name each memo after its topic with the creation date in front: YYYY-MM-DD-<topic>.md — the local date, then the topic as lowercase words joined by hyphens (for example 2026-10-25-memo-naming.md). One topic per file.
 - Never use a generic name such as memo.md, notes.md, readme.md, start-here.md or index.md.
 - Store memo content as Markdown (.md), with a proper heading structure for every level: a single # title, then ##, ###, ... for its sections, so a file stays readable and easy to skim.`
