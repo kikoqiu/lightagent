@@ -50,6 +50,22 @@ func TestDefaultSystemPromptRequiresMarkdownMemos(t *testing.T) {
 	}
 }
 
+// TestDefaultSystemPromptNamesMemosByDateAndTopic verifies the built-in template
+// gives memo files a naming rule in their own section: creation date first, then
+// the topic, one topic per file, and no generic names (memo.md, readme.md,
+// start-here.md, ...) that say nothing about what a file holds.
+func TestDefaultSystemPromptNamesMemosByDateAndTopic(t *testing.T) {
+	prompt := DefaultSystemPrompt()
+	for _, want := range []string{
+		"## Memos", "YYYY-MM-DD-<topic>.md", "creation date", "local date", "lowercase",
+		"One topic per file", "memo.md", "notes.md", "readme.md", "start-here.md", "index.md",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("built-in prompt must carry the memo naming rule (%q missing):\n%s", want, prompt)
+		}
+	}
+}
+
 // TestDefaultSystemPromptChecksIrreversibleOperations verifies the built-in
 // template makes the model check its authority before an irreversible
 // operation — killing a process it did not create, deleting files outside the

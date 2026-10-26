@@ -266,7 +266,9 @@ CLI 与 web 各订阅一次即可；web 侧再多路复用给每个 WebSocket �
   **都**超过 180 天的文件，子目录递归扫描；只有一条过期就保留，所以仍在被读或改的文件不会被删。
   符号链接与取不到访问时间的宿主不动，缺失 `temp/` 不算错。因此临时文件不再永久保留，值得留存的
   先移进 `archive/`，而 `archive/` 与 `memo/` 永不自动清理；它们一旦存在，上面那条「只剩锁文件就
-  整个删除」的清理不再触发。memo 里的文件按 Markdown 存储（每条一个 `.md`，带各级标题）；
+  整个删除」的清理不再触发。memo 里的文件按 Markdown 存储（每条一个 `.md`，带各级标题），
+  文件名以创建日期开头、后接 topic（`YYYY-MM-DD-<topic>.md`，一个 topic 一个文件，不用 `memo.md`、
+  `readme.md`、`start-here.md` 这类笼统名）；
   每个工作目录的第一条用户消息发出时，程序会扫描该目录并把工作目录与文件清单作为引擎信息附加在请求里（见
   [用户消息的引擎信息](#用户消息的引擎信息工作目录与-memo-清单)）。
 * 会话文件放在 `.lightagent/sessions/`：每个会话有自己的文件名（`/saveas` 起的名字），
@@ -501,8 +503,8 @@ tool 循环里一条超长的反馈（整份文件、读回的图片）、带图
 [engine meta info]
 working directory: D:\work\demo
 The memo folder holds these files:
-file     updated    size
-plan.md  1 day ago  1.2 KB
+file                       updated    size
+2026-10-25-memo-naming.md  1 day ago  1.2 KB
 ```
 
 * 块的内容写进该消息的 `meta` 字段（会话 JSON 里即 `{"role":"user","content":"…","meta":"…"}`），
@@ -516,7 +518,8 @@ plan.md  1 day ago  1.2 KB
 * 追加发生在唯一的请求头构建处（`livePrefix.head` → `withEngineMeta`），压缩摘要的调用同样经过它，
   因此摘要请求的前缀仍与活请求逐字节相同（见[摘要的放置](#摘要的放置agentsummary_in_system_prompt)）。
 * 系统提示词里没有工作目录行，所以 `/cd` 不会改动提示词——服务端缓存的前缀在切目录后仍然有效。
-* memo 里的每个文件按 Markdown 存储（`.md`，带各级标题）——内置提示词里的约定，见
+* memo 里的每个文件按 Markdown 存储（`.md`，带各级标题），文件名以创建日期开头并带 topic
+  （`YYYY-MM-DD-<topic>.md`，一个 topic 一个文件）——内置提示词里的约定，见
   [configuration.md](configuration.md)。
 
 ## MCP 工具发现 / unlock 控制面

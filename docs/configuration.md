@@ -326,8 +326,8 @@ lightagent 内置一个**纯标准库**的 MCP 客户端。启动时按 `servers
 [engine meta info]
 working directory: D:\work\demo
 The memo folder holds these files:
-file     updated    size
-plan.md  1 day ago  1.2 KB
+file                       updated    size
+2026-10-25-memo-naming.md  1 day ago  1.2 KB
 ```
 
 这一段只在**每个工作目录的第一条用户消息**的请求里出现（会话第一条，以及 `/cd` 之后的第一条；
@@ -419,7 +419,11 @@ user:   <历史里的第一条 user>
 用法——参数、行尾、脚本语言这些细节都在对应工具自己的描述里。它另外约定：临时文件放
 `.lightagent/temp/`（程序退出时删除修改与访问都超过 180 天的）、值得留存的临时成果移入
 `.lightagent/archive/`、项目相关的记忆文件放 `.lightagent/memo/`（都由模型按需创建），
-且 memo 里的内容都按 **Markdown** 存储（`.md`，带各级标题）。还有一条**不可撤销的危险操作**
+且 memo 里的内容都按 **Markdown** 存储（`.md`，带各级标题）。memo 要跨多个会话使用，因此
+**文件名以创建日期开头、后接 topic**：`YYYY-MM-DD-<topic>.md`（本地日期 + 小写连字符单词，
+如 `2026-10-25-memo-naming.md`），一个 topic 一个文件；不用 `memo.md`、`notes.md`、`readme.md`、
+`start-here.md`、`index.md` 这类只说明文档类型、看不出内容的笼统名。
+还有一条**不可撤销的危险操作**
 纪律：动手前先核对是否在用户授予的职权范围内——杀死不是自己创建的进程、删除工作目录或临时
 目录之外的文件、批量删除大量文件（含工作目录下）都算；同时优先用工具而不是系统命令（唯一按名
 提到工具的例子是「结束后台会话用 `manage_session` 的 kill，而不是系统的 kill」，不涉及该工具的
