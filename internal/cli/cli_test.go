@@ -390,13 +390,43 @@ func TestShowHistoryRendersTheWholeTranscript(t *testing.T) {
 		"--- history: 4 messages ---",
 		"[thinking]", "think about it",
 		"[tool]", "run_script", "script - ls",
-		"[result]", "Command completed.", "file1",
+		"[result]", "Script completed.", "file1",
 		"done",
 		"--- end of history ---",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("the resumed transcript is missing %q:\n%s", want, got)
 		}
+	}
+}
+
+// TestShowHistoryWordsSessionResults pins that a resumed manage_session result
+// is drawn about the session it acted on, matching the live view.
+func TestShowHistoryWordsSessionResults(t *testing.T) {
+	noColors(t)
+	c := newTestCLI(t)
+	var buf strings.Builder
+	c.out = &buf
+
+	c.ShowHistory([]llm.Message{
+		{Role: "user", Content: "poll it"},
+		{
+			Role: "assistant",
+			ToolCalls: []llm.ToolCall{{
+				ID:       "1",
+				Function: llm.ToolCallFunction{Name: "manage_session", Arguments: `{"action":"poll"}`},
+			}},
+		},
+		{Role: "tool", ToolCallID: "1", Name: "manage_session", Content: `{"status":"running","exit_code":null,"session_id":"abc","output":"tick","truncated":false,"total_lines":1,"total_bytes":4,"elapsed_seconds":0.1,"warning":null}`},
+		{Role: "assistant", Content: "done"},
+	}, "")
+
+	got := buf.String()
+	if !strings.Contains(got, "Session abc is still running") {
+		t.Fatalf("the resumed transcript should word the session result:\n%s", got)
+	}
+	if strings.Contains(got, "Script is running") {
+		t.Fatalf("the resumed transcript should not word a session result as a script:\n%s", got)
 	}
 }
 

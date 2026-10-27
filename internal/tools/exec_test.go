@@ -487,7 +487,7 @@ func TestExecCommandYieldsToUserMessageOnLongWait(t *testing.T) {
 		if !strings.Contains(cr.Output, "working") {
 			t.Fatalf("output = %q, want what the console had printed until then", cr.Output)
 		}
-		if !strings.Contains(res.ForUser, "Command is running in session") {
+		if !strings.Contains(res.ForUser, "Script is running in session") {
 			t.Fatalf("ForUser = %q, want the running-session rendering", res.ForUser)
 		}
 		session, err := engine.sessions.Get(*cr.SessionID)

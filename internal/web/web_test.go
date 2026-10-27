@@ -851,7 +851,7 @@ func TestHistoryFrameKeepsToolRows(t *testing.T) {
 	if rows[1].Name != "run_script" || rows[1].Args != `{"script":"ls"}` {
 		t.Fatalf("tool_call row = %+v", rows[1])
 	}
-	if !strings.Contains(rows[2].Content, "Command completed.") || !strings.Contains(rows[2].Content, "file1") {
+	if !strings.Contains(rows[2].Content, "Script completed.") || !strings.Contains(rows[2].Content, "file1") {
 		t.Fatalf("tool_result row = %q", rows[2].Content)
 	}
 
@@ -860,6 +860,32 @@ func TestHistoryFrameKeepsToolRows(t *testing.T) {
 	srv.seedHistory()
 	if got := rolesOf(decodeHistory(t, srv)); got != "user,tool_call,assistant" {
 		t.Fatalf("roles with results hidden = %q", got)
+	}
+}
+
+// TestHistoryFrameWordsSessionResults pins that the restored rendering of a
+// manage_session result speaks about the session, the way the live call did,
+// while a run_script result keeps its script wording.
+func TestHistoryFrameWordsSessionResults(t *testing.T) {
+	srv := newTestServer(t, "")
+	srv.agent.Load([]llm.Message{
+		{Role: "user", Content: "poll it"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{
+			ID:       "1",
+			Type:     "function",
+			Function: llm.ToolCallFunction{Name: "manage_session", Arguments: `{"action":"poll"}`},
+		}}},
+		{Role: "tool", ToolCallID: "1", Name: "manage_session", Content: `{"status":"running","exit_code":null,"session_id":"abc","output":"tick","truncated":false,"total_lines":1,"total_bytes":4,"elapsed_seconds":0.1,"warning":null}`},
+		{Role: "assistant", Content: "done"},
+	}, "")
+
+	srv.seedHistory()
+	rows := decodeHistory(t, srv)
+	if got := rolesOf(rows); got != "user,tool_call,tool_result,assistant" {
+		t.Fatalf("roles = %q, want user,tool_call,tool_result,assistant", got)
+	}
+	if !strings.Contains(rows[2].Content, "Session abc is still running") {
+		t.Fatalf("session tool_result row = %q, want the session wording", rows[2].Content)
 	}
 }
 
@@ -924,7 +950,7 @@ func TestScrollbackTracksLiveEvents(t *testing.T) {
 	bus.Publish(agent.Event{Type: agent.EventReasoningDelta, Text: "think"})
 	bus.Publish(agent.Event{Type: agent.EventAssistant, Text: "answer"})
 	bus.Publish(agent.Event{Type: agent.EventToolCall, Name: "run_script", Args: `{"script":"ls"}`})
-	bus.Publish(agent.Event{Type: agent.EventToolResult, Name: "run_script", Text: "Command completed."})
+	bus.Publish(agent.Event{Type: agent.EventToolResult, Name: "run_script", Text: "Script completed."})
 	bus.Publish(agent.Event{Type: agent.EventInfo, Text: "note"})
 	bus.Publish(agent.Event{Type: agent.EventError, Text: "boom"})
 	bus.Publish(agent.Event{Type: agent.EventInterrupted, Text: "stopped"})

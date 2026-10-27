@@ -837,7 +837,7 @@ func messageRows(msgs []llm.Message, showResults bool, dir string) []historyMess
 			}
 			// Only results that have a user-facing rendering are restored;
 			// the rest were never shown live either.
-			text, isErr, ok := tools.RenderStoredResult(m.Content)
+			text, isErr, ok := tools.RenderStoredResult(m.Content, m.Name)
 			if !ok {
 				continue
 			}

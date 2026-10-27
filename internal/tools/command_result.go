@@ -43,21 +43,64 @@ func (cr commandResult) marshal() string {
 	return string(data)
 }
 
-// toResult converts a structured result into a tool Result.
-func (cr commandResult) toResult() *Result {
+// resultWording is the phrasing one tool reports an outcome with: run_script
+// names the script it ran, manage_session the session it acted on. The statuses
+// are the same, only the subject of the sentence differs.
+type resultWording struct {
+	running     func(sessionID string) string
+	interrupted string
+	failed      string
+	completed   string
+}
+
+var (
+	// scriptWording is run_script's: the call ran a script.
+	scriptWording = resultWording{
+		running: func(sessionID string) string {
+			return fmt.Sprintf("Script is running in session %s (poll with manage_session)", sessionID)
+		},
+		interrupted: "Script interrupted by user.",
+		failed:      "Script failed.",
+		completed:   "Script completed.",
+	}
+	// sessionWording is manage_session's: the call acted on a background
+	// session (polled, fed input, killed or listed it), so the sentence is about
+	// the session rather than about the script that started it.
+	sessionWording = resultWording{
+		running: func(sessionID string) string {
+			return fmt.Sprintf("Session %s is still running (poll with manage_session)", sessionID)
+		},
+		interrupted: "Session operation interrupted by user.",
+		failed:      "Session operation failed.",
+		completed:   "Session operation completed.",
+	}
+)
+
+// wordingForTool returns the phrasing of the tool that produced a result, read
+// back from the tool name a persisted tool message carries.
+func wordingForTool(toolName string) resultWording {
+	if toolName == "manage_session" {
+		return sessionWording
+	}
+	return scriptWording
+}
+
+// toResult converts a structured result into a tool Result, phrased in the
+// subject of the tool that produced it.
+func (cr commandResult) toResult(wording resultWording) *Result {
 	res := &Result{
 		ForLLM:  cr.marshal(),
 		IsError: cr.Status == statusFailed || cr.Status == statusInterrupted,
 	}
-	switch {
-	case cr.Status == statusRunning:
-		res.ForUser = fmt.Sprintf("Command is running in session %s (poll with manage_session)", derefString(cr.SessionID))
-	case cr.Status == statusInterrupted:
-		res.ForUser = "Command interrupted by user."
-	case cr.Status == statusFailed:
-		res.ForUser = "Command failed."
+	switch cr.Status {
+	case statusRunning:
+		res.ForUser = wording.running(derefString(cr.SessionID))
+	case statusInterrupted:
+		res.ForUser = wording.interrupted
+	case statusFailed:
+		res.ForUser = wording.failed
 	default:
-		res.ForUser = "Command completed."
+		res.ForUser = wording.completed
 	}
 	// The warning explains a state the status alone cannot: the poll the user
 	// interrupted, for instance, leaves the process running.
@@ -72,8 +115,8 @@ func (cr commandResult) toResult() *Result {
 
 // toResultInfo is like toResult but never marks the call as an error. Used by
 // manage_session poll/list that merely observe session state.
-func (cr commandResult) toResultInfo() *Result {
-	res := cr.toResult()
+func (cr commandResult) toResultInfo(wording resultWording) *Result {
+	res := cr.toResult(wording)
 	res.IsError = false
 	return res
 }
@@ -89,10 +132,12 @@ var commandResultFields = []string{
 
 // RenderStoredResult recovers the user-facing rendering of a persisted
 // tool-result message. Command tools store their structured JSON contract
-// (see commandResult) rather than the display text, so it is reformatted here;
-// any other tool result carries no user-facing rendering and reports ok=false,
-// matching the live view where such results are not displayed.
-func RenderStoredResult(content string) (text string, isError, ok bool) {
+// (see commandResult) rather than the display text, so it is reformatted here,
+// phrased after the tool named by toolName (run_script and manage_session word
+// the same statuses differently); any other tool result carries no user-facing
+// rendering and reports ok=false, matching the live view where such results are
+// not displayed.
+func RenderStoredResult(content, toolName string) (text string, isError, ok bool) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(content), &raw); err != nil {
 		return "", false, false
@@ -106,7 +151,7 @@ func RenderStoredResult(content string) (text string, isError, ok bool) {
 	if err := json.Unmarshal([]byte(content), &cr); err != nil {
 		return "", false, false
 	}
-	res := cr.toResult()
+	res := cr.toResult(wordingForTool(toolName))
 	return res.ForUser, res.IsError, true
 }
 

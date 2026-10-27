@@ -2156,7 +2156,7 @@ func (c *CLI) ShowHistory(messages []llm.Message, summary string) {
 			if !showResults {
 				continue
 			}
-			text, isErr, ok := tools.RenderStoredResult(m.Content)
+			text, isErr, ok := tools.RenderStoredResult(m.Content, m.Name)
 			if !ok {
 				continue
 			}

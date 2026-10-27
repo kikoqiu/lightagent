@@ -606,7 +606,7 @@ func (t *RunScriptTool) Parameters() map[string]any {
 func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Result {
 	start := time.Now()
 	fail := func(message string) *Result {
-		return commandResult{Status: statusFailed, Output: message, ElapsedSeconds: elapsedSeconds(start)}.toResult()
+		return commandResult{Status: statusFailed, Output: message, ElapsedSeconds: elapsedSeconds(start)}.toResult(scriptWording)
 	}
 
 	if t.engine == nil {
@@ -701,7 +701,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 				TotalBytes:     totalBytes,
 				ElapsedSeconds: elapsedSeconds(start),
 				Warning:        strPtr(userMessageWarning(session.ID)),
-			}.toResult()
+			}.toResult(scriptWording)
 		}
 		raw := session.TakeOutput()
 		_ = session.Kill()
@@ -716,7 +716,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 			TotalLines:     totalLines,
 			TotalBytes:     totalBytes,
 			ElapsedSeconds: elapsedSeconds(start),
-		}.toResult()
+		}.toResult(scriptWording)
 	}
 	// The wait is over: take what the child produced, whether it exited within
 	// the window or is still running. The whole buffer is handed over as it
@@ -743,7 +743,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 			TotalLines:     totalLines,
 			TotalBytes:     totalBytes,
 			ElapsedSeconds: elapsedSeconds(start),
-		}.toResult()
+		}.toResult(scriptWording)
 	}
 
 	return commandResult{
@@ -754,5 +754,5 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 		TotalLines:     totalLines,
 		TotalBytes:     totalBytes,
 		ElapsedSeconds: elapsedSeconds(start),
-	}.toResult()
+	}.toResult(scriptWording)
 }

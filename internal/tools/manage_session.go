@@ -78,7 +78,7 @@ func (t *ManageSessionTool) Execute(ctx context.Context, args map[string]any) *R
 		return s
 	}())
 	fail := func(message string) *Result {
-		return commandResult{Status: statusFailed, Output: message, ElapsedSeconds: elapsedSeconds(start)}.toResult()
+		return commandResult{Status: statusFailed, Output: message, ElapsedSeconds: elapsedSeconds(start)}.toResult(sessionWording)
 	}
 
 	if action == "" {
@@ -119,7 +119,7 @@ func (t *ManageSessionTool) lookup(start time.Time, args map[string]any, action 
 			Output:         fmt.Sprintf("session_id is required for action='%s'", action),
 			ElapsedSeconds: elapsedSeconds(start),
 		}
-		return nil, cr.toResult()
+		return nil, cr.toResult(sessionWording)
 	}
 	session, err := t.engine.sessions.Get(id)
 	if err != nil {
@@ -128,7 +128,7 @@ func (t *ManageSessionTool) lookup(start time.Time, args map[string]any, action 
 			Output:         fmt.Sprintf("session %q not found", id),
 			ElapsedSeconds: elapsedSeconds(start),
 		}
-		return nil, cr.toResult()
+		return nil, cr.toResult(sessionWording)
 	}
 	return session, nil
 }
@@ -170,7 +170,7 @@ func (t *ManageSessionTool) executeList(start time.Time) *Result {
 		TotalLines:     len(infos),
 		TotalBytes:     len(text),
 		ElapsedSeconds: elapsedSeconds(start),
-	}).toResultInfo()
+	}).toResultInfo(sessionWording)
 }
 
 // sessionScriptDisplayLines is how many rows of a session's script list shows
@@ -259,7 +259,7 @@ func (t *ManageSessionTool) executePoll(ctx context.Context, start time.Time, ar
 			cr.Warning = strPtr("poll interrupted by user: the process is still running; poll again to take its output")
 		}
 	}
-	return cr.toResultInfo()
+	return cr.toResultInfo(sessionWording)
 }
 
 func (t *ManageSessionTool) executeInput(start time.Time, args map[string]any) *Result {
@@ -270,7 +270,7 @@ func (t *ManageSessionTool) executeInput(start time.Time, args map[string]any) *
 	data, ok := stringArg(args, "data")
 	if !ok {
 		cr := commandResult{Status: statusFailed, Output: "data is required for action='input'", ElapsedSeconds: elapsedSeconds(start)}
-		return cr.toResult()
+		return cr.toResult(sessionWording)
 	}
 	if session.IsDone() {
 		// Nothing can be written anymore, but the exit is not lost: the session
@@ -280,7 +280,7 @@ func (t *ManageSessionTool) executeInput(start time.Time, args map[string]any) *
 			Output:         fmt.Sprintf("process already exited with code %d; poll the session to take its last output", session.GetExitCode()),
 			ElapsedSeconds: elapsedSeconds(start),
 		}
-		return cr.toResult()
+		return cr.toResult(sessionWording)
 	}
 	if err := session.Write(encodeControlInput(data)); err != nil {
 		cr := commandResult{
@@ -288,14 +288,14 @@ func (t *ManageSessionTool) executeInput(start time.Time, args map[string]any) *
 			Output:         fmt.Sprintf("failed to write input: %v", err),
 			ElapsedSeconds: elapsedSeconds(start),
 		}
-		return cr.toResult()
+		return cr.toResult(sessionWording)
 	}
 	return (commandResult{
 		Status:         statusCompleted,
 		ExitCode:       intPtr(0),
 		Output:         fmt.Sprintf("Input written to session %s", session.ID),
 		ElapsedSeconds: elapsedSeconds(start),
-	}).toResultInfo()
+	}).toResultInfo(sessionWording)
 }
 
 // takeOutput hands the session's buffered output over and folds it the way a
@@ -337,7 +337,7 @@ func (t *ManageSessionTool) executeKill(start time.Time, args map[string]any, ma
 			TotalLines:     totalLines,
 			TotalBytes:     totalBytes,
 			ElapsedSeconds: elapsedSeconds(start),
-		}.toResult()
+		}.toResult(sessionWording)
 	}
 	if err := session.Kill(); err != nil {
 		cr := commandResult{
@@ -345,7 +345,7 @@ func (t *ManageSessionTool) executeKill(start time.Time, args map[string]any, ma
 			Output:         fmt.Sprintf("failed to kill session: %v", err),
 			ElapsedSeconds: elapsedSeconds(start),
 		}
-		return cr.toResult()
+		return cr.toResult(sessionWording)
 	}
 	shown, truncated, totalLines, totalBytes := takeOutput(session, maxLines, maxChars)
 	message := fmt.Sprintf("Process in session %s terminated", session.ID)
@@ -364,7 +364,7 @@ func (t *ManageSessionTool) executeKill(start time.Time, args map[string]any, ma
 		TotalLines:     totalLines,
 		TotalBytes:     totalBytes,
 		ElapsedSeconds: elapsedSeconds(start),
-	}.toResultInfo()
+	}.toResultInfo(sessionWording)
 }
 
 // controlKeys maps friendly names to their byte sequences.
