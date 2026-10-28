@@ -37,6 +37,86 @@ func TestExecCommandCompletes(t *testing.T) {
 	}
 }
 
+// TestExecCommandAcceptsTheCommandAlias covers `command`, the alias of
+// `script`: a call that carries the source there runs it, a blank `script` falls
+// back to it, and two different programs under the two names are refused with
+// the rule the surface states (one of the two, not both). Two identical copies
+// still run — the alias is honoured, not punished — but the result carries the
+// same rule as a warning, so a silent success cannot teach the habit. A call
+// with neither is refused with the name of the alias, so the retry can fix
+// itself.
+func TestExecCommandAcceptsTheCommandAlias(t *testing.T) {
+	aliasEcho := "echo alias-ran"
+	scriptEcho := "echo script-ran"
+	if runtime.GOOS == "windows" {
+		aliasEcho = "Write-Output alias-ran"
+		scriptEcho = "Write-Output script-ran"
+	}
+
+	engine := NewExecEngine(60, 5, true)
+	defer engine.Close()
+	tool := NewRunScriptTool(engine)
+
+	cases := []struct {
+		name string
+		args map[string]any
+		want string
+		deny string
+		note bool // the result must carry the "give only one of them" warning
+	}{
+		{"the alias alone", map[string]any{"command": aliasEcho}, "alias-ran", "script-ran", false},
+		{"a blank script falls back to the alias", map[string]any{"script": "  \n ", "command": aliasEcho}, "alias-ran", "script-ran", false},
+		{"the same source under both names", map[string]any{"script": scriptEcho, "command": scriptEcho}, "script-ran", "", true},
+		{"the same source, padded", map[string]any{"script": "\n " + scriptEcho + "\n", "command": scriptEcho}, "script-ran", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tool.Execute(context.Background(), tc.args)
+			if res.IsError {
+				t.Fatalf("unexpected error: %s", res.ForLLM)
+			}
+			if !strings.Contains(res.ForLLM, `"status":"completed"`) {
+				t.Fatalf("status not completed: %s", res.ForLLM)
+			}
+			if !strings.Contains(res.ForLLM, tc.want) {
+				t.Fatalf("output = %s, want %q", res.ForLLM, tc.want)
+			}
+			if tc.deny != "" && strings.Contains(res.ForLLM, tc.deny) {
+				t.Fatalf("output = %s, must not carry %q", res.ForLLM, tc.deny)
+			}
+			noted := strings.Contains(res.ForLLM, scriptAliasWarning)
+			if noted != tc.note {
+				t.Fatalf("the duplicate-argument warning = %v, want %v: %s", noted, tc.note, res.ForLLM)
+			}
+			if tc.note && !strings.Contains(res.ForUser, scriptAliasWarning) {
+				t.Fatalf("the user-facing text lost the warning: %q", res.ForUser)
+			}
+		})
+	}
+
+	// Two different programs under the two names: the call is refused with the
+	// rule, not with a guess about which one was meant.
+	res := tool.Execute(context.Background(), map[string]any{"script": scriptEcho, "command": aliasEcho})
+	if !res.IsError {
+		t.Fatalf("different sources under both names must fail: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, scriptAliasRule) {
+		t.Fatalf("refusal = %s, want %q", res.ForLLM, scriptAliasRule)
+	}
+	if strings.Contains(res.ForLLM, "disagree") {
+		t.Fatalf("refusal = %s, want the one-of-two rule instead of the old wording", res.ForLLM)
+	}
+
+	// Neither name: the refusal names both, so the next call can use either.
+	res = tool.Execute(context.Background(), map[string]any{})
+	if !res.IsError {
+		t.Fatalf("a call without the source must fail: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, `script is required (or its alias \"command\")`) {
+		t.Fatalf("refusal = %s, want both names", res.ForLLM)
+	}
+}
+
 // TestExecCommandCollapsesCRProgress covers the noise a refresh-driven program
 // makes: every write repaints the same terminal line with a leading CR, so only
 // that line's last version may reach the model — never one line per refresh.
@@ -1451,18 +1531,20 @@ func TestExecCommandLanguageParameter(t *testing.T) {
 }
 
 // TestExecCommandScriptParameter pins the `script` wording: it holds the source
-// code of the language `language` names — the text, not a path — and it stays the
-// only required parameter. The wording is host-independent (no engine is named,
-// in particular no Python example on a host without an interpreter) and the
-// inline (`-c`) advice is left to the tool description, so it is not repeated.
+// code of the language `language` names — the text, not a path — and it is the
+// name the source is expected under, with `command` as its alias. Neither key is
+// `required`: a call may carry the source in either one, so a required list
+// naming one of them would forbid the other. The wording is host-independent (no
+// engine is named, in particular no Python example on a host without an
+// interpreter) and the inline (`-c`) advice is left to the tool description, so
+// it is not repeated.
 func TestExecCommandScriptParameter(t *testing.T) {
 	engine := NewExecEngine(60, 10, true)
 	defer engine.Close()
 	params := NewRunScriptTool(engine).Parameters()
 
-	required, _ := params["required"].([]string)
-	if len(required) != 1 || required[0] != "script" {
-		t.Fatalf("required = %v, want [script]", required)
+	if required, ok := params["required"]; ok {
+		t.Fatalf("required = %v, want none: the source may travel in script or in its alias", required)
 	}
 	props, _ := params["properties"].(map[string]any)
 	param, ok := props["script"].(map[string]any)
@@ -1476,11 +1558,29 @@ func TestExecCommandScriptParameter(t *testing.T) {
 	if !strings.Contains(description, "not a path to a script file") {
 		t.Errorf("the script parameter does not state that it takes the text, not a path: %q", description)
 	}
+	// The parameter says what the source is and nothing about a requirement or
+	// about the alias's rules: that wording belongs to `command`, and a second
+	// copy here reads like a condition the call has to satisfy.
+	if strings.Contains(description, "Required") {
+		t.Errorf("the script parameter restates a requirement: %q", description)
+	}
 	if !systemPython().Found && strings.Contains(description, ScriptLanguagePython) {
 		t.Errorf("the script parameter names python although no interpreter was found: %q", description)
 	}
 	if strings.Contains(description, "-c") {
 		t.Errorf("the script parameter repeats the inline (`-c`) advice: %q", description)
+	}
+
+	alias, ok := props["command"].(map[string]any)
+	if !ok {
+		t.Fatal("command (the alias of script) is missing from the run_script parameters")
+	}
+	aliasDescription, _ := alias["description"].(string)
+	// The alias says only what it is and that it must not accompany `script`:
+	// the full explanation belongs to `script`, and a long alias description
+	// reads like a second argument with a life of its own.
+	if want := "Alias of `script`: do not give it together with `script`."; aliasDescription != want {
+		t.Errorf("the command parameter description = %q, want %q", aliasDescription, want)
 	}
 }
 

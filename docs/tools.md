@@ -121,7 +121,8 @@ type Tool interface {
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `script` | string | 必填 | **脚本源码**：`language` 所选语言的源代码——**是文本本身，不是脚本文件路径**；原样交给该引擎当作一个程序执行（shell 引擎即 shell 脚本，`busybox` 即 ash 脚本，`python` 即 Python 源码） |
+| `script` | string | 必填之一（或其别名 `command`） | **脚本源码**：`language` 所选语言的源代码——**是文本本身，不是脚本文件路径**；原样交给该引擎当作一个程序执行（shell 引擎即 shell 脚本，`busybox` 即 ash 脚本，`python` 即 Python 源码） |
+| `command` | string | — | **`script` 的别名**：参数说明只写一句——Alias of \`script\`: do not give it together with \`script\`.（`script` 的描述保持原文，不附加任何「必填 / 只能给一个」之类的要求）。`script` 没给（或只有空白）时用它代替。两者都给且**内容相同**（忽略首尾空白）时仍照常执行，并在结果里补一条 warning：「both script and command were given; the call still ran `script`」（`warning` 字段与用户文案都带）；**内容不同**则拒绝：「both script and command were given」。正因为源码可以走两个名字，schema 不列 `required`（列一个就会否掉「只给别名」的调用），源码缺失时由 `Execute` 报错并点名两个名字 |
 | `language` | string | 默认引擎（未配置时即宿主 shell `powershell` / `sh`） | **解释 `script` 的引擎**：决定源码是哪种语言、由什么执行（是引擎选择，不是调用标签）；**省略/留空即用默认引擎**（`tools.exec.default_language`，未配置或该引擎在本机不可用时为宿主 shell；`busybox` 也不会自动成为默认）。可选值由 schema 的 `enum` 按主机给出（`powershell`/`sh`，PATH 里有 `busybox64u.exe` 时的 `busybox`，以及存在时的 `python`——规范全名，另接受别名 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py`）；参数自带的 `description` 逐条说明各取值含义、别名、Python 版本与**实际生效**的默认引擎，**工具描述只讲机制** |
 | `wait_timeout` | int | `wait_seconds` | 同步等待**进程退出**的秒数（中间有输出也不提前返回）。**大于默认值**时这段等待还会让位于新的用户消息：消息到达即结束等待，进程留在后台（`status=running` + `session_id`），回答带 `warning` 与到那一刻的输出（见上） |
 | `run_timeout` | int | `exec.timeout_seconds` | 进程总寿命上限（秒），`0` 关闭 |

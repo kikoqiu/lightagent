@@ -490,6 +490,17 @@ func userMessageWarning(sessionID string) string {
 		"The console output so far is reported below.", sessionID)
 }
 
+// scriptAliasRule is the refusal of a call that names both `script` and
+// `command` with different sources: it says what is wrong with the call and
+// nothing else, leaving which one to keep to the caller.
+const scriptAliasRule = "both script and command were given"
+
+// scriptAliasWarning is the note of a call that named both and ran anyway: the
+// alias is honoured rather than punished, but the call is told that the argument
+// was duplicated and which parameter was used, so a silent success cannot teach
+// the habit.
+const scriptAliasWarning = "both script and command were given; the call still ran `script`"
+
 // RunScriptTool runs scripts with the wait-then-background model: the source is
 // handed to the engine chosen by the `language` parameter (the host shell by
 // default).
@@ -508,7 +519,8 @@ func (t *RunScriptTool) Name() string { return "run_script" }
 // Description implements Tool.
 func (t *RunScriptTool) Description() string {
 	description := fmt.Sprintf("Run a script with state-aware execution. This tool runs source text, "+
-		"not a shell command line: `script` holds the source, `language` selects the engine that "+
+		"not a shell command line: `script` holds the source (`command` is its alias; give only one of the two), "+
+		"`language` selects the engine that "+
 		"interprets it, and the text is handed to that engine as-is. It is recommended to put "+
 		"the program's own source directly in `script` and pick the `language` that matches it, rather "+
 		"than shelling out to another interpreter's inline (`-c`) one-liner, and to set `cwd` for the "+
@@ -548,6 +560,10 @@ func (t *RunScriptTool) Parameters() map[string]any {
 			"type": "string",
 			"description": "The script source: the source code of the language named by `language`, i.e. the " +
 				"text itself, not a path to a script file, handed to that engine as-is and run as one program.",
+		},
+		"command": map[string]any{
+			"type":        "string",
+			"description": "Alias of `script`: do not give it together with `script`.",
 		},
 		"language": map[string]any{
 			"type":    "string",
@@ -595,10 +611,13 @@ func (t *RunScriptTool) Parameters() map[string]any {
 		"default":     30000,
 		"description": "Maximum characters this call returns. The limit is per call, not over the process lifetime. Default: 30000.",
 	}
+	// The source is required, but either key carries it: listing one of them as
+	// `required` would forbid the very call the alias exists for (`command`
+	// alone), so the schema requires neither and a call without the source is
+	// answered by Execute, which names both.
 	return map[string]any{
 		"type":       "object",
 		"properties": properties,
-		"required":   []string{"script"},
 	}
 }
 
@@ -608,13 +627,44 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 	fail := func(message string) *Result {
 		return commandResult{Status: statusFailed, Output: message, ElapsedSeconds: elapsedSeconds(start)}.toResult(scriptWording)
 	}
+	// warn joins the notes a result carries: the alias rule and the end of the
+	// wait can both apply to the same call.
+	warn := func(notes ...string) *string {
+		kept := make([]string, 0, len(notes))
+		for _, n := range notes {
+			if n != "" {
+				kept = append(kept, n)
+			}
+		}
+		if len(kept) == 0 {
+			return nil
+		}
+		return strPtr(strings.Join(kept, "\n"))
+	}
 
 	if t.engine == nil {
 		return fail("run_script is not configured")
 	}
 	script, _ := stringArg(args, "script")
+	alias, _ := stringArg(args, "command")
+	note := ""
+	switch {
+	case trimSpace(script) == "":
+		// `command` is the alias some calls reach for: it stands in for `script`
+		// when that one was not given (or was blank), and nothing else changes.
+		script = alias
+	case trimSpace(alias) != "":
+		// Both names carry the source, which the surface says not to do. Two
+		// different programs are a contradiction and are refused; the same
+		// source twice is honoured (the alias is not a different argument) but
+		// the call is told, so a silent success does not teach the habit.
+		if trimSpace(alias) != trimSpace(script) {
+			return fail(scriptAliasRule)
+		}
+		note = scriptAliasWarning
+	}
 	if trimSpace(script) == "" {
-		return fail("script is required")
+		return fail("script is required (or its alias \"command\")")
 	}
 	rawLanguage, _ := stringArg(args, "language")
 	language, err := t.engine.resolveLanguage(rawLanguage)
@@ -700,7 +750,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 				TotalLines:     totalLines,
 				TotalBytes:     totalBytes,
 				ElapsedSeconds: elapsedSeconds(start),
-				Warning:        strPtr(userMessageWarning(session.ID)),
+				Warning:        warn(userMessageWarning(session.ID), note),
 			}.toResult(scriptWording)
 		}
 		raw := session.TakeOutput()
@@ -716,6 +766,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 			TotalLines:     totalLines,
 			TotalBytes:     totalBytes,
 			ElapsedSeconds: elapsedSeconds(start),
+			Warning:        warn(note),
 		}.toResult(scriptWording)
 	}
 	// The wait is over: take what the child produced, whether it exited within
@@ -743,6 +794,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 			TotalLines:     totalLines,
 			TotalBytes:     totalBytes,
 			ElapsedSeconds: elapsedSeconds(start),
+			Warning:        warn(note),
 		}.toResult(scriptWording)
 	}
 
@@ -754,5 +806,6 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 		TotalLines:     totalLines,
 		TotalBytes:     totalBytes,
 		ElapsedSeconds: elapsedSeconds(start),
+		Warning:        warn(note),
 	}.toResult(scriptWording)
 }
