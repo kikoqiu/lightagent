@@ -4,7 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestAcquireExcludesASecondHolder pins the core promise: while a directory is
@@ -92,6 +95,77 @@ func TestReleaseIsIdempotent(t *testing.T) {
 	}
 	if err := lk.Release(); err != nil {
 		t.Fatalf("second Release: %v", err)
+	}
+}
+
+// TestAcquireWaitTakesOverAHandedOffLock pins what a restart replacement needs:
+// a process that knows the holder is about to give the directory up waits for it
+// instead of reporting the conflict, while a holder that stays is still reported
+// at the deadline.
+func TestAcquireWaitTakesOverAHandedOffLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".lightagent")
+	first, err := Acquire(dir)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = first.Release()
+	}()
+
+	taken, err := AcquireWait(dir, 2*time.Second)
+	if err != nil {
+		t.Fatalf("AcquireWait must take the lock the holder gave up: %v", err)
+	}
+	_ = taken.Release()
+
+	// The same wait gives up on a directory that stays locked, with the message
+	// a user-facing run prints.
+	held, err := Acquire(dir)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+	_, err = AcquireWait(dir, 40*time.Millisecond)
+	if err == nil {
+		t.Fatal("AcquireWait must fail while the holder stays")
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("AcquireWait error = %v, want the instance conflict named", err)
+	}
+}
+
+// TestLockFileStillIs pins the check acquire makes after taking the flock: a
+// lock on a file that is no longer the one at the lock path guards nothing,
+// because the next instance would create a new file and lock that.
+func TestLockFileStillIs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, LockFileName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if !lockFileStillIs(f, path) {
+		t.Fatal("the open file is the lock file, so it must count as current")
+	}
+	if os.Remove(path) != nil {
+		// Windows keeps an open file from being removed or replaced, so the
+		// hand-over race this check catches cannot happen there.
+		if runtime.GOOS != "windows" {
+			t.Fatal("remove the lock file")
+		}
+		return
+	}
+	if lockFileStillIs(f, path) {
+		t.Fatal("a removed lock file must not count as the lock")
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if lockFileStillIs(f, path) {
+		t.Fatal("a different file at the lock path must not count as the lock")
 	}
 }
 

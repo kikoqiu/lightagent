@@ -79,11 +79,15 @@ func runSession(o *options, stdout io.Writer) error {
 	}
 	// One instance per state directory: the lock is taken before anything else
 	// touches the directory and released on the way out. A signal exit and the
-	// restart hand-over release it through the shutdown hooks as well, so the
-	// replacement process (which resumes this session) can take it over. The
-	// holder is what a /cd moves to the new working directory (see dirGuard).
+	// restart hand-over release it through the shutdown hooks as well, so the run
+	// that resumes this session can take it over (on Unix the image is replaced in
+	// place; on the other hosts a replacement process takes over). A replacement
+	// process is created while this lock is still held, so it waits for the
+	// hand-over instead of failing with an instance conflict (see restartProgram
+	// and lockWaitForThisRun); every other run fails at once. The holder is what a
+	// /cd moves to the new working directory (see dirGuard).
 	holder := lock.NewHolder(store.DirName)
-	if err := holder.Hold(st.Root()); err != nil {
+	if err := holder.HoldWait(st.Root(), lockWaitForThisRun()); err != nil {
 		return err
 	}
 	defer func() { _ = holder.Release() }()
@@ -348,11 +352,11 @@ func runSession(o *options, stdout io.Writer) error {
 		srv.SetSessionInfo(c.CurrentSession)
 		// The page's Restart button saves the session (the endpoint does that,
 		// so the conversation is on disk before anything is given up) and then
-		// hands the run over to a fresh process, which resumes it: the same
-		// conversation continues there, with the config.json that was just
-		// written put in effect. The mirror gives up its listening address on the
-		// way out, so the replacement binds it again and open pages reconnect to
-		// it on their own.
+		// hands the run over to a fresh start of the program, which resumes it:
+		// the same conversation continues there, with the config.json that was
+		// just written put in effect. The mirror gives up its listening address
+		// on the way out, so the restarted run binds it again and open pages
+		// reconnect to it on their own.
 		srv.SetRestarter(func() error { return restartProgram(srv.ReleaseListener) })
 		// Attachments: the accepted media types plus the directory the browser
 		// uploads land in (.lightagent/uploads beside the session files). They

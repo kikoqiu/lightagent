@@ -5,11 +5,11 @@ import (
 )
 
 // SetRestarter wires the callback behind the page's Restart button
-// (POST /api/restart): the program registers a function that starts a replacement
-// of itself and hands the run over to it. The mirror saves the conversation
-// before calling it and the replacement resumes that session, so the page
-// reconnects to a process that continues the same conversation with the
-// config.json that was just written in effect.
+// (POST /api/restart): the program registers a function that hands the run over
+// to a fresh start of itself. The mirror saves the conversation before calling
+// it and the restarted run resumes that session, so the page reconnects to a
+// process that continues the same conversation with the config.json that was
+// just written in effect.
 //
 // Without it the endpoint reports that restarting is unavailable and the page
 // hides the control, which is what an embedder that runs the mirror inside its
@@ -22,7 +22,7 @@ func (s *Server) SetRestarter(fn func() error) { s.restart = fn }
 func (s *Server) canRestart() bool { return s.restart != nil }
 
 // ReleaseListener gives up the listening address without touching the live
-// connections. A restart needs that before the replacement starts: the port has
+// connections. A restart needs that before the run is given up: the port has
 // to be free for it, while the reply of the request that asked for the restart
 // still travels on a connection that was already accepted — a Close, which drops
 // every client, would cut that reply off. The mirror keeps serving the accepted
@@ -36,18 +36,18 @@ func (s *Server) ReleaseListener() error {
 
 // handleRestart is the page's Restart button:
 //
-//	POST /api/restart -> save the conversation, then start a replacement process
+//	POST /api/restart -> save the conversation, then restart the run
 //
-// The order is the policy. The replacement resumes the session file, so the
+// The order is the policy. The restarted run resumes the session file, so the
 // conversation has to be on disk first, and everything that can go wrong is
 // answered before anything of this run is given up: a turn in progress is refused
 // (its text is not in the history yet, and the terminal does not leave mid-turn
 // either), a failed save is refused (a restart must not lose the conversation it
-// was asked to keep), and a restart that cannot start the replacement is refused
+// was asked to keep), and a restart that cannot hand the run over is refused
 // too — the run then continues as if nothing had been asked.
 //
 // The reply carries the path the session was written to. The page does not have
-// to do anything with it: the replacement binds the same address, so the page
+// to do anything with it: the restarted run binds the same address, so the page
 // reconnects and rebuilds its transcript from the resumed conversation (see
 // seedHistory).
 func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {

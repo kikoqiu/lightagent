@@ -24,7 +24,7 @@
 | 2 | 全局配置 | 程序目录下的 `config.json`：接口、上下文长度、web、工具限制 |
 | 3 | 运行状态在 CWD | 所有状态/记录写入**当前工作目录**的 `.lightagent/`；**一个目录一个实例**：启动时在 `.lightagent/.lock` 上加独占锁（Unix `flock` / Windows `LockFileEx`，纯 `syscall`），同一目录再启第二个实例直接报错退出，退出时解锁并（目录里只剩锁文件则）删掉 `.lightagent/`；不同目录仍可并行多实例；**锁与会话目录都跟着 `/cd` 走**——先取新目录的锁，取不到就拒绝这次 `/cd`（留在原目录），取到后切入新目录并释放原目录的锁，之后的保存写到新目录的 `.lightagent/sessions/`（旧文件不迁移） |
 | 4 | CLI 工具循环 | 彩色 REPL，循环期间可继续输入插入用户消息 |
-| 5 | Web 镜像 | 配置了 web 端口即启动（`web.host` 可选绑定 IP，默认 `127.0.0.1`）；端口被占用时自动递增；**WebSocket 实时双向镜像**；页面内置配置编辑器（控件表单 + JSON 双模式，`/api/config`，**重启生效**）与**一键重启**（`/api/restart`：先保存会话，新进程自动恢复）；**登录对话框**（密码明文保存在配置里、浏览器只发送加盐摘要，HttpOnly 会话 cookie + 记住我，**改密码立即生效**） |
+| 5 | Web 镜像 | 配置了 web 端口即启动（`web.host` 可选绑定 IP，默认 `127.0.0.1`）；端口被占用时自动递增；**WebSocket 实时双向镜像**；页面内置配置编辑器（控件表单 + JSON 双模式，`/api/config`，**重启生效**）与**一键重启**（`/api/restart`：先保存会话，新一轮运行自动恢复；Unix 上原地换镜像，终端与 PID 不变）；**登录对话框**（密码明文保存在配置里、浏览器只发送加盐摘要，HttpOnly 会话 cookie + 记住我，**改密码立即生效**） |
 | 6 | 会话记录 | **一个目录一个会话**：启动询问是否恢复历史（默认是），退出询问是否保存（默认是），运行中只存内存，`/save` 手动落盘 |
 | 7 | 命令执行 | `run_script` / `manage_session`（脚本语言 `powershell`/`sh`/`busybox`/`python`，另接受 `ps`/`pwsh`、`bash`/`shell`、`ash`、`python3`/`py` 等别名；Windows 上 PATH 里有 `busybox64u.exe` 时可选 `busybox`（busybox 的 `ash` 解释器，天然 UTF-8），但**不作为默认引擎**；后台会话、轮询、输入、终止；进程退出后保留为**僵尸**直到被 `poll` 取走最后的输出与退出码，没人取走则 24h 后清理）；`/result` 可开关结果输出 |
 | 8 | 文件操作 | `read_file` / `write_file` / `edit_file`（`read_file` 默认 `auto` 自动侦测编码，含 UTF-16/UTF-32 与 GBK 等字符集转换，先解码再切行） |
@@ -243,7 +243,12 @@ source <(lightagent completion bash)       # bash 补全
   `LockFileEx`，均为纯 `syscall`、不用库）。同一个目录里再启动一个实例会立即报错
   `another lightagent instance is already running in <目录>` 并以状态码 1 退出，不会两个实例
   共用同一个会话文件。锁会在正常退出、Ctrl+C / SIGTERM 以及 Web 重启交接时释放，好让用
-  `--resume` 起的替换进程接管。
+  `--resume` 起的新一轮运行接管。**Unix 宿主上的重启是原地换镜像**（`syscall.Exec`）：PID、会话、
+  进程组与控制终端都不变，终端与作业控制照旧，`systemd` 之类的监管者也仍然认这个 PID；换镜像取代了
+  「起一个替换进程、自己退出」——后者会让 shell 立刻把终端收回自己，留下的替换进程变成孤儿的后台
+  进程组，从终端读键直接得到 `EIO`（`lightagent: read /dev/stdin: input/output error`）。
+  **Windows 等无法换镜像的宿主**仍旧启动替换进程：它是**先被创建、旧进程才交锁**的，所以启动时
+  **等**这次交接（`LIGHTAGENT_RESTART` 标记 + 3 秒上限），而不是报「已有实例在运行」后退出。
 * **锁跟着 `/cd` 走**：`/cd` 到另一个目录时先在新目录的 `.lightagent/.lock` 上取锁，取不到（那里
   已有实例在跑）就**失败且不改目录**；取到后才切入新目录、再释放原目录的锁——实例始终只锁着它正在
   运行的目录，离开的目录随即空出来。`/cd` 回自己已在的目录不会与自己冲突。用 `--session` 指定会话
@@ -278,7 +283,7 @@ source <(lightagent completion bash)       # bash 补全
   磁盘上（下次仍可恢复），本次是一个没有名字的新会话。
 * `lightagent -r`（或 `--resume`）直接恢复最新会话，不弹出询问；无文件时提示后开始新会话。
 * Web 镜像的**重启**（配置面板里的 Restart）把「保存 + 恢复」两步自动做完：先写当前会话文件，
-  再由新进程用 `--resume` 载入同一会话（见 [docs/web.md](docs/web.md)）。
+  再用 `--resume` 载入同一会话重开这一轮运行（Unix 上是原地换镜像，见 [docs/web.md](docs/web.md)）。
 * 恢复时终端把整段历史按**实时渲染**重画：思考块、工具调用行、工具结果行与可见回答都在，
   与保存前屏幕上看到的一致（`/result off` 时工具结果行同样略去，与实时一致）。
 * 非交互（管道）输入无法询问，按默认值处理（恢复 + 保存）。

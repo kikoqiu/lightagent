@@ -234,6 +234,47 @@ func TestRunRefusesASecondInstanceInTheSameDirectory(t *testing.T) {
 	}
 }
 
+// TestRunWaitsForTheHandOverOfARestart covers the hand-over a web restart does
+// on both platforms: the replacement is created while the process it replaces
+// still holds the directory lock (that process gives the lock up a moment
+// later), so a run marked as the replacement waits for it instead of reporting
+// the instance conflict that is already ending.
+func TestRunWaitsForTheHandOverOfARestart(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfg := `{"openai":{"api_base":"http://127.0.0.1:1/v1","api_key":"x","model":"m","stream":false},"web":{"port":0}}`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The process being replaced still holds the lock when the replacement
+	// starts.
+	held, err := lock.Acquire(filepath.Join(dir, ".lightagent"))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = held.Release()
+	}()
+
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+
+	t.Setenv(restartEnv, "1")
+	var out, errBuf bytes.Buffer
+	code := run([]string{"-c", cfgPath, "-C", dir, "-p", "hello", "--json"}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("code = %d, stderr = %s", code, errBuf.String())
+	}
+	if strings.Contains(errBuf.String(), "already running") {
+		t.Fatalf("the replacement must wait for the hand-over, stderr = %q", errBuf.String())
+	}
+}
+
 // TestPrintConfig checks the effective configuration is dumped with the API key
 // masked.
 func TestPrintConfig(t *testing.T) {
