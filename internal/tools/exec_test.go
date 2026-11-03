@@ -35,6 +35,11 @@ func TestExecCommandCompletes(t *testing.T) {
 	if !strings.Contains(res.ForLLM, "hello") {
 		t.Fatalf("output missing: %s", res.ForLLM)
 	}
+	// A script that left nothing running must not carry the note about
+	// terminated background programs.
+	if !strings.Contains(res.ForLLM, `"warning":null`) {
+		t.Fatalf("a plain script reported a warning: %s", res.ForLLM)
+	}
 }
 
 // TestExecCommandAcceptsTheCommandAlias covers `command`, the alias of
@@ -699,6 +704,15 @@ func TestExecCommandCompletesWhenALeftoverHoldsThePipes(t *testing.T) {
 	if !strings.Contains(res.ForLLM, `"status":"completed"`) {
 		t.Fatalf("the session did not finish: %s", res.ForLLM)
 	}
+	// The leftover program was terminated, and the answer says so: without that
+	// note the call reads as a plain success while a program the script meant to
+	// keep running has already been killed.
+	if !strings.Contains(res.ForLLM, "were still running") {
+		t.Fatalf("the answer does not report the terminated background program: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "setsid") {
+		t.Fatalf("the answer does not say how to detach such a program: %s", res.ForLLM)
+	}
 
 	waitForHeartbeat(t, heartbeat)
 	// Reap runs before the session is marked done, so the leftover program is
@@ -708,6 +722,54 @@ func TestExecCommandCompletesWhenALeftoverHoldsThePipes(t *testing.T) {
 	time.Sleep(700 * time.Millisecond)
 	if grown := heartbeatSize(t, heartbeat); grown != size {
 		t.Fatalf("the leftover program is still running: the heartbeat grew from %d to %d bytes", size, grown)
+	}
+}
+
+// TestManageSessionPollReportsLeftovers covers the other hand-over of an exit:
+// a session polled after its script's process exited says the same thing about
+// the programs that were terminated with it.
+func TestManageSessionPollReportsLeftovers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PowerShell does not hand the parent's pipes to a detached program")
+	}
+	engine := NewExecEngine(60, 1, true)
+	defer engine.Close()
+	execTool := NewRunScriptTool(engine)
+	manageTool := NewManageSessionTool(engine)
+
+	// The root exits after two seconds while the program it backgrounded keeps
+	// running, so the session leaves the wait window first and only reports the
+	// exit later, through a poll.
+	res := execTool.Execute(context.Background(), map[string]any{
+		"script": "sleep 30 & sleep 2", "wait_timeout": 1,
+	})
+	sessionID := sessionIDFromResult(t, res.ForLLM)
+	if sessionID == "" {
+		t.Skipf("the script did not stay in the background: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "were still running") {
+		t.Fatalf("the running answer already reported a teardown: %s", res.ForLLM)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	var polled string
+	for {
+		poll := manageTool.Execute(context.Background(), map[string]any{
+			"action": "poll", "session_id": sessionID, "wait_timeout": 5,
+		})
+		if poll.IsError {
+			t.Fatalf("poll error: %s", poll.ForLLM)
+		}
+		polled = poll.ForLLM
+		if strings.Contains(polled, `"status":"completed"`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the script never exited: %s", polled)
+		}
+	}
+	if !strings.Contains(polled, "were still running") {
+		t.Fatalf("the poll does not report the terminated background program: %s", polled)
 	}
 }
 
@@ -892,6 +954,30 @@ func TestRunScriptDescriptionGuidance(t *testing.T) {
 		}
 	} else if strings.Contains(desc, `"language":"python"`) {
 		t.Fatalf("the Python example is advertised without an interpreter: %s", desc)
+	}
+}
+
+// TestRunScriptDescriptionStatesTheBackgroundJobRule pins the hint that keeps a
+// model from expecting a program it started with `&` to outlive the call: the
+// description says such a program dies with the script's process, names the way
+// out where one exists (`setsid` — a new process group/session on Unix) and
+// always names the managed alternative, the foreground route through
+// `wait_timeout`.
+func TestRunScriptDescriptionStatesTheBackgroundJobRule(t *testing.T) {
+	engine := NewExecEngine(60, 10, true)
+	defer engine.Close()
+	desc := NewRunScriptTool(engine).Description()
+
+	if !strings.Contains(desc, "starts in the background") {
+		t.Fatalf("the description says nothing about background programs: %s", desc)
+	}
+	// `setsid` exists only where the tree is a process group; a Windows job
+	// object has no breakaway limit, so advertising it there would mislead.
+	if wantsSetsid := runtime.GOOS != "windows"; strings.Contains(desc, "setsid") != wantsSetsid {
+		t.Fatalf("description mentions setsid = %v, want %v: %s", !wantsSetsid, wantsSetsid, desc)
+	}
+	if !strings.Contains(desc, "`wait_timeout`") {
+		t.Fatalf("the description does not point at the foreground/session route: %s", desc)
 	}
 }
 

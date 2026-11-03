@@ -286,6 +286,30 @@ func TestExecCommandCompletionLeavesNoSession(t *testing.T) {
 	}
 }
 
+// TestSessionLeftoversNoteIsReportedOnce pins the note a hand-over carries when
+// the teardown terminated programs the script had left running: it explains one
+// exit report and is then forgotten, and a session that left nothing behind
+// never produces it.
+func TestSessionLeftoversNoteIsReportedOnce(t *testing.T) {
+	session := &ProcessSession{ID: "abc", Status: sessionStatusRunning}
+
+	if note := leftoversNote(session); note != "" {
+		t.Fatalf("a session that left nothing behind produced the note %q", note)
+	}
+	session.noteLeftoversTerminated(false)
+	if note := leftoversNote(session); note != "" {
+		t.Fatalf("a negative report produced the note %q", note)
+	}
+	session.noteLeftoversTerminated(true)
+	note := leftoversNote(session)
+	if !strings.Contains(note, "were still running") {
+		t.Fatalf("the note does not say what happened: %q", note)
+	}
+	if again := leftoversNote(session); again != "" {
+		t.Fatalf("the note was reported twice: %q", again)
+	}
+}
+
 // TestManageSessionKillReportsTheOutputOfARunningProcess covers the running
 // process branch of kill: the tree is terminated, the session is released, and
 // what the process had printed until then is handed over with the answer instead

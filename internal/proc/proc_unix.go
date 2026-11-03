@@ -49,13 +49,22 @@ func killTree(cmd *exec.Cmd) error {
 }
 
 // releaseTree terminates what the root process left behind, so a finished
-// session cannot leak a background program.
-func releaseTree(cmd *exec.Cmd) {
+// session cannot leak a background program, and reports whether there was
+// anything to terminate. The root has already been waited for, so a group that
+// still has members holds programs the script started and that outlived it —
+// exactly the ones a caller can warn about.
+//
+// SIGKILL is deliberate: a background job of the script is part of its tree and
+// nothing of it may survive, and a program that ignores SIGTERM must not hold up
+// the caller either. It does mean such a program gets no chance to flush what it
+// buffered; a caller that has to keep it running must detach it (setsid).
+func releaseTree(cmd *exec.Cmd) bool {
 	pgid, ok := processGroup(cmd)
 	if !ok || !groupAlive(pgid) {
-		return
+		return false
 	}
 	_ = signalGroup(pgid, syscall.SIGKILL)
+	return true
 }
 
 // killProcess stops only the process that was launched; the children it started

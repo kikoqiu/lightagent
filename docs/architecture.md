@@ -562,7 +562,7 @@ MCP unlock 发现机制，由注册表 + 三个控制面工具组成：
 
 `internal/proc` 统一了子进程的启动与停止，并区分两种归属模式：
 
-* **树模式 `Start`**（`run_script` 会话）：孩子成为自己进程树的根（Windows 加入 kill-on-close 的 Job Object；Unix 新建进程组），`Kill` 结束整棵树——只看直接子进程是不够的（shell、`cmd.exe`、`npx` 之后还有真正在跑的程序）。Windows 直接 `TerminateJobObject`；Job 分配失败（如本进程处在一个禁止嵌套的 Job 里）时退回 `taskkill /T /F`。`Reap` 在根进程被 `Wait` 之后调用：根退出时留下的后台子进程同样被清理。
+* **树模式 `Start`**（`run_script` 会话）：孩子成为自己进程树的根（Windows 加入 kill-on-close 的 Job Object；Unix 新建进程组），`Kill` 结束整棵树——只看直接子进程是不够的（shell、`cmd.exe`、`npx` 之后还有真正在跑的程序）。Windows 直接 `TerminateJobObject`；Job 分配失败（如本进程处在一个禁止嵌套的 Job 里）时退回 `taskkill /T /F`。`Reap` 在根进程被 `Wait` 之后调用：根退出时留下的后台子进程同样被清理。这一步**只用 `SIGKILL`**（Unix 是整条进程组；Windows 关 Job 句柄触发 kill-on-close），所以被清的程序拿不到 flush/收尾的机会；`setsid` 出去的程序不在进程组里、Windows 的 Job 也没有 breakaway 许可，因此**逃不掉的是默认情形，只有 Unix 的 `setsid` 能脱离**（脱离后就不再受管，见 [tools.md](tools.md#run_script)）。`Reap` 返回「是否真的清掉了东西」，`run_script` 的完成回答与 `manage_session` 的 `poll` 据此在 `warning` 里说明——静默杀掉一个用户以为还在跑的后台程序，比报错更难查。
 * **单进程模式 `StartProcess`**（stdio MCP server）：只跟踪并停止**自己启动的那个进程**，它派生的进程一律不动。关闭顺序是「先礼后兵」：关 stdin（MCP 协议的退出信号）→ 最多等 2s → 仍未退出就强制结束该进程，不再多等。
 * **退出不会卡住**：所有等待都有上限——Unix 的树终止是 `SIGTERM` → 300ms 宽限 → `SIGKILL`，`taskkill` 带回退有 5s 超时，MCP 关闭只等该进程 2s（`cmd.WaitDelay` 同值：即使 server 把 stdout/stderr 留给别的进程持有，也不会一直等下去）。即使进程「杀不掉」，本程序照常退出。
 * **`Shutdown`**：主进程退出时调用（`ExecEngine.Close` 亦会结束所有运行中的会话），按各自模式停止所有仍存活的进程。树模式在 Windows 上的 kill-on-close 意味着即使 lightagent 被强杀（`taskkill`、崩溃），Job 句柄随进程关闭，整棵树仍会被 OS 带走；单进程模式没有这层保护（MCP server 只有在 lightagent 走正常退出/信号路径时才被停止）。Unix 无法拦截 `SIGKILL`，但 `SIGINT`/`SIGTERM`/`SIGHUP` 由信号看门狗处理（`shutdown.go`：先跑注册的清理钩子——例如把终端从 raw 模式恢复——再停止所有子进程，退出码 `128+signal`）。

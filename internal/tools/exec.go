@@ -294,8 +294,10 @@ func (e *ExecEngine) launch(language, script, cwd string, useUTF8 bool) (*Proces
 		waitErr := cmd.Wait()
 		// The root process is gone; whatever it left behind in its tree (a
 		// program the script started in the background, for example) is
-		// terminated with it, so a finished session leaks nothing.
-		proc.Reap(cmd)
+		// terminated with it, so a finished session leaks nothing. Whether
+		// anything was terminated is kept on the session, so the hand-over
+		// that reports the exit can say so instead of passing silently.
+		session.noteLeftoversTerminated(proc.Reap(cmd))
 		_ = stdin.Close()
 		// Wait returned, so the output copiers are done: flush the decoders so
 		// a character split by the final pipe read is still emitted.
@@ -490,6 +492,57 @@ func userMessageWarning(sessionID string) string {
 		"The console output so far is reported below.", sessionID)
 }
 
+// leftoversNote is the note a hand-over carries when the script's own process
+// exited while programs it had started were still running: the teardown
+// terminated them (see ProcessSession.TakeLeftoversNote), which the exit code
+// alone would never reveal. It is empty for a session that left nothing behind.
+func leftoversNote(session *ProcessSession) string {
+	if !session.TakeLeftoversNote() {
+		return ""
+	}
+	return leftoverWarning()
+}
+
+// leftoverWarning explains a teardown the exit code cannot: programs the script
+// had started in the background were still running when its root process exited,
+// so they were terminated with the call's process tree. It names the way out
+// where one exists — on Unix `setsid` starts a program outside the tree, so it
+// survives the call (and is then no longer managed by the agent); a Windows job
+// object has no such escape, so only the foreground is left there.
+func leftoverWarning() string {
+	note := "the script's process exited while programs it had started in the background were still " +
+		"running, so they were terminated with it: a background job of the script does not outlive the call"
+	if runtime.GOOS == "windows" {
+		return note + ". Run such a program in the foreground instead: the call then detaches to a session " +
+			"after `wait_timeout`."
+	}
+	return note + ". Run it in the foreground (the call then detaches to a session after `wait_timeout`), " +
+		"or start it outside the tree with `setsid` (`setsid prog > log 2>&1 &`): it then survives the call, " +
+		"but the agent no longer manages it (no `session_id`, no kill)."
+}
+
+// backgroundJobHint states, for the run_script description, how a program the
+// script starts in the background relates to the call's process tree — the
+// question that decides whether a long-running program survives the call. On
+// Unix the child leads its own process group, so a `&` job is a member of the
+// tree and dies with it, while `setsid` (a new session) is the way out. Windows
+// puts the tree in a job object without the breakaway limit, so nothing a script
+// starts can leave it and only the foreground route remains.
+func backgroundJobHint() string {
+	if runtime.GOOS == "windows" {
+		return " A program the script starts in the background is part of the call's process tree: when the " +
+			"script's own process exits, whatever it left running is terminated with it, and nothing the " +
+			"script starts can leave that tree. Run a program that must outlive the call in the foreground " +
+			"instead: the call then detaches to a session after `wait_timeout`."
+	}
+	return " A program the script starts in the background (`&`) stays inside the call's process tree: when " +
+		"the script's own process exits, whatever it left running is killed with SIGKILL, so `nohup prog &` " +
+		"does not outlive the call either. Start such a program outside the tree with `setsid` instead " +
+		"(`setsid nohup prog > log 2>&1 &`): it then survives the call, but the agent no longer manages it " +
+		"(no `session_id`, no kill). The managed alternative is to run it in the foreground — the call " +
+		"detaches to a session after `wait_timeout`."
+}
+
 // scriptAliasRule is the refusal of a call that names both `script` and
 // `command` with different sources: it says what is wrong with the call and
 // nothing else, leaving which one to keep to the caller.
@@ -535,6 +588,7 @@ func (t *RunScriptTool) Description() string {
 		"by `run_timeout` (default: %d seconds). Output is cleaned and truncated by "+
 		"`max_lines`/`max_chars`, which bound what a call returns rather than the process lifetime.",
 		t.engine.waitSeconds, int(t.engine.runTimeoutDefault()/time.Second))
+	description += backgroundJobHint()
 	description += runScriptExamplesHint(t.engine.DefaultLanguage())
 	description += t.engine.maxLinesRule()
 	description += powerShellFlagsHint()
@@ -794,7 +848,7 @@ func (t *RunScriptTool) Execute(ctx context.Context, args map[string]any) *Resul
 			TotalLines:     totalLines,
 			TotalBytes:     totalBytes,
 			ElapsedSeconds: elapsedSeconds(start),
-			Warning:        warn(note),
+			Warning:        warn(note, leftoversNote(session)),
 		}.toResult(scriptWording)
 	}
 

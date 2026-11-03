@@ -251,6 +251,11 @@ func (t *ManageSessionTool) executePoll(ctx context.Context, start time.Time, ar
 		if shown == "" {
 			cr.Output = fmt.Sprintf("process exited with code %d", code)
 		}
+		// Programs the script left running were terminated with its process
+		// tree; the exit code alone does not say that (see leftoversNote).
+		if note := leftoversNote(session); note != "" {
+			cr.Warning = strPtr(note)
+		}
 		t.engine.sessions.Collect(session)
 	} else {
 		cr.Status = statusRunning

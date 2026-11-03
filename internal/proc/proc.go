@@ -82,19 +82,23 @@ func Kill(cmd *exec.Cmd) error {
 // Reap releases the bookkeeping of a process whose root has been waited for;
 // call it after cmd.Wait. A tree-managed root that exited may still have left
 // processes behind (a program the shell started in the background, for
-// example), so whatever is still alive in that tree is terminated here too. A
-// process-managed command is only forgotten about.
-func Reap(cmd *exec.Cmd) {
+// example), so whatever is still alive in that tree is terminated here too. It
+// reports whether it terminated such leftovers, so a caller can pass the
+// teardown on instead of letting it happen silently — a background program that
+// vanishes without a word is hard to tell from one that is still working. A
+// process-managed command is only forgotten about and reports false.
+func Reap(cmd *exec.Cmd) bool {
 	if cmd == nil {
-		return
+		return false
 	}
 	liveMu.Lock()
 	m, ok := live[cmd]
 	delete(live, cmd)
 	liveMu.Unlock()
 	if ok && m == modeTree {
-		releaseTree(cmd)
+		return releaseTree(cmd)
 	}
+	return false
 }
 
 // Shutdown stops every process that has been started and not reaped, each in its

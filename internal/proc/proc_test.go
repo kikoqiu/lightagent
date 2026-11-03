@@ -115,8 +115,28 @@ func TestReapTerminatesLeftovers(t *testing.T) {
 		t.Fatalf("kill root: %v", err)
 	}
 	_ = cmd.Wait()
-	Reap(cmd)
+	// The leaf was still running, so the teardown is reported: that report is
+	// what lets run_script tell the model that a background program it started
+	// was terminated with the call.
+	if !Reap(cmd) {
+		t.Fatal("Reap did not report the leftover process it terminated")
+	}
 	waitForProcessExit(t, leaf)
+}
+
+// TestReapReportsNoLeftovers pins the other half of the report: a root that
+// leaves nothing behind must not be reported as having left something, or every
+// finished script would carry a note about a background program it never
+// started.
+func TestReapReportsNoLeftovers(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestTreeHelperProcess$")
+	if err := Start(cmd); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	_ = cmd.Wait()
+	if Reap(cmd) {
+		t.Fatal("Reap reported a terminated leftover for a tree that had none")
+	}
 }
 
 // TestShutdownTerminatesTrackedTrees pins the exit path: everything started

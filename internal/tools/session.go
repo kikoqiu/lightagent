@@ -54,6 +54,12 @@ type ProcessSession struct {
 	exitAt    int64
 	collected bool
 
+	// leftovers records that programs the script had started in the background
+	// were still running when its root process exited: the teardown terminated
+	// them (see proc.Reap), and the hand-over that reports the exit says so
+	// once (see TakeLeftoversNote).
+	leftovers bool
+
 	output sessionOutput // terminal-accurate, bounded child-output buffer
 
 	doneCh     chan struct{}
@@ -172,6 +178,31 @@ func (s *ProcessSession) markCollected() bool {
 	}
 	s.collected = true
 	return true
+}
+
+// noteLeftoversTerminated records that programs the script had started in the
+// background were still running when its root process exited, so the teardown
+// terminated them. It is called before the session is marked done, so a caller
+// that observes the exit always observes this too.
+func (s *ProcessSession) noteLeftoversTerminated(terminated bool) {
+	if !terminated {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.leftovers = true
+}
+
+// TakeLeftoversNote reports whether programs the script had left running were
+// terminated together with it, and forgets that: the note belongs to the
+// hand-over whose exit report it explains, and repeating it later would only be
+// noise.
+func (s *ProcessSession) TakeLeftoversNote() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	terminated := s.leftovers
+	s.leftovers = false
+	return terminated
 }
 
 // Zombie reports whether the process has exited while its exit state has not

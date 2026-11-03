@@ -29,13 +29,35 @@ const (
 // package only declares the latter).
 const processSetQuota = 0x0100
 
+// jobInfoClassBasicAccounting is the JOBOBJECTINFOCLASS value that accepts
+// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, whose ActiveProcesses field counts the
+// processes the job still holds.
+const jobInfoClassBasicAccounting = 1
+
+// jobBasicAccounting mirrors JOBOBJECT_BASIC_ACCOUNTING_INFORMATION. Its four
+// LARGE_INTEGER members sit at offsets 0/8/16/24 in the C layout, which Go's
+// int64 reproduces in both word sizes (a run of same-sized fields keeps its
+// offsets; only the struct's alignment shrinks), so the plain struct matches:
+// 48 bytes on 64-bit and on 32-bit alike.
+type jobBasicAccounting struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
+
 var (
 	jobKernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	procCreateJobObjectW         = jobKernel32.NewProc("CreateJobObjectW")
-	procSetInformationJobObject  = jobKernel32.NewProc("SetInformationJobObject")
-	procAssignProcessToJobObject = jobKernel32.NewProc("AssignProcessToJobObject")
-	procTerminateJobObject       = jobKernel32.NewProc("TerminateJobObject")
+	procCreateJobObjectW          = jobKernel32.NewProc("CreateJobObjectW")
+	procSetInformationJobObject   = jobKernel32.NewProc("SetInformationJobObject")
+	procQueryInformationJobObject = jobKernel32.NewProc("QueryInformationJobObject")
+	procAssignProcessToJobObject  = jobKernel32.NewProc("AssignProcessToJobObject")
+	procTerminateJobObject        = jobKernel32.NewProc("TerminateJobObject")
 )
 
 // jobExtendedLimitInformationSize is the size SetInformationJobObject expects
@@ -118,17 +140,20 @@ func killTree(cmd *exec.Cmd) error {
 
 // releaseTree drops the job handle of a tree whose root process has been waited
 // for. Closing the handle makes the kill-on-close limit remove whatever the
-// root left behind, so a finished session cannot leak a background program. A
-// tree that never made it into a job (the assignment can be refused when this
-// process already runs inside a job) has no handle to close, so taskkill is the
-// fallback, the way killTree falls back on it.
-func releaseTree(cmd *exec.Cmd) {
+// root left behind, so a finished session cannot leak a background program. The
+// job is asked how many processes it still holds before that, so the teardown
+// can be reported instead of passing silently. A tree that never made it into a
+// job (the assignment can be refused when this process already runs inside a
+// job) has no handle to close, so taskkill is the fallback, the way killTree
+// falls back on it.
+func releaseTree(cmd *exec.Cmd) bool {
 	job, ok := takeJob(cmd)
 	if ok {
+		leftovers := jobHasActiveProcesses(job)
 		_ = syscall.CloseHandle(job)
-		return
+		return leftovers
 	}
-	releaseTreeFallback(cmd)
+	return releaseTreeFallback(cmd)
 }
 
 // killProcess stops only the process that was launched (TerminateProcess); the
@@ -220,6 +245,23 @@ func terminateJob(job syscall.Handle) error {
 	return nil
 }
 
+// jobHasActiveProcesses reports whether any process would still be in the job
+// when the tree is released. The root has been waited for by then (its handle is
+// closed, so it is gone from the job's accounting too), which means a non-zero
+// count is a program the root left running. A query that fails reports false:
+// the teardown still happens, only the report about it is skipped.
+func jobHasActiveProcesses(job syscall.Handle) bool {
+	var info jobBasicAccounting
+	r, _, _ := procQueryInformationJobObject.Call(
+		uintptr(job),
+		uintptr(jobInfoClassBasicAccounting),
+		uintptr(unsafe.Pointer(&info)),
+		unsafe.Sizeof(info),
+		0,
+	)
+	return r != 0 && info.ActiveProcesses > 0
+}
+
 // taskkillTimeout bounds the fallback helper, so a stuck taskkill cannot hold up
 // the shutdown.
 const taskkillTimeout = 5 * time.Second
@@ -249,10 +291,11 @@ func killTreeFallback(cmd *exec.Cmd) error {
 // releaseTreeFallback stops what a tree that could not be put in a job left
 // behind, matching the effort killTreeFallback makes. The root has already been
 // waited for by the time Reap runs, so taskkill usually cannot find it any more;
-// this covers the window in which it still exists.
-func releaseTreeFallback(cmd *exec.Cmd) {
+// this covers the window in which it still exists. It succeeds — and is
+// reported — only when taskkill actually found the tree.
+func releaseTreeFallback(cmd *exec.Cmd) bool {
 	if cmd == nil || cmd.Process == nil {
-		return
+		return false
 	}
-	_ = taskkillTree(cmd.Process.Pid)
+	return taskkillTree(cmd.Process.Pid) == nil
 }

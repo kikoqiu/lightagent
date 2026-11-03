@@ -482,6 +482,12 @@ Ctrl+J，`/pause` 同效）。它**不是中断**：正在输出的这一轮（�
 都会结束整棵树，不留后台孤儿进程。详见
 [进程树与退出](docs/architecture.md#进程树与退出)。
 
+脚本自己 `&` 起的后台程序**不会活过这次调用**：根进程退出时它们被 `SIGKILL` 一并清掉（`nohup` 只忽略
+`SIGHUP`，无效）。要让它活过调用，Unix 上用 `setsid` 脱离进程树（之后就**不再受管理**：没有
+`session_id`，`kill` 与 lightagent 退出都打不到它；Windows 的 Job 没有 breakaway 许可，脱离不了），
+或者让它在**前台**跑、由 `wait_timeout` 到点转成后台会话。真的清掉了后台程序时回答里带 `warning`
+（`manage_session` 的 `poll` 同样会报）。
+
 * `language` 选择脚本语言：Windows `powershell`（别名 `ps`/`pwsh`）、Unix `sh`（别名
   `bash`/`shell`，宿主 shell），系统装了 Python 时的 `python`（别名 `python3`/`py`；
   **直接以解释器为引擎**，源码经 `-c` 传入），以及 **Windows 上 PATH 里有 `busybox64u.exe` 时的

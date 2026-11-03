@@ -15,7 +15,9 @@ func prepareTree(*exec.Cmd) {}
 
 func adoptTree(*exec.Cmd) {}
 
-func releaseTree(*exec.Cmd) {}
+// releaseTree reports false: without process groups or job objects there is
+// nothing to release here.
+func releaseTree(*exec.Cmd) bool { return false }
 
 // killTree falls back to stopping the single process; these hosts offer no
 // portable way to reach its descendants.
