@@ -1685,6 +1685,33 @@ func TestIndexAndAssets(t *testing.T) {
 	}
 }
 
+// TestTabTitleNamesTheAddress pins the name of the tab: "ip:port-lightagent",
+// built from the address bar the reader used and from nothing the server
+// reports — the same process answers on 127.0.0.1:8080 here and on a LAN
+// address for a phone, and with the CLI and several tabs open it is the URL
+// alone that says which one a tab belongs to.
+func TestTabTitleNamesTheAddress(t *testing.T) {
+	if !strings.Contains(appJS, "var authority = location.host || location.hostname;") ||
+		!strings.Contains(appJS, "document.title = authority ? authority + '-lightagent' : 'lightagent';") {
+		t.Error("the page should name its tab after the address it was opened at")
+	}
+	// It runs before anything else in the script does: the tab is named from the
+	// first moment the page is up, not once the transcript arrives.
+	head := "(function () {"
+	at := strings.Index(appJS, head)
+	if at < 0 {
+		t.Fatal("app.js does not open with its IIFE")
+	}
+	if first := strings.Index(appJS[at:], "document.title"); first < 0 || first > 800 {
+		t.Error("the tab title should be set at the top of app.js")
+	}
+	// The static title stays as the fallback for the moment before the script
+	// runs (and for a page whose scripts are blocked).
+	if !strings.Contains(indexHTML, "<title>lightagent</title>") {
+		t.Error("index.html should keep the static fallback title")
+	}
+}
+
 // TestIndexMarkdownOff checks the page falls back to plain text when disabled.
 func TestIndexMarkdownOff(t *testing.T) {
 	srv := newTestServerWithMarkdown(t, "", false)

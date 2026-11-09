@@ -1,4 +1,12 @@
 (function () {
+  // The tab names the instance this page is talking to, and the address it names
+  // is the one in the address bar, not one the server reports: the same process
+  // is reached as 127.0.0.1:8080 from this machine and as a LAN address from a
+  // phone, and with the CLI and several tabs open it is the URL alone that tells
+  // them apart. location.host is the authority exactly as the reader typed it —
+  // "host:port", with the port left out only when the URL carries none.
+  var authority = location.host || location.hostname;
+  document.title = authority ? authority + '-lightagent' : 'lightagent';
   var log = document.getElementById('log');
   var input = document.getElementById('input');
   var dot = document.getElementById('dot');
