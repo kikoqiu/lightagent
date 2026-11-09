@@ -30,7 +30,7 @@
 | 8 | 文件操作 | `read_file` / `write_file` / `edit_file`（`read_file` 默认 `auto` 自动侦测编码，含 UTF-16/UTF-32 与 GBK 等字符集转换，先解码再切行） |
 | 9 | 上下文压缩 | 全局唯一压缩模式：超阈值时把旧消息总结成一条摘要；**服务商报「上下文超限」时自动回退本轮消息、压缩后重发同一条消息**（最多 2 次）；`/history` 查看用量，CLI 提示行与网页徽标实时显示 |
 | 10 | 彩色 CLI | 角色区分颜色；仅在确认终端支持 ANSI 时才着色（非 TTY、`NO_COLOR`、`TERM=dumb`、旧版 Windows 控制台自动关闭） |
-| 11 | Markdown 渲染 | 助手回答与模型思考均渲染为 Markdown：CLI 转 ANSI，Web 用浏览器端 marked（GFM，含表格）+ DOMPurify，公式（`$…$` / `$$…$$`）由内嵌的 **math.js** 渲染为 MathML（浏览器原生排版，无字体文件、无第三方公式库）；`ui.markdown` 默认开启 |
+| 11 | Markdown 渲染 | 助手回答、模型思考与 Web 端的用户消息均渲染为 Markdown：CLI 转 ANSI，Web 用浏览器端 marked（GFM，含表格）+ DOMPurify，公式（`$…$` / `$$…$$`）由内嵌的 **math.js** 渲染为 MathML（浏览器原生排版，无字体文件、无第三方公式库）；`ui.markdown` 默认开启 |
 | 12 | 多行输入 | CLI 与 Web 均为 **Enter 换行**；CLI 发送用 **Ctrl+J**（Windows 本地也可 Ctrl+Enter；Linux/SSH 下终端支持 kitty 键盘协议时也可 Ctrl+Enter，另有 Alt+Enter），Web 用 **Ctrl+Enter** |
 | 13 | MCP 客户端 + 工具发现 / unlock | 纯标准库 MCP 客户端（stdio / Streamable HTTP / HTTP+SSE），server 在 `tools.mcp` 中配置；MCP 工具**恒为锁定函数**（永不进 `tools` 声明）：`tool_search_tool_bm25` 发现 → `unlock_tool` 下发 schema 并授权（TTL）→ `dynamic_call` 间接调用；系统提示词只注入 1 条全局 unlock 规则 + 每 server 1 条 MCP 全局信息（含 server 返回的 `serverInfo`/`instructions`） |
 | 14 | 思考流式展示 | 服务商返回 `reasoning_content` / `reasoning` 时，CLI 以 `[thinking]` 块、Web 以 thinking 行**实时流式**展示模型思考（与回答一样按 `ui.markdown` 渲染 Markdown）；定稿后的思考随 assistant 消息写入历史、以 `reasoning_content` 回传（配合 preserve thinking 模板）；模型只产出思考（可见正文为空、无工具调用，**无论 `finish_reason`**）时不再多问模型，是否记入历史由 `agent.include_interrupted` 决定（默认关闭）；被中断的不完整回复同理——开启时保留并追加一条 `[engine]` 提示、关闭时整体丢弃；带正文的 `length` 截断自动续跑上限连续 3 次 |
@@ -414,8 +414,8 @@ Ctrl+J，`/pause` 同效）。它**不是中断**：正在输出的这一轮（�
   点后显示 `pausing…`），回合结束且最后一条是 pending / 工具结果 / 用户消息 / `[paused]` 标记时
   为 **Continue**（挂起的消息一起发出，或用现有上下文再问一次模型）；其余空输入时置灰。
   `Ctrl+Enter` 与按钮走同一套判断。
-* 助手回复在浏览器里用内嵌的 **marked**（GFM，含表格）+ **DOMPurify** 渲染（`ui.markdown=false`
-  时退回纯文本）；两条库文件已随二进制内嵌，无需联网。
+* 助手回复与用户消息在浏览器里用内嵌的 **marked**（GFM，含表格）+ **DOMPurify** 渲染（`ui.markdown=false`
+  时退回纯文本；删除线只认 `~~…~~`，单个 `~` 按原文显示）；两条库文件已随二进制内嵌，无需联网。
 * 公式（`$…$` 行内、`$$…$$` 独立成行）由页面自带的 **math.js** 渲染为 **MathML**：浏览器原生排版，
   不需要字体文件；括号的指数落在整组上（`(x_i-\mu)^2`、`\left(\frac{n}{e}\right)^n`），`\\` 与 `&`
   以及 `aligned` / `cases` / `matrix` 等环境排成表格，也不会误判价格（`$5`）或代码块里的 `$`。

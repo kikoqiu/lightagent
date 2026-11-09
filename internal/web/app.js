@@ -1333,10 +1333,12 @@
   // addPendingRow draws one queued message. The row is appended after the pending
   // rows already waiting (submission order) and stays marked until the agent sends
   // the message: settlePendingRow then turns it into an ordinary row, in place. The
-  // event's id is kept, which is what pairs the row with that official one.
+  // event's id is kept, which is what pairs the row with that official one. Its
+  // text is drawn the way the official row will draw it — as markdown when the
+  // /markdown switch is on — so settling the row changes its mark, not its look.
   function addPendingRow(ev) {
     var text = ev.text || '';
-    var row = buildRow('user pending', 'you', text, false, ev.attachments);
+    var row = buildRow('user pending', 'you', text, MARKDOWN, ev.attachments);
     appendRow(row);
     pendingRows.push({ el: row, id: ev.id || '', text: text });
     return row;
@@ -2370,6 +2372,25 @@
   if (typeof marked !== 'undefined' && typeof marked.setOptions === 'function') {
     marked.setOptions({ gfm: true, breaks: true });
   }
+  // A strike is the standard GFM one: two tildes around it. marked's own rule
+  // also fires on a single tilde (it matches ~~?), which struck through ordinary
+  // text — a line holding two lone tildes, such as "5~10 个，另 20~30 个" or
+  // "单 ~a~ 也删除", came out struck between them. This tokenizer keeps every
+  // other part of marked's rule (no space just inside the markers, matching
+  // closing marker) and only drops the single tilde, so a lone ~ stays a
+  // character. Returning nothing says "not a strike"; marked falls back to its
+  // own rule only on false.
+  if (typeof marked !== 'undefined' && typeof marked.use === 'function') {
+    marked.use({
+      tokenizer: {
+        del: function (src) {
+          var m = /^(~~)(?=[^\s~])([\s\S]*?[^\s~])\1(?=[^~]|$)/.exec(src);
+          if (!m) { return; }
+          return { type: 'del', raw: m[0], text: m[2], tokens: this.lexer.inlineTokens(m[2]) };
+        }
+      }
+    });
+  }
   // Sessions live in a cookie, so the WebSocket handshake authenticates itself.
   // The mirror only connects once the sign-in dialog says the browser is (or
   // need not be) signed in, and drops the socket when a session ends. The dialog
@@ -2484,7 +2505,7 @@
     // it with the text the branches below render in full.
     if (pendingRender) { clearTimeout(pendingRender); pendingRender = null; }
     if (kind === 'turn_done') { return; }
-    if (kind === 'user') { addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time)); }
+    if (kind === 'user') { addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', MARKDOWN, ev.attachments, false, stampOf(ev.time)); }
     else if (kind === 'assistant') {
       var text = ev.text || streamedText;
       if (streamed) { setRow(streamed, text, true); }

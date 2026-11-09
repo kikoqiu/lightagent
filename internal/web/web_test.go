@@ -641,7 +641,7 @@ func TestFoldSwitchFoldsTheLongRowParts(t *testing.T) {
 	// The messages, the summary and the markers around them are not folded: only the
 	// thinking, the tool calls and their results are.
 	for _, reject := range []string{
-		"addRow('user', 'you', ev.text || '', false, ev.attachments, true)",
+		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', MARKDOWN, ev.attachments, true)",
 		"addRow('assistant', 'agent', text, true, null, true)",
 		"addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, true)",
 		"addRow('result', '', '[info] ' + (ev.text || ''), false, null, true)",
@@ -939,6 +939,26 @@ func TestReasoningRenderedAsMarkdown(t *testing.T) {
 	}
 }
 
+// TestUserMessagesRenderedAsMarkdown pins that what the reader typed is drawn
+// through the same markdown path as the reply — the ordinary row, the queued
+// (pending) one that becomes it, and the replayed one, which both go through
+// addRow — and that a lone tilde stays a character: marked's own strike rule
+// accepts one (~~?), which turned ordinary text such as "5~10 个" into a strike.
+func TestUserMessagesRenderedAsMarkdown(t *testing.T) {
+	src := pageSource()
+	for _, want := range []string{
+		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', MARKDOWN, ev.attachments, false, stampOf(ev.time))",
+		"buildRow('user pending', 'you', text, MARKDOWN, ev.attachments)",
+		// The strike rule: two tildes, and marked's own rule is not reached.
+		"marked.use({",
+		`var m = /^(~~)(?=[^\s~])([\s\S]*?[^\s~])\1(?=[^~]|$)/.exec(src);`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+}
+
 // TestScrollbackTracksLiveEvents pins that live events are recorded in the
 // mirror's scrollback (thinking, tool rows and markers included), so a browser
 // connecting afterwards sees them.
@@ -1030,7 +1050,7 @@ func TestPageStampsMessageTimes(t *testing.T) {
 		"if (label && stamp && !user) { label.appendChild(timeSpan(stamp)); }",
 		"if (label && stamp && user) { label.appendChild(timeSpan(stamp)); }",
 		// The live and replayed paths both carry it.
-		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
+		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', MARKDOWN, ev.attachments, false, stampOf(ev.time))",
 		"addRow('assistant', 'agent', text, true, null, false, stampOf(ev.time))",
 		"addRow('summary', SUMMARY_ROLE, ev.text || '', MARKDOWN, null, false, stampOf(ev.time))",
 		"render('assistant', { text: m.content, time: m.time })",
@@ -1058,7 +1078,7 @@ func TestPageLabelsEngineNotes(t *testing.T) {
 	for _, want := range []string{
 		"function isEngine(text) { return (/^\\[engine\\] /).test(text || ''); }",
 		"if (kind === 'user' && !isEngine(ev.text)) {",
-		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', false, ev.attachments, false, stampOf(ev.time))",
+		"addRow('user', isEngine(ev.text) ? 'engine' : 'you', ev.text || '', MARKDOWN, ev.attachments, false, stampOf(ev.time))",
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("the page is missing the engine label wiring %q", want)

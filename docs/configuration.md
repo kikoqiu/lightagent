@@ -378,7 +378,7 @@ user:   <历史里的第一条 user>
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `markdown` | bool | `true` | 把助手回答与模型思考（`[thinking]`）渲染为 Markdown：CLI 转 ANSI 着色，Web 由浏览器端 marked（GFM，含表格）+ DOMPurify 渲染。设为 `false` 则原样输出纯文本 |
+| `markdown` | bool | `true` | 把助手回答与模型思考（`[thinking]`）渲染为 Markdown：CLI 转 ANSI 着色，Web 由浏览器端 marked（GFM，含表格）+ DOMPurify 渲染，Web 的用户消息同样走这条管线（CLI 的输入行仍按原文显示）。设为 `false` 则原样输出纯文本 |
 
 * 由于加载时先取默认值再合并文件，**省略 `ui` 段即保持开启**；关闭需显式写 `"markdown": false`。
 * 运行中可用 `/markdown off` / `/markdown on` 临时切换（仅影响当前进程，不写回配置）。
