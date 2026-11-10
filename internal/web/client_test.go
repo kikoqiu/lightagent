@@ -260,8 +260,9 @@ func TestWriterDropsADeadSocket(t *testing.T) {
 
 
 // TestPageReplaysSnapshotsInBatches guards the page side of the fix: the
-// snapshot is consumed in batches, inserted as a whole, markdown is upgraded in
-// idle slices, and the replay skips the entrance animation.
+// snapshot is consumed in batches, inserted as a whole, each row is drawn with its
+// final markup as it is built (no plain text first, no idle pass afterwards), and the
+// replay skips the entrance animation.
 func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 	for _, want := range []string{
 		"history_start", // the header starts a replay
@@ -272,10 +273,7 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 		"function endHistory",
 		"function flushReplayBatch",
 		"replayBatch.appendChild(row)", // rows are collected in one fragment
-		"requestIdleCallback",          // markdown upgrades are sliced
-		"queueMarkdown",
-		"MAX_MD_CHARS",
-		"if (renderMD && replaying)", // replayed rows render plain text first
+		"MAX_MD_CHARS",                // one gigantic row stays plain text
 		"if (replaying) { setSpan(rowText(el), text, renderMD); return; }",
 		"#log.replaying .row { animation:none; }",
 	} {
@@ -297,7 +295,8 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 		"swapInAtEnd = log.childNodes.length > 0;",
 		"if (!replayBatch || swapInAtEnd) { return; }",
 		"if (swapped) {",
-		"if (replayBatch) { log.appendChild(replayBatch); }",
+		"var merged = keepRenderedRows();",
+		"log.appendChild(merged);",
 		"if (swapped && following) { writeBottom(); return; }",
 		"if (replayBatch) { replayBatch.appendChild(row); return; }",
 		"if (replayBatch && pendingRows[i].el.parentNode === replayBatch) { replayBatch.appendChild(pendingRows[i].el); }",
@@ -330,45 +329,197 @@ func TestPageReplaysSnapshotsInBatches(t *testing.T) {
 	}
 }
 
-// TestPageFlushesPendingMarkdownWhenVisible guards the page against the scroll a
-// backgrounded tab used to come back to. Idle slices do not run for a page nobody
-// is drawing, so the markdown queue is at its longest exactly when the page is
-// looked at again — and every pass over it grows the rows above whoever was
-// reading, which walks their view down the transcript pass after pass, for as long
-// as the queue lasts. The catch-up is therefore taken in one task on the way back
-// to the foreground, and a pass holds the reader's own row in place (a following
-// reader still ends it at the bottom).
-func TestPageFlushesPendingMarkdownWhenVisible(t *testing.T) {
-	// goActive is the way back to the foreground: visibilitychange, resume and
-	// pageshow all land there.
-	active := functionBody(t, "goActive")
-	if !strings.Contains(active, "flushMarkdownNow();") {
-		t.Error("the way back to the foreground does not flush the pending markdown")
-	}
-	// The dial comes first: a reconnect that rebuilt the log would replace the rows
-	// a long catch-up upgrades, and it must not wait behind one.
-	if dial, flush := strings.Index(active, "connect();"), strings.Index(active, "flushMarkdownNow();"); dial < 0 || dial > flush {
-		t.Errorf("goActive must dial before it catches up (connect at %d, flush at %d)", dial, flush)
-	}
+// TestResumeKeepsRenderedRows pins the reconciliation a resumed page runs. A
+// phone that stopped its page (goIdle) comes back to a transcript that grew while
+// the screen was off, and the snapshot it receives is mostly the rows it already
+// shows. Rebuilding them is what the reader feels — every row parsed as markdown
+// again and the whole log repainted — so the snapshot is compared with the log,
+// row by row, and the rows that match are the rows already rendered: they stay,
+// and only the rest of the snapshot is built and inserted after them.
+func TestResumeKeepsRenderedRows(t *testing.T) {
+	src := pageSource()
 	for _, want := range []string{
-		"function flushMarkdownNow",
-		"upgradeMarkdown(null, true)", // the catch-up takes the whole queue, no slice budget
-		"function holdView",
-		"function topVisibleRow",
-		"if (following) { return null; }", // a following reader is taken to the bottom instead
-		"if (release) { release(); }",
-		"if (!replaying) { keepBottom(); }",
-		"function sliceIsUp",
+		// The comparison, and what a row is identified by.
+		"function keepRenderedRows()",
+		"function rowSignature(row)",
+		"function rowKind(row)",
+		"function rowStamp(row)",
+		"function filesSignature(attachments)",
+		"rowSignature(old[same]) === rowSignature(fresh[same])",
+		// The head of the snapshot stands in for the rows on screen; the first row
+		// that differs ends the comparison, so the snapshot takes over from there.
+		"for (var k = 0; k < same; k++) { kept.appendChild(old[k]); }",
+		// A queued message's row is the page's own (the snapshot never carries it).
+		"if (log.children[i].classList.contains('pending')) { continue; }",
+		// A replayed row is already finished when it enters its batch, so a kept row
+		// keeps its markup and the dropped copy is simply removed.
+		"replayBatch.removeChild(fresh[d]);",
+		// The page's own state is not part of a row's identity.
+		"var ROW_STATE_CLASSES = ['foldable', 'folded', 'show-actions', 'pending'];",
 	} {
-		if !strings.Contains(pageSource(), want) {
+		if !strings.Contains(src, want) {
 			t.Errorf("the page is missing %q", want)
 		}
 	}
-	// A slice that finds the queue already drained — the catch-up took it — must
-	// leave the view alone: a write there would fight the pass that just finished,
-	// and the reader would see the transcript move twice.
-	if !strings.Contains(functionBody(t, "flushMarkdown"), "if (mdPending.size === 0) { return; }") {
-		t.Error("a slice of an empty queue must not write the view")
+	// The last replayed thinking row is paced like a live one, so its text has to
+	// be drawn before the comparison reads it.
+	if end := functionBody(t, "endHistory"); !strings.Contains(end, "setRow(reasoningRow, reasoningText, MARKDOWN);") {
+		t.Error("endHistory compares the pending thinking row before drawing it")
+	}
+}
+
+// TestMarkdownCacheSurvivesReload pins what browser storage buys a reloaded page:
+// the markdown conversions the last page made, keyed by a hash of the text they were
+// made from, written to one slot on the way out (pagehide/freeze, and the phone's
+// grace period) and read back at load. The rows themselves, their order, their text,
+// their timestamps and their files still come from the server — the cache answers
+// one question only ("this text converts to what?"), so a reloaded page draws its
+// first snapshot without parsing markdown and nothing about the transcript is stored.
+func TestMarkdownCacheSurvivesReload(t *testing.T) {
+	src := pageSource()
+	for _, want := range []string{
+		"function saveMarkdownCache()",
+		"function loadMarkdownCache()",
+		"function cachedMarkdown(text)",
+		"function mdKey(text)",
+		"function mdHash(text)",
+		"function storageArea()",
+		"window.localStorage", // not IndexedDB: a frozen page cannot wait for a commit
+		"var MD_CACHE_KEY = 'lightagent.markdown';",
+		"var STORAGE_MAX_BYTES = 10 * 1024 * 1024;",
+		// The key is the text's length and its hash, and nothing else: no version to
+		// keep in step with a snapshot, a session or a marked upgrade.
+		"return 'm' + text.length + ':' + mdHash(text);",
+		// What is written down is the conversion: the rendered markup of the row, and
+		// the text it was made from.
+		"var piece = JSON.stringify(mdKey(displayText(src))) + ':' + JSON.stringify(span.innerHTML);",
+		"if (!span || !span.classList.contains('md')) { continue; }",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the page is missing %q", want)
+		}
+	}
+	// Drawing a row consults the map before parsing anything.
+	apply := functionBody(t, "applyMarkdown")
+	lookup := strings.Index(apply, "var known = cachedMarkdown(text);")
+	fresh := strings.Index(apply, "var fresh = newStreamState();")
+	if lookup < 0 || fresh < 0 || lookup > fresh {
+		t.Error("applyMarkdown parses markdown without asking the cache first")
+	}
+	if !strings.Contains(apply[lookup:], "span.innerHTML = known;") {
+		t.Error("a cached conversion is not written back into the row")
+	}
+	// One slot, always replaced; the browser's own quota is answered with a shorter
+	// dump of the same prefix, which is what the cap keeps as well.
+	save := functionBody(t, "saveMarkdownCache")
+	if n := strings.Count(save, "area.setItem("); n != 1 {
+		t.Errorf("saveMarkdownCache writes %d slots, want exactly one", n)
+	}
+	if !strings.Contains(save, "if (bytes + piece.length > STORAGE_MAX_BYTES) { break; }") {
+		t.Error("saveMarkdownCache does not bound the entry it writes")
+	}
+	if !strings.Contains(save, "for (var i = 0; i < log.children.length; i++)") {
+		t.Error("the dump must follow the log, so that a capped entry holds the older rows")
+	}
+	if !strings.Contains(save, "n = n >> 1;") {
+		t.Error("a refused write (the browser's quota is the harder limit) must retry shorter")
+	}
+	if !strings.Contains(save, "if (replaying) { return; }") {
+		t.Error("saveMarkdownCache would write a log a snapshot is in the middle of rebuilding")
+	}
+	// It is written on the way out whatever state the page is in — a page stopped by
+	// its grace period keeps drawing until it is frozen.
+	idle := functionBody(t, "goIdle")
+	if !strings.Contains(idle, "saveMarkdownCache();") {
+		t.Error("a page that stops does not write its conversions down")
+	}
+	saveAt := strings.Index(idle, "saveMarkdownCache();")
+	guardAt := strings.Index(idle, "if (stopped) { return; }")
+	if guardAt < 0 || saveAt > guardAt {
+		t.Error("saveMarkdownCache must run before the stop guard, or a stopped page never saves again")
+	}
+	// The map is filled once, at load, and dropped once the load is drawn: the page's
+	// own conversions stay in the log, so nothing is kept in step with the transcript
+	// while it runs.
+	if n := strings.Count(src, "mdCache.set("); n != 1 {
+		t.Errorf("the conversion map is written from %d places, want only the load", n)
+	}
+	if !strings.Contains(functionBody(t, "endHistory"), "mdCache.clear();") {
+		t.Error("the map is kept after the snapshot it was read for is drawn")
+	}
+	// A row whose conversion is known gets the markup straight away, in the batch it
+	// is built into — no plain text, no later pass (see TestReplayDrawsRowsOnce).
+	if strings.Contains(functionBody(t, "setSpan"), "queueMarkdown") {
+		t.Error("a replayed row is still drawn as plain text first")
+	}
+	// The key is the text as it was drawn, not as it arrived (a file read verbatim
+	// may carry CRLF, see displayText).
+	if !strings.Contains(save, "JSON.stringify(mdKey(displayText(src)))") {
+		t.Error("the stored key is not the text the screen rendered")
+	}
+	// Nothing on screen needs converting leaves the previous entry alone: a page that
+	// never connected must not wipe an entry it knows nothing about.
+	if !strings.Contains(save, "if (!parts.length) { return; }") {
+		t.Error("a page with nothing to convert would clear the entry")
+	}
+	// It is read at load, before the socket is dialed, and the snapshot path neither
+	// reads nor writes it: what the server sends is drawn as always.
+	if !strings.Contains(src, "\n  loadMarkdownCache();") {
+		t.Error("the stored conversions are not read at load")
+	}
+	if strings.Contains(functionBody(t, "beginHistory"), "mdCache") {
+		t.Error("beginHistory must not touch the cache: a snapshot replaces the log, whatever session it belongs to")
+	}
+	// Only the conversion is kept: no rows, no session, no version.
+	for _, unwanted := range []string{"function restoreRow(", "function transcriptRecord(", "restoredRows", "restoredSession"} {
+		if strings.Contains(src, unwanted) {
+			t.Errorf("the page still restores rows from storage (%q)", unwanted)
+		}
+	}
+}
+
+// TestReplayDrawsRowsOnce pins what a snapshot replay does with the DOM: each row is
+// drawn with its final markup while its batch is built, and the batch reaches the log
+// in one insert — no plain text waiting for a later pass, and no idle-scheduled
+// upgrade queue (so nothing is parsed twice and nothing is rewritten after
+// insertion). A reply that is still streaming keeps its own pacing, which is a
+// different path (see TestPageStreamsMarkdownIncrementally).
+func TestReplayDrawsRowsOnce(t *testing.T) {
+	src := pageSource()
+	for _, gone := range []string{"queueMarkdown", "upgradeMarkdown", "flushMarkdown", "requestIdleCallback", "mdPending"} {
+		if strings.Contains(src, gone) {
+			t.Errorf("the page still carries the idle upgrade queue (%q)", gone)
+		}
+	}
+	span := functionBody(t, "setSpan")
+	if !strings.Contains(span, "if (renderMD) { applyMarkdown(span, text); return; }") {
+		t.Error("a replayed row is not rendered where it is built")
+	}
+	// A gigantic row is the one exception, and it is decided before anything is
+	// parsed.
+	apply := functionBody(t, "applyMarkdown")
+	guard := strings.Index(apply, "if (replaying && text.length > MAX_MD_CHARS) {")
+	lookup := strings.Index(apply, "var known = cachedMarkdown(text);")
+	if guard < 0 || lookup < 0 || guard > lookup {
+		t.Error("a replayed row past MAX_MD_CHARS must stay plain text, before anything else is tried")
+	}
+	// The live path keeps its own pacing: a streaming row is redrawn at the interval
+	// the device asks for.
+	for _, want := range []string{"function renderIntervalMs", "function streamDelay", "RENDER_LIVE_PHONE_MS", "RENDER_HIDDEN_MS"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the live pacing is gone (%q)", want)
+		}
+	}
+	// A change of the rows' heights keeps the reader's own row in place.
+	for _, want := range []string{
+		"function holdView",
+		"function topVisibleRow",
+		"if (following) { return null; }",
+		"if (release) { release(); }",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the page is missing %q", want)
+		}
 	}
 }
 

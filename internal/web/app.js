@@ -51,9 +51,10 @@
   var pendingReasoningRender = null;
   // replaying is true while a snapshot rebuilds the log (history_start …
   // history_end). It suppresses live-only side effects (a replayed user row must
-  // not light up the running indicator), holds the markdown work back to idle
-  // slices and makes row insertion batch, so a long conversation rebuilds
-  // without freezing the main thread.
+  // not light up the running indicator), makes row insertion batch, and tells the
+  // markdown pipeline that it is drawing finished text rather than a stream (see
+  // applyMarkdown): a batch is built with its final markup and inserted in one go,
+  // which is what the server's own batching keeps short.
   var replaying = false;
   // replayBatch collects the rows of the snapshot while it is being replayed;
   // it is inserted as a whole (see flushReplayBatch), which costs one reflow per
@@ -525,9 +526,9 @@
   // however the reader left them, and leaves the rest of the transcript alone.
   function toggleAllRows() {
     foldAll = !foldAll;
-    // Folding changes the height of the rows above the view — the same kind of change
-    // a markdown pass makes, so a reader who scrolled back keeps their row (see
-    // holdView) and a following one is put back on the newest row (see keepBottom).
+    // Folding changes the height of the rows above the view, so a reader who
+    // scrolled back keeps their row (see holdView) and a following one is put back on
+    // the newest row (see keepBottom).
     var release = holdView();
     eachFoldableRow(function (row) { foldRow(row, foldAll); });
     if (release) { release(); }
@@ -740,6 +741,7 @@
   // "saved: never"; the title carries the full name and the exact save time for
   // when the relative label is not enough.
   function setSessionInfo(name, saved) {
+    sessionName = name || '';
     var nameEl = document.getElementById('sessionName');
     if (nameEl) {
       nameEl.textContent = 'session: ' + (name || '(unsaved)');
@@ -848,19 +850,11 @@
   }
 
   // MAX_MD_CHARS keeps one gigantic row (a huge tool result, a whole file in a
-  // reply) from stalling the idle upgrade below: past this size the replayed row
-  // stays plain text.
+  // reply) from costing more than the reader gets: past this size a replayed row
+  // stays plain text. A row that is still streaming is rendered whatever its size —
+  // only its trailing block is parsed (see applyMarkdown) — so the bound is on what
+  // one batch has to do, not on what a reply may be.
   var MAX_MD_CHARS = 200000;
-  // Replaying a long conversation means parsing markdown for thousands of rows.
-  // That work is sliced into idle chunks instead of running as one long task:
-  // the main thread stays responsive, the transcript paints batch by batch, and
-  // each replayed row's plain text is upgraded in place. Rows that arrive live
-  // (a turn that is streaming) still render immediately; a page coming back to the
-  // foreground drains what queued up while nobody was looking in one batch (see
-  // flushMarkdownNow), and no pass moves a reader who scrolled back (see holdView).
-  var mdPending = new Map(); // span -> latest text waiting for its markdown pass
-  var mdFlushScheduled = false;
-  var MD_SLICE_MS = 8;
 
   // rowSource remembers the text a row was drawn from, keyed by that row's text
   // span: the copy control hands a row back exactly as it was written, whatever
@@ -868,6 +862,12 @@
   // setSpan — the live stream and a replayed snapshot alike — so a row restored
   // by a reconnect copies like a fresh one.
   var rowSource = new WeakMap();
+
+  // rowFiles remembers the files a row lists under its text, keyed by the row: two
+  // messages can read the same and carry different files, and a snapshot compared
+  // with the log (see rowSignature) has to tell them apart. The digest is taken
+  // from the attachments the row was built with, not from the markup.
+  var rowFiles = new WeakMap();
 
   // mdStream holds the incremental markdown state of a row, keyed by its text
   // span. A WeakMap, so a row the transcript drops frees its state with it.
@@ -976,15 +976,17 @@
   }
 
   // applyMarkdown renders one row's text as markdown, falling back to plain text
-  // when rendering is off or the libraries are missing. A row that only grew — a
-  // reply still streaming — is redrawn incrementally: the text is split at its
-  // last stable block boundary, everything before it was rendered once into the
-  // `md-stable` element and only the trailing block is re-parsed into the
-  // `md-live` element. Re-parsing the whole reply on every chunk made one answer
-  // cost O(length^2); now a redraw parses the trailing block alone.
+  // when rendering is off or the libraries are missing. It is the one path both
+  // kinds of row take: a replayed row arrives with its whole text and is rendered in
+  // that one call, in the task that built its batch; a reply that is still streaming
+  // is redrawn incrementally — the text is split at its last stable block boundary,
+  // everything before it was rendered once into the `md-stable` element and only the
+  // trailing block is re-parsed into the `md-live` element. Re-parsing the whole
+  // reply on every chunk made one answer cost O(length^2); now a redraw parses the
+  // trailing block alone.
   function applyMarkdown(span, text) {
-    // Rendering is off (or was turned off after this row was queued): show the
-    // text literally and drop any incremental state, exactly as before the split.
+    // Rendering is off (or was turned off after this row was drawn): show the text
+    // literally and drop any incremental state, exactly as before the split.
     if (!MARKDOWN) {
       span.className = 'text';
       span.textContent = text;
@@ -1000,6 +1002,28 @@
       st.text = text;
       return;
     }
+    // A replayed row past MAX_MD_CHARS stays plain text: it is not streaming, so
+    // there is no trailing block to hedge with, and one such row would hold up the
+    // whole batch it arrived in.
+    if (replaying && text.length > MAX_MD_CHARS) {
+      span.className = 'text';
+      span.textContent = text;
+      mdStream.delete(span);
+      return;
+    }
+    // The conversion of this exact text may be known already — this page read it
+    // back from browser storage at load (see the cache section), and a snapshot of a
+    // long conversation is then drawn without parsing anything: the markup that text
+    // produced goes back in as it was. There is no incremental state to go with it
+    // (the row is complete in what was written, and a row that grows afterwards is
+    // parsed as the new text it is).
+    var known = cachedMarkdown(text);
+    if (known !== null) {
+      span.className = 'text md';
+      span.innerHTML = known;
+      mdStream.delete(span);
+      return;
+    }
     var fresh = newStreamState();
     fresh.text = text;
     if (!streamMarkdown(span, text, fresh)) {
@@ -1009,22 +1033,6 @@
       return;
     }
     mdStream.set(span, fresh);
-  }
-
-  function queueMarkdown(span, text) {
-    mdPending.set(span, text);
-    scheduleMarkdownFlush();
-  }
-
-  function scheduleMarkdownFlush() {
-    if (mdFlushScheduled || mdPending.size === 0) { return; }
-    mdFlushScheduled = true;
-    if (typeof window.requestIdleCallback === 'function') {
-      // The timeout guarantees progress even while the snapshot keeps arriving.
-      window.requestIdleCallback(flushMarkdown, { timeout: 250 });
-    } else {
-      window.setTimeout(function () { flushMarkdown(null); }, 16);
-    }
   }
 
   // topVisibleRow is the row the reader's view starts at: the first one whose
@@ -1047,22 +1055,17 @@
     return found;
   }
 
-  // holdView keeps the row the reader is reading exactly where it is across one
-  // batch of markdown upgrades, and returns the function that writes it back.
+  // holdView keeps the row the reader is reading exactly where it is across a change
+  // of the rows' heights, and returns the function that writes it back.
   //
-  // An upgraded row grows — markdown brings paragraph margins, tables, code blocks
-  // and headings where a replayed row was one plain block — and the transcript has
-  // the browser's own scroll anchoring switched off (see #log in app.css: it pulls
-  // against the page's bottom writes). A pass that lands on rows above the reader
-  // therefore drags that reader along: the rows being read walk down the screen and
-  // older ones come in at the top, pass after pass, for as long as the queue lasts,
-  // and pulling back up only adds more of the same. That is the page that looked
-  // like it scrolled away on its own after a spell in the background, where the
-  // queue is at its longest (a hidden page draws nothing, so its idle slices do not
-  // run and every pass queues up).
+  // A row that grows — folding and unfolding do it to the whole transcript at once —
+  // moves everything below it down, and the transcript has the browser's own scroll
+  // anchoring switched off (see #log in app.css: it pulls against the page's bottom
+  // writes). Without this the reader's row would walk down (or up) the screen under
+  // their eyes, one change at a time.
   //
-  // A reader who follows needs none of this: the batch ends at the bottom instead
-  // (see upgradeMarkdown).
+  // A reader who follows needs none of it: the change ends at the bottom instead
+  // (see keepBottom).
   function holdView() {
     if (following) { return null; }
     var row = topVisibleRow();
@@ -1073,64 +1076,6 @@
       if (row.parentNode !== log) { return; }
       log.scrollTop += row.getBoundingClientRect().top - top;
     };
-  }
-
-  // flushMarkdown is one idle slice of upgrades. A callback that finds an empty
-  // queue — one flushMarkdownNow already drained — does nothing at all, so the
-  // batch cannot be charged for a view write of its own.
-  function flushMarkdown(deadline) {
-    mdFlushScheduled = false;
-    if (mdPending.size === 0) { return; }
-    upgradeMarkdown(deadline, false);
-    scheduleMarkdownFlush();
-  }
-
-  // flushMarkdownNow drains the whole queue in one task, with no slice budget: the
-  // page is coming back to the foreground and has to be finished before it is
-  // looked at again. Left to the idle slices, the same queue upgrades rows over the
-  // frames that follow — the pass after pass holdView exists for — and it is at its
-  // longest exactly here, since nothing queued for a page nobody was drawing. Rows
-  // too large to render (MAX_MD_CHARS) stay plain text and bound the batch.
-  function flushMarkdownNow() {
-    if (mdPending.size === 0) { return; }
-    upgradeMarkdown(null, true);
-  }
-
-  // upgradeMarkdown upgrades the queued rows and leaves the reader where they
-  // belong. The Map keeps insertion order and the lowest text wins per row (a row
-  // that was re-streamed while waiting is parsed once, with its final text). A row
-  // still sitting in the batch fragment counts too: only rows whose log was
-  // replaced (no parent left) are skipped. One slice stops when its time is up; a
-  // whole pass (whole) takes the queue as it stands.
-  function upgradeMarkdown(deadline, whole) {
-    var release = holdView();
-    var started = Date.now();
-    var entries = mdPending.entries();
-    for (var next = entries.next(); !next.done; next = entries.next()) {
-      var span = next.value[0];
-      var text = next.value[1];
-      mdPending.delete(span);
-      if ((span.isConnected || span.parentNode) && text.length <= MAX_MD_CHARS) {
-        applyMarkdown(span, text);
-      }
-      if (!whole && sliceIsUp(deadline, started)) { break; }
-    }
-    if (release) { release(); }
-    // A reader who follows ends the pass on the newest row, exactly like every
-    // other content change (see keepBottom): the rows above them grew, and the pass
-    // can pull the view back itself instead of waiting for the next output to. A
-    // snapshot still being replayed is left alone — those rows are not in the log
-    // yet, and the end of the replay pins the view once (see endHistory).
-    if (!replaying) { keepBottom(); }
-  }
-
-  // sliceIsUp reports a slice's budget being spent: the browser's own deadline when
-  // it gave one (it knows what is left of the frame), MD_SLICE_MS otherwise.
-  function sliceIsUp(deadline, started) {
-    if (deadline && typeof deadline.timeRemaining === 'function') {
-      return deadline.timeRemaining() <= 1;
-    }
-    return Date.now() - started >= MD_SLICE_MS;
   }
 
   // displayText rewrites a row's row endings for the screen: a file read verbatim
@@ -1149,20 +1094,6 @@
     if (span) { rowSource.set(span, text); }
     // Drawn with LF endings, whatever the source used (see displayText).
     text = displayText(text);
-    // While a snapshot is being replayed the markdown pass is deferred: the row is
-    // drawn as plain text now and upgraded in an idle slice (see queueMarkdown).
-    // Parsing thousands of rows as one long task is what froze the tab (and hid the
-    // log behind "Waiting for messages…") on a long conversation. The one pass that
-    // does run in a single task is the catch-up on the way back from the background
-    // (see flushMarkdownNow): a page nobody was drawing got no further than its
-    // queue, so that pass is bounded by one snapshot.
-    if (renderMD && replaying) {
-      span.className = 'text';
-      span.textContent = text;
-      mdStream.delete(span);
-      queueMarkdown(span, text);
-      return;
-    }
     if (renderMD) { applyMarkdown(span, text); return; }
     span.className = 'text';
     span.textContent = text;
@@ -1298,6 +1229,10 @@
     row.appendChild(t);
     var media = mediaList(attachments);
     if (media) { row.appendChild(media); }
+    // What the row lists as its files is part of its identity (see rowSignature):
+    // it is read from the event's attachments rather than from the markup, which
+    // an image that failed to load may well have replaced.
+    rowFiles.set(row, filesSignature(attachments));
     // The stamp sits on the role line, next to the label it belongs to: to the
     // right of "agent", to the left of "you". A user message hugs the right edge
     // of the log, so its stamp is mirrored to stay on the message's side — it is
@@ -1391,14 +1326,23 @@
     keepBottom();
   }
 
-  // rowText returns the row's own text span. It is not simply the last child: a
-  // row that carries files keeps them after its text (see mediaList).
-  function rowText(row) {
+  // textSpan returns the row's own text span, or null for a row the page drew as a
+  // whole (the /list table, whose cells are all there is).
+  function textSpan(row) {
     if (!row) { return null; }
     for (var i = 0; i < row.children.length; i++) {
       if (row.children[i].classList.contains('text')) { return row.children[i]; }
     }
-    return row.lastChild;
+    return null;
+  }
+
+  // rowText returns the row's own text span. It is not simply the last child: a
+  // row that carries files keeps them after its text (see mediaList). A row with
+  // no text span at all (see textSpan) falls back to its last child, which is what
+  // its identity is read from as well (see rowSignature).
+  function rowText(row) {
+    var span = textSpan(row);
+    return span || (row ? row.lastChild : null);
   }
 
   function setRow(el, text, renderMD) {
@@ -2629,8 +2573,9 @@
     // The open copy menu points at a row that is being replaced.
     closeCopyMenu();
     hideCopyControl();
-    // Nothing queued points at a row in the document any more.
-    mdPending.clear();
+    // The rows a snapshot keeps are already drawn (each replayed row carries its
+    // markup into the batch, see setSpan), so the comparison below decides only
+    // whether the node stays or the replayed copy replaces it.
     replaying = true;
     log.classList.add('replaying');
     replayBatch = document.createDocumentFragment();
@@ -2686,26 +2631,135 @@
     flushReplayBatch();
   }
 
+  // ---- reconciling a snapshot with the transcript on screen ----
+  // A snapshot replaces the log, but most of it is usually the very rows the
+  // reader already has: a phone that stopped its page (goIdle) comes back to a
+  // transcript that grew by a few rows while the screen was off, and a first
+  // reconnect after a restart records nothing the page does not already show.
+  // Rebuilding all of it is exactly the cost the reader notices — every row parsed
+  // as markdown again, the whole log repainted — so the snapshot is compared with
+  // the rows on screen, in order, and the rows that match are the rows that are
+  // already there: they keep their markup, their folding state and their place,
+  // and only the snapshot's own remaining rows are built and inserted after them
+  // (see endHistory).
+
+  // ROW_STATE_CLASSES are the class tokens a row wears for the page's own state
+  // rather than for the message it shows: they change while the reader uses the
+  // row and say nothing about what it describes.
+  var ROW_STATE_CLASSES = ['foldable', 'folded', 'show-actions', 'pending'];
+
+  // rowKind is a row's kind with the state left out: "row assistant", "row
+  // reasoning", "row result" ... Two rows of one kind show the same sort of thing.
+  function rowKind(row) {
+    var cls = row.className.split(/\s+/), kind = [];
+    for (var i = 0; i < cls.length; i++) {
+      if (cls[i] === '' || ROW_STATE_CLASSES.indexOf(cls[i]) >= 0) { continue; }
+      kind.push(cls[i]);
+    }
+    return kind.join(' ');
+  }
+
+  // rowStamp reads the gray time off a row's role line, without the date in front:
+  // a page left open across midnight draws yesterday's rows with the date added,
+  // which is a change of the clock's format, not of the transcript. A row with no
+  // stamp returns ''.
+  function rowStamp(row) {
+    var el = row.querySelector('.role > .time');
+    var stamp = el ? el.textContent : '';
+    return stamp.length > 8 ? stamp.slice(-8) : stamp;
+  }
+
+  // rowSignature identifies a row by what it was drawn from: its kind, the exact
+  // source text of its body, its stamp and the files it lists. Two rows with the
+  // same signature describe the same row of the same conversation, so the one
+  // already rendered can stand in for the other. The markup is deliberately left
+  // out — comparing it is what the page is trying to avoid producing twice.
+  function rowSignature(row) {
+    var span = rowText(row);
+    var text = span ? rowSource.get(span) : '';
+    // Rows the page does not draw a text source into (a tool call, the session
+    // table) carry none: their own text is what identifies them.
+    if (typeof text !== 'string') { text = span ? span.textContent : ''; }
+    return rowKind(row) + '\u0001' + rowStamp(row) + '\u0001' + (rowFiles.get(row) || '') + '\u0001' + text;
+  }
+
+  // keepRenderedRows merges the snapshot being replayed into the transcript on
+  // screen and hands back one fragment holding the log as it should look: at its
+  // head the rows that match (the snapshot's copies of them are dropped), then the
+  // snapshot's own rows. The first row that differs ends the comparison, so from
+  // there on the snapshot is what the log shows — exactly what a full rebuild
+  // would have drawn, without touching the rows above.
+  function keepRenderedRows() {
+    var kept = document.createDocumentFragment();
+    var old = [];
+    for (var i = 0; i < log.children.length; i++) {
+      // A queued message's row is the page's own and the snapshot never carries it
+      // (the agent draws the message's own row when it sends it): the rebuild
+      // drops it, as it always has.
+      if (log.children[i].classList.contains('pending')) { continue; }
+      old.push(log.children[i]);
+    }
+    var fresh = [];
+    if (replayBatch) {
+      for (var r = 0; r < replayBatch.children.length; r++) { fresh.push(replayBatch.children[r]); }
+    }
+    var same = 0;
+    while (same < old.length && same < fresh.length &&
+           rowSignature(old[same]) === rowSignature(fresh[same])) {
+      same++;
+    }
+    // The rows on screen go over as they are: this moves them out of the log, so
+    // the rebuilt log holds the very nodes the reader is looking at (their
+    // listeners, their rendered markdown and their scroll anchoring with them).
+    for (var k = 0; k < same; k++) { kept.appendChild(old[k]); }
+    // Their replayed copies are dropped before they cost anything: the row is already
+    // on screen, markup and all, so the copy (and the markup it was just given) goes.
+    for (var d = 0; d < same && replayBatch; d++) {
+      replayBatch.removeChild(fresh[d]);
+    }
+    if (replayBatch) { kept.appendChild(replayBatch); }
+    return kept;
+  }
+
   // endHistory closes the replay: the snapshot's rows reach the log, the view is
   // pinned to the bottom (the way a refreshed page sits) and the running indicator
   // picks up whatever the header reported. A held-back rebuild replaces the
   // transcript in one insert (see flushReplayBatch): an empty snapshot still has to
   // clear what is on screen, and the messages sent while the snapshot was arriving
   // are newer than everything it carries, so they go after the last replayed row.
+  // The rows the snapshot shares with the transcript on screen are not built again
+  // (see keepRenderedRows): a resumed page pays for the rows that changed, not for
+  // the whole conversation.
   function endHistory() {
     if (!replaying) { return; }
     for (var i = 0; i < pendingRows.length; i++) {
       if (replayBatch && pendingRows[i].el.parentNode === replayBatch) { replayBatch.appendChild(pendingRows[i].el); }
     }
+    // The last replayed thinking row may still be waiting for its paced redraw
+    // (see scheduleReasoningRender): its text is part of its identity, so it is
+    // drawn now, markup and all, like the rows around it.
+    if (reasoningRow && pendingReasoningRender) {
+      clearTimeout(pendingReasoningRender);
+      pendingReasoningRender = null;
+      setRow(reasoningRow, reasoningText, MARKDOWN);
+    }
     var swapped = swapInAtEnd;
     if (swapped) {
+      // The log is rebuilt from what the two have in common: the rows that match
+      // stay, the rest of the snapshot follows them (see keepRenderedRows).
+      var merged = keepRenderedRows();
       log.innerHTML = '';
-      if (replayBatch) { log.appendChild(replayBatch); }
+      log.appendChild(merged);
     } else {
       flushReplayBatch();
     }
     replayBatch = null;
     swapInAtEnd = false;
+    // Every replayed row was drawn as it was built (see setSpan), so the snapshot the
+    // map was read for is on screen now: the map has nothing left to answer and is let
+    // go — the page's own conversions stay where they landed, in the log (see the
+    // cache section).
+    mdCache.clear();
     // The log now shows the snapshot's transcript, so a reconnect may report its
     // version (see replayVersion).
     if (replayVersion) { historyVersion = replayVersion; replayVersion = 0; }
@@ -2727,10 +2781,9 @@
   // closed in the middle of stays half-built (a held-back rebuild never touched the
   // log, see flushReplayBatch), and the next connection replaces it with a fresh
   // snapshot anyway. The transcript a held-back snapshot was going to replace is
-  // still the one on screen, so only the queued markdown upgrades of the discarded
-  // rows have to go.
+  // still the one on screen, and the map read at load is kept for that next
+  // connection.
   function dropReplayState() {
-    if (swapInAtEnd) { mdPending.clear(); }
     // The snapshot never reached the log: the transcript on screen keeps its own
     // version, so the next connection asks for a full one again (see replayVersion).
     replayVersion = 0;
@@ -2873,7 +2926,7 @@
   // easing its redraws to one per second (see renderIntervalMs/turnTickMs). A
   // phone gets HIDDEN_GRACE_MS_PHONE of grace and is then stopped: its clock, its
   // socket (the server pings an idle connection every 30s, and every ping wakes a
-  // radio), its idle markdown slices and its CSS animation all go. Coming back
+  // radio) and its CSS animation all go. Coming back
   // from a stopped page dials again and rebuilds the log from the snapshot, which
   // is exactly how a reloaded page restores itself.
   var HIDDEN_GRACE_MS_PHONE = 60000;
@@ -2883,36 +2936,32 @@
   var stopped = false;
 
   function goIdle() {
+    // The conversions the log holds go to browser storage first, whatever state the
+    // page is in (see the cache section below): a page stopped by its grace period
+    // keeps living in the background and keeps drawing, so the entry has to follow it
+    // to the last pagehide or freeze.
+    saveMarkdownCache();
     if (stopped) { return; }
     stopped = true;
     document.documentElement.setAttribute('data-idle', '1');
     // The "running" state and its clock come back with the snapshot.
     stopTurnTimer();
-    // The pending markdown passes are kept: the log may well survive the trip (a
-    // reconnect with nothing to report is answered with history_same, which keeps
-    // it), and the log has to be complete when the page is looked at again — it is
-    // flushed in one batch as the page comes back (see flushMarkdownNow). No timer
-    // of this page runs while it is hidden and stopped.
+    // The log itself is kept: it may well survive the trip (a reconnect with nothing
+    // to report is answered with history_same, which keeps it). No timer of this page
+    // runs while it is hidden and stopped.
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) { try { ws.close(); } catch (err) { /* already closed */ } }
   }
 
   // goActive puts the page back to work: the animation resumes, a stopped page
   // dials again (a fresh connection means a fresh snapshot), and the rhythm the
-  // foreground asks for is armed. The markdown passes that queued up while nobody
-  // was looking are done now, in one batch (see flushMarkdownNow): the page is
-  // about to be read again, and a queue left to the idle slices would upgrade rows
-  // under the reader's eyes for as long as it lasts.
+  // foreground asks for is armed.
   function goActive() {
     var wasStopped = stopped;
     stopped = false;
     document.documentElement.removeAttribute('data-idle');
     reconnectDelay = 0;
-    // The dial comes first, so a long catch-up cannot delay it: a reconnect that
-    // brings a fresh snapshot replaces the rows the pass upgrades anyway, and one
-    // answered with history_same needs the log complete as it stands.
     if (wasStopped && AUTH().ok()) { connect(); }
-    flushMarkdownNow();
     restartTurnTimer();
   }
 
@@ -2937,6 +2986,141 @@
   window.addEventListener('pageshow', goActive);
   window.addEventListener('freeze', goIdle);
   window.addEventListener('resume', goActive);
+
+  // ---- the markdown conversion cache ----
+  // Drawing a snapshot costs one thing above all others: turning each row's
+  // markdown into HTML (marked, the formulas, the sanitizer) for thousands of rows.
+  // That conversion is a pure function of the text, so the page writes the answers
+  // down — a hash of the text mapped to the HTML it produced — and a reloaded page
+  // reads the map back before the socket is even open, drawing its first snapshot
+  // out of it without parsing a line.
+  //
+  // Only the conversion crosses the trip: the rows, their order, their text, their
+  // timestamps and their files all come from the server exactly as before. Nothing
+  // is restored into the log and nothing is reported back as state, so a stale entry
+  // cannot show a row that is not there — the worst it can do is draw a row with the
+  // markup an older marked produced for that same text. A hash is the whole key,
+  // which is why there is no version to keep in step: the same text always converts
+  // to the same HTML, and a text that changed is simply a key nobody asks for again.
+  //
+  // The map is read once, at load, and dropped as soon as the snapshot it was read
+  // for is drawn (see endHistory): this page's own conversions stay where they landed,
+  // in the log, so there is nothing left for the cache to answer afterwards — a row a
+  // later rebuild draws again is simply parsed again.
+  //
+  // localStorage, not IndexedDB: a page being frozen has no time for anything
+  // asynchronous, so the write has to land in the same task or not at all.
+  var MD_CACHE_KEY = 'lightagent.markdown';
+  // STORAGE_MAX_BYTES bounds one dump: 10 MB. The browser's own quota is the harder
+  // limit (Chrome allows about 5 MB per origin, counted as UTF-16), and a write it
+  // refuses is retried with a shorter dump (see saveMarkdownCache).
+  var STORAGE_MAX_BYTES = 10 * 1024 * 1024;
+  // mdCache holds the conversions the last save wrote down, keyed by the text's hash.
+  // It is filled once, at load, and dropped once the load's rows are drawn.
+  var mdCache = new Map();
+
+  // storageArea returns the browser storage the conversions are kept in, or null when
+  // the browser hands none over (private mode, storage switched off, a sandboxed
+  // frame): the cache is an optimisation and the page works without it.
+  function storageArea() {
+    try { return window.localStorage || null; } catch (err) { return null; }
+  }
+
+  // mdHash is the key of the cache: cyrb53, a 53-bit string hash. It runs over the
+  // text of every replayed row, so it has to be cheap — one pass, no allocation, and
+  // far less work than parsing what it stands in for. The text's length is part of
+  // the key (see mdKey), which is what keeps two different texts off one entry.
+  function mdHash(text) {
+    var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  }
+
+  // mdKey is the key a text is cached under. The leading letter keeps the key from
+  // looking like an array index (which would reorder the stored object).
+  function mdKey(text) { return 'm' + text.length + ':' + mdHash(text); }
+
+  // cachedMarkdown returns the HTML a text was converted to, or null when this page
+  // has no answer for it.
+  function cachedMarkdown(text) {
+    if (mdCache.size === 0) { return null; }
+    var html = mdCache.get(mdKey(text));
+    return typeof html === 'string' ? html : null;
+  }
+
+  // loadMarkdownCache reads the entry back into the map, once, at load. An entry this
+  // page cannot make sense of is left alone: it is replaced by the next save anyway,
+  // and until then the page converts everything as it always did.
+  function loadMarkdownCache() {
+    var area = storageArea();
+    if (!area) { return; }
+    var raw = null;
+    try { raw = area.getItem(MD_CACHE_KEY); } catch (err) { return; }
+    if (!raw) { return; }
+    var data = null;
+    try { data = JSON.parse(raw); } catch (err) { return; }
+    if (!data || typeof data !== 'object') { return; }
+    Object.keys(data).forEach(function (key) {
+      var html = data[key];
+      if (typeof html === 'string') { mdCache.set(key, html); }
+    });
+  }
+
+  // saveMarkdownCache writes down the conversion of everything on screen, replacing
+  // the previous entry whole — there is one slot, and the log is the transcript the
+  // page actually has. The dump follows the log's order, so reaching the cap keeps
+  // the rows written down first (the older part of the conversation) and leaves the
+  // newer ones for the next round; a browser whose quota is smaller than the cap is
+  // handed a shorter dump of the same prefix (see the retry below).
+  //
+  // A row the page has no conversion for (drawn as plain text, or one the reader's
+  // /markdown switch is off for) has nothing to write down, and a row with no source
+  // text at all (a tool call, the /list table) has nothing to key a conversion by.
+  function saveMarkdownCache() {
+    var area = storageArea();
+    if (!area) { return; }
+    // A snapshot on its way means the log is either the transcript being replaced or
+    // a half-built one: the save after it landed has the real thing.
+    if (replaying) { return; }
+    var parts = [];
+    var bytes = 2; // the braces
+    for (var i = 0; i < log.children.length; i++) {
+      var span = textSpan(log.children[i]);
+      if (!span || !span.classList.contains('md')) { continue; }
+      var src = rowSource.get(span);
+      if (typeof src !== 'string') { continue; }
+      // The key is the text as it was drawn — the row endings the screen gets, not
+      // the ones the message arrived with (see displayText): the same normalization
+      // happens before every lookup.
+      var piece = JSON.stringify(mdKey(displayText(src))) + ':' + JSON.stringify(span.innerHTML);
+      if (bytes + piece.length > STORAGE_MAX_BYTES) { break; }
+      bytes += piece.length + 1;
+      parts.push(piece);
+    }
+    // Nothing on screen needs converting (a page that never connected, a /new
+    // conversation): the entry is left exactly as it is — its answers are keyed by
+    // the text they convert, so they stay true whatever this page is showing.
+    if (!parts.length) { return; }
+    // One slot, always replaced. A quota smaller than the dump is answered by trying
+    // half of it, then half of that: the browser then holds the beginning of the
+    // transcript, which is the part the cap itself keeps.
+    var n = parts.length;
+    while (n > 0) {
+      try {
+        area.setItem(MD_CACHE_KEY, '{' + parts.slice(0, n).join(',') + '}');
+        return;
+      } catch (err) {
+        n = n >> 1;
+      }
+    }
+    try { area.removeItem(MD_CACHE_KEY); } catch (err) { /* nothing to drop */ }
+  }
 
   // ---- attachments ----
   // An attached file is uploaded to the mirror as soon as it is picked (the
@@ -3015,6 +3199,20 @@
     list.className = 'attachments';
     attachments.forEach(function (item) { list.appendChild(mediaItem(item)); });
     return list;
+  }
+
+  // filesSignature is the identity of the files a message carried: the name, the
+  // type and the URL of each, in the order they were sent. It is what tells two
+  // messages with the same text and different files apart (see rowSignature), so
+  // it is read from the event, never from the markup.
+  function filesSignature(attachments) {
+    if (!attachments || !attachments.length) { return ''; }
+    var parts = [];
+    for (var i = 0; i < attachments.length; i++) {
+      var a = attachments[i] || {};
+      parts.push((a.name || '') + '\u0002' + (a.type || '') + '\u0002' + (a.url || ''));
+    }
+    return parts.join('\u0001');
   }
 
   // mediaItem draws one attachment as a list item: a framed picture that opens
@@ -3534,6 +3732,11 @@
   setInterval(function () {
     if (!stopped) { renderSessionSaved(); }
   }, 30000);
+  // The conversions the previous page wrote down are read back before the socket is
+  // dialed, so the first snapshot is drawn without parsing markdown at all (see the
+  // cache section): the reader gets the transcript at once, and the rows themselves
+  // come from the server as always.
+  loadMarkdownCache();
   // The composer starts gray: there is no socket yet (see updateComposer).
   updateComposer();
   // Wait for the session state before dialing: the handshake fails without a
